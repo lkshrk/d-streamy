@@ -7,11 +7,18 @@ enum IPCCommand: Encodable {
     case disconnect
     case getGuilds
     case getChannels(guildId: String)
+    case updateVideo(UpdateVideoPayload)
 
     struct ConnectPayload: Codable {
         let token: String
         let guildId: String
         let channelId: String
+        let width: Int
+        let height: Int
+        let fps: Int
+    }
+
+    struct UpdateVideoPayload: Codable {
         let width: Int
         let height: Int
         let fps: Int
@@ -34,6 +41,9 @@ enum IPCCommand: Encodable {
         case .getChannels(let guildId):
             try container.encode("getChannels", forKey: .type)
             try container.encode(["guildId": guildId], forKey: .payload)
+        case .updateVideo(let payload):
+            try container.encode("updateVideo", forKey: .type)
+            try container.encode(payload, forKey: .payload)
         }
     }
 }

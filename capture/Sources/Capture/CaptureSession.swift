@@ -46,10 +46,15 @@ public final class CaptureSession {
     private var capture: WindowCapture?
     private var encoder: VideoEncoder?
     private var pipeWriter: PipeWriter?
+    private var currentFps: Int = 30
+    private var currentBitrate: Double = 6.0
 
     public private(set) var captureWidth: Int = 0
     public private(set) var captureHeight: Int = 0
     public private(set) var isRunning = false
+
+    /// Live-updatable crop. Reads are on the frame callback thread.
+    public private(set) var activeCrop: CropFilter?
 
     public init() {}
 
@@ -58,7 +63,19 @@ public final class CaptureSession {
         let srcW = config.sourceWidth
         let srcH = config.sourceHeight
 
-        // Compute dimensions preserving aspect ratio
+        // Determine SCStream capture size — always full source resolution
+        // so CropFilter can extract the right region.
+        let streamW: Int
+        let streamH: Int
+        if srcW > 0 && srcH > 0 {
+            streamW = srcW
+            streamH = srcH
+        } else {
+            streamW = config.maxWidth
+            streamH = config.maxHeight
+        }
+
+        // Encoder/output dimensions = crop size if cropping, else scaled to max
         if let crop = config.crop {
             captureWidth = crop.width
             captureHeight = crop.height
@@ -72,6 +89,9 @@ public final class CaptureSession {
             captureWidth = config.maxWidth
             captureHeight = config.maxHeight
         }
+
+        self.currentFps = config.fps
+        self.currentBitrate = config.bitrateMbps
 
         let writer = PipeWriter(fd: config.outputFd)
         self.pipeWriter = writer
@@ -89,11 +109,14 @@ public final class CaptureSession {
 
         let cap = WindowCapture()
 
-        // Video
+        // Set initial crop
+        self.activeCrop = config.crop
+
+        // Video — capture at full source resolution, crop per-frame
         cap.onVideoFrame = { [weak self] pixelBuffer, pts in
             guard let self, let encoder = self.encoder else { return }
             let buf: CVPixelBuffer
-            if let crop = config.crop {
+            if let crop = self.activeCrop {
                 guard let cropped = crop.apply(to: pixelBuffer) else { return }
                 buf = cropped
             } else {
@@ -154,7 +177,7 @@ public final class CaptureSession {
             writer.write(type: .audio, timestamp: timestampUs, data: int16Data)
         }
 
-        try await cap.start(filter: config.filter, width: captureWidth, height: captureHeight, fps: config.fps)
+        try await cap.start(filter: config.filter, width: streamW, height: streamH, fps: config.fps)
         self.capture = cap
         self.isRunning = true
     }
@@ -167,5 +190,38 @@ public final class CaptureSession {
         capture = nil
         encoder = nil
         pipeWriter = nil
+    }
+
+    /// Update crop while running. Returns new (width, height) if encoder was reinitialized, nil if only position changed.
+    public func updateCrop(_ crop: CropFilter?) -> (Int, Int)? {
+        self.activeCrop = crop
+        guard let crop else {
+            // Removing crop — would need full restart to go back to uncropped. Skip for now.
+            return nil
+        }
+
+        // If dimensions match current encoder, just a position change — no reinit needed
+        let newW = crop.width
+        let newH = crop.height
+        guard newW != captureWidth || newH != captureHeight else { return nil }
+
+        // Dimensions changed — reinit encoder
+        encoder?.stop()
+        captureWidth = newW
+        captureHeight = newH
+
+        guard let writer = pipeWriter else { return (newW, newH) }
+        let enc = VideoEncoder(
+            width: newW,
+            height: newH,
+            fps: currentFps,
+            bitrateMbps: currentBitrate
+        ) { frameData, timestampUs in
+            writer.write(type: .video, timestamp: timestampUs, data: frameData)
+        }
+        try? enc.start()
+        self.encoder = enc
+
+        return (newW, newH)
     }
 }

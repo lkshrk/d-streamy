@@ -33,7 +33,7 @@ export class StreamManager extends EventEmitter {
   private channelId = "";
   private reconnectAttempt = 0;
   private intentionalDisconnect = false;
-  private streamOpts: StreamOptions = { width: 1280, height: 720, fps: 30 };
+  private streamOpts: StreamOptions = { width: 1920, height: 1080, fps: 30 };
 
   async connect(token: string, guildId: string, channelId: string, opts?: Partial<StreamOptions>): Promise<void> {
     this.token = token;
@@ -65,6 +65,13 @@ export class StreamManager extends EventEmitter {
     } catch {
       // Drop frame on transient error
     }
+  }
+
+  updateVideoAttributes(width: number, height: number, fps: number): void {
+    if (!this.connection) return;
+    this.streamOpts = { width, height, fps };
+    this.connection.mediaConnection.setVideoAttributes(true, { width, height, fps });
+    process.stderr.write(`[stream] updated video attributes: ${width}x${height}@${fps}\n`);
   }
 
   private async doConnect(): Promise<void> {

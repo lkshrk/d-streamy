@@ -107,6 +107,7 @@ struct PopoverView: View {
                 }
 
                 if state.streamState.isActive {
+                    WindowPickerView()
                     StatsView()
                 } else if !state.token.isEmpty {
                     WindowPickerView()

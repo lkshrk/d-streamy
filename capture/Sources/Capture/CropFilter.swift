@@ -34,7 +34,6 @@ public struct CropFilter {
         guard let srcBase = CVPixelBufferGetBaseAddress(source) else { return nil }
 
         let pixelFormat = CVPixelBufferGetPixelFormatType(source)
-        let dstBytesPerRow = width * 4  // BGRA = 4 bytes per pixel
 
         var dst: CVPixelBuffer?
         let status = CVPixelBufferCreate(
@@ -52,13 +51,16 @@ public struct CropFilter {
 
         guard let dstBase = CVPixelBufferGetBaseAddress(dstBuffer) else { return nil }
 
+        let dstStride = CVPixelBufferGetBytesPerRow(dstBuffer)
+        let copyBytes = width * 4  // actual pixel data per row
+
         // Copy row by row
         for row in 0..<height {
             let srcRow = srcBase
                 .advanced(by: (y + row) * bytesPerRow + x * 4)
             let dstRow = dstBase
-                .advanced(by: row * dstBytesPerRow)
-            memcpy(dstRow, srcRow, dstBytesPerRow)
+                .advanced(by: row * dstStride)
+            memcpy(dstRow, srcRow, copyBytes)
         }
 
         return dstBuffer

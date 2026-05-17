@@ -21,6 +21,10 @@ final class AppState: ObservableObject {
     @Published var captureLabel: String = ""   // display name for selected content
     @Published var username: String = ""
 
+    // Crop
+    @Published var cropRect: CGRect? = nil
+    @Published var isCropOverlayVisible = false
+
     // Stream state
     @Published var streamState: StreamState = .idle
     @Published var stats = StatsPayload(uptime: 0, fps: 0, bitrate: 0, droppedFrames: 0)
@@ -36,6 +40,7 @@ final class AppState: ObservableObject {
     let daemon = DaemonController()
     private var captureSession = CaptureSession()
     private let defaults = UserDefaults.standard
+    let cropOverlayController = CropOverlayController()
 
     enum StreamState: Equatable {
         case idle
@@ -54,8 +59,8 @@ final class AppState: ObservableObject {
 
     init() {
         // Load persisted settings
-        maxWidth = defaults.object(forKey: "maxWidth") as? Int ?? 1280
-        maxHeight = defaults.object(forKey: "maxHeight") as? Int ?? 720
+        maxWidth = defaults.object(forKey: "maxWidth") as? Int ?? 1920
+        maxHeight = defaults.object(forKey: "maxHeight") as? Int ?? 1080
         fps = defaults.object(forKey: "fps") as? Int ?? 30
         bitrateMbps = defaults.object(forKey: "bitrateMbps") as? Double ?? 6.0
         audioGain = defaults.object(forKey: "audioGain") as? Float ?? 1.0
@@ -75,6 +80,37 @@ final class AppState: ObservableObject {
             self?.handleDaemonEvent(type, payload)
         }
 
+        cropOverlayController.onCropChanged = { [weak self] rect in
+            guard let self else { return }
+            self.cropRect = rect
+            self.persistCrop()
+            // Live-update crop on running stream
+            if self.streamState.isActive, let filter = self.captureFilter {
+                let scale = filter.pointPixelScale
+                let sourceH = filter.contentRect.height * CGFloat(scale)
+                // NSView coords are bottom-left origin; pixel buffer is top-left origin
+                let pixelY = Int(sourceH - (rect.origin.y + rect.height) * CGFloat(scale))
+                let crop = CropFilter(
+                    x: Int(rect.origin.x * CGFloat(scale)),
+                    y: max(0, pixelY),
+                    width: Int(rect.width * CGFloat(scale)),
+                    height: Int(rect.height * CGFloat(scale))
+                )
+                if let newDims = self.captureSession.updateCrop(crop) {
+                    // Encoder reinitialized with new dimensions — tell Discord
+                    self.daemon.send(.updateVideo(.init(
+                        width: newDims.0,
+                        height: newDims.1,
+                        fps: self.fps
+                    )))
+                }
+            }
+        }
+        cropOverlayController.onApply = { [weak self] in
+            self?.cropOverlayController.hide()
+            self?.isCropOverlayVisible = false
+        }
+
         if !token.isEmpty {
             Task { await loginAndFetch() }
         }
@@ -88,16 +124,27 @@ final class AppState: ObservableObject {
               !bundleId.isEmpty else { return }
         let savedTitle = defaults.string(forKey: "lastWindowTitle") ?? ""
         let savedApp = defaults.string(forKey: "lastWindowApp") ?? ""
+        let savedFrame = defaults.array(forKey: "lastWindowFrame") as? [CGFloat]
 
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            // Find matching window: same app, prefer same title
             let candidates = content.windows.filter {
                 $0.owningApplication?.bundleIdentifier == bundleId
+                && $0.frame.width > 100 && $0.frame.height > 100
             }
-            let match = candidates.first(where: { $0.title == savedTitle })
-                ?? candidates.first(where: { ($0.title ?? "").contains(savedTitle) })
-                ?? candidates.first // fallback to any window from same app
+
+            // Best match: exact title > contains title > closest frame position+size
+            let match: SCWindow?
+            if let exact = candidates.first(where: { $0.title == savedTitle }) {
+                match = exact
+            } else if let partial = candidates.first(where: { ($0.title ?? "").contains(savedTitle) }) {
+                match = partial
+            } else if let sf = savedFrame, sf.count == 4 {
+                let saved = CGRect(x: sf[0], y: sf[1], width: sf[2], height: sf[3])
+                match = candidates.min(by: { frameDist($0.frame, saved) < frameDist($1.frame, saved) })
+            } else {
+                match = candidates.first
+            }
 
             guard let window = match else {
                 log.info("restoreWindow: no match for \(bundleId)/\(savedTitle)")
@@ -109,6 +156,7 @@ final class AppState: ObservableObject {
             let app = window.owningApplication?.applicationName ?? savedApp
             let title = window.title ?? savedTitle
             captureLabel = app.isEmpty ? title : "\(app) — \(title)"
+            loadCropForCurrentWindow()
             log.info("restoreWindow: auto-selected \(app) — \(title)")
         } catch {
             log.error("restoreWindow failed: \(error.localizedDescription)")
@@ -196,6 +244,19 @@ final class AppState: ObservableObject {
         let sourceH = Int(rect.height * CGFloat(scale))
         log.debug("startStream: contentRect=\(rect.debugDescription) scale=\(scale) source=\(sourceW)x\(sourceH)")
 
+        var pixelCrop: CropFilter? = nil
+        if let crop = cropRect {
+            let sourceH = rect.height * CGFloat(scale)
+            // NSView coords are bottom-left origin; pixel buffer is top-left origin
+            let pixelY = Int(sourceH - (crop.origin.y + crop.height) * CGFloat(scale))
+            pixelCrop = CropFilter(
+                x: Int(crop.origin.x * CGFloat(scale)),
+                y: max(0, pixelY),
+                width: Int(crop.width * CGFloat(scale)),
+                height: Int(crop.height * CGFloat(scale))
+            )
+        }
+
         let config = CaptureConfig(
             filter: filter,
             sourceWidth: sourceW > 0 ? sourceW : maxWidth,
@@ -204,6 +265,7 @@ final class AppState: ObservableObject {
             maxHeight: maxHeight,
             fps: fps,
             bitrateMbps: bitrateMbps,
+            crop: pixelCrop,
             audioGain: audioGain,
             outputFd: mediaFd
         )
@@ -227,6 +289,78 @@ final class AppState: ObservableObject {
             fps: fps
         )))
         log.info("startStream: connect command sent")
+    }
+
+    // MARK: - Crop overlay
+
+    func toggleCropOverlay() {
+        if isCropOverlayVisible {
+            cropOverlayController.hide()
+            isCropOverlayVisible = false
+        } else {
+            guard let filter = captureFilter else { return }
+            // Bring target window to front so it's fully visible
+            if #available(macOS 15.2, *), let window = filter.includedWindows.first {
+                let pid = window.owningApplication?.processID ?? 0
+                if pid > 0, let app = NSRunningApplication(processIdentifier: pid) {
+                    app.activate()
+                }
+            }
+            cropOverlayController.show(for: filter, currentCrop: cropRect)
+            isCropOverlayVisible = true
+        }
+    }
+
+    /// Switch capture source while streaming (new window selected live).
+    func switchCaptureSource() async {
+        guard let filter = captureFilter,
+              let mediaFd = daemon.mediaFd else { return }
+
+        // Stop current capture
+        await captureSession.stop()
+
+        let rect = filter.contentRect
+        let scale = filter.pointPixelScale
+        let sourceW = Int(rect.width * CGFloat(scale))
+        let sourceH = Int(rect.height * CGFloat(scale))
+
+        var cropFilter: CropFilter? = nil
+        if let crop = cropRect {
+            let sourceH = rect.height * CGFloat(scale)
+            let pixelY = Int(sourceH - (crop.origin.y + crop.height) * CGFloat(scale))
+            cropFilter = CropFilter(
+                x: Int(crop.origin.x * CGFloat(scale)),
+                y: max(0, pixelY),
+                width: Int(crop.width * CGFloat(scale)),
+                height: Int(crop.height * CGFloat(scale))
+            )
+        }
+
+        let config = CaptureConfig(
+            filter: filter,
+            sourceWidth: sourceW > 0 ? sourceW : maxWidth,
+            sourceHeight: sourceH > 0 ? sourceH : maxHeight,
+            maxWidth: maxWidth,
+            maxHeight: maxHeight,
+            fps: fps,
+            bitrateMbps: bitrateMbps,
+            crop: cropFilter,
+            audioGain: audioGain,
+            outputFd: mediaFd
+        )
+
+        do {
+            try await captureSession.start(config: config)
+            // Update Discord video attributes if dimensions changed
+            daemon.send(.updateVideo(.init(
+                width: captureSession.captureWidth,
+                height: captureSession.captureHeight,
+                fps: fps
+            )))
+            log.info("switchCaptureSource: now capturing \(self.captureSession.captureWidth)x\(self.captureSession.captureHeight)")
+        } catch {
+            log.error("switchCaptureSource failed: \(error.localizedDescription)")
+        }
     }
 
     func stopStream() async {
@@ -311,11 +445,50 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func frameDist(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        let dx = a.origin.x - b.origin.x
+        let dy = a.origin.y - b.origin.y
+        let dw = a.width - b.width
+        let dh = a.height - b.height
+        return dx*dx + dy*dy + dw*dw + dh*dh
+    }
+
     private func discordAPI(_ path: String) async throws -> (Data, URLResponse) {
         let url = URL(string: "https://discord.com/api/v9/\(path)")!
         var req = URLRequest(url: url)
         req.setValue(token, forHTTPHeaderField: "Authorization")
         return try await URLSession.shared.data(for: req)
+    }
+
+    // MARK: - Crop persistence
+
+    private func cropKey() -> String? {
+        guard let filter = captureFilter else { return nil }
+        if #available(macOS 15.2, *), let window = filter.includedWindows.first {
+            let bundleId = window.owningApplication?.bundleIdentifier ?? "unknown"
+            let title = window.title ?? ""
+            return "crop_\(bundleId)_\(title)"
+        }
+        return nil
+    }
+
+    func persistCrop() {
+        guard let key = cropKey() else { return }
+        if let rect = cropRect {
+            let arr = [rect.origin.x, rect.origin.y, rect.width, rect.height]
+            defaults.set(arr, forKey: key)
+        } else {
+            defaults.removeObject(forKey: key)
+        }
+    }
+
+    func loadCropForCurrentWindow() {
+        guard let key = cropKey() else { cropRect = nil; return }
+        if let arr = defaults.array(forKey: key) as? [CGFloat], arr.count == 4 {
+            cropRect = CGRect(x: arr[0], y: arr[1], width: arr[2], height: arr[3])
+        } else {
+            cropRect = nil
+        }
     }
 
     private func loadToken() {

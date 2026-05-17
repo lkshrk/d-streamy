@@ -150,6 +150,12 @@ async function handleCommand(json: string) {
         sendEvent("channels", []);
         break;
       }
+      case "updateVideo": {
+        const { width, height, fps } = payload;
+        process.stderr.write(`[daemon] updateVideo: ${width}x${height}@${fps}\n`);
+        stream.updateVideoAttributes(width, height, fps);
+        break;
+      }
       default:
         process.stderr.write(`[daemon] unknown command: ${type}\n`);
     }

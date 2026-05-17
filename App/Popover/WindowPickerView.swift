@@ -12,7 +12,7 @@ struct WindowPickerView: View {
             Label("Window", systemImage: "macwindow")
                 .font(.subheadline.bold())
 
-            HStack {
+            HStack(spacing: 6) {
                 Button {
                     ContentPickerController.shared.showPicker(state: state)
                 } label: {
@@ -26,9 +26,17 @@ struct WindowPickerView: View {
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
                 }
                 .buttonStyle(.bordered)
+
+                Button {
+                    state.toggleCropOverlay()
+                } label: {
+                    Image(systemName: state.isCropOverlayVisible ? "crop.rotate" : "crop")
+                }
+                .buttonStyle(.bordered)
+                .disabled(state.captureFilter == nil)
+                .help(state.isCropOverlayVisible ? "Hide crop overlay" : "Set crop region")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -68,6 +76,13 @@ final class ContentPickerController: NSObject, SCContentSharingPickerObserver {
     ) {
         Task { @MainActor in
             guard let state = self.appState else { return }
+
+            // Hide crop overlay when window changes
+            if state.isCropOverlayVisible {
+                state.cropOverlayController.hide()
+                state.isCropOverlayVisible = false
+            }
+
             state.captureFilter = filter
 
             // Extract label from filter and persist window identity
@@ -79,12 +94,23 @@ final class ContentPickerController: NSObject, SCContentSharingPickerObserver {
 
                 // Save for auto-restore on next launch
                 let bundleId = window.owningApplication?.bundleIdentifier ?? ""
+                let frame = window.frame
                 UserDefaults.standard.set(bundleId, forKey: "lastWindowBundleId")
                 UserDefaults.standard.set(title, forKey: "lastWindowTitle")
                 UserDefaults.standard.set(app, forKey: "lastWindowApp")
+                UserDefaults.standard.set([frame.origin.x, frame.origin.y, frame.width, frame.height],
+                                          forKey: "lastWindowFrame")
                 log.info("saved window: \(bundleId) / \(title)")
             } else {
                 state.captureLabel = "Selected content"
+            }
+
+            // Load saved crop for this window (or nil if none)
+            state.loadCropForCurrentWindow()
+
+            // If streaming, switch capture to new window live
+            if state.streamState.isActive {
+                Task { await state.switchCaptureSource() }
             }
         }
     }
