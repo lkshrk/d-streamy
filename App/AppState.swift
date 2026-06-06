@@ -29,6 +29,13 @@ final class AppState: ObservableObject {
     // Stream state
     @Published var streamState: StreamState = .idle
     @Published var stats = StatsPayload(uptime: 0, fps: 0, bitrate: 0, droppedFrames: 0)
+    @Published var metricsHistory: [MetricsPayload] = []
+    private let metricsHistoryCap = 60
+
+    // Menubar health indicator
+    @Published var healthLevel: HealthLevel = .good
+    @Published var menuDotVisible = true
+    private var blinkTimer: Timer?
 
     // Settings (persisted via UserDefaults)
     @Published var maxWidth: Int { didSet { defaults.set(maxWidth, forKey: "maxWidth") } }
@@ -330,6 +337,7 @@ final class AppState: ObservableObject {
 
         sessionId = UUID().uuidString
         metricsStart = Date()
+        metricsHistory = []
         healthLog.info("session start session=\(self.sessionId, privacy: .public)")
 
         let config = CaptureConfig(
@@ -539,6 +547,8 @@ final class AppState: ObservableObject {
         daemon.stop()
         streamState = .idle
         stats = StatsPayload(uptime: 0, fps: 0, bitrate: 0, droppedFrames: 0)
+        metricsHistory = []
+        resetHealth()
     }
 
     func shutdownForQuit() async {
@@ -556,6 +566,8 @@ final class AppState: ObservableObject {
         daemon.stop()
         streamState = .idle
         stats = StatsPayload(uptime: 0, fps: 0, bitrate: 0, droppedFrames: 0)
+        metricsHistory = []
+        resetHealth()
     }
 
     // MARK: - Token management
@@ -622,6 +634,29 @@ final class AppState: ObservableObject {
     private func stopMetricsTimer() {
         metricsTimer?.invalidate()
         metricsTimer = nil
+        resetHealth()
+    }
+
+    private func updateBlink() {
+        if healthLevel == .bad {
+            guard blinkTimer == nil else { return }
+            let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.menuDotVisible.toggle() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            blinkTimer = timer
+        } else {
+            blinkTimer?.invalidate()
+            blinkTimer = nil
+            menuDotVisible = true
+        }
+    }
+
+    private func resetHealth() {
+        blinkTimer?.invalidate()
+        blinkTimer = nil
+        healthLevel = .good
+        menuDotVisible = true
     }
 
     private func handleDaemonEvent(_ type: String, _ payload: Data?) {
@@ -654,6 +689,12 @@ final class AppState: ObservableObject {
             }
         case "metrics":
             if let data = payload, let m = try? JSONDecoder().decode(MetricsPayload.self, from: data) {
+                metricsHistory.append(m)
+                if metricsHistory.count > metricsHistoryCap {
+                    metricsHistory.removeFirst(metricsHistory.count - metricsHistoryCap)
+                }
+                healthLevel = StreamHealth.compute(history: metricsHistory, targetFps: fps).overallLevel
+                updateBlink()
                 streamMetricsLog.info(
                     "session=\(m.session, privacy: .public) t=\(m.t, privacy: .public) fps=\(m.fps, privacy: .public) gapP95=\(m.gapP95Ms, privacy: .public)ms gapMax=\(m.gapMaxMs, privacy: .public)ms gapTrunc=\(m.gapTrunc, privacy: .public) bitrate=\(m.bitrateKbps, privacy: .public)kbps vDrop=\(m.vDrop, privacy: .public) aEnc=\(m.aEnc, privacy: .public) aSent=\(m.aSent, privacy: .public) aDropNotReady=\(m.aDropNotReady, privacy: .public) aEncErr=\(m.aEncErr, privacy: .public) pipeBuf=\(m.pipeBuf, privacy: .public)B audioBuf=\(m.audioBuf, privacy: .public)B rss=\(m.rssMb, privacy: .public)MB"
                 )

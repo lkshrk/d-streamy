@@ -26,7 +26,11 @@ struct DStreamyApp: App {
                     appDelegate.appState = appState
                 }
         } label: {
-            MenuBarLabel(isActive: appState.streamState.isActive)
+            MenuBarLabel(
+                isActive: appState.streamState.isActive,
+                dotColor: appState.healthLevel.nsColor,
+                dotVisible: appState.menuDotVisible
+            )
         }
         .menuBarExtraStyle(.window)
     }
@@ -34,6 +38,8 @@ struct DStreamyApp: App {
 
 struct MenuBarLabel: View {
     let isActive: Bool
+    let dotColor: NSColor
+    let dotVisible: Bool
 
     var body: some View {
         Image(nsImage: makeStatusIcon(active: isActive))
@@ -57,10 +63,10 @@ struct MenuBarLabel: View {
                 )
                 configured.draw(in: NSRect(origin: symbolOrigin, size: symbolSize))
             }
-            if active {
+            if active && dotVisible {
                 let dotSize: CGFloat = 5
                 let dotRect = NSRect(x: rect.width - dotSize - 1, y: rect.height - dotSize - 1, width: dotSize, height: dotSize)
-                NSColor.systemGreen.setFill()
+                dotColor.setFill()
                 NSBezierPath(ovalIn: dotRect).fill()
             }
             return true
