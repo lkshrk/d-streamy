@@ -80,7 +80,7 @@ jobs:
           bun-version: latest
 
       - name: Install daemon dependencies
-        run: bun install --frozen-lockfile
+        run: bun install
 
       - name: Import signing certificate
         env:
