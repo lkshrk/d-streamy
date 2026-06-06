@@ -72,8 +72,8 @@ jobs:
           ref: ${{ needs.gate.outputs.tag }}
           fetch-depth: 0
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.app
+      - name: Select latest Xcode 16 (needs SDK >= 15.2 for SCContentFilter.includedWindows)
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
 
       - uses: oven-sh/setup-bun@v2
         with:
