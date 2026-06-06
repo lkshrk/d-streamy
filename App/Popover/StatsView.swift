@@ -26,6 +26,8 @@ struct StatsView: View {
                 StatCard(label: "FPS", value: "\(state.stats.fps)")
                 StatCard(label: "Bitrate", value: "\(state.stats.bitrate) kbps")
                 StatCard(label: "Dropped", value: "\(state.stats.droppedFrames)")
+                StatCard(label: "Audio Sent", value: "\(state.stats.audioFramesSent ?? 0)")
+                StatCard(label: "Audio Enc", value: "\(state.stats.audioFramesEncoded ?? 0)")
             }
         }
     }

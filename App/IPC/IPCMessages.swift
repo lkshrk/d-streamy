@@ -16,6 +16,7 @@ enum IPCCommand: Encodable {
         let width: Int
         let height: Int
         let fps: Int
+        let session: String
     }
 
     struct UpdateVideoPayload: Codable {
@@ -83,6 +84,72 @@ struct StatsPayload: Codable {
     let fps: Int
     let bitrate: Int
     let droppedFrames: Int
+    let rssBytes: Int?
+    let heapUsedBytes: Int?
+    let externalBytes: Int?
+    let arrayBuffersBytes: Int?
+    let pipeBufferBytes: Int?
+    let audioBufferBytes: Int?
+    let audioPackets: Int?
+    let audioBytesReceived: Int?
+    let audioFramesEncoded: Int?
+    let audioFramesSent: Int?
+    let audioFramesDroppedNotReady: Int?
+    let audioEncodeErrors: Int?
+
+    init(
+        uptime: Int,
+        fps: Int,
+        bitrate: Int,
+        droppedFrames: Int,
+        rssBytes: Int? = nil,
+        heapUsedBytes: Int? = nil,
+        externalBytes: Int? = nil,
+        arrayBuffersBytes: Int? = nil,
+        pipeBufferBytes: Int? = nil,
+        audioBufferBytes: Int? = nil,
+        audioPackets: Int? = nil,
+        audioBytesReceived: Int? = nil,
+        audioFramesEncoded: Int? = nil,
+        audioFramesSent: Int? = nil,
+        audioFramesDroppedNotReady: Int? = nil,
+        audioEncodeErrors: Int? = nil
+    ) {
+        self.uptime = uptime
+        self.fps = fps
+        self.bitrate = bitrate
+        self.droppedFrames = droppedFrames
+        self.rssBytes = rssBytes
+        self.heapUsedBytes = heapUsedBytes
+        self.externalBytes = externalBytes
+        self.arrayBuffersBytes = arrayBuffersBytes
+        self.pipeBufferBytes = pipeBufferBytes
+        self.audioBufferBytes = audioBufferBytes
+        self.audioPackets = audioPackets
+        self.audioBytesReceived = audioBytesReceived
+        self.audioFramesEncoded = audioFramesEncoded
+        self.audioFramesSent = audioFramesSent
+        self.audioFramesDroppedNotReady = audioFramesDroppedNotReady
+        self.audioEncodeErrors = audioEncodeErrors
+    }
+}
+
+struct MetricsPayload: Codable {
+    let session: String
+    let t: Int
+    let fps: Int
+    let gapP95Ms: Int
+    let gapMaxMs: Int
+    let gapTrunc: Bool
+    let bitrateKbps: Int
+    let vDrop: Int
+    let aEnc: Int
+    let aSent: Int
+    let aDropNotReady: Int
+    let aEncErr: Int
+    let pipeBuf: Int
+    let audioBuf: Int
+    let rssMb: Int
 }
 
 struct GuildInfo: Codable, Identifiable, Hashable {

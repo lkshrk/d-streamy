@@ -19,6 +19,7 @@ final class AppState: ObservableObject {
     // Capture (set by SCContentSharingPicker)
     @Published var captureFilter: SCContentFilter?
     @Published var captureLabel: String = ""   // display name for selected content
+    @Published var captureKind: CaptureKind = .window
     @Published var username: String = ""
 
     // Crop
@@ -41,6 +42,16 @@ final class AppState: ObservableObject {
     private var captureSession = CaptureSession()
     private let defaults = UserDefaults.standard
     let cropOverlayController = CropOverlayController()
+    private var captureStartTask: Task<Void, Never>?
+    private var captureStartWatchdogTask: Task<Void, Never>?
+    private var connectWatchdogTask: Task<Void, Never>?
+    private let streamLog = StreamFileLogger.shared
+    private let captureMetricsLog = Logger(subsystem: "me.harke.d-streamy", category: "capture")
+    private let streamMetricsLog = Logger(subsystem: "me.harke.d-streamy", category: "stream")
+    private let healthLog = Logger(subsystem: "me.harke.d-streamy", category: "health")
+    private var sessionId = ""
+    private var metricsTimer: Timer?
+    private var metricsStart = Date()
 
     enum StreamState: Equatable {
         case idle
@@ -52,6 +63,13 @@ final class AppState: ObservableObject {
         var isActive: Bool {
             switch self {
             case .streaming, .reconnecting: return true
+            default: return false
+            }
+        }
+
+        var canStop: Bool {
+            switch self {
+            case .connecting, .streaming, .reconnecting: return true
             default: return false
             }
         }
@@ -116,7 +134,46 @@ final class AppState: ObservableObject {
         }
 
         // Auto-restore last selected window
-        Task { await restoreWindow() }
+        Task { await restoreCaptureSelection() }
+    }
+
+    var canCropSelectedContent: Bool {
+        guard captureFilter != nil else { return false }
+        return captureKind == .window
+    }
+
+    private func restoreCaptureSelection() async {
+        if defaults.string(forKey: "lastCaptureKind") == CaptureKind.display.rawValue,
+           await restoreDisplay() {
+            return
+        }
+
+        await restoreWindow()
+    }
+
+    private func restoreDisplay() async -> Bool {
+        let savedDisplayID = CGDirectDisplayID(defaults.integer(forKey: "lastDisplayID"))
+        guard savedDisplayID != 0 else { return false }
+
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            guard let display = content.displays.first(where: { $0.displayID == savedDisplayID }) else {
+                log.info("restoreDisplay: no match for \(savedDisplayID)")
+                return false
+            }
+
+            let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+            captureFilter = filter
+            captureKind = .display
+            cropRect = nil
+            captureLabel = displayCaptureLabel(for: display, filter: filter)
+            log.info("restoreDisplay: auto-selected \(self.captureLabel)")
+            streamLog.write(component: "app", "restore display: \(captureLabel)")
+            return true
+        } catch {
+            log.error("restoreDisplay failed: \(error.localizedDescription)")
+            return false
+        }
     }
 
     private func restoreWindow() async {
@@ -153,11 +210,13 @@ final class AppState: ObservableObject {
 
             let filter = SCContentFilter(desktopIndependentWindow: window)
             captureFilter = filter
+            captureKind = .window
             let app = window.owningApplication?.applicationName ?? savedApp
             let title = window.title ?? savedTitle
             captureLabel = app.isEmpty ? title : "\(app) — \(title)"
             loadCropForCurrentWindow()
             log.info("restoreWindow: auto-selected \(app) — \(title)")
+            streamLog.write(component: "app", "restore window: \(captureLabel)")
         } catch {
             log.error("restoreWindow failed: \(error.localizedDescription)")
         }
@@ -208,11 +267,18 @@ final class AppState: ObservableObject {
               let channel = selectedChannel,
               !token.isEmpty else {
             log.warning("startStream guard failed: filter=\(self.captureFilter != nil) guild=\(self.selectedGuild != nil) channel=\(self.selectedChannel != nil) token=\(!self.token.isEmpty)")
+            streamLog.write(component: "app", "start guard failed filter=\(captureFilter != nil) guild=\(selectedGuild != nil) channel=\(selectedChannel != nil) token=\(!token.isEmpty)")
             return
         }
 
+        log.info("startStream: resetting stale sharing session")
+        streamLog.write(component: "app", "start: reset stale sharing session")
+        cancelStreamTasks()
+        await resetSharingSessionBeforeStart()
+
         streamState = .connecting
         log.info("startStream: connecting")
+        streamLog.write(component: "app", "start: connecting source=\(captureLabel) kind=\(captureKind.rawValue)")
 
         // Start daemon if needed
         if !daemon.isConnected {
@@ -224,17 +290,21 @@ final class AppState: ObservableObject {
                 }
                 guard daemon.isConnected else {
                     streamState = .error("Daemon failed to connect")
+                    streamLog.write(component: "app", "start: daemon failed to connect")
                     return
                 }
             } catch {
                 streamState = .error("Failed to start daemon: \(error.localizedDescription)")
+                streamLog.write(component: "app", "start: daemon start failed: \(error.localizedDescription)")
                 return
             }
         }
         log.info("startStream: daemon connected")
+        streamLog.write(component: "app", "start: daemon connected")
 
         guard let mediaFd = daemon.mediaFd else {
             streamState = .error("No media pipe available")
+            streamLog.write(component: "app", "start: no media pipe")
             return
         }
 
@@ -243,6 +313,7 @@ final class AppState: ObservableObject {
         let sourceW = Int(rect.width * CGFloat(scale))
         let sourceH = Int(rect.height * CGFloat(scale))
         log.debug("startStream: contentRect=\(rect.debugDescription) scale=\(scale) source=\(sourceW)x\(sourceH)")
+        streamLog.write(component: "app", "start: source=\(sourceW)x\(sourceH) max=\(maxWidth)x\(maxHeight) fps=\(fps) bitrate=\(bitrateMbps)")
 
         var pixelCrop: CropFilter? = nil
         if let crop = cropRect {
@@ -257,6 +328,10 @@ final class AppState: ObservableObject {
             )
         }
 
+        sessionId = UUID().uuidString
+        metricsStart = Date()
+        healthLog.info("session start session=\(self.sessionId, privacy: .public)")
+
         let config = CaptureConfig(
             filter: filter,
             sourceWidth: sourceW > 0 ? sourceW : maxWidth,
@@ -270,25 +345,113 @@ final class AppState: ObservableObject {
             outputFd: mediaFd
         )
 
-        do {
-            try await captureSession.start(config: config)
-        } catch {
-            log.error("startStream: capture failed: \(error.localizedDescription)")
-            streamState = .error("Capture failed: \(error.localizedDescription)")
-            return
-        }
-
-        log.info("startStream: capture started \(self.captureSession.captureWidth)x\(self.captureSession.captureHeight)")
-
-        daemon.send(.connect(.init(
+        startCaptureThenConnect(
+            config: config,
             token: token,
             guildId: guild.id,
             channelId: channel.id,
-            width: captureSession.captureWidth,
-            height: captureSession.captureHeight,
             fps: fps
-        )))
-        log.info("startStream: connect command sent")
+        )
+    }
+
+    private func resetSharingSessionBeforeStart() async {
+        // Keep the picker active here: the selected SCContentFilter can rely on
+        // picker-backed authorization, especially for system audio.
+        await captureSession.stop()
+
+        if daemon.isConnected {
+            daemon.send(.disconnect)
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        daemon.stop()
+    }
+
+    private func startCaptureThenConnect(
+        config: CaptureConfig,
+        token: String,
+        guildId: String,
+        channelId: String,
+        fps: Int
+    ) {
+        captureStartTask?.cancel()
+        captureStartWatchdogTask?.cancel()
+
+        log.info("startStream: starting capture")
+
+        captureStartTask = Task { [weak self] in
+            guard let self else { return }
+
+            do {
+                try await self.captureSession.start(config: config)
+            } catch {
+                guard !Task.isCancelled else { return }
+                log.error("startStream: capture failed: \(error.localizedDescription)")
+                self.streamLog.write(component: "app", "start: capture failed: \(error.localizedDescription)")
+                await self.failStart("Capture failed: \(error.localizedDescription)")
+                return
+            }
+
+            guard !Task.isCancelled else { return }
+            guard self.streamState == .connecting, self.daemon.isConnected else { return }
+
+            self.captureStartWatchdogTask?.cancel()
+            log.info("startStream: capture started \(self.captureSession.captureWidth)x\(self.captureSession.captureHeight)")
+            self.streamLog.write(component: "app", "start: capture started \(self.captureSession.captureWidth)x\(self.captureSession.captureHeight)")
+
+            self.daemon.send(.connect(.init(
+                token: token,
+                guildId: guildId,
+                channelId: channelId,
+                width: self.captureSession.captureWidth,
+                height: self.captureSession.captureHeight,
+                fps: fps,
+                session: self.sessionId
+            )))
+            log.info("startStream: connect command sent")
+            self.streamLog.write(component: "app", "start: connect command sent")
+            self.startConnectWatchdog()
+        }
+
+        captureStartWatchdogTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(12))
+            guard !Task.isCancelled else { return }
+            await self?.failStartIfStillConnecting("Timed out starting screen capture")
+        }
+    }
+
+    private func startConnectWatchdog() {
+        connectWatchdogTask?.cancel()
+        connectWatchdogTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(35))
+            guard !Task.isCancelled else { return }
+            await self?.failStartIfStillConnecting("Timed out connecting to Discord")
+        }
+    }
+
+    private func failStartIfStillConnecting(_ message: String) async {
+        guard streamState == .connecting else { return }
+        log.error("startStream: \(message)")
+        streamLog.write(component: "app", "start failed: \(message)")
+        await failStart(message)
+    }
+
+    private func failStart(_ message: String) async {
+        cancelStreamTasks()
+        SCContentSharingPicker.shared.isActive = false
+        daemon.send(.disconnect)
+        await captureSession.stop()
+        try? await Task.sleep(for: .milliseconds(250))
+        daemon.stop()
+        streamState = .error(message)
+    }
+
+    private func cancelStreamTasks() {
+        captureStartTask?.cancel()
+        captureStartTask = nil
+        captureStartWatchdogTask?.cancel()
+        captureStartWatchdogTask = nil
+        connectWatchdogTask?.cancel()
+        connectWatchdogTask = nil
     }
 
     // MARK: - Crop overlay
@@ -298,7 +461,7 @@ final class AppState: ObservableObject {
             cropOverlayController.hide()
             isCropOverlayVisible = false
         } else {
-            guard let filter = captureFilter else { return }
+            guard canCropSelectedContent, let filter = captureFilter else { return }
             // Bring target window to front so it's fully visible
             if #available(macOS 15.2, *), let window = filter.includedWindows.first {
                 let pid = window.owningApplication?.processID ?? 0
@@ -358,17 +521,39 @@ final class AppState: ObservableObject {
                 fps: fps
             )))
             log.info("switchCaptureSource: now capturing \(self.captureSession.captureWidth)x\(self.captureSession.captureHeight)")
+            streamLog.write(component: "app", "switch source: \(captureLabel) \(captureSession.captureWidth)x\(captureSession.captureHeight)")
         } catch {
             log.error("switchCaptureSource failed: \(error.localizedDescription)")
+            streamLog.write(component: "app", "switch source failed: \(error.localizedDescription)")
         }
     }
 
     func stopStream() async {
+        streamLog.write(component: "app", "stop requested")
+        cancelStreamTasks()
+        SCContentSharingPicker.shared.isActive = false
         daemon.send(.disconnect)
+        await captureSession.stop()
         // Wait for leave opcode to flush over WS before killing daemon
         try? await Task.sleep(for: .milliseconds(1000))
         daemon.stop()
+        streamState = .idle
+        stats = StatsPayload(uptime: 0, fps: 0, bitrate: 0, droppedFrames: 0)
+    }
+
+    func shutdownForQuit() async {
+        streamLog.write(component: "app", "quit cleanup requested")
+        cancelStreamTasks()
+        SCContentSharingPicker.shared.isActive = false
+        if isCropOverlayVisible {
+            cropOverlayController.hide()
+            isCropOverlayVisible = false
+        }
+
+        daemon.send(.disconnect)
         await captureSession.stop()
+        try? await Task.sleep(for: .milliseconds(1000))
+        daemon.stop()
         streamState = .idle
         stats = StatsPayload(uptime: 0, fps: 0, bitrate: 0, droppedFrames: 0)
     }
@@ -418,27 +603,69 @@ final class AppState: ObservableObject {
 
     // MARK: - Private
 
+    private func startMetricsTimer() {
+        metricsTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                let s = self.captureSession.metrics.snapshot()
+                let t = Int(Date().timeIntervalSince(self.metricsStart))
+                self.captureMetricsLog.info(
+                    "session=\(self.sessionId, privacy: .public) t=\(t, privacy: .public) delivered=\(s.delivered, privacy: .public) encSubmit=\(s.encSubmit, privacy: .public) encDrop=\(s.encDrop, privacy: .public) audioBuf=\(s.audioBuf, privacy: .public) audioConvFail=\(s.audioConvFail, privacy: .public)"
+                )
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        metricsTimer = timer
+    }
+
+    private func stopMetricsTimer() {
+        metricsTimer?.invalidate()
+        metricsTimer = nil
+    }
+
     private func handleDaemonEvent(_ type: String, _ payload: Data?) {
-        if type != "stats" { log.debug("daemon event: \(type)") }
+        if type != "stats" && type != "metrics" { log.debug("daemon event: \(type)") }
         switch type {
         case "connected":
+            cancelStreamTasks()
             streamState = .streaming
+            streamLog.write(component: "app", "stream connected")
+            healthLog.info("connected session=\(self.sessionId, privacy: .public)")
+            startMetricsTimer()
         case "disconnected":
+            cancelStreamTasks()
             streamState = .idle
+            streamLog.write(component: "app", "stream disconnected")
+            healthLog.info("disconnected session=\(self.sessionId, privacy: .public)")
+            stopMetricsTimer()
             Task { await captureSession.stop() }
         case "reconnecting":
             if let data = payload,
                let obj = try? JSONDecoder().decode([String: Int].self, from: data),
                let attempt = obj["attempt"] {
                 streamState = .reconnecting(attempt)
+                streamLog.write(component: "app", "stream reconnecting attempt=\(attempt)")
+                healthLog.info("reconnecting session=\(self.sessionId, privacy: .public) attempt=\(attempt, privacy: .public)")
             }
         case "stats":
             if let data = payload, let s = try? JSONDecoder().decode(StatsPayload.self, from: data) {
                 stats = s
             }
+        case "metrics":
+            if let data = payload, let m = try? JSONDecoder().decode(MetricsPayload.self, from: data) {
+                streamMetricsLog.info(
+                    "session=\(m.session, privacy: .public) t=\(m.t, privacy: .public) fps=\(m.fps, privacy: .public) gapP95=\(m.gapP95Ms, privacy: .public)ms gapMax=\(m.gapMaxMs, privacy: .public)ms gapTrunc=\(m.gapTrunc, privacy: .public) bitrate=\(m.bitrateKbps, privacy: .public)kbps vDrop=\(m.vDrop, privacy: .public) aEnc=\(m.aEnc, privacy: .public) aSent=\(m.aSent, privacy: .public) aDropNotReady=\(m.aDropNotReady, privacy: .public) aEncErr=\(m.aEncErr, privacy: .public) pipeBuf=\(m.pipeBuf, privacy: .public)B audioBuf=\(m.audioBuf, privacy: .public)B rss=\(m.rssMb, privacy: .public)MB"
+                )
+            }
         case "error":
+            cancelStreamTasks()
             if let data = payload, let msg = String(data: data, encoding: .utf8) {
-                streamState = .error(msg.trimmingCharacters(in: CharacterSet(charactersIn: "\"")))
+                let clean = msg.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+                streamState = .error(clean)
+                streamLog.write(component: "app", "stream error: \(clean)")
+                healthLog.error("error session=\(self.sessionId, privacy: .public) msg=\(clean, privacy: .public)")
+                stopMetricsTimer()
             }
         default:
             break
@@ -463,7 +690,7 @@ final class AppState: ObservableObject {
     // MARK: - Crop persistence
 
     private func cropKey() -> String? {
-        guard let filter = captureFilter else { return nil }
+        guard captureKind == .window, let filter = captureFilter else { return nil }
         if #available(macOS 15.2, *), let window = filter.includedWindows.first {
             let bundleId = window.owningApplication?.bundleIdentifier ?? "unknown"
             let title = window.title ?? ""
@@ -505,4 +732,5 @@ final class AppState: ObservableObject {
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
     }
+
 }

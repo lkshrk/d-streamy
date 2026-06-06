@@ -1,6 +1,7 @@
 import { EventEmitter } from "events";
 import { Client } from "discord.js-selfbot-v13";
 import { Streamer } from "@dank074/discord-video-stream";
+import { withTimeout } from "./timeout.js";
 
 export interface StreamManagerEvents {
   connected: () => void;
@@ -17,6 +18,7 @@ export declare interface StreamManager {
 const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
 const MAX_RECONNECT_ATTEMPTS = 10;
+const CONNECT_STEP_TIMEOUT_MS = 30_000;
 
 export interface StreamOptions {
   width: number;
@@ -49,21 +51,25 @@ export class StreamManager extends EventEmitter {
     await this.doDisconnect();
   }
 
-  sendVideo(data: Buffer, frametime: number): void {
-    if (!this.connection) return;
+  sendVideo(data: Buffer, frametime: number): boolean {
+    if (!this.connection?.ready) return false;
     try {
       this.connection.sendVideoFrame(data, frametime);
+      return true;
     } catch {
       // Drop frame on transient error
+      return false;
     }
   }
 
-  sendAudio(data: Buffer, frametime: number): void {
-    if (!this.connection) return;
+  sendAudio(data: Buffer, frametime: number): boolean {
+    if (!this.connection?.ready) return false;
     try {
       this.connection.sendAudioFrame(data, frametime);
+      return true;
     } catch {
       // Drop frame on transient error
+      return false;
     }
   }
 
@@ -81,7 +87,11 @@ export class StreamManager extends EventEmitter {
       // Assign immediately so disconnect() can destroy it mid-flight
       this.client = client;
 
-      await client.login(this.token);
+      await withTimeout(
+        client.login(this.token),
+        CONNECT_STEP_TIMEOUT_MS,
+        "Timed out logging in to Discord"
+      );
 
       if (this.intentionalDisconnect) {
         client.destroy();
@@ -123,7 +133,11 @@ export class StreamManager extends EventEmitter {
 
       // Join voice channel
       process.stderr.write(`[stream] joining voice ${this.guildId}/${this.channelId}\n`);
-      await streamer.joinVoice(this.guildId, this.channelId);
+      await withTimeout(
+        streamer.joinVoice(this.guildId, this.channelId),
+        CONNECT_STEP_TIMEOUT_MS,
+        "Timed out joining Discord voice"
+      );
 
       if (this.intentionalDisconnect) {
         streamer.leaveVoice();
@@ -135,7 +149,11 @@ export class StreamManager extends EventEmitter {
       process.stderr.write("[stream] voice joined, creating stream...\n");
 
       // createStream() calls signalStream() internally
-      const connection = await streamer.createStream();
+      const connection = await withTimeout(
+        streamer.createStream(),
+        CONNECT_STEP_TIMEOUT_MS,
+        "Timed out creating Discord stream"
+      );
 
       if (this.intentionalDisconnect) {
         streamer.stopStream();
@@ -165,6 +183,7 @@ export class StreamManager extends EventEmitter {
       this.emit("connected");
     } catch (err) {
       process.stderr.write(`[stream] connect error: ${err instanceof Error ? err.message : err}\n`);
+      this.cleanupPartialConnection();
       this.emit("error", err instanceof Error ? err : new Error(String(err)));
       if (!this.intentionalDisconnect) {
         await this.scheduleReconnect();
@@ -192,7 +211,11 @@ export class StreamManager extends EventEmitter {
         process.stderr.write(`[stream] patched voiceConnection.channelId\n`);
       }
 
-      const connection = await this.streamer.createStream();
+      const connection = await withTimeout(
+        this.streamer.createStream(),
+        CONNECT_STEP_TIMEOUT_MS,
+        "Timed out recreating Discord stream"
+      );
 
       if (this.intentionalDisconnect) {
         try { this.streamer.stopStream(); } catch {}
@@ -243,6 +266,11 @@ export class StreamManager extends EventEmitter {
 
   private async doDisconnect(): Promise<void> {
     process.stderr.write(`[stream] doDisconnect: client=${!!this.client} streamer=${!!this.streamer}\n`);
+    this.cleanupPartialConnection();
+    this.emit("disconnected");
+  }
+
+  private cleanupPartialConnection(): void {
     this.stopHealthCheck();
     try {
       this.streamer?.stopStream();
@@ -254,7 +282,6 @@ export class StreamManager extends EventEmitter {
     this.connection = null;
     this.streamer = null;
     this.client = null;
-    this.emit("disconnected");
   }
 
   private onDisconnect(): void {

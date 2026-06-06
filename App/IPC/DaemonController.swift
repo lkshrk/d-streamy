@@ -1,5 +1,6 @@
 import Foundation
 import os
+import CaptureLib
 
 private let log = Logger(subsystem: "me.harke.d-streamy", category: "daemon")
 
@@ -12,6 +13,7 @@ final class DaemonController: ObservableObject {
     private var socketHandle: FileHandle?
     private var clientFd: Int32 = -1
     private var readBuffer = Data()
+    private let streamLog = StreamFileLogger.shared
 
     @Published var isConnected = false
 
@@ -41,6 +43,7 @@ final class DaemonController: ObservableObject {
 
         let bunPath = findBun()
         log.info("bun path: \(bunPath, privacy: .public)")
+        streamLog.write(component: "app", "daemon bun path: \(bunPath)")
 
         if let bundledDir = Bundle.main.resourceURL?.appendingPathComponent("daemon"),
            FileManager.default.fileExists(atPath: bundledDir.appendingPathComponent("index.js").path) {
@@ -49,6 +52,7 @@ final class DaemonController: ObservableObject {
             proc.arguments = ["run", bundledDir.appendingPathComponent("index.js").path]
             proc.currentDirectoryURL = bundledDir
             log.info("daemon mode: release, dir=\(bundledDir.path, privacy: .public)")
+            streamLog.write(component: "app", "daemon mode=release dir=\(bundledDir.path)")
         } else {
             // Dev: run source directly
             let projectRoot = resolveProjectRoot()
@@ -56,6 +60,7 @@ final class DaemonController: ObservableObject {
             proc.arguments = ["run", projectRoot + "/src/daemon/index.ts"]
             proc.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
             log.info("daemon mode: dev, root=\(projectRoot, privacy: .public)")
+            streamLog.write(component: "app", "daemon mode=dev root=\(projectRoot)")
         }
 
         let stdin = Pipe()
@@ -66,20 +71,29 @@ final class DaemonController: ObservableObject {
         do {
             try proc.run()
             log.info("daemon spawned, pid=\(proc.processIdentifier)")
+            streamLog.write(component: "app", "daemon spawned pid=\(proc.processIdentifier)")
         } catch {
             log.error("daemon spawn failed: \(error.localizedDescription, privacy: .public)")
+            streamLog.write(component: "app", "daemon spawn failed: \(error.localizedDescription)")
             throw error
         }
         self.process = proc
         self.stdinPipe = stdin
 
         // Pipe daemon stderr → os_log (info level so it persists in log show)
+        let streamLog = self.streamLog
         stderr.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty,
-                  let line = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !line.isEmpty else { return }
-            log.info("[stderr] \(line, privacy: .public)")
+                  let text = String(data: data, encoding: .utf8) else { return }
+            for line in text.split(whereSeparator: \.isNewline) {
+                let message = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !message.isEmpty else { continue }
+                log.info("[stderr] \(message, privacy: .public)")
+                if !message.hasPrefix("[daemon] ") {
+                    streamLog.write(component: "daemon-stderr", message)
+                }
+            }
         }
 
         // Connect to daemon's socket (retry until it's listening)
@@ -154,6 +168,7 @@ final class DaemonController: ObservableObject {
             }
         }
         log.error("failed to connect to daemon socket")
+        streamLog.write(component: "app", "failed to connect to daemon socket")
     }
 
     private func handleIncoming(_ data: Data) {
@@ -173,6 +188,9 @@ final class DaemonController: ObservableObject {
     private func parseEvent(_ data: Data) {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = json["type"] as? String else { return }
+        if type != "stats" {
+            streamLog.write(component: "app", "daemon event: \(type)")
+        }
 
         var payload: Data?
         if let obj = json["payload"] {

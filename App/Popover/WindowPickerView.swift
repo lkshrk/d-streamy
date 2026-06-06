@@ -1,5 +1,6 @@
 import SwiftUI
 import ScreenCaptureKit
+import AppKit
 import os
 
 private let log = Logger(subsystem: "me.harke.d-streamy", category: "picker")
@@ -9,7 +10,7 @@ struct WindowPickerView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Window", systemImage: "macwindow")
+            Label("Source", systemImage: state.captureKind == .display ? "display" : "macwindow")
                 .font(.subheadline.bold())
 
             HStack(spacing: 6) {
@@ -17,11 +18,11 @@ struct WindowPickerView: View {
                     ContentPickerController.shared.showPicker(state: state)
                 } label: {
                     HStack {
-                        Text(state.captureLabel.isEmpty ? "Choose Window..." : state.captureLabel)
+                        Text(state.captureLabel.isEmpty ? "Choose Source..." : state.captureLabel)
                             .lineLimit(1)
                             .truncationMode(.tail)
                         Spacer()
-                        Image(systemName: "rectangle.inset.filled.and.person.filled")
+                        Image(systemName: state.captureKind == .display ? "display" : "rectangle.inset.filled.and.person.filled")
                             .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity)
@@ -35,8 +36,10 @@ struct WindowPickerView: View {
                     Image(systemName: state.isCropOverlayVisible ? "crop.rotate" : "crop")
                 }
                 .buttonStyle(.bordered)
-                .disabled(state.captureFilter == nil)
-                .help(state.isCropOverlayVisible ? "Hide crop overlay" : "Set crop region")
+                .disabled(!state.canCropSelectedContent)
+                .help(state.canCropSelectedContent
+                      ? (state.isCropOverlayVisible ? "Hide crop overlay" : "Set crop region")
+                      : "Crop is available for window sharing")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -59,12 +62,19 @@ final class ContentPickerController: NSObject, SCContentSharingPickerObserver {
         if !isSetUp {
             picker.add(self)
             var config = SCContentSharingPickerConfiguration()
-            config.allowedPickerModes = [.singleWindow]
+            config.allowedPickerModes = [.singleWindow, .singleDisplay]
+            config.allowsChangingSelectedContent = true
             picker.defaultConfiguration = config
             isSetUp = true
         }
-        picker.isActive = true
-        picker.present()
+
+        let menuWindow = NSApp.keyWindow
+        menuWindow?.orderOut(nil)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            picker.isActive = true
+            picker.present()
+        }
     }
 
     // MARK: - SCContentSharingPickerObserver
@@ -88,6 +98,7 @@ final class ContentPickerController: NSObject, SCContentSharingPickerObserver {
             // Extract label from filter and persist window identity
             if #available(macOS 15.2, *),
                let window = filter.includedWindows.first {
+                state.captureKind = .window
                 let app = window.owningApplication?.applicationName ?? ""
                 let title = window.title ?? ""
                 state.captureLabel = app.isEmpty ? title : "\(app) — \(title)"
@@ -100,9 +111,19 @@ final class ContentPickerController: NSObject, SCContentSharingPickerObserver {
                 UserDefaults.standard.set(app, forKey: "lastWindowApp")
                 UserDefaults.standard.set([frame.origin.x, frame.origin.y, frame.width, frame.height],
                                           forKey: "lastWindowFrame")
+                UserDefaults.standard.set(CaptureKind.window.rawValue, forKey: "lastCaptureKind")
                 log.info("saved window: \(bundleId) / \(title)")
+            } else if #available(macOS 15.2, *),
+                      let display = filter.includedDisplays.first {
+                state.captureKind = .display
+                state.captureLabel = displayCaptureLabel(for: display, filter: filter)
+                state.cropRect = nil
+                UserDefaults.standard.set(CaptureKind.display.rawValue, forKey: "lastCaptureKind")
+                UserDefaults.standard.set(Int(display.displayID), forKey: "lastDisplayID")
+                log.info("saved display: \(display.displayID)")
             } else {
                 state.captureLabel = "Selected content"
+                state.captureKind = .window
             }
 
             // Load saved crop for this window (or nil if none)

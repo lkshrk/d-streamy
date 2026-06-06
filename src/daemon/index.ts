@@ -9,10 +9,33 @@ import net from "net";
 import { PipeReader } from "../core/pipe.js";
 import { StreamManager } from "../core/stream.js";
 import { getAudioEncoder } from "../core/audio.js";
+import { AsyncTaskQueue } from "../core/async-task-queue.js";
+import { FileLogger } from "../core/file-logger.js";
+import { MediaPipeline } from "../core/media-pipeline.js";
+import { MetricsSampler } from "../core/metrics-sampler.js";
+
+const fileLogger = new FileLogger();
+
+function logDaemon(message: string): void {
+  // stderr is a pipe to the app; if the app went away the write throws EPIPE.
+  // Never let logging throw — that would re-enter the uncaughtException handler
+  // and spin a tight stderr loop.
+  try {
+    process.stderr.write(`[daemon] ${message}\n`);
+  } catch {
+    // pipe closed; drop the stderr line
+  }
+  fileLogger.write("daemon", message);
+}
+
+// Async EPIPE on the std streams surfaces as a stream 'error' event, not a
+// throw from write(); swallow it so it doesn't become an uncaughtException.
+process.stdout.on("error", () => {});
+process.stderr.on("error", () => {});
 
 const SOCKET_PATH = process.env.DSTREAMY_SOCKET;
 if (!SOCKET_PATH) {
-  process.stderr.write("DSTREAMY_SOCKET env not set\n");
+  logDaemon("DSTREAMY_SOCKET env not set");
   process.exit(1);
 }
 
@@ -23,58 +46,70 @@ const encoder = getAudioEncoder();
 
 // Wire stream events once (not per-command)
 stream.on("connected", () => {
-  process.stderr.write("[daemon] stream connected\n");
+  logDaemon("stream connected");
   sendEvent("connected");
 });
 stream.on("disconnected", () => {
-  process.stderr.write("[daemon] stream disconnected\n");
+  logDaemon("stream disconnected");
   sendEvent("disconnected");
 });
 stream.on("error", (err) => {
-  process.stderr.write(`[daemon] stream error: ${err.message}\n`);
+  logDaemon(`stream error: ${err.message}`);
   sendEvent("error", err.message);
 });
 stream.on("reconnecting", (attempt) => {
-  process.stderr.write(`[daemon] reconnecting attempt ${attempt}\n`);
+  logDaemon(`reconnecting attempt ${attempt}`);
   sendEvent("reconnecting", { attempt });
 });
 
-// Stats
-let frameCount = 0;
-let droppedFrames = 0;
-let bytesSent = 0;
 let startTime = 0;
+const pipeline = new MediaPipeline({
+  stream,
+  encoder,
+  onFirstVideoFrameSent: () => {
+    logDaemon("first video frame sent to WebRTC");
+  },
+  onFirstAudioPacket: (bytes) => {
+    logDaemon(`first audio packet: ${bytes} bytes`);
+  },
+  onFirstAudioFrameSent: () => {
+    logDaemon("first audio frame sent to WebRTC");
+  },
+  onAudioEncodeError: (err, count) => {
+    if (count <= 5) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logDaemon(`audio encode failed: ${msg}`);
+    }
+  },
+});
 
-// Audio ring buffer (Opus needs 960 samples × 2ch × 2B = 3840 bytes)
-const OPUS_FRAME_BYTES = 960 * 2 * 2;
-let audioBuffer = Buffer.alloc(0);
+let sessionId = "";
+const metricsSampler = new MetricsSampler({
+  stats: () => pipeline.stats,
+  drainJitter: () => pipeline.drainFrameIntervalStats(),
+  now: () => performance.now(),
+});
 
-// Wire media
-const videoFrametimeMs = 1000 / 30;
-const audioFrametimeMs = 20;
+reader.on("error", (err) => {
+  logDaemon(`pipe error: ${err.message}`);
+  sendEvent("error", err.message);
+  pipeline.clearAudioBuffer();
+  void stream.disconnect().finally(() => {
+    startTime = 0;
+  });
+});
 
 reader.on("video", (data) => {
-  frameCount++;
-  bytesSent += data.length;
-  stream.sendVideo(data, videoFrametimeMs);
+  pipeline.handleVideo(data);
 });
 
 reader.on("audio", (data) => {
-  audioBuffer = Buffer.concat([audioBuffer, data]);
-  while (audioBuffer.length >= OPUS_FRAME_BYTES) {
-    const frame = audioBuffer.subarray(0, OPUS_FRAME_BYTES);
-    audioBuffer = audioBuffer.subarray(OPUS_FRAME_BYTES);
-    try {
-      const opus = encoder.encode(frame);
-      stream.sendAudio(opus, audioFrametimeMs);
-    } catch {
-      droppedFrames++;
-    }
-  }
+  pipeline.handleAudio(data);
 });
 
 // Control socket
 let controlConn: net.Socket | null = null;
+const commandQueue = new AsyncTaskQueue();
 
 function sendEvent(type: string, payload?: unknown) {
   if (!controlConn) return;
@@ -84,7 +119,7 @@ function sendEvent(type: string, payload?: unknown) {
 
 const server = net.createServer((socket) => {
   controlConn = socket;
-  process.stderr.write("[daemon] control connection established\n");
+  logDaemon("control connection established");
 
   let buf = "";
   socket.on("data", (chunk) => {
@@ -92,7 +127,8 @@ const server = net.createServer((socket) => {
     const lines = buf.split("\n");
     buf = lines.pop() ?? "";
     for (const line of lines) {
-      if (line.trim()) handleCommand(line.trim());
+      const command = line.trim();
+      if (command) void commandQueue.add(() => handleCommand(command));
     }
   });
 
@@ -102,20 +138,52 @@ const server = net.createServer((socket) => {
 });
 
 server.listen(SOCKET_PATH, () => {
-  process.stderr.write(`[daemon] listening on ${SOCKET_PATH}\n`);
+  logDaemon(`listening on ${SOCKET_PATH}`);
 });
 
 // Stats reporting
+let lastLoggedUptime = -1;
 setInterval(() => {
   if (startTime === 0) return;
   const uptimeSec = Math.floor((Date.now() - startTime) / 1000);
   const elapsed = uptimeSec || 1;
+  const memory = process.memoryUsage();
+  const stats = pipeline.stats;
+  if (uptimeSec > 0 && uptimeSec % 5 === 0 && uptimeSec !== lastLoggedUptime) {
+    lastLoggedUptime = uptimeSec;
+    logDaemon(
+      `stats uptime=${uptimeSec}s fps=${Math.round(stats.frameCount / elapsed)} bitrate=${Math.round((stats.bytesSent * 8) / elapsed / 1000)}kbps dropped=${stats.droppedFrames} rss=${Math.round(memory.rss / 1024 / 1024)}MB pipe=${reader.pendingBytes}B audioPackets=${stats.audioPackets} audioEncoded=${stats.audioFramesEncoded} audioSent=${stats.audioFramesSent} audioDroppedNotReady=${stats.audioFramesDroppedNotReady}`
+    );
+  }
   sendEvent("stats", {
     uptime: uptimeSec,
-    fps: Math.round(frameCount / elapsed),
-    bitrate: Math.round((bytesSent * 8) / elapsed / 1000),
-    droppedFrames,
+    fps: Math.round(stats.frameCount / elapsed),
+    bitrate: Math.round((stats.bytesSent * 8) / elapsed / 1000),
+    droppedFrames: stats.droppedFrames,
+    rssBytes: memory.rss,
+    heapUsedBytes: memory.heapUsed,
+    externalBytes: memory.external,
+    arrayBuffersBytes: memory.arrayBuffers,
+    pipeBufferBytes: reader.pendingBytes,
+    audioBufferBytes: stats.audioBufferBytes,
+    audioPackets: stats.audioPackets,
+    audioBytesReceived: stats.audioBytesReceived,
+    audioFramesEncoded: stats.audioFramesEncoded,
+    audioFramesSent: stats.audioFramesSent,
+    audioFramesDroppedNotReady: stats.audioFramesDroppedNotReady,
+    audioEncodeErrors: stats.audioEncodeErrors,
   });
+  const intervalMetrics = metricsSampler.sample();
+  if (intervalMetrics) {
+    sendEvent("metrics", {
+      session: sessionId,
+      t: uptimeSec,
+      ...intervalMetrics,
+      pipeBuf: reader.pendingBytes,
+      audioBuf: stats.audioBufferBytes,
+      rssMb: Math.round(memory.rss / 1024 / 1024),
+    });
+  }
 }, 1000);
 
 // Command handler
@@ -125,16 +193,21 @@ async function handleCommand(json: string) {
 
     switch (type) {
       case "connect": {
-        const { token, guildId, channelId, width, height, fps } = payload;
-        process.stderr.write(`[daemon] connect: ${guildId}/${channelId} ${width}x${height}@${fps}\n`);
+        const { token, guildId, channelId, width, height, fps, session } = payload;
+        sessionId = typeof session === "string" ? session : "";
+        logDaemon(`connect: ${guildId}/${channelId} ${width}x${height}@${fps} session=${sessionId}`);
+        pipeline.setVideoFps(fps);
+        pipeline.clearAudioBuffer();
+        pipeline.resetCounters();
+        pipeline.drainFrameIntervalStats();
+        metricsSampler.reset();
         await stream.connect(token, guildId, channelId, { width, height, fps });
         startTime = Date.now();
-        frameCount = 0;
-        bytesSent = 0;
-        droppedFrames = 0;
         break;
       }
       case "disconnect": {
+        logDaemon("disconnect");
+        pipeline.clearAudioBuffer();
         await stream.disconnect();
         startTime = 0;
         sendEvent("disconnected");
@@ -152,12 +225,13 @@ async function handleCommand(json: string) {
       }
       case "updateVideo": {
         const { width, height, fps } = payload;
-        process.stderr.write(`[daemon] updateVideo: ${width}x${height}@${fps}\n`);
+        logDaemon(`updateVideo: ${width}x${height}@${fps}`);
+        pipeline.setVideoFps(fps);
         stream.updateVideoAttributes(width, height, fps);
         break;
       }
       default:
-        process.stderr.write(`[daemon] unknown command: ${type}\n`);
+        logDaemon(`unknown command: ${type}`);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -167,11 +241,16 @@ async function handleCommand(json: string) {
 
 // Catch unhandled errors
 process.on("uncaughtException", (err) => {
-  process.stderr.write(`[daemon] uncaught: ${err.message}\n${err.stack}\n`);
+  // Broken pipe means the app (our stderr/IPC reader) is gone — exit instead of
+  // logging, which would write to the same dead pipe and loop forever.
+  if ((err as NodeJS.ErrnoException).code === "EPIPE") {
+    process.exit(0);
+  }
+  logDaemon(`uncaught: ${err.message}\n${err.stack}`);
   sendEvent("error", err.message);
 });
 process.on("unhandledRejection", (reason) => {
-  process.stderr.write(`[daemon] unhandled rejection: ${reason}\n`);
+  logDaemon(`unhandled rejection: ${reason}`);
   sendEvent("error", String(reason));
 });
 

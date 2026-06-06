@@ -38,5 +38,10 @@ let package = Package(
                 .linkedFramework("AppKit"),
             ]
         ),
+        .testTarget(
+            name: "CaptureLibTests",
+            dependencies: ["CaptureLib"],
+            path: "capture/Tests/CaptureLibTests"
+        ),
     ]
 )

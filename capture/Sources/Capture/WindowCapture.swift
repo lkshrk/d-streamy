@@ -8,6 +8,11 @@ public final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
     public var onAudioBuffer: ((CMSampleBuffer) -> Void)?
 
     private var stream: SCStream?
+    private var startContinuation: CheckedContinuation<Void, Error>?
+    private var startCompleted = false
+    private var startAudioSeen = false
+    private var startVideoSeen = false
+    private let startLock = NSLock()
     private let queue = DispatchQueue(label: "capture.stream", qos: .userInteractive)
 
     public override init() { super.init() }
@@ -29,14 +34,35 @@ public final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
         let s = SCStream(filter: filter, configuration: config, delegate: self)
         try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         try s.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
-        try await s.startCapture()
         self.stream = s
+        resetStartState()
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            startLock.lock()
+            startContinuation = continuation
+            startLock.unlock()
+
+            Task {
+                do {
+                    try await s.startCapture()
+                    completeStart(.success(()))
+                } catch {
+                    completeStart(.failure(error))
+                }
+            }
+
+            Task {
+                try? await Task.sleep(for: .milliseconds(750))
+                completeStartFromVideoIfNeeded()
+            }
+        }
     }
 
     // MARK: - Stop
 
     public func stop() async {
         guard let stream else { return }
+        completeStart(.failure(CancellationError()))
         try? await stream.stopCapture()
         self.stream = nil
     }
@@ -48,9 +74,11 @@ public final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
         switch type {
         case .screen:
             guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+            markStartVideoSeen()
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             onVideoFrame?(imageBuffer, pts)
         case .audio:
+            markStartAudioSeen()
             onAudioBuffer?(sampleBuffer)
         case .microphone:
             break
@@ -62,7 +90,59 @@ public final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
     // MARK: - SCStreamDelegate
 
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
+        completeStart(.failure(error))
         fputs("SCStream stopped: \(error)\n", stderr)
+    }
+
+    private func markStartVideoSeen() {
+        startLock.lock()
+        startVideoSeen = true
+        startLock.unlock()
+    }
+
+    private func markStartAudioSeen() {
+        startLock.lock()
+        startAudioSeen = true
+        startLock.unlock()
+        completeStart(.success(()))
+    }
+
+    private func completeStartFromVideoIfNeeded() {
+        startLock.lock()
+        let shouldComplete = startVideoSeen && !startAudioSeen
+        startLock.unlock()
+
+        if shouldComplete {
+            completeStart(.success(()))
+        }
+    }
+
+    private func completeStart(_ result: Result<Void, Error>) {
+        startLock.lock()
+        guard !startCompleted else {
+            startLock.unlock()
+            return
+        }
+        startCompleted = true
+        let continuation = startContinuation
+        startContinuation = nil
+        startLock.unlock()
+
+        switch result {
+        case .success:
+            continuation?.resume()
+        case .failure(let error):
+            continuation?.resume(throwing: error)
+        }
+    }
+
+    private func resetStartState() {
+        startLock.lock()
+        startCompleted = false
+        startContinuation = nil
+        startAudioSeen = false
+        startVideoSeen = false
+        startLock.unlock()
     }
 
     // MARK: - Static helpers
@@ -183,4 +263,3 @@ public final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
         }
     }
 }
-

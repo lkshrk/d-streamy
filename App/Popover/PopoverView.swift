@@ -150,7 +150,7 @@ struct StreamButton: View {
     var body: some View {
         Button {
             Task {
-                if state.streamState.isActive {
+                if state.streamState.canStop {
                     await state.stopStream()
                 } else {
                     await state.startStream()
@@ -158,11 +158,7 @@ struct StreamButton: View {
             }
         } label: {
             if state.streamState == .connecting {
-                HStack(spacing: 4) {
-                    ProgressView()
-                        .controlSize(.mini)
-                    Text("Connecting…")
-                }
+                Label("Cancel", systemImage: "stop.fill")
             } else {
                 Label(
                     state.streamState.isActive ? "Stop" : "Start",
@@ -171,20 +167,20 @@ struct StreamButton: View {
             }
         }
         .buttonStyle(.borderedProminent)
-        .tint(state.streamState.isActive ? .red : .accentColor)
-        .disabled(state.streamState == .connecting || !canStart)
+        .tint(state.streamState.canStop ? .red : .accentColor)
+        .disabled(!state.streamState.canStop && !canStart)
         .help(missingInfo)
     }
 
     private var canStart: Bool {
-        state.streamState.isActive ||
+        state.streamState.canStop ||
         (state.captureFilter != nil && state.selectedGuild != nil && state.selectedChannel != nil)
     }
 
     private var missingInfo: String {
-        if state.streamState.isActive { return "Stop streaming" }
+        if state.streamState.canStop { return "Stop streaming" }
         var missing: [String] = []
-        if state.captureFilter == nil { missing.append("window") }
+        if state.captureFilter == nil { missing.append("source") }
         if state.selectedGuild == nil { missing.append("server") }
         if state.selectedChannel == nil { missing.append("channel") }
         if missing.isEmpty { return "Start streaming" }

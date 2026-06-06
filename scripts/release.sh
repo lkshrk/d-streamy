@@ -68,6 +68,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <string>D-Streamy needs screen recording access to capture your window for streaming.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>D-Streamy needs microphone access to capture audio for streaming.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>D-Streamy needs system audio access to capture window audio for streaming.</string>
 </dict>
 </plist>
 EOF
@@ -82,6 +84,8 @@ cat > "$ENTITLEMENTS" <<EOF
     <key>com.apple.security.app-sandbox</key>
     <false/>
     <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.device.audio-input</key>
     <true/>
 </dict>
 </plist>
