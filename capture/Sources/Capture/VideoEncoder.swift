@@ -2,22 +2,41 @@ import VideoToolbox
 import CoreMedia
 import Foundation
 
+public enum VideoCodec: String {
+    case h264 = "H264"
+    case h265 = "H265"
+
+    var codecType: CMVideoCodecType {
+        self == .h265 ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
+    }
+
+    var profileLevel: CFString {
+        self == .h265 ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_Baseline_AutoLevel
+    }
+
+    /// Number of parameter sets prepended on keyframes (HEVC: VPS+SPS+PPS, H264: SPS+PPS).
+    var parameterSetCount: Int { self == .h265 ? 3 : 2 }
+}
+
 public final class VideoEncoder {
     private let width: Int
     private let height: Int
     private let fps: Int
     private let bitrateBps: Int
-    /// Callback receives a complete Annex B frame (all NALUs concatenated, SPS/PPS prepended on keyframes)
+    private let codec: VideoCodec
+    /// Callback receives a complete Annex B frame (all NALUs concatenated, parameter sets prepended on keyframes)
     public let onFrame: (Data, UInt64) -> Void
 
     private var session: VTCompressionSession?
 
     public init(width: Int, height: Int, fps: Int = 30, bitrateMbps: Double = 3.0,
+         codec: VideoCodec = .h264,
          onFrame: @escaping (Data, UInt64) -> Void) {
         self.width = width
         self.height = height
         self.fps = fps
         self.bitrateBps = Int(bitrateMbps * 1_000_000)
+        self.codec = codec
         self.onFrame = onFrame
     }
 
@@ -27,7 +46,7 @@ public final class VideoEncoder {
             allocator: kCFAllocatorDefault,
             width: Int32(width),
             height: Int32(height),
-            codecType: kCMVideoCodecType_H264,
+            codecType: codec.codecType,
             encoderSpecification: nil,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
@@ -40,10 +59,9 @@ public final class VideoEncoder {
         }
         self.session = session
 
-        // H.264 Baseline
         status = VTSessionSetProperty(session,
             key: kVTCompressionPropertyKey_ProfileLevel,
-            value: kVTProfileLevel_H264_Baseline_AutoLevel)
+            value: codec.profileLevel)
         check(status, "ProfileLevel")
 
         // Average bitrate (CBR approximation)
@@ -150,48 +168,35 @@ public final class VideoEncoder {
         }
 
         if isKeyframe, let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) {
-            // Extract SPS
-            var spsSize = 0
-            var spsCount = 0
-            var spsPtr: UnsafePointer<UInt8>?
-            let spsStatus = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                formatDesc, parameterSetIndex: 0,
-                parameterSetPointerOut: &spsPtr, parameterSetSizeOut: &spsSize,
-                parameterSetCountOut: &spsCount, nalUnitHeaderLengthOut: nil
-            )
-            if spsStatus == noErr, let spsPtr {
-                frameData.append(contentsOf: [0x00, 0x00, 0x00, 0x01])
-                frameData.append(UnsafeBufferPointer(start: spsPtr, count: spsSize))
-            }
-
-            // Extract PPS
-            var ppsSize = 0
-            var ppsPtr: UnsafePointer<UInt8>?
-            let ppsStatus = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                formatDesc, parameterSetIndex: 1,
-                parameterSetPointerOut: &ppsPtr, parameterSetSizeOut: &ppsSize,
-                parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil
-            )
-            if ppsStatus == noErr, let ppsPtr {
-                frameData.append(contentsOf: [0x00, 0x00, 0x00, 0x01])
-                frameData.append(UnsafeBufferPointer(start: ppsPtr, count: ppsSize))
+            for index in 0..<codec.parameterSetCount {
+                var setSize = 0
+                var setPtr: UnsafePointer<UInt8>?
+                let status: OSStatus
+                if codec == .h265 {
+                    status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                        formatDesc, parameterSetIndex: index,
+                        parameterSetPointerOut: &setPtr, parameterSetSizeOut: &setSize,
+                        parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil
+                    )
+                } else {
+                    status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                        formatDesc, parameterSetIndex: index,
+                        parameterSetPointerOut: &setPtr, parameterSetSizeOut: &setSize,
+                        parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil
+                    )
+                }
+                if status == noErr, let setPtr {
+                    frameData.append(contentsOf: [0x00, 0x00, 0x00, 0x01])
+                    frameData.append(UnsafeBufferPointer(start: setPtr, count: setSize))
+                }
             }
         }
 
-        // Walk AVCC length-prefixed NALUs, convert to Annex B and concatenate
-        var offset = 0
-        while offset < totalLength - 4 {
-            var naluLength: UInt32 = 0
-            memcpy(&naluLength, dataPointer.advanced(by: offset), 4)
-            naluLength = UInt32(bigEndian: naluLength)
-
-            offset += 4
-            guard offset + Int(naluLength) <= totalLength else { break }
-
-            frameData.append(contentsOf: [0x00, 0x00, 0x00, 0x01])
-            frameData.append(Data(bytes: dataPointer.advanced(by: offset), count: Int(naluLength)))
-
-            offset += Int(naluLength)
+        dataPointer.withMemoryRebound(to: UInt8.self, capacity: totalLength) { u8 in
+            AnnexB.appendNALUs(
+                from: UnsafeBufferPointer(start: u8, count: totalLength),
+                into: &frameData
+            )
         }
 
         // Emit complete frame as single callback

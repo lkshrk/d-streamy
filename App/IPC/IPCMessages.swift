@@ -16,6 +16,7 @@ enum IPCCommand: Encodable {
         let width: Int
         let height: Int
         let fps: Int
+        let codec: String
         let session: String
     }
 

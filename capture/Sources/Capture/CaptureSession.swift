@@ -17,6 +17,7 @@ public struct CaptureConfig {
     public var bitrateMbps: Double
     public var crop: CropFilter?
     public var audioGain: Float
+    public var codec: VideoCodec
     public var outputFd: Int32
 
     public init(
@@ -29,6 +30,7 @@ public struct CaptureConfig {
         bitrateMbps: Double = 6.0,
         crop: CropFilter? = nil,
         audioGain: Float = 1.0,
+        codec: VideoCodec = .h264,
         outputFd: Int32 = STDOUT_FILENO
     ) {
         self.filter = filter
@@ -40,6 +42,7 @@ public struct CaptureConfig {
         self.bitrateMbps = bitrateMbps
         self.crop = crop
         self.audioGain = audioGain
+        self.codec = codec
         self.outputFd = outputFd
     }
 }
@@ -51,6 +54,7 @@ public final class CaptureSession {
     private var pipeWriter: PipeWriter?
     private var currentFps: Int = 30
     private var currentBitrate: Double = 6.0
+    private var currentCodec: VideoCodec = .h264
     private var didLogAudioFormat = false
 
     public private(set) var captureWidth: Int = 0
@@ -77,6 +81,7 @@ public final class CaptureSession {
 
         self.currentFps = config.fps
         self.currentBitrate = config.bitrateMbps
+        self.currentCodec = config.codec
 
         let writer = PipeWriter(fd: config.outputFd)
         self.pipeWriter = writer
@@ -85,7 +90,8 @@ public final class CaptureSession {
             width: captureWidth,
             height: captureHeight,
             fps: config.fps,
-            bitrateMbps: config.bitrateMbps
+            bitrateMbps: config.bitrateMbps,
+            codec: config.codec
         ) { frameData, timestampUs in
             writer.write(type: .video, timestamp: timestampUs, data: frameData)
         }
@@ -206,7 +212,8 @@ public final class CaptureSession {
             width: newW,
             height: newH,
             fps: currentFps,
-            bitrateMbps: currentBitrate
+            bitrateMbps: currentBitrate,
+            codec: currentCodec
         ) { frameData, timestampUs in
             writer.write(type: .video, timestamp: timestampUs, data: frameData)
         }

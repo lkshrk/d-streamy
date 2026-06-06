@@ -2,6 +2,7 @@ import { EventEmitter } from "events";
 import { Client } from "discord.js-selfbot-v13";
 import { Streamer } from "@dank074/discord-video-stream";
 import { withTimeout } from "./timeout.js";
+import type { VideoCodec } from "./codec.js";
 
 export interface StreamManagerEvents {
   connected: () => void;
@@ -24,6 +25,7 @@ export interface StreamOptions {
   width: number;
   height: number;
   fps: number;
+  codec: VideoCodec;
 }
 
 export class StreamManager extends EventEmitter {
@@ -35,7 +37,7 @@ export class StreamManager extends EventEmitter {
   private channelId = "";
   private reconnectAttempt = 0;
   private intentionalDisconnect = false;
-  private streamOpts: StreamOptions = { width: 1920, height: 1080, fps: 30 };
+  private streamOpts: StreamOptions = { width: 1920, height: 1080, fps: 30, codec: "H264" };
 
   async connect(token: string, guildId: string, channelId: string, opts?: Partial<StreamOptions>): Promise<void> {
     this.token = token;
@@ -75,7 +77,7 @@ export class StreamManager extends EventEmitter {
 
   updateVideoAttributes(width: number, height: number, fps: number): void {
     if (!this.connection) return;
-    this.streamOpts = { width, height, fps };
+    this.streamOpts = { ...this.streamOpts, width, height, fps };
     this.connection.mediaConnection.setVideoAttributes(true, { width, height, fps });
     process.stderr.write(`[stream] updated video attributes: ${width}x${height}@${fps}\n`);
   }
@@ -164,7 +166,7 @@ export class StreamManager extends EventEmitter {
         return;
       }
       process.stderr.write("[stream] stream created, configuring\n");
-      connection.setPacketizer("H264");
+      connection.setPacketizer(this.streamOpts.codec);
 
       // Tell Discord we're sending video (required — without this, grey screen)
       connection.mediaConnection.setSpeaking(true);
@@ -222,7 +224,7 @@ export class StreamManager extends EventEmitter {
         return;
       }
 
-      connection.setPacketizer("H264");
+      connection.setPacketizer(this.streamOpts.codec);
       connection.mediaConnection.setSpeaking(true);
       connection.mediaConnection.setVideoAttributes(true, {
         width: this.streamOpts.width,

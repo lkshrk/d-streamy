@@ -8,6 +8,7 @@
 import net from "net";
 import { PipeReader } from "../core/pipe.js";
 import { StreamManager } from "../core/stream.js";
+import { normalizeCodec } from "../core/codec.js";
 import { getAudioEncoder } from "../core/audio.js";
 import { AsyncTaskQueue } from "../core/async-task-queue.js";
 import { FileLogger } from "../core/file-logger.js";
@@ -193,15 +194,16 @@ async function handleCommand(json: string) {
 
     switch (type) {
       case "connect": {
-        const { token, guildId, channelId, width, height, fps, session } = payload;
+        const { token, guildId, channelId, width, height, fps, codec, session } = payload;
         sessionId = typeof session === "string" ? session : "";
-        logDaemon(`connect: ${guildId}/${channelId} ${width}x${height}@${fps} session=${sessionId}`);
+        const videoCodec = normalizeCodec(codec);
+        logDaemon(`connect: ${guildId}/${channelId} ${width}x${height}@${fps} codec=${videoCodec} session=${sessionId}`);
         pipeline.setVideoFps(fps);
         pipeline.clearAudioBuffer();
         pipeline.resetCounters();
         pipeline.drainFrameIntervalStats();
         metricsSampler.reset();
-        await stream.connect(token, guildId, channelId, { width, height, fps });
+        await stream.connect(token, guildId, channelId, { width, height, fps, codec: videoCodec });
         startTime = Date.now();
         break;
       }

@@ -43,6 +43,20 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
             }
 
+            // Codec
+            HStack {
+                Text("Codec")
+                    .font(.caption)
+                    .frame(width: 70, alignment: .leading)
+                Picker("", selection: $state.videoCodec) {
+                    Text("H.264").tag("H264")
+                    Text("H.265").tag("H265")
+                }
+                .labelsHidden()
+                .controlSize(.small)
+                .pickerStyle(.segmented)
+            }
+
             // Bitrate
             HStack {
                 Text("Bitrate")

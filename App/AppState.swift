@@ -43,6 +43,7 @@ final class AppState: ObservableObject {
     @Published var fps: Int { didSet { defaults.set(fps, forKey: "fps") } }
     @Published var bitrateMbps: Double { didSet { defaults.set(bitrateMbps, forKey: "bitrateMbps") } }
     @Published var audioGain: Float { didSet { defaults.set(audioGain, forKey: "audioGain") } }
+    @Published var videoCodec: String { didSet { defaults.set(videoCodec, forKey: "videoCodec") } }
 
     // Components
     let daemon = DaemonController()
@@ -89,6 +90,7 @@ final class AppState: ObservableObject {
         fps = defaults.object(forKey: "fps") as? Int ?? 30
         bitrateMbps = defaults.object(forKey: "bitrateMbps") as? Double ?? 6.0
         audioGain = defaults.object(forKey: "audioGain") as? Float ?? 1.0
+        videoCodec = defaults.string(forKey: "videoCodec") ?? "H264"
 
         // Load saved guild/channel selection
         if let gId = defaults.string(forKey: "lastGuildId"),
@@ -350,6 +352,7 @@ final class AppState: ObservableObject {
             bitrateMbps: bitrateMbps,
             crop: pixelCrop,
             audioGain: audioGain,
+            codec: VideoCodec(rawValue: videoCodec) ?? .h264,
             outputFd: mediaFd
         )
 
@@ -413,6 +416,7 @@ final class AppState: ObservableObject {
                 width: self.captureSession.captureWidth,
                 height: self.captureSession.captureHeight,
                 fps: fps,
+                codec: self.videoCodec,
                 session: self.sessionId
             )))
             log.info("startStream: connect command sent")
@@ -517,6 +521,7 @@ final class AppState: ObservableObject {
             bitrateMbps: bitrateMbps,
             crop: cropFilter,
             audioGain: audioGain,
+            codec: VideoCodec(rawValue: videoCodec) ?? .h264,
             outputFd: mediaFd
         )
 
