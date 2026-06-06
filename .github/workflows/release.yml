@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  # Cheap gate: runs only when the triggering CI passed (or a manual dispatch),
+  # then resolves whether a vX.Y.Z tag points at the tested commit. The heavy
+  # release job is skipped (grey, not green) whenever there is no tag.
+  gate:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Verify CI passed for manual release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          run_count="$(gh api --method GET "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+            -f head_sha="${TARGET_SHA}" \
+            -f status=success \
+            -f per_page=1 \
+            --jq '.total_count')"
+          if [ "${run_count}" = "0" ]; then
+            echo "::error::No successful CI run found for commit ${TARGET_SHA}. Run CI for this commit before dispatching release."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Check for release tag
+        id: tag
+        run: |
+          git fetch --tags --force
+          TAG=$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if [ -z "$TAG" ]; then
+            echo "No vX.Y.Z tag points at this commit; release job will be skipped."
+          else
+            echo "Release tag: $TAG"
+          fi
+
+  release:
+    needs: gate
+    if: needs.gate.outputs.tag != ''
+    runs-on: macos-15
+    env:
+      DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+      SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+      TAG: ${{ needs.gate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.gate.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install daemon dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Import signing certificate
+        env:
+          CERT_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN=$RUNNER_TEMP/signing.keychain-db
+          echo "$CERT_P12" | base64 --decode > $RUNNER_TEMP/cert.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import $RUNNER_TEMP/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | tr -d '"')
+
+      - name: Build & sign (Developer ID, hardened, nested)
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+        run: |
+          export VERSION="${TAG#v}"
+          export BUN_BIN="$(command -v bun)"
+          bash scripts/release.sh
+
+      - name: Notarize & staple
+        id: pkg
+        env:
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          APP="bin/D-Streamy.app"
+          echo "$NOTARY_KEY_P8" | base64 --decode > $RUNNER_TEMP/notary.p8
+          ditto -c -k --sequesterRsrc --keepParent "$APP" D-Streamy.zip
+          SUBMIT_JSON=$(xcrun notarytool submit D-Streamy.zip \
+            --key $RUNNER_TEMP/notary.p8 \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --output-format json --wait)
+          echo "$SUBMIT_JSON"
+          SUBMIT_ID=$(echo "$SUBMIT_JSON" | /usr/bin/python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+          STATUS=$(echo "$SUBMIT_JSON" | /usr/bin/python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')
+          echo "Notarization status: $STATUS (id $SUBMIT_ID)"
+          xcrun notarytool log "$SUBMIT_ID" \
+            --key $RUNNER_TEMP/notary.p8 \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" || true
+          if [ "$STATUS" != "Accepted" ]; then
+            echo "::error::Notarization not accepted (status $STATUS) — see log above."
+            exit 1
+          fi
+          xcrun stapler staple "$APP"
+          rm D-Streamy.zip
+          ditto -c -k --sequesterRsrc --keepParent "$APP" D-Streamy.zip
+          echo "sha256=$(shasum -a 256 D-Streamy.zip | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" D-Streamy.zip \
+            --title "$TAG" \
+            --generate-notes \
+            --notes "sha256: \`${{ steps.pkg.outputs.sha256 }}\`"
+
+      - name: Bump Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          VERSION="${TAG#v}"
+          SHA="${{ steps.pkg.outputs.sha256 }}"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/lkshrk/homebrew-tap.git" tap
+          mkdir -p tap/Casks
+          cp Casks/d-streamy.rb tap/Casks/d-streamy.rb
+          sed -i '' -E "s/version \".*\"/version \"${VERSION}\"/" tap/Casks/d-streamy.rb
+          sed -i '' -E "s/sha256 \".*\"/sha256 \"${SHA}\"/" tap/Casks/d-streamy.rb
+          cd tap
+          git add Casks/d-streamy.rb
+          if ! git diff --cached --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "d-streamy: bump to ${VERSION}"
+            git push
+          fi

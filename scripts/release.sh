@@ -32,9 +32,11 @@ if [ -z "$IDENTITY" ]; then
 fi
 BUNDLE_ID="me.harke.d-streamy"
 APP_NAME="D-Streamy"
+VERSION="${VERSION:-${TAG:-0.1.0}}"
+VERSION="${VERSION#v}"
 
-echo "==> Building release..."
-"$SCRIPT_DIR/build.sh"
+echo "==> Building release (version $VERSION)..."
+SKIP_SIGN=1 "$SCRIPT_DIR/build.sh"
 
 APP="$ROOT/bin/$APP_NAME.app"
 
@@ -55,7 +57,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>${VERSION}</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
@@ -91,23 +93,57 @@ cat > "$ENTITLEMENTS" <<EOF
 </plist>
 EOF
 
+# Bun runs JavaScriptCore (JIT) and dlopens native .node addons; under a
+# hardened runtime it needs these entitlements or it crashes after notarization.
+BUN_ENTITLEMENTS=$(mktemp)
+cat > "$BUN_ENTITLEMENTS" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
 echo "==> Signing with: $IDENTITY"
 
-# Sign daemon first (nested code)
-if [ -f "$APP/Contents/Resources/daemon" ]; then
-    codesign --force --sign "$IDENTITY" \
-        --identifier "${BUNDLE_ID}.daemon" \
-        "$APP/Contents/Resources/daemon"
-fi
+# Timestamp requires network; notarization requires a secure timestamp. Allow
+# local offline signing to skip it via NO_TIMESTAMP=1.
+TS_FLAG="--timestamp"
+[ "${NO_TIMESTAMP:-0}" = "1" ] && TS_FLAG="--timestamp=none"
 
-# Sign main app
+# Sign nested Mach-O inside-out: the bundled bun runtime and every native
+# addon/binary under Resources (.node, .dylib, ffmpeg, etc.) must be signed
+# and hardened before the outer app, or notarization rejects them. The bun
+# binary gets the JIT/library-validation entitlements above.
+BUN_PATH="$APP/Contents/Resources/bun"
+echo "==> Signing nested Mach-O..."
+while IFS= read -r f; do
+    if file "$f" | grep -q "Mach-O"; then
+        if [ "$f" = "$BUN_PATH" ]; then
+            codesign --force --options runtime $TS_FLAG \
+                --entitlements "$BUN_ENTITLEMENTS" --sign "$IDENTITY" "$f"
+        else
+            codesign --force --options runtime $TS_FLAG --sign "$IDENTITY" "$f"
+        fi
+    fi
+done < <(find "$APP/Contents/Resources" -type f)
+
+# Sign main app last
 codesign --force --sign "$IDENTITY" \
     --identifier "$BUNDLE_ID" \
     --entitlements "$ENTITLEMENTS" \
     --options runtime \
+    $TS_FLAG \
     "$APP"
 
-rm "$ENTITLEMENTS"
+rm "$ENTITLEMENTS" "$BUN_ENTITLEMENTS"
 
 # Verify
 echo "==> Verifying signature..."

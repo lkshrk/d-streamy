@@ -205,6 +205,12 @@ final class DaemonController: ObservableObject {
     }
 
     private func findBun() -> String {
+        // Release: bun is bundled in the app (self-contained, no external dependency).
+        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("bun").path,
+           FileManager.default.isExecutableFile(atPath: bundled) {
+            return bundled
+        }
+        // Dev: fall back to a bun installed on the system.
         let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
         let candidates = [
             home + "/.bun/bin/bun",

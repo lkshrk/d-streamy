@@ -45,6 +45,18 @@ copy_native_pkg "@img/sharp-darwin-arm64"
 copy_native_pkg "@img/sharp-libvips-darwin-arm64"
 copy_native_pkg "ws"
 
+# Bundle the bun runtime so the app is self-contained (no external bun needed)
+BUN_BIN="${BUN_BIN:-$HOME/.bun/bin/bun}"
+if [ ! -x "$BUN_BIN" ]; then
+    BUN_BIN="$(command -v bun || true)"
+fi
+if [ -z "${BUN_BIN:-}" ] || [ ! -x "$BUN_BIN" ]; then
+    echo "error: bun binary not found (set BUN_BIN)" >&2
+    exit 1
+fi
+cp "$BUN_BIN" "$APP/Contents/Resources/bun"
+chmod +x "$APP/Contents/Resources/bun"
+
 
 # Compile and copy app icon
 echo "==> Compiling asset catalog..."
@@ -55,7 +67,12 @@ xcrun actool "$ROOT/App/Assets.xcassets" \
     --app-icon AppIcon \
     --output-partial-info-plist /dev/null > /dev/null
 
-# Codesign (stable identity so macOS permissions persist across rebuilds)
-codesign --force --sign "Apple Development: dev@harke.me (L2GZ9Q95QW)" --identifier me.harke.d-streamy "$APP"
+# Codesign (stable identity so macOS permissions persist across rebuilds).
+# Skipped for release builds (release.sh signs nested code inside-out with a
+# Developer ID identity). Override the dev identity via CODESIGN_IDENTITY.
+if [ "${SKIP_SIGN:-0}" != "1" ]; then
+    SIGN_IDENTITY="${CODESIGN_IDENTITY:-Apple Development: dev@harke.me (L2GZ9Q95QW)}"
+    codesign --force --sign "$SIGN_IDENTITY" --identifier me.harke.d-streamy "$APP"
+fi
 
 echo "==> Done: $APP"
