@@ -158,3 +158,6 @@ node_modules/
 
 # Swift
 capture/.build/
+
+# Docs (local only)
+docs/
