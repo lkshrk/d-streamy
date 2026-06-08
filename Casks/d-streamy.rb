@@ -9,7 +9,7 @@ cask "d-streamy" do
 
   # Native daemon addons ship as darwin-arm64 only.
   depends_on arch: :arm64
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
 
   app "D-Streamy.app"
 
