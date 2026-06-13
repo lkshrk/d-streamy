@@ -16,15 +16,18 @@ import { MediaPipeline } from "../core/media-pipeline.js";
 import { MetricsSampler } from "../core/metrics-sampler.js";
 
 const fileLogger = new FileLogger();
+let stderrAvailable = true;
 
 function logDaemon(message: string): void {
   // stderr is a pipe to the app; if the app went away the write throws EPIPE.
   // Never let logging throw — that would re-enter the uncaughtException handler
   // and spin a tight stderr loop.
-  try {
-    process.stderr.write(`[daemon] ${message}\n`);
-  } catch {
-    // pipe closed; drop the stderr line
+  if (stderrAvailable) {
+    try {
+      process.stderr.write(`[daemon] ${message}\n`);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPIPE") stderrAvailable = false;
+    }
   }
   fileLogger.write("daemon", message);
 }
@@ -32,7 +35,9 @@ function logDaemon(message: string): void {
 // Async EPIPE on the std streams surfaces as a stream 'error' event, not a
 // throw from write(); swallow it so it doesn't become an uncaughtException.
 process.stdout.on("error", () => {});
-process.stderr.on("error", () => {});
+process.stderr.on("error", (err) => {
+  if ((err as NodeJS.ErrnoException).code === "EPIPE") stderrAvailable = false;
+});
 
 const SOCKET_PATH = process.env.DSTREAMY_SOCKET;
 if (!SOCKET_PATH) {
@@ -90,14 +95,35 @@ const metricsSampler = new MetricsSampler({
   drainJitter: () => pipeline.drainFrameIntervalStats(),
   now: () => performance.now(),
 });
+let shuttingDown = false;
+let statsInterval: ReturnType<typeof setInterval> | undefined;
+
+async function shutdown(reason: string, exitCode = 0): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logDaemon(`shutdown: ${reason}`);
+
+  if (statsInterval) clearInterval(statsInterval);
+  controlConn?.destroy();
+  controlConn = null;
+  server.close();
+
+  await Promise.race([
+    stream.disconnect(),
+    new Promise((resolve) => setTimeout(resolve, 1500)),
+  ]).catch(() => {});
+
+  process.exit(exitCode);
+}
 
 reader.on("error", (err) => {
   logDaemon(`pipe error: ${err.message}`);
   sendEvent("error", err.message);
   pipeline.clearAudioBuffer();
-  void stream.disconnect().finally(() => {
-    startTime = 0;
-  });
+  void shutdown("media pipe error");
+});
+reader.on("end", () => {
+  void shutdown("media pipe closed");
 });
 
 reader.on("video", (data) => {
@@ -135,6 +161,7 @@ const server = net.createServer((socket) => {
 
   socket.on("close", () => {
     controlConn = null;
+    void shutdown("control connection closed");
   });
 });
 
@@ -144,7 +171,7 @@ server.listen(SOCKET_PATH, () => {
 
 // Stats reporting
 let lastLoggedUptime = -1;
-setInterval(() => {
+statsInterval = setInterval(() => {
   if (startTime === 0) return;
   const uptimeSec = Math.floor((Date.now() - startTime) / 1000);
   const elapsed = uptimeSec || 1;
@@ -246,7 +273,8 @@ process.on("uncaughtException", (err) => {
   // Broken pipe means the app (our stderr/IPC reader) is gone — exit instead of
   // logging, which would write to the same dead pipe and loop forever.
   if ((err as NodeJS.ErrnoException).code === "EPIPE") {
-    process.exit(0);
+    void shutdown("broken pipe");
+    return;
   }
   logDaemon(`uncaught: ${err.message}\n${err.stack}`);
   sendEvent("error", err.message);
@@ -258,8 +286,8 @@ process.on("unhandledRejection", (reason) => {
 
 // Graceful shutdown
 process.on("SIGTERM", () => {
-  stream.disconnect().finally(() => {
-    server.close();
-    process.exit(0);
-  });
+  void shutdown("SIGTERM");
+});
+process.on("SIGINT", () => {
+  void shutdown("SIGINT");
 });

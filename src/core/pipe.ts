@@ -18,6 +18,7 @@ export interface PipeReaderEvents {
   video: (data: Buffer, timestamp: bigint) => void;
   audio: (data: Buffer, timestamp: bigint) => void;
   error: (err: Error) => void;
+  end: () => void;
 }
 
 export declare interface PipeReader {
@@ -92,6 +93,7 @@ export class PipeReader extends EventEmitter {
   private flush(): void {
     // EOF — drain whatever is left (will be a no-op if incomplete frame)
     this.drain();
+    this.emit("end");
   }
 
   private fail(err: Error): void {

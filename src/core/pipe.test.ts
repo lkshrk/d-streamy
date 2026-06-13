@@ -41,3 +41,18 @@ test("PipeReader emits frames split across chunks", async () => {
   expect(videoFrames.map((data) => [...data])).toEqual([[1, 2, 3, 4]]);
   expect(reader.pendingBytes).toBe(0);
 });
+
+test("PipeReader emits end when source reaches EOF", async () => {
+  const source = new PassThrough();
+  const reader = new PipeReader(source);
+  let ended = false;
+
+  reader.on("end", () => {
+    ended = true;
+  });
+
+  source.end();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  expect(ended).toBe(true);
+});
