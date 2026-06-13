@@ -15,9 +15,7 @@ bun build src/daemon/index.ts --outdir .build/daemon-bundle --target node \
     --external ws \
     --external @snazzah/davey-darwin-arm64 \
     --external @seydx/node-av-darwin-arm64 \
-    --external @lng2004/node-datachannel \
-    --external @img/sharp-darwin-arm64 \
-    --external @img/sharp-libvips-darwin-arm64
+    --external @lng2004/node-datachannel
 
 echo "==> Assembling D-Streamy.app..."
 APP="$ROOT/bin/D-Streamy.app"
@@ -41,8 +39,6 @@ copy_native_pkg() {
 copy_native_pkg "@snazzah/davey-darwin-arm64"
 copy_native_pkg "@seydx/node-av-darwin-arm64"
 copy_native_pkg "@lng2004/node-datachannel"
-copy_native_pkg "@img/sharp-darwin-arm64"
-copy_native_pkg "@img/sharp-libvips-darwin-arm64"
 copy_native_pkg "ws"
 
 # Bundle the bun runtime so the app is self-contained (no external bun needed)

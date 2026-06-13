@@ -1,0 +1,7 @@
+{
+  "name": "sharp",
+  "version": "0.34.5",
+  "description": "Local no-op stub. dstreamy does not use sharp; see index.js.",
+  "main": "index.js",
+  "type": "commonjs"
+}
