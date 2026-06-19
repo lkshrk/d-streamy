@@ -13,6 +13,8 @@ rm -rf .build/daemon-bundle
 bun build src/daemon/index.ts --outdir .build/daemon-bundle --target node \
     --external ffmpeg-static \
     --external ws \
+    --external @discordjs/opus \
+    --external opusscript \
     --external @snazzah/davey-darwin-arm64 \
     --external @seydx/node-av-darwin-arm64 \
     --external @lng2004/node-datachannel
@@ -40,6 +42,8 @@ copy_native_pkg "@snazzah/davey-darwin-arm64"
 copy_native_pkg "@seydx/node-av-darwin-arm64"
 copy_native_pkg "@lng2004/node-datachannel"
 copy_native_pkg "ws"
+copy_native_pkg "@discordjs/opus"
+copy_native_pkg "opusscript"
 
 # Bundle the bun runtime so the app is self-contained (no external bun needed)
 BUN_BIN="${BUN_BIN:-$HOME/.bun/bin/bun}"
