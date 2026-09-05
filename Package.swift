@@ -43,5 +43,10 @@ let package = Package(
             dependencies: ["CaptureLib"],
             path: "capture/Tests/CaptureLibTests"
         ),
+        .testTarget(
+            name: "DStreamyAppTests",
+            dependencies: ["DStreamyApp"],
+            path: "AppTests"
+        ),
     ]
 )

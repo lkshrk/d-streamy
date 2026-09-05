@@ -13,14 +13,14 @@ struct PopoverView: View {
                 Text("D-Streamy")
                     .font(.headline)
                 Spacer()
-                if state.token.isEmpty {
+                if !state.isAuthenticated {
                     Image(systemName: "circle.fill")
                         .font(.system(size: 8))
                         .foregroundStyle(.red)
-                    Text("Not logged in")
+                    Text(state.authError == nil ? "Not logged in" : "Login failed")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Button("Login") { showTokenInput = true }
+                    Button(state.token.isEmpty ? "Login" : "Edit token") { showTokenInput = true }
                         .font(.caption)
                         .buttonStyle(.bordered)
                         .controlSize(.small)
@@ -61,6 +61,15 @@ struct PopoverView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
+
+            if let authError = state.authError {
+                Text(authError)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            }
 
             if showTokenInput {
                 VStack(alignment: .leading, spacing: 4) {
@@ -109,7 +118,7 @@ struct PopoverView: View {
                 if state.streamState.isActive {
                     WindowPickerView()
                     StatsView()
-                } else if !state.token.isEmpty {
+                } else if state.isAuthenticated {
                     WindowPickerView()
                     GuildChannelView()
 
@@ -174,12 +183,13 @@ struct StreamButton: View {
 
     private var canStart: Bool {
         state.streamState.canStop ||
-        (state.captureFilter != nil && state.selectedGuild != nil && state.selectedChannel != nil)
+        (state.isAuthenticated && state.captureFilter != nil && state.selectedGuild != nil && state.selectedChannel != nil)
     }
 
     private var missingInfo: String {
         if state.streamState.canStop { return "Stop streaming" }
         var missing: [String] = []
+        if !state.isAuthenticated { missing.append("login") }
         if state.captureFilter == nil { missing.append("source") }
         if state.selectedGuild == nil { missing.append("server") }
         if state.selectedChannel == nil { missing.append("channel") }

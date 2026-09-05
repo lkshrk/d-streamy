@@ -6,6 +6,40 @@ import os
 
 private let log = Logger(subsystem: "me.harke.d-streamy", category: "app")
 
+private struct DiscordLoginError: LocalizedError {
+    let errorDescription: String?
+}
+
+func normalizeDiscordToken(_ value: String) -> String {
+    let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard value.lowercased().hasPrefix("authorization:") else { return value }
+    return String(value.dropFirst("authorization:".count))
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+func isDiscordAuthenticated(username: String, authError: String?) -> Bool {
+    !username.isEmpty && authError == nil
+}
+
+func discordUsername(from data: Data, response: URLResponse) throws -> String {
+    guard let response = response as? HTTPURLResponse else {
+        throw DiscordLoginError(errorDescription: "Discord returned an invalid login response.")
+    }
+    guard response.statusCode != 401 && response.statusCode != 403 else {
+        throw DiscordLoginError(
+            errorDescription: "Discord rejected this token. Copy only the Authorization header value and try again."
+        )
+    }
+    guard 200..<300 ~= response.statusCode else {
+        throw DiscordLoginError(errorDescription: "Discord login failed (HTTP \(response.statusCode)).")
+    }
+    struct User: Decodable { let username: String }
+    guard let user = try? JSONDecoder().decode(User.self, from: data) else {
+        throw DiscordLoginError(errorDescription: "Discord returned an unexpected login response.")
+    }
+    return user.username
+}
+
 /// Single source of truth for the app.
 @MainActor
 final class AppState: ObservableObject {
@@ -15,12 +49,15 @@ final class AppState: ObservableObject {
     @Published var channels: [ChannelInfo] = []
     @Published var selectedGuild: GuildInfo?
     @Published var selectedChannel: ChannelInfo?
+    @Published var authError: String?
 
     // Capture (set by SCContentSharingPicker)
     @Published var captureFilter: SCContentFilter?
     @Published var captureLabel: String = ""   // display name for selected content
     @Published var captureKind: CaptureKind = .window
     @Published var username: String = ""
+
+    var isAuthenticated: Bool { isDiscordAuthenticated(username: username, authError: authError) }
 
     // Crop
     @Published var cropRect: CGRect? = nil
@@ -234,21 +271,27 @@ final class AppState: ObservableObject {
     // MARK: - Actions
 
     func loginAndFetch() async {
+        authError = nil
         await fetchUser()
+        guard authError == nil else { return }
         await fetchGuilds()
     }
 
     func fetchUser() async {
         guard !token.isEmpty else { return }
-        guard let (data, _) = try? await discordAPI("users/@me") else { return }
-        struct User: Decodable { let username: String }
-        if let user = try? JSONDecoder().decode(User.self, from: data) {
-            username = user.username
+        do {
+            let (data, response) = try await discordAPI("users/@me")
+            username = try discordUsername(from: data, response: response)
+        } catch {
+            username = ""
+            guilds = []
+            channels = []
+            authError = error.localizedDescription
         }
     }
 
     func fetchGuilds() async {
-        guard !token.isEmpty else { return }
+        guard isAuthenticated else { return }
         guard let (data, _) = try? await discordAPI("users/@me/guilds") else { return }
         if let g = try? JSONDecoder().decode([GuildInfo].self, from: data) {
             guilds = g
@@ -259,7 +302,7 @@ final class AppState: ObservableObject {
     }
 
     func fetchChannels(guildId: String) async {
-        guard !token.isEmpty else { return }
+        guard isAuthenticated else { return }
         guard let (data, _) = try? await discordAPI("guilds/\(guildId)/channels") else { return }
         struct DiscordChannel: Decodable { let id: String; let name: String; let type: Int }
         if let all = try? JSONDecoder().decode([DiscordChannel].self, from: data) {
@@ -274,9 +317,9 @@ final class AppState: ObservableObject {
         guard let filter = captureFilter,
               let guild = selectedGuild,
               let channel = selectedChannel,
-              !token.isEmpty else {
-            log.warning("startStream guard failed: filter=\(self.captureFilter != nil) guild=\(self.selectedGuild != nil) channel=\(self.selectedChannel != nil) token=\(!self.token.isEmpty)")
-            streamLog.write(component: "app", "start guard failed filter=\(captureFilter != nil) guild=\(selectedGuild != nil) channel=\(selectedChannel != nil) token=\(!token.isEmpty)")
+              isAuthenticated else {
+            log.warning("startStream guard failed: filter=\(self.captureFilter != nil) guild=\(self.selectedGuild != nil) channel=\(self.selectedChannel != nil) authenticated=\(self.isAuthenticated)")
+            streamLog.write(component: "app", "start guard failed filter=\(captureFilter != nil) guild=\(selectedGuild != nil) channel=\(selectedChannel != nil) authenticated=\(isAuthenticated)")
             return
         }
 
@@ -578,14 +621,19 @@ final class AppState: ObservableObject {
     // MARK: - Token management
 
     func saveToken(_ newToken: String) {
+        let normalizedToken = normalizeDiscordToken(newToken)
+        guard !normalizedToken.isEmpty else {
+            authError = "Paste an Authorization header value."
+            return
+        }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        proc.arguments = ["add-generic-password", "-U", "-s", "dstreamy", "-a", "discord-token", "-w", newToken]
+        proc.arguments = ["add-generic-password", "-U", "-s", "dstreamy", "-a", "discord-token", "-w", normalizedToken]
         proc.standardOutput = Pipe()
         proc.standardError = Pipe()
         try? proc.run()
         proc.waitUntilExit()
-        token = newToken
+        token = normalizedToken
         Task { await loginAndFetch() }
     }
 
@@ -598,6 +646,7 @@ final class AppState: ObservableObject {
         try? proc.run()
         proc.waitUntilExit()
         token = ""
+        authError = nil
         username = ""
         guilds = []
         channels = []
