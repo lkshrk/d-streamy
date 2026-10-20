@@ -1,17 +1,17 @@
 use crate::gateway::events::GatewayEvent;
 use crate::gateway::opcodes::GatewayOpCode;
-use crate::utils::parse_stream_key;
-use crate::voice::connection::{ConnectionError, VoiceConnection, VoiceEvent};
+use crate::utils::{StreamType, generate_stream_key, parse_stream_key};
+use crate::voice::connection::{
+    ConnectionError, MediaConnection, ReadyReceiver, VoiceConnection, VoiceEvent,
+};
 use serde_json::{Value, json};
-use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
+use webrtc::api::setting_engine::SettingEngine;
 
 #[derive(Debug, Error)]
 pub enum StreamerError {
-    #[error("Not logged in")]
-    NotLoggedIn,
     #[error("Not in voice channel")]
     NotInVoice,
     #[error("No session yet")]
@@ -20,30 +20,132 @@ pub enum StreamerError {
     Connection(#[from] ConnectionError),
 }
 
-/// Outbound opcodes the Streamer needs to send back to the Discord main
-/// gateway (the caller is responsible for the actual WS write).
-#[derive(Debug)]
+/// Outbound opcode for the main gateway; the caller does the actual WS write.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GatewayPayload {
     pub op: u8,
     pub d: Value,
 }
 
-/// The main controller — mirrors `Streamer.ts`.
-///
-/// Because Rust does not have a browser/selfbot client built-in, the `Streamer`
-/// is *not* responsible for the main gateway WebSocket connection. Instead:
-///
-/// 1. The caller maintains the main gateway WS.
-/// 2. Every raw dispatch packet is fed into [`Streamer::handle_event`].
-/// 3. Whenever the `Streamer` needs to send something to the main gateway it
-///    pushes a [`GatewayPayload`] via the `gateway_tx` channel.
-///
-/// This keeps the library transport-agnostic (no specific HTTP client tied in).
+/// A voice or stream connection being set up.
+pub struct PendingConnection {
+    ready: ReadyReceiver,
+    /// Lifecycle events of this connection.
+    pub events: mpsc::UnboundedReceiver<VoiceEvent>,
+}
+
+impl PendingConnection {
+    /// Wait until the connection can send media (after SELECT_PROTOCOL_ACK).
+    pub async fn ready(&mut self) -> Result<MediaConnection, StreamerError> {
+        match (&mut self.ready).await {
+            Ok(result) => Ok(result?),
+            Err(_) => Err(StreamerError::Connection(ConnectionError::Closed)),
+        }
+    }
+}
+
+type ReadySender = oneshot::Sender<Result<MediaConnection, ConnectionError>>;
+
+/// A connection that starts once session id and server tokens are both known.
+struct Slot {
+    pending: Option<Box<VoiceConnection>>,
+    ready_tx: Option<ReadySender>,
+    started: Option<MediaConnection>,
+}
+
+impl Slot {
+    fn new(conn: VoiceConnection, ready_tx: ReadySender) -> Self {
+        Self {
+            pending: Some(Box::new(conn)),
+            ready_tx: Some(ready_tx),
+            started: None,
+        }
+    }
+
+    fn set_session(&mut self, session_id: String) {
+        if let Some(c) = &mut self.pending {
+            c.set_session(session_id);
+        } else if let Some(m) = &self.started {
+            m.set_session(session_id);
+        }
+    }
+
+    fn set_tokens(&mut self, server: String, token: String) {
+        if let Some(c) = &mut self.pending {
+            c.set_tokens(server, token);
+        } else if let Some(m) = &self.started {
+            m.set_tokens(server, token);
+        }
+    }
+
+    fn start_if_ready(&mut self, webrtc: &WebRtcConfig) {
+        if !self.pending.as_ref().is_some_and(|c| c.can_start()) {
+            return;
+        }
+        let Some(mut conn) = self.pending.take() else {
+            return;
+        };
+        webrtc.apply(&mut conn);
+        let (media, ready, _task) = conn.start();
+        if let Some(tx) = self.ready_tx.take() {
+            tokio::spawn(async move {
+                let _ = tx.send(ready.await.unwrap_or(Err(ConnectionError::Closed)));
+            });
+        }
+        self.started = Some(media);
+    }
+
+    fn stop(&self) {
+        if let Some(m) = &self.started {
+            m.stop();
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct WebRtcConfig {
+    ice_servers: Option<Vec<String>>,
+    setting_engine: Option<SettingEngine>,
+}
+
+impl WebRtcConfig {
+    fn apply(&self, conn: &mut VoiceConnection) {
+        if let Some(w) = conn.webrtc_mut() {
+            if let Some(urls) = &self.ice_servers {
+                w.set_ice_servers(urls.clone());
+            }
+            if let Some(engine) = &self.setting_engine {
+                w.set_setting_engine(engine.clone());
+            }
+        }
+    }
+}
+
+struct VoiceState {
+    guild_id: Option<String>,
+    channel_id: String,
+    session_id: Option<String>,
+    slot: Slot,
+}
+
+struct StreamState {
+    guild_id: Option<String>,
+    channel_id: String,
+    session_id: String,
+    stream_key: Option<String>,
+    endpoint: Option<(String, String)>,
+    ready_tx: Option<ReadySender>,
+    event_tx: mpsc::UnboundedSender<VoiceEvent>,
+    slot: Option<Slot>,
+}
+
+/// Mirrors `Streamer.ts`; the caller owns the main gateway WS, feeds `handle_event` and writes `gateway_tx`.
 pub struct Streamer {
     user_id: String,
-    /// Channel to send outbound main-gateway opcodes to the caller.
     gateway_tx: mpsc::UnboundedSender<GatewayPayload>,
-    voice_connection: Option<Arc<Mutex<VoiceConnection>>>,
+    voice: Option<VoiceState>,
+    stream: Option<StreamState>,
+    webrtc: WebRtcConfig,
 }
 
 impl Streamer {
@@ -51,144 +153,223 @@ impl Streamer {
         Self {
             user_id,
             gateway_tx,
-            voice_connection: None,
+            voice: None,
+            stream: None,
+            webrtc: WebRtcConfig::default(),
         }
     }
 
-    // ------------------------------------------------------------------
-    // Public API — mirrors Streamer.ts public methods
-    // ------------------------------------------------------------------
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
 
-    /// Join a guild voice channel.
-    /// Returns an `mpsc` receiver the caller uses to get [`VoiceEvent`]s.
+    /// ICE servers for connections started after this call (default: the JS reference's STUN server).
+    pub fn set_ice_servers(&mut self, urls: Vec<String>) {
+        self.webrtc.ice_servers = Some(urls);
+    }
+
+    /// webrtc-rs setting engine for connections started after this call.
+    pub fn set_setting_engine(&mut self, engine: SettingEngine) {
+        self.webrtc.setting_engine = Some(engine);
+    }
+
+    /// Join a voice channel (`joinVoice`); `guild_id` is `None` for DM calls.
     pub fn join_voice(
         &mut self,
         guild_id: Option<String>,
         channel_id: String,
-    ) -> mpsc::UnboundedReceiver<VoiceEvent> {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+    ) -> PendingConnection {
+        self.leave_voice_connections();
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let (ready_tx, ready) = oneshot::channel();
         let conn = VoiceConnection::new(
             guild_id.clone(),
             channel_id.clone(),
             self.user_id.clone(),
             event_tx,
         );
-        self.voice_connection = Some(Arc::new(Mutex::new(conn)));
-
-        // Tell Discord we want to join the voice channel (op 4)
-        self.signal_video(false, guild_id, channel_id);
-
-        event_rx
+        let slot = Slot::new(conn, ready_tx);
+        self.voice = Some(VoiceState {
+            guild_id,
+            channel_id,
+            session_id: None,
+            slot,
+        });
+        self.signal_video(false);
+        PendingConnection { ready, events }
     }
 
-    /// Must be called whenever a raw dispatch packet arrives from the main
-    /// gateway (`op == 0`). Ported from the `client.on("raw", ...)` handler
-    /// in `Streamer.ts`.
-    pub async fn handle_event(&mut self, event: GatewayEvent) {
+    /// Start a Go Live stream on the joined channel (`createStream`).
+    pub fn create_stream(&mut self) -> Result<PendingConnection, StreamerError> {
+        let voice = self.voice.as_ref().ok_or(StreamerError::NotInVoice)?;
+        let session_id = voice.session_id.clone().ok_or(StreamerError::NoSession)?;
+        let (guild_id, channel_id) = (voice.guild_id.clone(), voice.channel_id.clone());
+        self.stop_stream_connection();
+        self.signal_stream();
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let (ready_tx, ready) = oneshot::channel();
+        self.stream = Some(StreamState {
+            guild_id,
+            channel_id,
+            session_id,
+            stream_key: None,
+            endpoint: None,
+            ready_tx: Some(ready_tx),
+            event_tx,
+            slot: None,
+        });
+        Ok(PendingConnection { ready, events })
+    }
+
+    /// Feed one main-gateway dispatch (`client.on("raw")` in JS).
+    pub fn handle_event(&mut self, event: GatewayEvent) {
         match event {
             GatewayEvent::VoiceStateUpdate(d) => {
                 if d.user_id != self.user_id {
                     return;
                 }
                 debug!("Gateway: VOICE_STATE_UPDATE session={}", d.session_id);
-                if let Some(vc) = &self.voice_connection {
-                    vc.lock().await.set_session(d.session_id);
+                if let Some(voice) = &mut self.voice {
+                    voice.session_id = Some(d.session_id.clone());
+                    voice.slot.set_session(d.session_id);
+                    voice.slot.start_if_ready(&self.webrtc);
                 }
             }
-
             GatewayEvent::VoiceServerUpdate(d) => {
-                // Ignore events for other guilds/channels
-                let matches = self.voice_connection.as_ref().is_some_and(|_| true);
-                if !matches {
+                let Some(voice) = &mut self.voice else {
+                    return;
+                };
+                if voice.guild_id != d.guild_id {
                     return;
                 }
-                debug!("Gateway: VOICE_SERVER_UPDATE endpoint={}", d.endpoint);
-                if let Some(vc) = &self.voice_connection {
-                    let mut conn = vc.lock().await;
-                    conn.set_tokens(d.endpoint, d.token);
-                    if conn.can_start() {
-                        drop(conn); // release lock before await
-                        let conn_arc = vc.clone();
-                        tokio::spawn(async move {
-                            {
-                                // Take ownership by temporarily swapping — in
-                                // a real impl you'd restructure to avoid this.
-                                // For now we start inside a new task.
-                                let _guard = conn_arc.lock().await;
-                                // We can't move out of Arc<Mutex<>>; start()
-                                // needs `self`. A production impl would split
-                                // the connection into a builder + handle.
-                                // Placeholder: log that start would be called.
-                                debug!("VoiceConnection ready to start");
-                            };
-                        });
-                    }
+                if d.channel_id
+                    .as_ref()
+                    .is_some_and(|c| *c != voice.channel_id)
+                {
+                    return;
                 }
+                let Some(endpoint) = d.endpoint else {
+                    debug!("Gateway: VOICE_SERVER_UPDATE without endpoint ignored");
+                    return;
+                };
+                debug!("Gateway: VOICE_SERVER_UPDATE endpoint={}", endpoint);
+                voice.slot.set_tokens(endpoint, d.token);
+                voice.slot.start_if_ready(&self.webrtc);
             }
-
             GatewayEvent::StreamCreate(d) => {
                 debug!("Gateway: STREAM_CREATE key={}", d.stream_key);
-                if let Ok(_parsed) = parse_stream_key(&d.stream_key)
-                    && let Some(vc) = &self.voice_connection
-                {
-                    let mut vc_guard = vc.lock().await;
-                    let session_id = vc_guard.session_id().map(str::to_owned);
-                    if let Some(sc) = vc_guard.stream_connection_mut() {
-                        sc.server_id = Some(d.rtc_server_id);
-                        sc.stream_key = Some(d.stream_key);
-                        if let Some(sid) = session_id {
-                            sc.inner.set_session(sid);
-                        }
-                    }
+                let user_id = self.user_id.clone();
+                let Some(stream) = &mut self.stream else {
+                    return;
+                };
+                if !stream.matches(&d.stream_key, &user_id) || stream.slot.is_some() {
+                    return;
                 }
+                let conn = VoiceConnection::new_stream(
+                    stream.guild_id.clone(),
+                    stream.channel_id.clone(),
+                    user_id,
+                    d.rtc_server_id,
+                    stream.event_tx.clone(),
+                );
+                let ready_tx = stream
+                    .ready_tx
+                    .take()
+                    .unwrap_or_else(|| oneshot::channel().0);
+                let mut slot = Slot::new(conn, ready_tx);
+                slot.set_session(stream.session_id.clone());
+                if let Some((endpoint, token)) = stream.endpoint.take() {
+                    slot.set_tokens(endpoint, token);
+                }
+                slot.start_if_ready(&self.webrtc);
+                stream.stream_key = Some(d.stream_key);
+                stream.slot = Some(slot);
             }
-
             GatewayEvent::StreamServerUpdate(d) => {
                 debug!("Gateway: STREAM_SERVER_UPDATE key={}", d.stream_key);
-                if let Some(vc) = &self.voice_connection {
-                    let mut vc_guard = vc.lock().await;
-                    if let Some(sc) = vc_guard.stream_connection_mut() {
-                        sc.inner.set_tokens(d.endpoint, d.token);
+                let user_id = self.user_id.clone();
+                let Some(stream) = &mut self.stream else {
+                    return;
+                };
+                if !stream.matches(&d.stream_key, &user_id) {
+                    return;
+                }
+                let Some(endpoint) = d.endpoint else {
+                    return;
+                };
+                match &mut stream.slot {
+                    Some(slot) => {
+                        slot.set_tokens(endpoint, d.token);
+                        slot.start_if_ready(&self.webrtc);
                     }
+                    None => stream.endpoint = Some((endpoint, d.token)),
                 }
             }
-
             GatewayEvent::Unknown(_) => {}
         }
     }
 
-    /// Create a Go Live stream on the current voice connection.
-    pub fn create_stream(&mut self) -> Result<(), StreamerError> {
-        self.signal_stream()?;
-        Ok(())
+    /// Stop the Go Live stream (`stopStream`).
+    pub fn stop_stream(&mut self) {
+        if self.stream.is_none() {
+            return;
+        }
+        self.stop_stream_connection();
+        self.signal_stop_stream();
     }
 
-    /// Stop the Go Live stream.
-    pub fn stop_stream(&mut self) -> Result<(), StreamerError> {
-        self.signal_stop_stream()?;
-        Ok(())
-    }
-
-    /// Leave the current voice channel.
+    /// Leave the voice channel (`leaveVoice`).
     pub fn leave_voice(&mut self) {
-        self.voice_connection = None;
+        self.leave_voice_connections();
         self.signal_leave_voice();
     }
 
-    // ------------------------------------------------------------------
-    // Signalling helpers — send opcodes to the main gateway
-    // ------------------------------------------------------------------
-
-    fn send_opcode(&self, op: GatewayOpCode, d: Value) {
-        let _ = self.gateway_tx.send(GatewayPayload { op: op as u8, d });
+    /// Retarget the next `create_stream()` after a channel move, without rejoining.
+    pub fn set_voice_channel(&mut self, guild_id: Option<String>, channel_id: String) {
+        if let Some(voice) = &mut self.voice {
+            voice.guild_id = guild_id;
+            voice.channel_id = channel_id;
+        }
     }
 
-    fn signal_video(&self, video_enabled: bool, guild_id: Option<String>, channel_id: String) {
+    pub fn voice_channel(&self) -> Option<(Option<&str>, &str)> {
+        self.voice
+            .as_ref()
+            .map(|v| (v.guild_id.as_deref(), v.channel_id.as_str()))
+    }
+
+    pub fn voice_connection(&self) -> Option<&MediaConnection> {
+        self.voice.as_ref().and_then(|v| v.slot.started.as_ref())
+    }
+
+    pub fn stream_connection(&self) -> Option<&MediaConnection> {
+        self.stream
+            .as_ref()
+            .and_then(|s| s.slot.as_ref())
+            .and_then(|s| s.started.as_ref())
+    }
+
+    /// The stream key of the current or next Go Live stream.
+    pub fn stream_key(&self) -> Option<String> {
+        let voice = self.voice.as_ref()?;
+        Some(generate_stream_key(
+            stream_type(voice.guild_id.as_deref()),
+            voice.guild_id.as_deref(),
+            &voice.channel_id,
+            &self.user_id,
+        ))
+    }
+
+    /// Op 4 with the current channel, as `signalVideo(enabled)`.
+    pub fn signal_video(&self, video_enabled: bool) {
+        let Some(voice) = &self.voice else {
+            return;
+        };
         self.send_opcode(
             GatewayOpCode::VoiceStateUpdate,
             json!({
-                "guild_id": guild_id,
-                "channel_id": channel_id,
+                "guild_id": voice.guild_id,
+                "channel_id": voice.channel_id,
                 "self_mute": false,
                 "self_deaf": true,
                 "self_video": video_enabled,
@@ -196,19 +377,48 @@ impl Streamer {
         );
     }
 
-    fn signal_stream(&self) -> Result<(), StreamerError> {
-        let _vc = self
-            .voice_connection
-            .as_ref()
-            .ok_or(StreamerError::NotInVoice)?;
-        // Opcodes 18+22 require guild/channel info from the VoiceConnection.
-        // These will be wired up properly once `start()` is refactored to
-        // expose cached ids without requiring an async lock here.
-        Ok(())
+    fn leave_voice_connections(&mut self) {
+        self.stop_stream_connection();
+        if let Some(voice) = self.voice.take() {
+            voice.slot.stop();
+        }
     }
 
-    fn signal_stop_stream(&self) -> Result<(), StreamerError> {
-        Ok(())
+    fn stop_stream_connection(&mut self) {
+        if let Some(stream) = self.stream.take()
+            && let Some(slot) = stream.slot
+        {
+            slot.stop();
+        }
+    }
+
+    fn send_opcode(&self, op: GatewayOpCode, d: Value) {
+        let _ = self.gateway_tx.send(GatewayPayload { op: op as u8, d });
+    }
+
+    fn signal_stream(&self) {
+        let (Some(voice), Some(key)) = (&self.voice, self.stream_key()) else {
+            return;
+        };
+        self.send_opcode(
+            GatewayOpCode::StreamCreate,
+            json!({
+                "type": stream_type(voice.guild_id.as_deref()).to_string(),
+                "guild_id": voice.guild_id,
+                "channel_id": voice.channel_id,
+                "preferred_region": null,
+            }),
+        );
+        self.send_opcode(
+            GatewayOpCode::StreamSetPaused,
+            json!({ "stream_key": key, "paused": false }),
+        );
+    }
+
+    fn signal_stop_stream(&self) {
+        if let Some(key) = self.stream_key() {
+            self.send_opcode(GatewayOpCode::StreamDelete, json!({ "stream_key": key }));
+        }
     }
 
     fn signal_leave_voice(&self) {
@@ -222,5 +432,21 @@ impl Streamer {
                 "self_video": false,
             }),
         );
+    }
+}
+
+impl StreamState {
+    fn matches(&self, stream_key: &str, user_id: &str) -> bool {
+        parse_stream_key(stream_key).is_ok_and(|k| {
+            k.guild_id == self.guild_id && k.channel_id == self.channel_id && k.user_id == user_id
+        })
+    }
+}
+
+fn stream_type(guild_id: Option<&str>) -> StreamType {
+    if guild_id.is_some() {
+        StreamType::Guild
+    } else {
+        StreamType::Call
     }
 }

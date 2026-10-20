@@ -1,44 +1,17 @@
-use crate::voice::connection::VoiceConnection;
-use crate::voice::connection::VoiceEvent;
-use tokio::sync::mpsc;
-
-/// A second voice WebSocket connection used for Go Live streams.
-/// Mirrors `StreamConnection.ts` which extends `BaseMediaConnection`.
-pub struct StreamConnection {
-    /// Underlying voice connection state machine (reuses all DAVE + WS logic).
-    pub inner: VoiceConnection,
-    /// The Discord stream key (e.g. `guild:<guild>:<ch>:<user>`).
-    pub stream_key: Option<String>,
-    /// The RTC server ID used to derive `daveChannelId`.
-    pub server_id: Option<String>,
+/// DAVE channel id of a Go Live stream: `rtc_server_id - 1`, as `StreamConnection.daveChannelId` in JS.
+pub fn dave_channel_id(rtc_server_id: &str) -> Option<u64> {
+    rtc_server_id.parse::<u64>().ok()?.checked_sub(1)
 }
 
-impl StreamConnection {
-    pub fn new(
-        guild_id: Option<String>,
-        channel_id: String,
-        bot_id: String,
-        event_tx: mpsc::UnboundedSender<VoiceEvent>,
-    ) -> Self {
-        Self {
-            inner: VoiceConnection::new(guild_id, channel_id, bot_id, event_tx),
-            stream_key: None,
-            server_id: None,
-        }
-    }
-
-    /// The DAVE channel id for a stream is `rtc_server_id - 1`.
-    /// Mirrors `StreamConnection.daveChannelId` getter in TS.
-    pub fn dave_channel_id(&self) -> Option<u64> {
-        self.server_id
-            .as_deref()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|id| id.saturating_sub(1))
-    }
-
-    /// The `serverId` used in IDENTIFY for a stream connection equals the
-    /// raw RTC server ID (not the guild id).
-    pub fn server_id(&self) -> Option<&str> {
-        self.server_id.as_deref()
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dave_channel_id_is_server_id_minus_one() {
+        assert_eq!(
+            super::dave_channel_id("1234567890123456789"),
+            Some(1234567890123456788)
+        );
+        assert_eq!(super::dave_channel_id("0"), None);
+        assert_eq!(super::dave_channel_id("x"), None);
     }
 }

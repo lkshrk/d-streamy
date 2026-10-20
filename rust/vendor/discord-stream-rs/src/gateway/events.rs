@@ -25,7 +25,7 @@ pub struct VoiceStateUpdate {
 pub struct VoiceServerUpdate {
     pub guild_id: Option<String>,
     pub channel_id: Option<String>,
-    pub endpoint: String,
+    pub endpoint: Option<String>,
     pub token: String,
 }
 
@@ -48,7 +48,7 @@ pub struct StreamCreate {
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamServerUpdate {
     pub stream_key: String,
-    pub endpoint: String,
+    pub endpoint: Option<String>,
     pub token: String,
 }
 

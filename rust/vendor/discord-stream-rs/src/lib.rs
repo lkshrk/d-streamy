@@ -22,7 +22,9 @@ pub mod utils;
 pub mod voice;
 
 pub use dave::{DaveError, DaveHandler};
-pub use gateway::{GatewayEvent, GatewayOpCode, GatewayPayload, Streamer, StreamerError};
+pub use gateway::{
+    GatewayEvent, GatewayOpCode, GatewayPayload, PendingConnection, Streamer, StreamerError,
+};
 pub use processing::{
     H264Helpers, H264NalUnitType, H265Helpers, H265NalUnitType, rewrite_sps_vui, split_nalu,
 };
@@ -30,6 +32,6 @@ pub use utils::{
     StreamKey, StreamType, VideoCodec, generate_stream_key, normalize_video_codec, parse_stream_key,
 };
 pub use voice::{
-    ConnectionError, StreamConnection, VoiceConnection, VoiceEvent, WebRtcError, WebRtcParams,
-    WebRtcWrapper,
+    ConnectionError, ConnectionKind, MediaConnection, VideoAttributes, VoiceConnection, VoiceEvent,
+    WebRtcError, WebRtcParams, WebRtcWrapper,
 };

@@ -4,4 +4,4 @@ pub mod streamer;
 
 pub use events::GatewayEvent;
 pub use opcodes::GatewayOpCode;
-pub use streamer::{GatewayPayload, Streamer, StreamerError};
+pub use streamer::{GatewayPayload, PendingConnection, Streamer, StreamerError};
