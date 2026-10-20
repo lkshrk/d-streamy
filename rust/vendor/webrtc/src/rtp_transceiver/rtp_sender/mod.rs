@@ -224,7 +224,7 @@ impl RTCRtpSender {
         track_encodings: &mut Vec<TrackEncoding>,
         track: Arc<dyn TrackLocal + Send + Sync>,
     ) -> Result<()> {
-        let ssrc = rand::random::<u32>();
+        let ssrc = track.preferred_ssrc().unwrap_or_else(rand::random::<u32>);
         let srtp_stream = Arc::new(SrtpWriterFuture {
             closed: AtomicBool::new(false),
             ssrc,

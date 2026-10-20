@@ -126,6 +126,12 @@ pub trait TrackLocal {
     fn kind(&self) -> RTPCodecType;
 
     fn as_any(&self) -> &dyn Any;
+
+    /// SSRC the sender must use for this track instead of a random one, e.g. one
+    /// assigned by a signalling server.
+    fn preferred_ssrc(&self) -> Option<SSRC> {
+        None
+    }
 }
 
 /// TrackBinding is a single bind for a Track
