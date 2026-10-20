@@ -762,7 +762,10 @@ dependencies = [
 name = "dstreamy-discord"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "discord-stream-rs",
+ "dstreamy-media",
+ "dstreamy-mock-discord",
  "flate2",
  "futures-util",
  "rand 0.9.5",
