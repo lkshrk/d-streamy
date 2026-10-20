@@ -77,6 +77,7 @@ pub struct VoiceConnection {
     dave: DaveHandler,
     connected_users: HashSet<String>,
     pending_transitions: HashMap<u64, u16>,
+    dave_downgraded: bool,
 
     /// Optional Go Live stream connection attached to this voice connection.
     pub stream_connection: Option<Box<StreamConnection>>,
@@ -106,6 +107,7 @@ impl VoiceConnection {
             dave: DaveHandler::new(user_id, ch_id),
             connected_users: HashSet::new(),
             pending_transitions: HashMap::new(),
+            dave_downgraded: false,
             stream_connection: None,
             event_tx,
         }
@@ -480,14 +482,15 @@ impl VoiceConnection {
     fn execute_pending_transition(&mut self, transition_id: u64) {
         if let Some(new_version) = self.pending_transitions.remove(&transition_id) {
             let old_version = self.dave.protocol_version();
-            // Downgrade → passthrough
-            if old_version != 0 && new_version == 0 {
-                self.dave.set_passthrough_mode(true, Some(10));
+            self.dave.set_protocol_version(new_version);
+            if old_version != new_version && new_version == 0 {
+                self.dave_downgraded = true;
                 debug!(
                     "DAVE: Downgraded to non-E2EE (transition {})",
                     transition_id
                 );
-            } else if transition_id > 0 && old_version == 0 && new_version != 0 {
+            } else if transition_id > 0 && self.dave_downgraded {
+                self.dave_downgraded = false;
                 self.dave.set_passthrough_mode(true, Some(10));
                 debug!("DAVE: Upgraded to E2EE (transition {})", transition_id);
             }
@@ -531,5 +534,22 @@ mod tests {
         let conn = VoiceConnection::new(Some("1".into()), "2".into(), "3".into(), tx);
         let v: Value = serde_json::from_str(&conn.build_identify()).unwrap();
         assert_eq!(v["d"]["max_dave_protocol_version"], 1);
+    }
+
+    #[test]
+    fn executed_transitions_switch_protocol_version() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut conn = VoiceConnection::new(Some("1".into()), "2".into(), "3".into(), tx);
+        conn.dave.set_protocol_version(1);
+
+        conn.pending_transitions.insert(5, 0);
+        conn.execute_pending_transition(5);
+        assert_eq!(conn.dave.protocol_version(), 0);
+        assert!(conn.dave_downgraded);
+
+        conn.pending_transitions.insert(6, 1);
+        conn.execute_pending_transition(6);
+        assert_eq!(conn.dave.protocol_version(), 1);
+        assert!(!conn.dave_downgraded);
     }
 }

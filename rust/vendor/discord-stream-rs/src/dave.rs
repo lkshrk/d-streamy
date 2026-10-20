@@ -180,7 +180,7 @@ impl DaveHandler {
     /// Returns the original packet unchanged if the session is not ready.
     pub fn encrypt_opus(&mut self, packet: &[u8]) -> Result<Vec<u8>, DaveError> {
         match &mut self.inner {
-            Some(s) if s.is_ready() => {
+            Some(s) if self.protocol_version != 0 && s.is_ready() => {
                 let out = s
                     .encrypt_opus(packet)
                     .map_err(|e| DaveError::Encrypt(e.to_string()))?;
@@ -199,7 +199,7 @@ impl DaveHandler {
         packet: &[u8],
     ) -> Result<Vec<u8>, DaveError> {
         match &mut self.inner {
-            Some(s) if s.is_ready() => {
+            Some(s) if self.protocol_version != 0 && s.is_ready() => {
                 let out = s
                     .encrypt(media_type, codec, packet)
                     .map_err(|e| DaveError::Encrypt(e.to_string()))?;
@@ -225,8 +225,16 @@ impl DaveHandler {
         }
     }
 
+    /// Mirrors `daveReady` in the JS reference: E2EE is active only while the
+    /// negotiated protocol version is non-zero and the MLS group is ready.
     pub fn is_ready(&self) -> bool {
-        self.inner.as_ref().is_some_and(|s| s.is_ready())
+        self.protocol_version != 0 && self.inner.as_ref().is_some_and(|s| s.is_ready())
+    }
+
+    /// Switch the active protocol version when a transition executes, without
+    /// touching the MLS session.
+    pub fn set_protocol_version(&mut self, protocol_version: u16) {
+        self.protocol_version = protocol_version;
     }
 
     pub fn status(&self) -> Option<SessionStatus> {
