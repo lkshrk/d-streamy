@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "vendor/discord-stream-rs"]
+exclude = ["vendor/webrtc"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,3 +21,6 @@ unsafe_op_in_unsafe_fn = "deny"
 [workspace.lints.clippy]
 dbg_macro = "warn"
 todo = "warn"
+
+[patch.crates-io]
+webrtc = { path = "vendor/webrtc" }
