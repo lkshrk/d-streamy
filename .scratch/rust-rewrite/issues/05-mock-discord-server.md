@@ -1,6 +1,6 @@
 # 05 — mock discord server
 
-Status: ready-for-agent
+Status: done
 Depends: 04
 
 ## Scope
@@ -15,3 +15,6 @@ Behaviour must mirror real Discord per protocol-audit.md. Scriptable faults: dro
 - Global gates from PRD
 
 ## Comments
+- Evidence (2026-10-21, coordinator): merged 44e7aba; macOS gates 174 passed / 4 ignored; Linux `rust/ci/linux.sh` ok. Self-tests stream test-pattern H264+Opus through Streamer and real DiscordClient with DAVE active; frames bit-identical.
+- Decision: mock accepts only the announced video codec (webrtc-rs H264 partial-match caveat, see protocol-audit.md Verification).
+- Known test-only gaps left: `wait_for` runs closure under state lock; voice handler sends under connection lock; `pump` helper has no stop handle.
