@@ -152,6 +152,7 @@ impl Shared {
 pub struct StreamHandle {
     client: Arc<DiscordClient>,
     conn: MediaConnection,
+    voice: MediaConnection,
     shared: Arc<Shared>,
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
@@ -173,7 +174,7 @@ pub async fn start_stream(
         fps: capture.fps,
     };
     let teardown = Teardown(Some(&client));
-    let (conn, events) = connect(&client, guild_id, channel_id, &options, attrs).await?;
+    let (voice, conn, events) = connect(&client, guild_id, channel_id, &options, attrs).await?;
     let frames = source.start(capture).await?;
     teardown.defuse();
 
@@ -196,6 +197,7 @@ pub async fn start_stream(
     Ok(StreamHandle {
         client,
         conn,
+        voice,
         shared,
         shutdown,
         tasks,
@@ -230,10 +232,10 @@ async fn connect(
     channel_id: String,
     options: &StreamOptions,
     attrs: VideoAttributes,
-) -> Result<(MediaConnection, ConnectionEvents), StreamError> {
+) -> Result<(MediaConnection, MediaConnection, ConnectionEvents), StreamError> {
     let step = options.step_timeout;
     let mut voice = client.join_voice(guild_id, channel_id);
-    timeout(step, voice.ready())
+    let voice_conn = timeout(step, voice.ready())
         .await
         .map_err(|_| StreamError::Timeout("joining voice"))??;
     let mut stream = client.create_stream()?;
@@ -270,7 +272,7 @@ async fn connect(
         .await?;
     conn.set_speaking(true)?;
     conn.set_video_attributes(Some(attrs))?;
-    Ok((conn, [voice.events, stream.events]))
+    Ok((voice_conn, conn, [voice.events, stream.events]))
 }
 
 fn codec_name(codec: dstreamy_media::VideoCodec) -> &'static str {
@@ -306,7 +308,23 @@ impl StreamHandle {
         self.shared.request_keyframe();
     }
 
-    /// Dropping the handle instead aborts the pump and ends Go Live, but leaves the source to its own `Drop`.
+    // The Streamer holds one session; a newer one (reconnect, channel move) must survive this handle.
+    fn end_session(&self) {
+        let mut streamer = self.client.streamer();
+        if streamer
+            .stream_connection()
+            .is_some_and(|c| c.ptr_eq(&self.conn))
+        {
+            streamer.stop_stream();
+        }
+        if streamer
+            .voice_connection()
+            .is_some_and(|c| c.ptr_eq(&self.voice))
+        {
+            streamer.leave_voice();
+        }
+    }
+
     pub async fn stop(mut self) -> Result<StreamStats, StreamError> {
         let _ = self.shutdown.send(true);
         {
@@ -321,8 +339,7 @@ impl StreamHandle {
                 let _ = task.await;
             }
         }
-        self.client.stop_stream();
-        self.client.leave_voice();
+        self.end_session();
         self.stopped = true;
         let stopped = timeout(TASK_JOIN_TIMEOUT, async {
             self.shared.source.write().await.stop().await
@@ -343,8 +360,13 @@ impl Drop for StreamHandle {
         for task in &self.tasks {
             task.abort();
         }
-        self.client.stop_stream();
-        self.client.leave_voice();
+        self.end_session();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let shared = self.shared.clone();
+            runtime.spawn(async move {
+                let _ = shared.source.write().await.stop().await;
+            });
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -423,40 +423,211 @@ async fn h265_replay_streams_through_the_mock() {
     .await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn stop_ends_every_task_it_started() {
-    let mock = MockDiscord::start().await.unwrap();
-    let client = client(&mock).await;
-    let metrics = tokio::runtime::Handle::current().metrics();
-    sleep(Duration::from_millis(200)).await;
-    let baseline = metrics.num_alive_tasks();
+/// Synthetic H.264 AUs of `size` bytes, as fast as the receiver takes them; keyframe on request.
+struct FloodSource {
+    size: usize,
+    task: Option<JoinHandle<()>>,
+    keyframe_requests: Arc<AtomicUsize>,
+    stopped: Arc<AtomicBool>,
+}
 
-    let (source, _) = Tee::new(TestPatternSource::new());
-    let handle = start_stream(
-        client.clone(),
-        Some(MOCK_GUILD_ID.into()),
-        MOCK_VOICE_CHANNEL_ID.into(),
-        Box::new(source),
-        StreamOptions::new(capture(VideoCodec::H264, 320, 180)),
+impl FloodSource {
+    fn new(size: usize) -> Self {
+        Self {
+            size,
+            task: None,
+            keyframe_requests: Arc::default(),
+            stopped: Arc::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl CaptureSource for FloodSource {
+    async fn list_targets(&self) -> Result<Vec<CaptureTarget>, MediaError> {
+        Ok(Vec::new())
+    }
+
+    async fn start(&mut self, _config: CaptureConfig) -> Result<FrameReceiver, MediaError> {
+        let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+        let size = self.size;
+        let requests = self.keyframe_requests.clone();
+        self.task = Some(tokio::spawn(async move {
+            let mut served = 0;
+            for index in 0u64.. {
+                let wanted = requests.load(Ordering::Relaxed);
+                let keyframe = index % 300 == 0 || wanted > served;
+                served = wanted;
+                let mut data = vec![0, 0, 0, 1, if keyframe { 0x65 } else { 0x41 }];
+                data.resize(size, 0x55);
+                let frame = MediaFrame::Video(EncodedVideoFrame {
+                    codec: VideoCodec::H264,
+                    data,
+                    pts_us: index * 33_333,
+                    keyframe,
+                });
+                if tx.send(frame).await.is_err() {
+                    return;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        }));
+        Ok(rx)
+    }
+
+    async fn stop(&mut self) -> Result<(), MediaError> {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.stopped.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn request_keyframe(&self) {
+        self.keyframe_requests.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+async fn start(
+    client: &Arc<DiscordClient>,
+    source: impl CaptureSource + 'static,
+) -> dstreamy_discord::StreamHandle {
+    timeout(
+        T,
+        start_stream(
+            client.clone(),
+            Some(MOCK_GUILD_ID.into()),
+            MOCK_VOICE_CHANNEL_ID.into(),
+            Box::new(source),
+            StreamOptions::new(capture(VideoCodec::H264, 320, 180)),
+        ),
     )
     .await
-    .unwrap();
-    wait_sent(|| handle.stats(), 10).await;
-    assert!(metrics.num_alive_tasks() > baseline);
-    timeout(T, handle.stop()).await.unwrap().unwrap();
+    .unwrap()
+    .unwrap()
+}
 
+async fn left_voice(mock: &MockDiscord) {
+    mock.wait_for(T, |r| {
+        r.ops
+            .iter()
+            .filter(|o| o.is(None, gw::OP_VOICE_STATE_UPDATE))
+            .any(|o| o.json().unwrap()["channel_id"].is_null())
+            .then_some(())
+    })
+    .await
+    .expect("voice left");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transport_lag_drops_video_until_a_requested_keyframe() {
+    let mock = MockDiscord::start().await.unwrap();
+    let client = client(&mock).await;
+    let source = FloodSource::new(100_000);
+    let requests = source.keyframe_requests.clone();
+    let handle = start(&client, source).await;
     timeout(T, async {
-        while metrics.num_alive_tasks() > baseline {
-            sleep(Duration::from_millis(50)).await;
+        while handle.stats().keyframe_requests == 0 {
+            sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "{} tasks alive after stop, {baseline} before start",
-            metrics.num_alive_tasks()
-        )
-    });
+    .unwrap_or_else(|_| panic!("no keyframe requested: {:?}", handle.stats()));
+    let lagged = handle.stats();
+    assert!(lagged.video_frames_dropped > 0, "{lagged:?}");
+    assert!(requests.load(Ordering::Relaxed) > 0);
+    wait_sent(|| handle.stats(), lagged.video_frames_sent + 5).await;
+
+    let stats = timeout(T, handle.stop()).await.unwrap().unwrap();
+    assert!(stats.video_frames_sent > lagged.video_frames_sent);
+    let keyframes = mock
+        .recorded()
+        .video
+        .iter()
+        .filter(|f| nal_units(&f.data).first().is_some_and(|n| n[0] & 0x1F == 5))
+        .count();
+    assert!(keyframes >= 1);
     Arc::try_unwrap(client).ok().unwrap().close().await;
     mock.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_handle_ends_go_live_and_stops_the_source() {
+    let mock = MockDiscord::start().await.unwrap();
+    let client = client(&mock).await;
+    let source = FloodSource::new(2_000);
+    let stopped = source.stopped.clone();
+    let handle = start(&client, source).await;
+    wait_sent(|| handle.stats(), 5).await;
+    drop(handle);
+    mock.wait_for_op(None, gw::OP_STREAM_DELETE, 0, T)
+        .await
+        .expect("STREAM_DELETE");
+    left_voice(&mock).await;
+    timeout(T, async {
+        while !stopped.load(Ordering::Relaxed) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("source stopped");
+    Arc::try_unwrap(client).ok().unwrap().close().await;
+    mock.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_start_leaves_voice() {
+    let mock = MockDiscord::start().await.unwrap();
+    let client = client(&mock).await;
+    let started = timeout(
+        Duration::from_millis(1),
+        start_stream(
+            client.clone(),
+            Some(MOCK_GUILD_ID.into()),
+            MOCK_VOICE_CHANNEL_ID.into(),
+            Box::new(FloodSource::new(2_000)),
+            StreamOptions::default(),
+        ),
+    )
+    .await;
+    assert!(started.is_err(), "start finished within 1 ms");
+    left_voice(&mock).await;
+    assert!(mock.streams().is_empty());
+    Arc::try_unwrap(client).ok().unwrap().close().await;
+    mock.shutdown().await;
+}
+
+#[test]
+fn stop_ends_every_task_it_started() {
+    let mock_runtime = tokio::runtime::Runtime::new().unwrap();
+    let mock = mock_runtime.block_on(MockDiscord::start()).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = client(&mock).await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        sleep(Duration::from_millis(200)).await;
+        let baseline = metrics.num_alive_tasks();
+
+        let (source, _) = Tee::new(TestPatternSource::new());
+        let handle = start(&client, source).await;
+        wait_sent(|| handle.stats(), 10).await;
+        assert!(metrics.num_alive_tasks() > baseline);
+        timeout(T, handle.stop()).await.unwrap().unwrap();
+
+        timeout(T, async {
+            while metrics.num_alive_tasks() > baseline {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{} tasks alive after stop, {baseline} before start",
+                metrics.num_alive_tasks()
+            )
+        });
+        Arc::try_unwrap(client).ok().unwrap().close().await;
+    });
+    mock_runtime.block_on(mock.shutdown());
 }
