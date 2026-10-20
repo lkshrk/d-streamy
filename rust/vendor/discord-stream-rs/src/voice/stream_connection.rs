@@ -1,8 +1,6 @@
 use crate::voice::connection::VoiceConnection;
-use crate::voice::opcodes::VoiceOpCode;
-use serde_json::json;
-use tokio::sync::mpsc;
 use crate::voice::connection::VoiceEvent;
+use tokio::sync::mpsc;
 
 /// A second voice WebSocket connection used for Go Live streams.
 /// Mirrors `StreamConnection.ts` which extends `BaseMediaConnection`.

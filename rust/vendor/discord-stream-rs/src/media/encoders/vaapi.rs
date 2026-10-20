@@ -1,7 +1,6 @@
 /// VA-API hardware encoder settings.
 ///
 /// Mirrors `vaapi()` in `encoders/vaapi.ts`.
-
 use super::software::EncoderInfo;
 
 #[derive(Debug, Clone)]
@@ -32,7 +31,7 @@ pub struct VaapiEncoderInfo {
 pub struct VaapiEncoders {
     pub h264: VaapiEncoderInfo,
     pub h265: VaapiEncoderInfo,
-    pub av1:  VaapiEncoderInfo,
+    pub av1: VaapiEncoderInfo,
 }
 
 impl VaapiEncoders {
@@ -48,7 +47,7 @@ impl VaapiEncoders {
         Self {
             h264: make("h264_vaapi"),
             h265: make("hevc_vaapi"),
-            av1:  make("av1_vaapi"),
+            av1: make("av1_vaapi"),
         }
     }
 }

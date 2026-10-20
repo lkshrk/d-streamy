@@ -6,7 +6,7 @@ use crate::voice::types::{
     DavePrepareTransition, GatewayMessage, Hello, Ready, SelectProtocolAck,
 };
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -132,9 +132,7 @@ impl VoiceConnection {
 
     /// Returns the server_id used for IDENTIFY (guild_id or channel_id for DMs).
     pub fn server_id(&self) -> &str {
-        self.guild_id
-            .as_deref()
-            .unwrap_or_else(|| self.channel_id.as_str())
+        self.guild_id.as_deref().unwrap_or(self.channel_id.as_str())
     }
 
     /// Return `true` if both gateway credentials have been received and the
@@ -149,10 +147,7 @@ impl VoiceConnection {
         mut self,
         resuming: bool,
     ) -> Result<tokio::task::JoinHandle<()>, ConnectionError> {
-        let server = self
-            .server
-            .clone()
-            .ok_or(ConnectionError::NotConnected)?;
+        let server = self.server.clone().ok_or(ConnectionError::NotConnected)?;
 
         let url = format!("wss://{}/?v=8", server);
         let (ws_stream, _) = connect_async(&url)
@@ -182,7 +177,7 @@ impl VoiceConnection {
         } else {
             self.build_identify()
         };
-        let _ = out_tx.send(Message::Text(first_msg.into()));
+        let _ = out_tx.send(Message::Text(first_msg));
 
         let _event_tx = self.event_tx.clone();
         let out_tx_clone = out_tx.clone();
@@ -222,7 +217,7 @@ impl VoiceConnection {
                             "op": VoiceOpCode::Heartbeat as u8,
                             "d": { "t": Self::now_ms(), "seq_ack": self.seq }
                         });
-                        let _ = out_tx_clone.send(Message::Text(payload.to_string().into()));
+                        let _ = out_tx_clone.send(Message::Text(payload.to_string()));
                     }
                 }
             }
@@ -263,14 +258,9 @@ impl VoiceConnection {
         .to_string()
     }
 
-    fn send_opcode(
-        &self,
-        tx: &mpsc::UnboundedSender<Message>,
-        op: VoiceOpCode,
-        d: Value,
-    ) {
+    fn send_opcode(&self, tx: &mpsc::UnboundedSender<Message>, op: VoiceOpCode, d: Value) {
         let msg = json!({ "op": op as u8, "d": d });
-        let _ = tx.send(Message::Text(msg.to_string().into()));
+        let _ = tx.send(Message::Text(msg.to_string()));
     }
 
     fn send_binary(
@@ -281,7 +271,7 @@ impl VoiceConnection {
         payload: &[u8],
     ) {
         let frame = BinaryMessage::encode(seq, op.as_u8(), payload);
-        let _ = tx.send(Message::Binary(frame.into()));
+        let _ = tx.send(Message::Binary(frame));
     }
 
     fn handle_text(
@@ -300,8 +290,7 @@ impl VoiceConnection {
         match op {
             Some(VoiceOpCode::Hello) => {
                 if let Ok(hello) = serde_json::from_value::<Hello>(msg.d) {
-                    let interval_ms =
-                        (hello.heartbeat_interval * 0.75) as u64;
+                    let interval_ms = (hello.heartbeat_interval * 0.75) as u64;
                     debug!("Heartbeat interval {}ms", interval_ms);
                     // heartbeat timer is handled in the select! loop above
                 }
@@ -375,10 +364,10 @@ impl VoiceConnection {
             Some(VoiceOpCode::DavePrepareEpoch) => {
                 if let Ok(d) = serde_json::from_value::<DavePrepareEpoch>(msg.d) {
                     debug!("DAVE prepare epoch {:?}", d);
-                    if d.epoch == 1 {
-                        if let Some(kp) = self.dave.init(d.protocol_version)? {
-                            self.send_binary(tx, VoiceOpCodeBinary::MlsKeyPackage, 0, &kp);
-                        }
+                    if d.epoch == 1
+                        && let Some(kp) = self.dave.init(d.protocol_version)?
+                    {
+                        self.send_binary(tx, VoiceOpCodeBinary::MlsKeyPackage, 0, &kp);
                     }
                 }
             }
@@ -494,7 +483,10 @@ impl VoiceConnection {
             // Downgrade → passthrough
             if old_version != 0 && new_version == 0 {
                 self.dave.set_passthrough_mode(true, Some(10));
-                debug!("DAVE: Downgraded to non-E2EE (transition {})", transition_id);
+                debug!(
+                    "DAVE: Downgraded to non-E2EE (transition {})",
+                    transition_id
+                );
             } else if transition_id > 0 && old_version == 0 && new_version != 0 {
                 self.dave.set_passthrough_mode(true, Some(10));
                 debug!("DAVE: Upgraded to E2EE (transition {})", transition_id);
@@ -505,11 +497,7 @@ impl VoiceConnection {
         }
     }
 
-    fn process_invalid_commit(
-        &mut self,
-        transition_id: u64,
-        tx: &mpsc::UnboundedSender<Message>,
-    ) {
+    fn process_invalid_commit(&mut self, transition_id: u64, tx: &mpsc::UnboundedSender<Message>) {
         warn!(
             "DAVE: Invalid commit (transition {}), reinitializing",
             transition_id

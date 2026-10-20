@@ -6,10 +6,9 @@
 /// - Perform H264 SPS/VUI rewriting before packetization
 /// - Apply DAVE E2EE encryption when the session is ready
 /// - Send encoded RTP frames to Discord
-
 use crate::dave::DaveHandler;
-use crate::processing::{rewrite_sps_vui, split_nalu, AnnexBHelpers, H264Helpers, H264NalUnitType};
-use crate::utils::{normalize_video_codec, VideoCodec};
+use crate::processing::{AnnexBHelpers, H264Helpers, H264NalUnitType, rewrite_sps_vui, split_nalu};
+use crate::utils::{VideoCodec, normalize_video_codec};
 use crate::voice::codec_payload::{self, ALL_VIDEO_CODECS};
 use crate::voice::connection::WebRtcParams;
 use bytes::Bytes;
@@ -20,21 +19,18 @@ use tokio::sync::Mutex;
 use tracing::debug;
 use webrtc::{
     api::{
-        interceptor_registry::register_default_interceptors,
-        media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9},
         APIBuilder,
+        interceptor_registry::register_default_interceptors,
+        media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9, MediaEngine},
     },
     ice_transport::ice_server::RTCIceServer,
     interceptor::registry::Registry,
     peer_connection::{
-        configuration::RTCConfiguration,
+        RTCPeerConnection, configuration::RTCConfiguration,
         peer_connection_state::RTCPeerConnectionState,
-        RTCPeerConnection,
     },
     rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType},
-    track::track_local::{
-        track_local_static_rtp::TrackLocalStaticRTP, TrackLocalWriter,
-    },
+    track::track_local::{TrackLocalWriter, track_local_static_rtp::TrackLocalStaticRTP},
 };
 
 #[derive(Debug, Error)]
@@ -81,7 +77,11 @@ impl RtpState {
         // V=2, P=0, X=0, CC=0
         pkt.push(0x80);
         // M bit + payload type
-        pkt.push(if marker { 0x80 | self.payload_type } else { self.payload_type });
+        pkt.push(if marker {
+            0x80 | self.payload_type
+        } else {
+            self.payload_type
+        });
         // Sequence number
         pkt.extend_from_slice(&self.seq.to_be_bytes());
         // Timestamp
@@ -94,9 +94,9 @@ impl RtpState {
     }
 
     fn advance_timestamp(&mut self, frametime_ms: f64) {
-        self.timestamp = self.timestamp.wrapping_add(
-            (frametime_ms * self.clock_rate as f64 / 1000.0).round() as u32,
-        );
+        self.timestamp = self
+            .timestamp
+            .wrapping_add((frametime_ms * self.clock_rate as f64 / 1000.0).round() as u32);
     }
 }
 
@@ -261,8 +261,8 @@ impl WebRtcWrapper {
         params: &WebRtcParams,
         video_codec: &str,
     ) -> Result<(), WebRtcError> {
-        let codec = normalize_video_codec(video_codec)
-            .map_err(|e| WebRtcError::UnknownCodec(e.0))?;
+        let codec =
+            normalize_video_codec(video_codec).map_err(|e| WebRtcError::UnknownCodec(e.0))?;
 
         let video_info = match codec {
             VideoCodec::H264 => codec_payload::H264,
@@ -284,8 +284,10 @@ impl WebRtcWrapper {
         ));
         self.video_codec = Some(codec);
 
-        debug!("RTP packetizer configured: audio_ssrc={} video_ssrc={} codec={:?}",
-            params.audio_ssrc, params.video_ssrc, codec);
+        debug!(
+            "RTP packetizer configured: audio_ssrc={} video_ssrc={} codec={:?}",
+            params.audio_ssrc, params.video_ssrc, codec
+        );
         Ok(())
     }
 
@@ -296,13 +298,20 @@ impl WebRtcWrapper {
         frame: &[u8],
         frametime_ms: f64,
     ) -> Result<(), WebRtcError> {
-        let track = self.audio_track.as_ref().ok_or(WebRtcError::NotInitialized)?;
-        let state = self.audio_state.as_mut().ok_or(WebRtcError::PacketizerNotConfigured)?;
+        let track = self
+            .audio_track
+            .as_ref()
+            .ok_or(WebRtcError::NotInitialized)?;
+        let state = self
+            .audio_state
+            .as_mut()
+            .ok_or(WebRtcError::PacketizerNotConfigured)?;
 
         // DAVE E2EE encrypt before sending
         let encrypted = {
             let mut dave = self.dave.lock().await;
-            dave.encrypt_opus(frame).map_err(|e| WebRtcError::Dave(e.to_string()))?
+            dave.encrypt_opus(frame)
+                .map_err(|e| WebRtcError::Dave(e.to_string()))?
         };
 
         let pkt = state.make_packet(&encrypted, true);
@@ -323,9 +332,17 @@ impl WebRtcWrapper {
         frame: &[u8],
         frametime_ms: f64,
     ) -> Result<(), WebRtcError> {
-        let track = self.video_track.as_ref().ok_or(WebRtcError::NotInitialized)?;
-        let state = self.video_state.as_mut().ok_or(WebRtcError::PacketizerNotConfigured)?;
-        let codec = self.video_codec.ok_or(WebRtcError::PacketizerNotConfigured)?;
+        let track = self
+            .video_track
+            .as_ref()
+            .ok_or(WebRtcError::NotInitialized)?;
+        let state = self
+            .video_state
+            .as_mut()
+            .ok_or(WebRtcError::PacketizerNotConfigured)?;
+        let codec = self
+            .video_codec
+            .ok_or(WebRtcError::PacketizerNotConfigured)?;
 
         // H264: rewrite SPS VUI timing before packetization
         let processed: Vec<u8> = if codec == VideoCodec::H264 {
@@ -359,9 +376,9 @@ impl WebRtcWrapper {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.peer_connection.as_ref().map_or(false, |pc| {
-            pc.connection_state() == RTCPeerConnectionState::Connected
-        })
+        self.peer_connection
+            .as_ref()
+            .is_some_and(|pc| pc.connection_state() == RTCPeerConnectionState::Connected)
     }
 
     pub async fn close(&mut self) {

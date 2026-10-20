@@ -3,18 +3,9 @@
 /// Opens a media container (Matroska / NUT), locates audio + video streams,
 /// applies Annex-B bitstream filters for H264/H265, and emits `MediaPacket`s
 /// into two separate channels (video and audio).
-
-use crate::media::{
-    base_stream::MediaPacket,
-    codec_id::AVCodecID,
-};
-use ffmpeg_next::{
-    self as ffmpeg,
-    format,
-    media::Type as MediaType,
-    Rational,
-};
+use crate::media::{base_stream::MediaPacket, codec_id::AVCodecID};
 use ffmpeg_next::sys::AVCodecParameters;
+use ffmpeg_next::{self as ffmpeg, Rational, format, media::Type as MediaType};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
@@ -87,15 +78,15 @@ const ALLOWED_AUDIO_CODECS: &[AVCodecID] = &[AVCodecID::OPUS];
 /// Opus frame sizes table (ms) indexed by TOC byte >> 3.
 /// See https://datatracker.ietf.org/doc/html/rfc6716#section-3.1
 const OPUS_FRAME_SIZES: &[f64] = &[
-    10., 20., 40., 60.,  // SILK narrow
-    10., 20., 40., 60.,  // SILK medium
-    10., 20., 40., 60.,  // SILK wide
-    10., 20.,            // Hybrid SWB
-    10., 20.,            // Hybrid FB
-    2.5, 5., 10., 20.,  // CELT NB
-    2.5, 5., 10., 20.,  // CELT WB
-    2.5, 5., 10., 20.,  // CELT SWB
-    2.5, 5., 10., 20.,  // CELT FB
+    10., 20., 40., 60., // SILK narrow
+    10., 20., 40., 60., // SILK medium
+    10., 20., 40., 60., // SILK wide
+    10., 20., // Hybrid SWB
+    10., 20., // Hybrid FB
+    2.5, 5., 10., 20., // CELT NB
+    2.5, 5., 10., 20., // CELT WB
+    2.5, 5., 10., 20., // CELT SWB
+    2.5, 5., 10., 20., // CELT FB
 ];
 
 fn parse_opus_duration(data: &[u8]) -> i64 {
@@ -133,8 +124,7 @@ pub async fn demux(path: &str, _format: ContainerFormat) -> Result<DemuxResult, 
         let codec_id = params.id();
         let medium = params.medium();
         // SAFETY: ptr is valid for the lifetime of `ictx`
-        let raw: &ffmpeg_next::sys::AVCodecParameters =
-            unsafe { &*params.as_ptr() };
+        let raw: &ffmpeg_next::sys::AVCodecParameters = unsafe { &*params.as_ptr() };
         match medium {
             MediaType::Video if v_idx.is_none() => {
                 if !ALLOWED_VIDEO_CODECS.contains(&codec_id) {

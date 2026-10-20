@@ -2,7 +2,6 @@
 ///
 /// Drains `MediaPacket` frames from a channel and forwards them to
 /// `WebRtcWrapper::send_audio_frame` with proper PTS-based timing.
-
 use crate::media::base_stream::{BaseMediaStream, MediaPacket, StreamSyncState};
 use crate::voice::webrtc::WebRtcWrapper;
 use std::sync::{Arc, Mutex};

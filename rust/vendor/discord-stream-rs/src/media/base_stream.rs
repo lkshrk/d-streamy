@@ -2,9 +2,8 @@
 ///
 /// Implements the PTS-based timing / sync logic for draining encoded frames
 /// into the Discord WebRTC pipeline at the correct wall-clock rate.
-
 use std::sync::{Arc, Mutex};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
@@ -186,7 +185,9 @@ impl BaseMediaStream {
         *start_time = start_time.or(Some(t0));
         *start_pts = start_pts.or(Some(pts_ms));
 
-        let elapsed_ms = start_time.map(|s| s.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+        let elapsed_ms = start_time
+            .map(|s| s.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
         let sleep_ms = (pts_ms - start_pts.unwrap_or(pts_ms) + frametime - elapsed_ms).max(0.0);
 
         if self.no_sleep || sleep_ms == 0.0 {

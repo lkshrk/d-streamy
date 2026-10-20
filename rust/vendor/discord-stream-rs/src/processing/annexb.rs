@@ -1,7 +1,7 @@
-/// AnnexB NAL unit helpers — ported from `AnnexBHelper.ts`.
-///
-/// Provides H264 / H265 NALU type enums, per-codec helpers (header parsing,
-/// AUD detection), and `split_nalu` for demuxing Annex-B streams.
+//! AnnexB NAL unit helpers — ported from `AnnexBHelper.ts`.
+//!
+//! Provides H264 / H265 NALU type enums, per-codec helpers (header parsing,
+//! AUD detection), and `split_nalu` for demuxing Annex-B streams.
 
 // ---------------------------------------------------------------------------
 // H264 NAL unit types
@@ -114,7 +114,7 @@ impl H265NalUnitType {
     pub fn from_u8(v: u8) -> Option<Self> {
         if v <= 47 {
             // SAFETY: repr(u8) with contiguous values 0-47
-            Some(unsafe { std::mem::transmute(v) })
+            Some(unsafe { std::mem::transmute::<u8, H265NalUnitType>(v) })
         } else {
             None
         }
@@ -183,7 +183,7 @@ pub fn split_nalu(buf: &[u8]) -> Vec<&[u8]> {
         // Find next `0x00 0x00 0x01`
         let pos = find_start_code(remaining);
 
-        let (nalu, rest, start_len) = match pos {
+        let (nalu, _rest, start_len) = match pos {
             None => {
                 // No more start codes — the rest is one NALU
                 (remaining, &[] as &[u8], 0)
@@ -222,10 +222,5 @@ pub fn split_nalu(buf: &[u8]) -> Vec<&[u8]> {
 
 fn find_start_code(buf: &[u8]) -> Option<usize> {
     // Find `0x00 0x00 0x01`
-    for i in 0..buf.len().saturating_sub(2) {
-        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
-            return Some(i);
-        }
-    }
-    None
+    buf.windows(3).position(|w| w == [0, 0, 1])
 }

@@ -1,6 +1,6 @@
-/// AnnexB bitstream reader/writer — ported from `AnnexBBitstreamReaderWriter.ts`.
-///
-/// Used by `sps_vui.rs` to rewrite the SPS VUI timing info in H264 streams.
+//! AnnexB bitstream reader/writer — ported from `AnnexBBitstreamReaderWriter.ts`.
+//!
+//! Used by `sps_vui.rs` to rewrite the SPS VUI timing info in H264 streams.
 
 // ---------------------------------------------------------------------------
 // Reader
@@ -51,9 +51,8 @@ impl<'a> AnnexBBitstreamReader<'a> {
             } else {
                 let bits_to_read = count.min(8 - self.bit_offset as u32) as u8;
                 let mask = (1u8 << bits_to_read) - 1;
-                let new_bits = (self.buffer[self.byte_offset]
-                    >> (8 - self.bit_offset - bits_to_read))
-                    & mask;
+                let new_bits =
+                    (self.buffer[self.byte_offset] >> (8 - self.bit_offset - bits_to_read)) & mask;
                 result = (result << bits_to_read) | new_bits as u32;
                 count -= bits_to_read as u32;
                 self.bit_offset += bits_to_read;
@@ -94,10 +93,10 @@ impl<'a> AnnexBBitstreamReader<'a> {
     /// Mapping: even → −x/2, odd → (x+1)/2
     pub fn read_se(&mut self) -> i32 {
         let unsigned = self.read_ue();
-        if unsigned % 2 == 0 {
+        if unsigned.is_multiple_of(2) {
             -((unsigned / 2) as i32)
         } else {
-            ((unsigned + 1) / 2) as i32
+            unsigned.div_ceil(2) as i32
         }
     }
 }
@@ -187,7 +186,11 @@ impl AnnexBBitstreamWriter {
             return;
         }
         assert!(count <= 32, "write_signed supports up to 32 bits");
-        let mask: u32 = if count == 32 { 0xFFFF_FFFF } else { (1u32 << count) - 1 };
+        let mask: u32 = if count == 32 {
+            0xFFFF_FFFF
+        } else {
+            (1u32 << count) - 1
+        };
         let unsigned = (num as u32) & mask;
         self.write_bits(unsigned, count);
     }

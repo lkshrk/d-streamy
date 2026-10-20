@@ -18,8 +18,8 @@ pub struct Identify {
 pub struct StreamDesc {
     #[serde(rename = "type")]
     pub kind: String, // "screen"
-    pub rid: String,  // "100"
-    pub quality: u8,  // 100
+    pub rid: String, // "100"
+    pub quality: u8, // 100
 }
 
 #[derive(Debug, Serialize)]

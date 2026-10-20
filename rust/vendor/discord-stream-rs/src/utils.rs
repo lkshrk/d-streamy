@@ -1,5 +1,4 @@
 /// Ported from `utils.ts`.
-
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

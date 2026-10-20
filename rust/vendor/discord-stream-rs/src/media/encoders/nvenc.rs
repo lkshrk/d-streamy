@@ -1,7 +1,6 @@
 /// NVENC hardware encoder settings.
 ///
 /// Mirrors `nvenc()` in `encoders/nvenc.ts`.
-
 use super::software::EncoderInfo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -69,9 +68,18 @@ impl NvencEncoders {
         }
 
         Self {
-            h264: EncoderInfo { name: "h264_nvenc", options: opts.clone() },
-            h265: EncoderInfo { name: "hevc_nvenc", options: opts.clone() },
-            av1:  EncoderInfo { name: "av1_nvenc",  options: opts },
+            h264: EncoderInfo {
+                name: "h264_nvenc",
+                options: opts.clone(),
+            },
+            h265: EncoderInfo {
+                name: "hevc_nvenc",
+                options: opts.clone(),
+            },
+            av1: EncoderInfo {
+                name: "av1_nvenc",
+                options: opts,
+            },
         }
     }
 }

@@ -1,7 +1,7 @@
 use serde::Deserialize;
 
-/// Inbound events dispatched from the Discord main gateway (op 0 DISPATCH).
-/// Ported from `GatewayEvents.ts`.
+// Inbound events dispatched from the Discord main gateway (op 0 DISPATCH).
+// Ported from `GatewayEvents.ts`.
 
 // ---------------------------------------------------------------------------
 // VOICE_STATE_UPDATE
@@ -70,10 +70,7 @@ pub enum GatewayEvent {
 impl GatewayEvent {
     /// Try to parse a raw gateway dispatch packet. `event_name` is the `t`
     /// field; `data` is the `d` field (already a `serde_json::Value`).
-    pub fn from_dispatch(
-        event_name: &str,
-        data: serde_json::Value,
-    ) -> Self {
+    pub fn from_dispatch(event_name: &str, data: serde_json::Value) -> Self {
         match event_name {
             "VOICE_STATE_UPDATE" => {
                 if let Ok(v) = serde_json::from_value(data) {

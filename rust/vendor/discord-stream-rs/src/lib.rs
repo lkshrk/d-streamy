@@ -23,10 +23,13 @@ pub mod voice;
 
 pub use dave::{DaveError, DaveHandler};
 pub use gateway::{GatewayEvent, GatewayOpCode, GatewayPayload, Streamer, StreamerError};
-pub use processing::{rewrite_sps_vui, split_nalu, H264Helpers, H264NalUnitType, H265Helpers, H265NalUnitType};
-pub use utils::{
-    generate_stream_key, normalize_video_codec, parse_stream_key, StreamKey, StreamType,
-    VideoCodec,
+pub use processing::{
+    H264Helpers, H264NalUnitType, H265Helpers, H265NalUnitType, rewrite_sps_vui, split_nalu,
 };
-pub use voice::{ConnectionError, StreamConnection, VoiceConnection, VoiceEvent, WebRtcParams, WebRtcError, WebRtcWrapper};
-
+pub use utils::{
+    StreamKey, StreamType, VideoCodec, generate_stream_key, normalize_video_codec, parse_stream_key,
+};
+pub use voice::{
+    ConnectionError, StreamConnection, VoiceConnection, VoiceEvent, WebRtcError, WebRtcParams,
+    WebRtcWrapper,
+};

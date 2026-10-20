@@ -6,7 +6,6 @@
 ///
 /// Based on the WebRTC project reference implementation:
 /// <https://webrtc.googlesource.com/src/+/5f2c9278/common_video/h264/sps_vui_rewriter.cc>
-
 use super::annexb_rw::{AnnexBBitstreamReader, AnnexBBitstreamWriter};
 
 /// Rewrite the SPS NALU VUI timing info in-place and return the patched bytes.
@@ -17,14 +16,46 @@ pub fn rewrite_sps_vui(buffer: &[u8]) -> Vec<u8> {
     let mut writer = AnnexBBitstreamWriter::new();
 
     // Helpers (mirror TS aliases)
-    macro_rules! rb  { ($n:expr) => { reader.read_bits($n) } }
-    macro_rules! wb  { ($v:expr, $n:expr) => { writer.write_bits($v, $n) } }
-    macro_rules! ru  { ($n:expr) => { reader.read_unsigned($n) } }
-    macro_rules! wu  { ($v:expr, $n:expr) => { writer.write_unsigned($v, $n) } }
-    macro_rules! rue { () => { reader.read_ue() } }
-    macro_rules! wue { ($v:expr) => { writer.write_ue($v) } }
-    macro_rules! rse { () => { reader.read_se() } }
-    macro_rules! wse { ($v:expr) => { writer.write_se($v) } }
+    macro_rules! rb {
+        ($n:expr) => {
+            reader.read_bits($n)
+        };
+    }
+    macro_rules! wb {
+        ($v:expr, $n:expr) => {
+            writer.write_bits($v, $n)
+        };
+    }
+    macro_rules! ru {
+        ($n:expr) => {
+            reader.read_unsigned($n)
+        };
+    }
+    macro_rules! wu {
+        ($v:expr, $n:expr) => {
+            writer.write_unsigned($v, $n)
+        };
+    }
+    macro_rules! rue {
+        () => {
+            reader.read_ue()
+        };
+    }
+    macro_rules! wue {
+        ($v:expr) => {
+            writer.write_ue($v)
+        };
+    }
+    macro_rules! rse {
+        () => {
+            reader.read_se()
+        };
+    }
+    macro_rules! wse {
+        ($v:expr) => {
+            writer.write_se($v)
+        };
+    }
 
     // NAL header byte (already consumed by the reader's slice offset 1)
     wu!(buffer[0] as u32, 8);
@@ -270,10 +301,7 @@ fn write_bitstream_restriction(writer: &mut AnnexBBitstreamWriter, max_num_ref_f
 }
 
 /// Copy an `hrd_parameters()` block verbatim.
-fn copy_hrd_parameters(
-    reader: &mut AnnexBBitstreamReader<'_>,
-    writer: &mut AnnexBBitstreamWriter,
-) {
+fn copy_hrd_parameters(reader: &mut AnnexBBitstreamReader<'_>, writer: &mut AnnexBBitstreamWriter) {
     let cpb_cnt_minus1 = reader.read_ue();
     writer.write_ue(cpb_cnt_minus1);
     let bit_rate_scale = reader.read_bits(4);

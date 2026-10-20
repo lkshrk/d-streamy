@@ -79,8 +79,7 @@ impl DaveHandler {
             return Ok(None);
         }
 
-        let version =
-            NonZeroU16::new(protocol_version).ok_or(DaveError::InvalidProtocolVersion)?;
+        let version = NonZeroU16::new(protocol_version).ok_or(DaveError::InvalidProtocolVersion)?;
 
         if let Some(s) = &mut self.inner {
             s.reinit(version, self.user_id, self.channel_id, None)
@@ -179,7 +178,7 @@ impl DaveHandler {
 
     /// Encrypt an Opus audio frame for E2EE (before SRTP transport encryption).
     /// Returns the original packet unchanged if the session is not ready.
-    pub fn encrypt_opus<'a>(&mut self, packet: &'a [u8]) -> Result<Vec<u8>, DaveError> {
+    pub fn encrypt_opus(&mut self, packet: &[u8]) -> Result<Vec<u8>, DaveError> {
         match &mut self.inner {
             Some(s) if s.is_ready() => {
                 let out = s
@@ -193,7 +192,12 @@ impl DaveHandler {
 
     /// Encrypt any media frame (video/audio with explicit codec).
     /// Returns the original packet unchanged if the session is not ready.
-    pub fn encrypt(&mut self, media_type: MediaType, codec: Codec, packet: &[u8]) -> Result<Vec<u8>, DaveError> {
+    pub fn encrypt(
+        &mut self,
+        media_type: MediaType,
+        codec: Codec,
+        packet: &[u8],
+    ) -> Result<Vec<u8>, DaveError> {
         match &mut self.inner {
             Some(s) if s.is_ready() => {
                 let out = s
@@ -222,7 +226,7 @@ impl DaveHandler {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.inner.as_ref().map_or(false, |s| s.is_ready())
+        self.inner.as_ref().is_some_and(|s| s.is_ready())
     }
 
     pub fn status(&self) -> Option<SessionStatus> {

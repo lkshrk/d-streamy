@@ -2,10 +2,10 @@ use crate::gateway::events::GatewayEvent;
 use crate::gateway::opcodes::GatewayOpCode;
 use crate::utils::parse_stream_key;
 use crate::voice::connection::{ConnectionError, VoiceConnection, VoiceEvent};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::debug;
 
 #[derive(Debug, Error)]
@@ -98,7 +98,7 @@ impl Streamer {
 
             GatewayEvent::VoiceServerUpdate(d) => {
                 // Ignore events for other guilds/channels
-                let matches = self.voice_connection.as_ref().map_or(false, |_| true);
+                let matches = self.voice_connection.as_ref().is_some_and(|_| true);
                 if !matches {
                     return;
                 }
@@ -110,11 +110,11 @@ impl Streamer {
                         drop(conn); // release lock before await
                         let conn_arc = vc.clone();
                         tokio::spawn(async move {
-                            let conn = {
+                            {
                                 // Take ownership by temporarily swapping — in
                                 // a real impl you'd restructure to avoid this.
                                 // For now we start inside a new task.
-                                let guard = conn_arc.lock().await;
+                                let _guard = conn_arc.lock().await;
                                 // We can't move out of Arc<Mutex<>>; start()
                                 // needs `self`. A production impl would split
                                 // the connection into a builder + handle.
@@ -128,16 +128,16 @@ impl Streamer {
 
             GatewayEvent::StreamCreate(d) => {
                 debug!("Gateway: STREAM_CREATE key={}", d.stream_key);
-                if let Ok(_parsed) = parse_stream_key(&d.stream_key) {
-                    if let Some(vc) = &self.voice_connection {
-                        let mut vc_guard = vc.lock().await;
-                        let session_id = vc_guard.session_id().map(str::to_owned);
-                        if let Some(sc) = vc_guard.stream_connection_mut() {
-                            sc.server_id = Some(d.rtc_server_id);
-                            sc.stream_key = Some(d.stream_key);
-                            if let Some(sid) = session_id {
-                                sc.inner.set_session(sid);
-                            }
+                if let Ok(_parsed) = parse_stream_key(&d.stream_key)
+                    && let Some(vc) = &self.voice_connection
+                {
+                    let mut vc_guard = vc.lock().await;
+                    let session_id = vc_guard.session_id().map(str::to_owned);
+                    if let Some(sc) = vc_guard.stream_connection_mut() {
+                        sc.server_id = Some(d.rtc_server_id);
+                        sc.stream_key = Some(d.stream_key);
+                        if let Some(sid) = session_id {
+                            sc.inner.set_session(sid);
                         }
                     }
                 }
@@ -197,7 +197,10 @@ impl Streamer {
     }
 
     fn signal_stream(&self) -> Result<(), StreamerError> {
-        let _vc = self.voice_connection.as_ref().ok_or(StreamerError::NotInVoice)?;
+        let _vc = self
+            .voice_connection
+            .as_ref()
+            .ok_or(StreamerError::NotInVoice)?;
         // Opcodes 18+22 require guild/channel info from the VoiceConnection.
         // These will be wired up properly once `start()` is refactored to
         // expose cached ids without requiring an async lock here.

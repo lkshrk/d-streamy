@@ -11,7 +11,7 @@ pub enum X26xPreset {
     Ultrafast,
     Superfast,
     #[default]
-    Superfast_,   // alias — matches TS default "superfast"
+    Superfast_, // alias — matches TS default "superfast"
     Veryfast,
     Faster,
     Fast,

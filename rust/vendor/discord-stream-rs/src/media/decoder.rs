@@ -1,11 +1,10 @@
 /// Libav decoder — ported from `LibavDecoder.ts`.
 ///
 /// Creates a decoder for a given stream and decodes packets into raw frames.
-
 use crate::media::base_stream::MediaPacket;
 use ffmpeg_next::{
     self as ffmpeg,
-    codec::{decoder, Context},
+    codec::{Context, decoder},
     format::stream::Stream,
     frame,
     software::scaling::{self, flag::Flags as ScaleFlags},
@@ -73,7 +72,10 @@ impl VideoDecoder {
     }
 
     /// Decode all frames from a packet and return them as RGBA `DecodedFrame`s.
-    pub fn decode_all(&mut self, packet: &ffmpeg::Packet) -> Result<Vec<DecodedFrame>, DecodeError> {
+    pub fn decode_all(
+        &mut self,
+        packet: &ffmpeg::Packet,
+    ) -> Result<Vec<DecodedFrame>, DecodeError> {
         if self.freed {
             return Err(DecodeError::Freed);
         }
@@ -122,7 +124,10 @@ impl AudioDecoder {
         ffmpeg::init()?;
         let context = Context::from_parameters(stream.parameters())?;
         let decoder = context.decoder().audio()?;
-        Ok(Self { decoder, freed: false })
+        Ok(Self {
+            decoder,
+            freed: false,
+        })
     }
 
     /// Decode all audio frames from a packet.  Returns raw PCM byte data.
