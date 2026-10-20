@@ -188,12 +188,33 @@ impl BinaryMessage {
         Some(Self { seq, op, payload })
     }
 
-    /// Encode a binary frame to send to the voice gateway.
-    pub fn encode(seq: u16, op: u8, payload: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(3 + payload.len());
-        out.extend_from_slice(&seq.to_be_bytes());
+    /// Encode a client binary frame. Unlike server frames it has no sequence prefix.
+    pub fn encode(op: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + payload.len());
         out.push(op);
         out.extend_from_slice(payload);
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BinaryMessage;
+
+    #[test]
+    fn client_frame_is_opcode_then_payload() {
+        assert_eq!(
+            BinaryMessage::encode(26, &[0xAA, 0xBB]),
+            vec![26, 0xAA, 0xBB]
+        );
+    }
+
+    #[test]
+    fn server_frame_carries_sequence() {
+        let m = BinaryMessage::parse(&[0x01, 0x02, 29, 0x00, 0x05, 0xFF]).unwrap();
+        assert_eq!(
+            (m.seq, m.op, m.payload),
+            (0x0102, 29, vec![0x00, 0x05, 0xFF])
+        );
     }
 }

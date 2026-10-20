@@ -267,10 +267,9 @@ impl VoiceConnection {
         &self,
         tx: &mpsc::UnboundedSender<Message>,
         op: VoiceOpCodeBinary,
-        seq: u16,
         payload: &[u8],
     ) {
-        let frame = BinaryMessage::encode(seq, op.as_u8(), payload);
+        let frame = BinaryMessage::encode(op.as_u8(), payload);
         let _ = tx.send(Message::Binary(frame));
     }
 
@@ -314,7 +313,7 @@ impl VoiceConnection {
                     let dave_version = ack.dave_protocol_version.unwrap_or(0);
                     // Initialize DAVE and send key package
                     if let Some(kp) = self.dave.init(dave_version)? {
-                        self.send_binary(tx, VoiceOpCodeBinary::MlsKeyPackage, 0, &kp);
+                        self.send_binary(tx, VoiceOpCodeBinary::MlsKeyPackage, &kp);
                     }
                     let _ = self
                         .event_tx
@@ -367,7 +366,7 @@ impl VoiceConnection {
                     if d.epoch == 1
                         && let Some(kp) = self.dave.init(d.protocol_version)?
                     {
-                        self.send_binary(tx, VoiceOpCodeBinary::MlsKeyPackage, 0, &kp);
+                        self.send_binary(tx, VoiceOpCodeBinary::MlsKeyPackage, &kp);
                     }
                 }
             }
@@ -415,7 +414,7 @@ impl VoiceConnection {
                     if let Some(w) = cw.welcome {
                         payload.extend_from_slice(&w);
                     }
-                    self.send_binary(tx, VoiceOpCodeBinary::MlsCommitWelcome, frame.seq, &payload);
+                    self.send_binary(tx, VoiceOpCodeBinary::MlsCommitWelcome, &payload);
                     let _ = self.event_tx.send(VoiceEvent::MlsCommitWelcome(payload));
                 }
             }
@@ -509,7 +508,7 @@ impl VoiceConnection {
         );
         // Reinit will send a new key package automatically
         if let Ok(Some(kp)) = self.dave.init(self.dave.protocol_version()) {
-            self.send_binary(tx, VoiceOpCodeBinary::MlsKeyPackage, 0, &kp);
+            self.send_binary(tx, VoiceOpCodeBinary::MlsKeyPackage, &kp);
         }
     }
 
