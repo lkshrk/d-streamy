@@ -209,18 +209,24 @@ impl AnnexBBitstreamWriter {
 
     /// Exponential-Golomb unsigned coding.
     pub fn write_ue(&mut self, num: u32) {
-        let n = num + 1;
-        let bit_count = 32 - n.leading_zeros(); // position of MSB
-        self.write_bits(0, bit_count - 1); // leading zeros
-        self.write_bits(n, bit_count);
+        self.write_code_num_plus_one(u64::from(num) + 1);
     }
 
     /// Exponential-Golomb signed coding.
     pub fn write_se(&mut self, num: i32) {
-        if num <= 0 {
-            self.write_ue((-2 * num) as u32);
+        let num = i64::from(num);
+        let code_num = if num <= 0 { -2 * num } else { 2 * num - 1 };
+        self.write_code_num_plus_one(code_num as u64 + 1);
+    }
+
+    fn write_code_num_plus_one(&mut self, n: u64) {
+        let bit_count = 64 - n.leading_zeros();
+        self.write_bits(0, bit_count - 1);
+        if bit_count > 32 {
+            self.write_bits((n >> 32) as u32, bit_count - 32);
+            self.write_bits(n as u32, 32);
         } else {
-            self.write_ue((2 * num - 1) as u32);
+            self.write_bits(n as u32, bit_count);
         }
     }
 }

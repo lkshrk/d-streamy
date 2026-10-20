@@ -109,17 +109,18 @@ fn try_rewrite_sps_vui(buffer: &[u8]) -> Option<Vec<u8>> {
                     let mut last_scale: i32 = 8;
                     let mut next_scale: i32 = 8;
                     for _ in 0..size {
-                        let delta = rse!();
-                        if !(-128..=127).contains(&delta) {
-                            return None;
+                        if next_scale != 0 {
+                            let delta = rse!();
+                            if !(-128..=127).contains(&delta) {
+                                return None;
+                            }
+                            wse!(delta);
+                            next_scale = (last_scale + delta + 256) % 256;
                         }
-                        wse!(delta);
-                        next_scale = (last_scale + delta + 256) % 256;
                         if next_scale != 0 {
                             last_scale = next_scale;
                         }
                     }
-                    let _ = next_scale;
                 }
             }
         }
@@ -438,5 +439,67 @@ mod tests {
         ] {
             assert_eq!(rewrite_sps_vui(sps), sps);
         }
+    }
+
+    fn high_sps_with_terminated_scaling_list(with_vui: bool) -> Vec<u8> {
+        let mut w = AnnexBBitstreamWriter::new();
+        w.write_bits(0x67, 8);
+        w.write_bits(100, 8);
+        w.write_bits(0, 8);
+        w.write_bits(40, 8);
+        for v in [0, 1, 0, 0] {
+            w.write_ue(v);
+        }
+        w.write_bits(0, 1);
+        w.write_bits(1, 1);
+        w.write_bits(1, 1);
+        w.write_se(-8);
+        w.write_bits(0, 7);
+        for v in [0, 0, 2, 1] {
+            w.write_ue(v);
+        }
+        w.write_bits(0, 1);
+        w.write_ue(79);
+        w.write_ue(44);
+        w.write_bits(0b110, 3);
+        if with_vui {
+            w.write_bits(1, 1);
+            w.write_bits(0, 8);
+            w.write_bits(0b11, 2);
+            for v in [2, 1, 16, 16, 0, 1] {
+                w.write_ue(v);
+            }
+        } else {
+            w.write_bits(0, 1);
+        }
+        w.write_bits(1, 1);
+        w.flush_final();
+        w.to_vec()
+    }
+
+    #[test]
+    fn scaling_list_stops_reading_after_zero_next_scale() {
+        assert_eq!(
+            rewrite_sps_vui(&high_sps_with_terminated_scaling_list(false)),
+            high_sps_with_terminated_scaling_list(true)
+        );
+    }
+
+    #[test]
+    fn exp_golomb_round_trips_extremes() {
+        let mut w = AnnexBBitstreamWriter::new();
+        for v in [0, 1, i32::MAX, i32::MIN + 1, -5] {
+            w.write_se(v);
+        }
+        w.write_ue(u32::MAX - 1);
+        w.write_bits(1, 1);
+        w.flush_final();
+        let buf = w.to_vec();
+        let mut r = AnnexBBitstreamReader::new(&buf);
+        for v in [0, 1, i32::MAX, i32::MIN + 1, -5] {
+            assert_eq!(r.read_se(), v);
+        }
+        assert_eq!(r.read_ue(), u32::MAX - 1);
+        assert!(!r.overrun());
     }
 }
