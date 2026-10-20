@@ -120,6 +120,10 @@ impl MediaConnection {
         &self.shared.kind
     }
 
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
     pub fn webrtc_params(&self) -> Option<WebRtcParams> {
         lock(&self.shared.params).clone()
     }
