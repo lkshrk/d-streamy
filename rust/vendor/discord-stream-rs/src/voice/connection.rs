@@ -23,6 +23,7 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 pub const MAX_CONNECT_ATTEMPTS: u32 = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const MAX_UNACKED_HEARTBEATS: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum ConnectionError {
@@ -273,6 +274,8 @@ pub struct VoiceConnection {
     dave_downgraded: bool,
 
     heartbeat_interval: Option<Duration>,
+    unacked_heartbeats: u32,
+    established: bool,
     params: Option<WebRtcParams>,
     webrtc: Option<WebRtcWrapper>,
     shared: Option<Arc<Shared>>,
@@ -342,6 +345,8 @@ impl VoiceConnection {
             pending_transitions: HashMap::new(),
             dave_downgraded: false,
             heartbeat_interval: None,
+            unacked_heartbeats: 0,
+            established: false,
             params: None,
             shared: None,
             ready_tx: None,
@@ -432,7 +437,6 @@ impl VoiceConnection {
                     continue;
                 }
             };
-            failed_connects = 0;
             debug!("Voice WS connected to {}", url);
 
             let code = self.session(ws, resuming, &mut cmd_rx).await;
@@ -440,6 +444,15 @@ impl VoiceConnection {
             let can_resume = code.is_none_or(|c| c == 4015 || c < 4000);
             if self.closed || !can_resume {
                 break;
+            }
+            if self.established {
+                failed_connects = 0;
+            } else {
+                failed_connects += 1;
+                if failed_connects >= MAX_CONNECT_ATTEMPTS {
+                    break;
+                }
+                tokio::time::sleep(RECONNECT_DELAY).await;
             }
             resuming = true;
         }
@@ -474,6 +487,8 @@ impl VoiceConnection {
             return None;
         }
         self.heartbeat_interval = None;
+        self.unacked_heartbeats = 0;
+        self.established = false;
         let mut heartbeat: Option<tokio::time::Interval> = None;
 
         loop {
@@ -512,6 +527,11 @@ impl VoiceConnection {
                     }
                 }
                 _ = tick(&mut heartbeat) => {
+                    if self.unacked_heartbeats >= MAX_UNACKED_HEARTBEATS {
+                        warn!("Voice WS missed {} heartbeat ACKs, reconnecting", self.unacked_heartbeats);
+                        return None;
+                    }
+                    self.unacked_heartbeats += 1;
                     let msg = text(
                         VoiceOpCode::Heartbeat,
                         json!({ "t": now_ms(), "seq_ack": self.seq }),
@@ -656,6 +676,7 @@ impl VoiceConnection {
                 ));
             }
             Some(VoiceOpCode::Ready) => {
+                self.established = true;
                 let ready: Ready = serde_json::from_value(msg.d)?;
                 let stream = ready.streams.first().ok_or(ConnectionError::NotConnected)?;
                 let params = WebRtcParams {
@@ -682,8 +703,15 @@ impl VoiceConnection {
                 };
                 let dave_version = ack.dave_protocol_version.unwrap_or(0);
                 self.init_dave(dave_version, tx);
-                if let Some(shared) = &self.shared {
-                    shared.webrtc.lock().await.set_remote_answer(&sdp).await?;
+                if let Some(shared) = &self.shared
+                    && let Err(e) = shared.webrtc.lock().await.set_remote_answer(&sdp).await
+                {
+                    if let Some(ready) = self.ready_tx.take() {
+                        let _ = ready.send(Err(ConnectionError::WebRtc(WebRtcError::Webrtc(
+                            e.to_string(),
+                        ))));
+                    }
+                    return Err(e.into());
                 }
                 let _ = self
                     .event_tx
@@ -695,6 +723,7 @@ impl VoiceConnection {
                 }
             }
             Some(VoiceOpCode::Resumed) => {
+                self.established = true;
                 let _ = self.event_tx.send(VoiceEvent::Resumed);
             }
             Some(VoiceOpCode::ClientsConnect) => {
@@ -739,7 +768,8 @@ impl VoiceConnection {
                     }
                 }
             }
-            Some(VoiceOpCode::HeartbeatAck) | Some(VoiceOpCode::Speaking) => {}
+            Some(VoiceOpCode::HeartbeatAck) => self.unacked_heartbeats = 0,
+            Some(VoiceOpCode::Speaking) => {}
             _ => {
                 debug!("Unhandled voice op {}", msg.op);
             }

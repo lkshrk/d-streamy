@@ -19,11 +19,15 @@ type Ws = WebSocketStream<TcpStream>;
 const T: Duration = Duration::from_secs(10);
 
 async fn accept(listener: &TcpListener) -> Ws {
+    accept_with_heartbeat(listener, 1000).await
+}
+
+async fn accept_with_heartbeat(listener: &TcpListener, interval_ms: u64) -> Ws {
     let (tcp, _) = timeout(T, listener.accept()).await.unwrap().unwrap();
     let mut ws = accept_async(tcp).await.unwrap();
     send(
         &mut ws,
-        json!({ "op": 8, "d": { "heartbeat_interval": 100 } }),
+        json!({ "op": 8, "d": { "heartbeat_interval": interval_ms } }),
     )
     .await;
     ws
@@ -262,4 +266,27 @@ async fn channel_move_retargets_next_stream_without_rejoining() {
         "guild:100:300:42"
     );
     assert!(gw_rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_heartbeat_acks_trigger_resume() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let (gw_tx, _gw_rx) = mpsc::unbounded_channel();
+    let mut streamer = Streamer::new("42".into(), gw_tx);
+    let _voice = streamer.join_voice(Some("100".into()), "200".into());
+    streamer.handle_event(dispatch(
+        "VOICE_STATE_UPDATE",
+        json!({ "user_id": "42", "session_id": "sess" }),
+    ));
+    streamer.handle_event(dispatch(
+        "VOICE_SERVER_UPDATE",
+        json!({ "guild_id": "100", "endpoint": endpoint, "token": "tok" }),
+    ));
+    let mut ws = accept_with_heartbeat(&listener, 30).await;
+    recv_op(&mut ws, 0).await;
+    let silent = tokio::spawn(async move { while ws.next().await.is_some() {} });
+    let mut ws = accept(&listener).await;
+    assert_eq!(recv_op(&mut ws, 7).await["session_id"], "sess");
+    silent.abort();
 }

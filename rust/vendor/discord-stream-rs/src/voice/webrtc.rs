@@ -49,6 +49,8 @@ pub const VIDEO_PACING_BITS_PER_SECOND: f64 = 25_000_000.0;
 
 const AUDIO_PLAYOUT_DELAY: (u16, u16) = (0, 1);
 const VIDEO_PLAYOUT_DELAY: (u16, u16) = (0, 10);
+/// About 10 MB of queued video packets; whole frames are dropped beyond it.
+pub const PACER_QUEUE_PACKETS: usize = 8192;
 
 #[derive(Debug, Error)]
 pub enum WebRtcError {
@@ -58,6 +60,8 @@ pub enum WebRtcError {
     PacketizerNotConfigured,
     #[error("Peer connection is not connected")]
     NotConnected,
+    #[error("Video pacer queue is full; frame dropped")]
+    PacerQueueFull,
     #[error("Unknown video codec: {0}")]
     UnknownCodec(String),
     #[error("No packetizer for video codec {0}")]
@@ -150,13 +154,13 @@ impl TrackLocal for DiscordTrack {
 }
 
 struct Pacer {
-    tx: mpsc::UnboundedSender<Packet>,
+    tx: mpsc::Sender<Packet>,
     task: JoinHandle<()>,
 }
 
 impl Pacer {
     fn spawn(track: Arc<DiscordTrack>, bits_per_second: f64) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(PACER_QUEUE_PACKETS);
         let task = tokio::spawn(run_pacer(track, rx, bits_per_second / 8.0));
         Self { tx, task }
     }
@@ -170,7 +174,7 @@ impl Drop for Pacer {
 
 async fn run_pacer(
     track: Arc<DiscordTrack>,
-    mut rx: mpsc::UnboundedReceiver<Packet>,
+    mut rx: mpsc::Receiver<Packet>,
     bytes_per_second: f64,
 ) {
     let burst = bytes_per_second / 1000.0;
@@ -477,8 +481,12 @@ impl WebRtcWrapper {
         let payload = lock_dave(&self.dave)
             .encrypt(MediaType::VIDEO, dave_codec(codec), frame)
             .map_err(|e| WebRtcError::Dave(e.to_string()))?;
-        for packet in timing.packetize(packetizer, &payload) {
-            if pacer.tx.send(packet).is_err() {
+        let packets = timing.packetize(packetizer, &payload);
+        if pacer.tx.capacity() < packets.len() {
+            return Err(WebRtcError::PacerQueueFull);
+        }
+        for packet in packets {
+            if pacer.tx.try_send(packet).is_err() {
                 warn!("video pacer stopped");
                 return Err(WebRtcError::NotInitialized);
             }
