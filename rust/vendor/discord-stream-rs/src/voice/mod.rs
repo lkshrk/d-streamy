@@ -1,6 +1,7 @@
 pub mod codec_payload;
 pub mod connection;
 pub mod opcodes;
+pub mod packetizer;
 pub mod stream_connection;
 pub mod types;
 pub mod webrtc;

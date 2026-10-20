@@ -32,6 +32,9 @@ futures-util = "0.3"
 # WebRTC (ICE + DTLS-SRTP + RTP)
 webrtc = "0.14"
 bytes = "1"
+async-trait = "0.1"
+rand = "0.9"
+uuid = { version = "1", features = ["v4"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
