@@ -13,3 +13,5 @@ Depends: 08
 - Global gates from PRD
 
 ## Comments
+- Note from 11: any binary linking `dstreamy-capture-macos` must emit `cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift` (copy `crates/dstreamy-capture-macos/build.rs`), else it fails at load with `libswift_Concurrency.dylib` not found. Add a test that runs the built `dstreamy --help` on macOS.
+- Note from 11: `dstreamy_media::CaptureConfig` has no audio gain field; backends apply gain 1.0. Wire `StreamConfig` gain through (add field to `CaptureConfig`).
