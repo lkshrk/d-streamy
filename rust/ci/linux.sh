@@ -8,5 +8,5 @@ cmd=("$@")
 exec docker run --rm \
   -v "$root":/w -w /w/rust \
   -v dstreamy-cargo-registry:/usr/local/cargo/registry \
-  -v dstreamy-linux-target:/w/rust/target \
+  -v "${DSTREAMY_TARGET_VOLUME:-dstreamy-linux-target}":/w/rust/target \
   dstreamy-linux-ci "${cmd[@]}"
