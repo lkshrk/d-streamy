@@ -190,3 +190,32 @@ fn odd_or_zero_sizes_are_rejected() {
         assert!(VtEncoder::new(cfg).is_err(), "{width}x{height}");
     }
 }
+
+/// Regenerates the H.265 replay fixture used by the stream tests in `dstreamy-discord`.
+#[test]
+#[ignore = "writes a fixture; run with DSTREAMY_H265_FIXTURE=<path>"]
+fn write_h265_fixture() {
+    let path = std::env::var("DSTREAMY_H265_FIXTURE").expect("DSTREAMY_H265_FIXTURE");
+    let mut encoder = VtEncoder::new(VtEncoderConfig {
+        bitrate_bps: 600_000,
+        ..config(VideoCodec::H265)
+    })
+    .expect("HEVC encoder");
+    let mut units = Vec::new();
+    for i in 0..90 {
+        units.extend(
+            encoder
+                .encode(&bgra_frame(i), i * 33_333, i % 45 == 0)
+                .unwrap(),
+        );
+    }
+    units.extend(encoder.flush().unwrap());
+    let mut out = Vec::new();
+    for unit in &units {
+        out.extend(unit.pts_us.to_le_bytes());
+        out.push(u8::from(unit.keyframe));
+        out.extend(u32::try_from(unit.data.len()).unwrap().to_le_bytes());
+        out.extend(&unit.data);
+    }
+    std::fs::write(path, out).unwrap();
+}
