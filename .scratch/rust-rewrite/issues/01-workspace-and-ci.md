@@ -1,6 +1,6 @@
 # 01 — workspace and ci
 
-Status: ready-for-agent
+Status: done
 Depends: —
 
 ## Scope
@@ -17,3 +17,7 @@ Extend `.github/workflows/ci.yml` with jobs `rust-macos` (macos-15) and `rust-li
 - Global gates from PRD
 
 ## Comments
+- Evidence (2026-10-20): macOS `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` ok; `rust/ci/linux.sh` ok (Debian trixie image, arm64 local); CI run 39502849645 on 2ff2ce6: rust-macos, rust-linux, build-test all success.
+- Decision: CI `push` trigger now also covers `rust-rewrite`, otherwise branch pushes get no CI.
+- Decision: `rust/ci/linux.sh` takes `DSTREAMY_TARGET_VOLUME` so parallel worktrees don't share one Linux target dir.
+- Decision: no `license` field in manifests; repo has no LICENSE file.
