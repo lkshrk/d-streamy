@@ -1,0 +1,69 @@
+{
+  "v": 9,
+  "user": {
+    "id": "100000000000000001",
+    "username": "streamer",
+    "global_name": "Streamer",
+    "discriminator": "0",
+    "avatar": null,
+    "verified": true,
+    "mfa_enabled": false,
+    "premium_type": 0,
+    "flags": 0,
+    "bot": false
+  },
+  "session_id": "6f1c0b1a2d3e4f5a6b7c8d9e0f1a2b3c",
+  "session_type": "normal",
+  "resume_gateway_url": "RESUME_URL",
+  "auth_session_id_hash": "c2Vzc2lvbi1oYXNo",
+  "country_code": "DE",
+  "analytics_token": "analytics",
+  "user_settings_proto": "",
+  "guilds": [
+    {
+      "id": "200000000000000001",
+      "name": "Gaming",
+      "icon": null,
+      "owner_id": "100000000000000099",
+      "member_count": 42,
+      "large": false,
+      "lazy": true,
+      "joined_at": "2024-01-01T00:00:00.000000+00:00",
+      "premium_tier": 0,
+      "features": [],
+      "roles": [{"id": "200000000000000001", "name": "@everyone", "permissions": "1071698529857", "position": 0}],
+      "emojis": [],
+      "stickers": [],
+      "threads": [],
+      "guild_scheduled_events": [],
+      "stage_instances": [],
+      "voice_states": [],
+      "channels": [
+        {"id": "300000000000000010", "type": 4, "name": "Voice", "position": 1, "permission_overwrites": [], "flags": 0},
+        {"id": "300000000000000001", "type": 0, "name": "general", "position": 0, "parent_id": null, "topic": null, "last_message_id": null, "rate_limit_per_user": 0, "nsfw": false, "permission_overwrites": [], "flags": 0},
+        {"id": "300000000000000003", "type": 2, "name": "Lounge 2", "position": 2, "parent_id": "300000000000000010", "bitrate": 64000, "user_limit": 0, "rtc_region": null, "permission_overwrites": [], "flags": 0},
+        {"id": "300000000000000002", "type": 2, "name": "Lounge 1", "position": 1, "parent_id": "300000000000000010", "bitrate": 64000, "user_limit": 0, "rtc_region": null, "video_quality_mode": 2, "permission_overwrites": [], "flags": 0},
+        {"id": "300000000000000004", "type": 13, "name": "Stage", "position": 3, "parent_id": null, "bitrate": 64000, "user_limit": 10000, "rtc_region": null, "permission_overwrites": [], "flags": 0},
+        {"id": "300000000000000005", "type": 5, "name": "announcements", "position": 4, "permission_overwrites": [], "flags": 0}
+      ]
+    },
+    {
+      "id": "200000000000000002",
+      "unavailable": true
+    }
+  ],
+  "private_channels": [
+    {"id": "400000000000000001", "type": 1, "last_message_id": null, "flags": 0, "recipient_ids": ["100000000000000099"]}
+  ],
+  "relationships": [],
+  "connected_accounts": [],
+  "user_guild_settings": {"entries": [], "partial": false, "version": 0},
+  "read_state": {"entries": [], "partial": false, "version": 0},
+  "guild_join_requests": [],
+  "guild_experiments": [],
+  "experiments": [],
+  "notes": {},
+  "sessions": [{"session_id": "6f1c0b1a2d3e4f5a6b7c8d9e0f1a2b3c", "status": "online", "activities": [], "client_info": {"version": 0, "os": "windows", "client": "desktop"}}],
+  "consents": {"personalization": {"consented": false}},
+  "tutorial": null
+}
