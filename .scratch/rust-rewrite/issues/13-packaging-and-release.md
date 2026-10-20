@@ -15,3 +15,4 @@ Release builds for aarch64/x86_64 macOS and x86_64/aarch64 Linux via GitHub Acti
 - Global gates from PRD
 
 ## Comments
+- Note: `screencapturekit` 11 depends on `apple-metal`, which needs the Xcode 26 SDK (`MTLTensor*`). macOS release jobs must run on `macos-26` (as `rust-macos` CI does since 998aa8e); macos-15 fails with `cannot find 'MTLTensorDataType' in scope`.
