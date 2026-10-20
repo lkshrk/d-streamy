@@ -10,6 +10,7 @@ pub struct AnnexBBitstreamReader<'a> {
     buffer: &'a [u8],
     byte_offset: usize,
     bit_offset: u8,
+    overrun: bool,
 }
 
 impl<'a> AnnexBBitstreamReader<'a> {
@@ -18,7 +19,14 @@ impl<'a> AnnexBBitstreamReader<'a> {
             buffer,
             byte_offset: 0,
             bit_offset: 0,
+            overrun: false,
         }
+    }
+
+    /// True once a read ran past the end of the buffer or hit an invalid
+    /// Exp-Golomb code; every later read returns 0.
+    pub fn overrun(&self) -> bool {
+        self.overrun
     }
 
     /// Read `count` bits (MSB first), skipping emulation-prevention bytes.
@@ -28,19 +36,19 @@ impl<'a> AnnexBBitstreamReader<'a> {
         }
         let mut result: u32 = 0;
         while count > 0 {
-            assert!(
-                self.byte_offset < self.buffer.len(),
-                "AnnexBBitstreamReader: bad byte offset"
-            );
-
             // Skip emulation prevention byte (0x00 0x00 0x03)
             if self.bit_offset == 0
                 && self.byte_offset >= 2
+                && self.byte_offset < self.buffer.len()
                 && self.buffer[self.byte_offset - 2] == 0
                 && self.buffer[self.byte_offset - 1] == 0
                 && self.buffer[self.byte_offset] == 3
             {
                 self.byte_offset += 1;
+            }
+            if self.overrun || self.byte_offset >= self.buffer.len() {
+                self.overrun = true;
+                return 0;
             }
 
             if self.bit_offset == 0 && count >= 8 {
@@ -85,6 +93,10 @@ impl<'a> AnnexBBitstreamReader<'a> {
         let mut leading_zeros: u32 = 0;
         while self.read_bits(1) == 0 {
             leading_zeros += 1;
+            if self.overrun || leading_zeros > 31 {
+                self.overrun = true;
+                return 0;
+            }
         }
         (1 << leading_zeros) + self.read_bits(leading_zeros) - 1
     }

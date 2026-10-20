@@ -11,7 +11,16 @@ use super::annexb_rw::{AnnexBBitstreamReader, AnnexBBitstreamWriter};
 /// Rewrite the SPS NALU VUI timing info in-place and return the patched bytes.
 ///
 /// `buffer` must start with the NAL unit header byte (NAL ref IDC + type 7).
+///
+/// A truncated or out-of-spec SPS is returned unchanged instead of panicking.
 pub fn rewrite_sps_vui(buffer: &[u8]) -> Vec<u8> {
+    try_rewrite_sps_vui(buffer).unwrap_or_else(|| buffer.to_vec())
+}
+
+fn try_rewrite_sps_vui(buffer: &[u8]) -> Option<Vec<u8>> {
+    if buffer.len() < 2 {
+        return None;
+    }
     let mut reader = AnnexBBitstreamReader::new(&buffer[1..]);
     let mut writer = AnnexBBitstreamWriter::new();
 
@@ -101,6 +110,9 @@ pub fn rewrite_sps_vui(buffer: &[u8]) -> Vec<u8> {
                     let mut next_scale: i32 = 8;
                     for _ in 0..size {
                         let delta = rse!();
+                        if !(-128..=127).contains(&delta) {
+                            return None;
+                        }
                         wse!(delta);
                         next_scale = (last_scale + delta + 256) % 256;
                         if next_scale != 0 {
@@ -130,6 +142,9 @@ pub fn rewrite_sps_vui(buffer: &[u8]) -> Vec<u8> {
         wse!(offset_for_top_to_bottom_field);
         let num_ref_frames_in_pic_order_cnt_cycle = rue!();
         wue!(num_ref_frames_in_pic_order_cnt_cycle);
+        if num_ref_frames_in_pic_order_cnt_cycle > 255 {
+            return None;
+        }
         for _ in 0..num_ref_frames_in_pic_order_cnt_cycle {
             let offset_for_ref_frame = rse!();
             wse!(offset_for_ref_frame);
@@ -243,13 +258,13 @@ pub fn rewrite_sps_vui(buffer: &[u8]) -> Vec<u8> {
         let nal_hrd_parameters_present_flag = rb!(1);
         wb!(nal_hrd_parameters_present_flag, 1);
         if nal_hrd_parameters_present_flag != 0 {
-            copy_hrd_parameters(&mut reader, &mut writer);
+            copy_hrd_parameters(&mut reader, &mut writer)?;
         }
 
         let vcl_hrd_parameters_present_flag = rb!(1);
         wb!(vcl_hrd_parameters_present_flag, 1);
         if vcl_hrd_parameters_present_flag != 0 {
-            copy_hrd_parameters(&mut reader, &mut writer);
+            copy_hrd_parameters(&mut reader, &mut writer)?;
         }
 
         if nal_hrd_parameters_present_flag != 0 || vcl_hrd_parameters_present_flag != 0 {
@@ -285,8 +300,11 @@ pub fn rewrite_sps_vui(buffer: &[u8]) -> Vec<u8> {
     }
 
     wb!(1, 1); // rbsp_stop_one_bit
+    if reader.overrun() {
+        return None;
+    }
     writer.flush_final();
-    writer.to_vec()
+    Some(writer.to_vec())
 }
 
 /// Write a default `bitstream_restriction()` block.
@@ -301,9 +319,15 @@ fn write_bitstream_restriction(writer: &mut AnnexBBitstreamWriter, max_num_ref_f
 }
 
 /// Copy an `hrd_parameters()` block verbatim.
-fn copy_hrd_parameters(reader: &mut AnnexBBitstreamReader<'_>, writer: &mut AnnexBBitstreamWriter) {
+fn copy_hrd_parameters(
+    reader: &mut AnnexBBitstreamReader<'_>,
+    writer: &mut AnnexBBitstreamWriter,
+) -> Option<()> {
     let cpb_cnt_minus1 = reader.read_ue();
     writer.write_ue(cpb_cnt_minus1);
+    if cpb_cnt_minus1 > 31 {
+        return None;
+    }
     let bit_rate_scale = reader.read_bits(4);
     writer.write_bits(bit_rate_scale, 4);
     let cpb_size_scale = reader.read_bits(4);
@@ -321,5 +345,98 @@ fn copy_hrd_parameters(reader: &mut AnnexBBitstreamReader<'_>, writer: &mut Anne
         // dpb_output_delay_length_minus1, time_offset_length — each 5 bits
         let v = reader.read_bits(5);
         writer.write_bits(v, 5);
+    }
+    Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn baseline_720p_sps_without_vui() -> Vec<u8> {
+        let mut w = AnnexBBitstreamWriter::new();
+        w.write_bits(0x67, 8);
+        w.write_bits(66, 8);
+        w.write_bits(0xC0, 8);
+        w.write_bits(31, 8);
+        for v in [0, 0, 0, 2, 1] {
+            w.write_ue(v);
+        }
+        w.write_bits(0, 1);
+        w.write_ue(79);
+        w.write_ue(44);
+        w.write_bits(0b1100, 4);
+        w.write_bits(1, 1);
+        w.flush_final();
+        w.to_vec()
+    }
+
+    fn parse_vui_reorder(sps: &[u8]) -> (u32, u32) {
+        let mut r = AnnexBBitstreamReader::new(&sps[1..]);
+        r.read_bits(24);
+        r.read_ue();
+        r.read_ue();
+        assert_eq!(r.read_ue(), 0, "poc type");
+        r.read_ue();
+        let max_num_ref_frames = r.read_ue();
+        r.read_bits(1);
+        r.read_ue();
+        r.read_ue();
+        assert_eq!(r.read_bits(1), 1, "frame_mbs_only");
+        r.read_bits(1);
+        assert_eq!(r.read_bits(1), 0, "cropping");
+        assert_eq!(r.read_bits(1), 1, "vui present");
+        assert_eq!(
+            r.read_bits(8),
+            0,
+            "no aspect/overscan/signal/chroma/timing/hrd/pic_struct"
+        );
+        assert_eq!(r.read_bits(1), 1, "bitstream_restriction");
+        r.read_bits(1);
+        r.read_ue();
+        r.read_ue();
+        r.read_ue();
+        r.read_ue();
+        let reorder = r.read_ue();
+        let dec_buffering = r.read_ue();
+        assert!(!r.overrun());
+        assert_eq!(dec_buffering, max_num_ref_frames);
+        (reorder, max_num_ref_frames)
+    }
+
+    #[test]
+    fn adds_bitstream_restriction_with_zero_reorder() {
+        let sps = baseline_720p_sps_without_vui();
+        let out = rewrite_sps_vui(&sps);
+        assert_eq!(out[..4], sps[..4]);
+        assert_eq!(parse_vui_reorder(&out).0, 0);
+    }
+
+    #[test]
+    fn matches_js_reference_output() {
+        let sps = baseline_720p_sps_without_vui();
+        assert_eq!(sps, [0x67, 0x42, 0xC0, 0x1F, 0xED, 0x00, 0xA0, 0x0B, 0x72]);
+        // Output of rewriteSPSVUI() from @dank074/discord-video-stream 6.0.0 for the same input.
+        let js = [
+            0x67, 0x42, 0xC0, 0x1F, 0xED, 0x00, 0xA0, 0x0B, 0x74, 0x03, 0x68, 0x22, 0x11, 0xA8,
+        ];
+        assert_eq!(rewrite_sps_vui(&sps), js);
+    }
+
+    #[test]
+    fn rewrite_is_idempotent() {
+        let once = rewrite_sps_vui(&baseline_720p_sps_without_vui());
+        assert_eq!(rewrite_sps_vui(&once), once);
+    }
+
+    #[test]
+    fn malformed_sps_is_returned_unchanged() {
+        for sps in [
+            &[0x67][..],
+            &[0x67, 0x64, 0x00],
+            &[0x67, 0x42, 0xC0, 0x1F, 0x00, 0x00],
+        ] {
+            assert_eq!(rewrite_sps_vui(sps), sps);
+        }
     }
 }
