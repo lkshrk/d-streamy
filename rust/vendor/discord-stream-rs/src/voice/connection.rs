@@ -239,7 +239,8 @@ impl VoiceConnection {
                 "session_id": self.session_id,
                 "token": self.token,
                 "video": true,
-                "streams": [{ "type": "screen", "rid": "100", "quality": 100 }]
+                "streams": [{ "type": "screen", "rid": "100", "quality": 100 }],
+                "max_dave_protocol_version": davey::DAVE_PROTOCOL_VERSION
             }
         })
         .to_string()
@@ -517,5 +518,18 @@ impl VoiceConnection {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identify_advertises_dave() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let conn = VoiceConnection::new(Some("1".into()), "2".into(), "3".into(), tx);
+        let v: Value = serde_json::from_str(&conn.build_identify()).unwrap();
+        assert_eq!(v["d"]["max_dave_protocol_version"], 1);
     }
 }
