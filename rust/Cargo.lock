@@ -667,6 +667,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "davey",
+ "dstreamy-mock-discord",
  "ffmpeg-next",
  "futures-util",
  "rand 0.9.5",
@@ -791,6 +792,26 @@ dependencies = [
 [[package]]
 name = "dstreamy-mock-discord"
 version = "0.1.0"
+dependencies = [
+ "davey",
+ "discord-stream-rs",
+ "dstreamy-discord",
+ "dstreamy-media",
+ "flate2",
+ "futures-util",
+ "openmls",
+ "openmls_basic_credential",
+ "openmls_rust_crypto",
+ "rand 0.9.5",
+ "secrecy",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tls_codec",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "webrtc",
+]
 
 [[package]]
 name = "dtls"
