@@ -4,7 +4,19 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-[dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
+async-trait = "0.1"
+dstreamy-media = { path = "../dstreamy-media" }
+objc2-core-foundation = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-core-video = "0.3.2"
+objc2-video-toolbox = "0.3.2"
+screencapturekit = { version = "11", features = ["macos_14_0"] }
+tokio = { version = "1", features = ["sync", "rt"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+openh264 = "0.9"
+tokio = { version = "1", features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true
