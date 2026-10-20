@@ -17,7 +17,7 @@ exclude = [
 ]
 
 [features]
-default = ["media"]
+default = []
 media = ["dep:ffmpeg-next"]
 
 [dependencies]
