@@ -29,15 +29,20 @@ pub struct GatewayPayload {
 
 /// A voice or stream connection being set up.
 pub struct PendingConnection {
-    ready: ReadyReceiver,
+    ready: Option<ReadyReceiver>,
     /// Lifecycle events of this connection.
     pub events: mpsc::UnboundedReceiver<VoiceEvent>,
 }
 
 impl PendingConnection {
-    /// Wait until the connection can send media (after SELECT_PROTOCOL_ACK).
+    /// Wait until media can be sent (after SELECT_PROTOCOL_ACK); cancel-safe, `Closed` once consumed.
     pub async fn ready(&mut self) -> Result<MediaConnection, StreamerError> {
-        match (&mut self.ready).await {
+        let Some(ready) = self.ready.as_mut() else {
+            return Err(StreamerError::Connection(ConnectionError::Closed));
+        };
+        let result = ready.await;
+        self.ready = None;
+        match result {
             Ok(result) => Ok(result?),
             Err(_) => Err(StreamerError::Connection(ConnectionError::Closed)),
         }
@@ -196,7 +201,10 @@ impl Streamer {
             slot,
         });
         self.signal_video(false);
-        PendingConnection { ready, events }
+        PendingConnection {
+            ready: Some(ready),
+            events,
+        }
     }
 
     /// Start a Go Live stream on the joined channel (`createStream`).
@@ -218,7 +226,10 @@ impl Streamer {
             event_tx,
             slot: None,
         });
-        Ok(PendingConnection { ready, events })
+        Ok(PendingConnection {
+            ready: Some(ready),
+            events,
+        })
     }
 
     /// Feed one main-gateway dispatch (`client.on("raw")` in JS).
