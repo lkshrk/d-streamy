@@ -32,4 +32,13 @@ pub enum GatewayOpCode {
     RequestForumUnreads = 28,
     RemoteCommand = 29,
     GetDeletedEntityIdsNotMatchingHash = 30,
+    RequestSoundboardSounds = 31,
+    SpeedTestCreate = 32,
+    SpeedTestDelete = 33,
+    RequestLastMessages = 34,
+    SearchRecentMembers = 35,
+    RequestChannelStatuses = 36,
+    GuildSubscriptionsBulk = 37,
+    GuildChannelsResync = 38,
+    RequestChannelMemberCount = 39,
 }
