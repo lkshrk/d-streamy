@@ -371,7 +371,7 @@ impl WebRtcWrapper {
     ) -> Result<(), WebRtcError> {
         let codec =
             normalize_video_codec(video_codec).map_err(|e| WebRtcError::UnknownCodec(e.0))?;
-        if !matches!(codec, VideoCodec::H264 | VideoCodec::H265 | VideoCodec::Av1) {
+        if !matches!(codec, VideoCodec::H264 | VideoCodec::H265) {
             return Err(WebRtcError::UnsupportedCodec(codec));
         }
         let info = video_info(codec);
@@ -725,5 +725,26 @@ mod tests {
         assert_eq!(nalus.len(), 2);
         assert!(nalus[0].len() > 9);
         assert_eq!(nalus[1], [0x65, 0x88]);
+    }
+
+    #[test]
+    fn packetizer_only_for_h264_and_h265() {
+        let params = WebRtcParams {
+            address: String::new(),
+            port: 0,
+            audio_ssrc: 1,
+            video_ssrc: 2,
+            rtx_ssrc: 3,
+            supported_encryption_modes: vec![],
+        };
+        let mut w = WebRtcWrapper::new(Arc::new(StdMutex::new(DaveHandler::new(1, 2))));
+        w.set_packetizer(&params, "hevc").unwrap();
+        assert_eq!(w.video_codec(), Some(VideoCodec::H265));
+        for codec in ["AV1", "VP8", "VP9"] {
+            assert!(matches!(
+                w.set_packetizer(&params, codec),
+                Err(WebRtcError::UnsupportedCodec(_))
+            ));
+        }
     }
 }
