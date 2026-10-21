@@ -20,6 +20,14 @@ impl HealthLevel {
             Self::Bad
         }
     }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Good => "good",
+            Self::Warn => "warn",
+            Self::Bad => "bad",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -114,11 +122,6 @@ impl StreamHealth {
             fps_series: spark.iter().map(|m| m.fps as f64).collect(),
             audio_series: spark.iter().map(|m| m.a_sent as f64).collect(),
         }
-    }
-
-    /// Worst of video and audio.
-    pub fn overall_level(&self) -> HealthLevel {
-        self.video_level.min(self.audio_level)
     }
 }
 
@@ -284,7 +287,6 @@ mod tests {
         let h = StreamHealth::compute(&[], 30);
         assert_eq!(h.video_score, 100);
         assert_eq!(h.audio_score, 100);
-        assert_eq!(h.overall_level(), HealthLevel::Good);
         assert!(h.fps_series.is_empty());
         assert!(h.audio_series.is_empty());
     }
@@ -298,15 +300,6 @@ mod tests {
         assert_eq!(h.video_level, HealthLevel::Good);
         assert_eq!(h.audio_score, 100);
         assert_eq!(h.audio_level, HealthLevel::Good);
-    }
-
-    #[test]
-    fn overall_level_is_worst_of_video_and_audio() {
-        let history = vec![metrics(30, 47); 5];
-        let h = StreamHealth::compute(&history, 30);
-        assert_eq!(h.video_level, HealthLevel::Good);
-        assert_eq!(h.audio_level, HealthLevel::Bad);
-        assert_eq!(h.overall_level(), HealthLevel::Bad);
     }
 
     #[test]

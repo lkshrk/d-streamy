@@ -1,62 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CaptureMetricsSnapshot {
-    pub delivered: u64,
-    pub enc_submit: u64,
-    pub enc_drop: u64,
-    pub audio_buf: u64,
-    pub audio_conv_fail: u64,
-}
-
-/// Capture-stage counters, bumped from capture threads and drained by [`CaptureMetrics::snapshot`].
-#[derive(Debug, Default)]
-pub struct CaptureMetrics {
-    delivered: AtomicU64,
-    enc_submit: AtomicU64,
-    enc_drop: AtomicU64,
-    audio_buf: AtomicU64,
-    audio_conv_fail: AtomicU64,
-}
-
-impl CaptureMetrics {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn record_delivered(&self) {
-        self.delivered.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_encode_submit(&self) {
-        self.enc_submit.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_encode_drop(&self) {
-        self.enc_drop.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_audio_buffer(&self) {
-        self.audio_buf.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_audio_conv_fail(&self) {
-        self.audio_conv_fail.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Returns the counts since the previous snapshot and resets them.
-    pub fn snapshot(&self) -> CaptureMetricsSnapshot {
-        let take = |c: &AtomicU64| c.swap(0, Ordering::Relaxed);
-        CaptureMetricsSnapshot {
-            delivered: take(&self.delivered),
-            enc_submit: take(&self.enc_submit),
-            enc_drop: take(&self.enc_drop),
-            audio_buf: take(&self.audio_buf),
-            audio_conv_fail: take(&self.audio_conv_fail),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameIntervalSnapshot {
@@ -223,49 +165,6 @@ impl MetricsSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn capture_counters_accumulate() {
-        let m = CaptureMetrics::new();
-        m.record_delivered();
-        m.record_delivered();
-        m.record_encode_submit();
-        m.record_encode_drop();
-        m.record_audio_buffer();
-        m.record_audio_conv_fail();
-
-        assert_eq!(
-            m.snapshot(),
-            CaptureMetricsSnapshot {
-                delivered: 2,
-                enc_submit: 1,
-                enc_drop: 1,
-                audio_buf: 1,
-                audio_conv_fail: 1,
-            }
-        );
-    }
-
-    #[test]
-    fn capture_snapshot_resets() {
-        let m = CaptureMetrics::new();
-        m.record_delivered();
-        let _ = m.snapshot();
-        assert_eq!(m.snapshot().delivered, 0);
-    }
-
-    #[test]
-    fn capture_counters_are_shared_across_threads() {
-        let m = std::sync::Arc::new(CaptureMetrics::new());
-        let handles: Vec<_> = (0..4)
-            .map(|_| {
-                let m = m.clone();
-                std::thread::spawn(move || (0..1000).for_each(|_| m.record_delivered()))
-            })
-            .collect();
-        handles.into_iter().for_each(|h| h.join().unwrap());
-        assert_eq!(m.snapshot().delivered, 4000);
-    }
 
     fn at(base: Instant, ms: u64) -> Instant {
         base + Duration::from_millis(ms)

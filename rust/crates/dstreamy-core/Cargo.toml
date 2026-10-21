@@ -7,11 +7,11 @@ publish.workspace = true
 [dependencies]
 directories.workspace = true
 serde.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "fmt", "std"] }
 

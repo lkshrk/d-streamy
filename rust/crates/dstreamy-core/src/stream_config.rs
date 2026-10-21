@@ -5,6 +5,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::codec::Codec;
+use crate::crop::CropRect;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum InvalidStreamConfig {
@@ -18,6 +19,10 @@ pub enum InvalidStreamConfig {
     Bitrate(u32),
     #[error("invalid audio gain {0}: expected 0.0..=3.0")]
     AudioGain(f32),
+    #[error("invalid crop {0}: width and height must be positive")]
+    EmptyCrop(CropRect),
+    #[error("invalid crop {0}: its right and bottom edges must fit in u32")]
+    CropOverflow(CropRect),
 }
 
 /// Maximum output size; the capture is scaled down to fit it.

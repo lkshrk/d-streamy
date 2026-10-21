@@ -38,14 +38,6 @@ impl RotatingFileWriter {
         Self::new(path, DEFAULT_MAX_LOG_BYTES, DEFAULT_KEPT_LOGS)
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn rotated_path(&self, n: usize) -> PathBuf {
-        rotated(&self.path, n)
-    }
-
     fn append(&self, buf: &[u8]) {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if inner.file.is_none() && inner.open(&self.path).is_err() {
@@ -71,7 +63,17 @@ impl Inner {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // mode() only applies on creation; a log from an older build may be world-readable.
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
         self.bytes = file.metadata()?.len();
         self.file = Some(file);
         Ok(())
@@ -81,7 +83,7 @@ impl Inner {
         self.file = None;
         self.bytes = 0;
         if self.keep == 0 {
-            let _ = File::create(path);
+            let _ = File::options().write(true).truncate(true).open(path);
             return;
         }
         for n in (1..self.keep).rev() {
@@ -177,7 +179,7 @@ mod tests {
         w.write_all(&line(3)).unwrap();
         assert_eq!(fs::read(&path).unwrap(), line(3));
         assert_eq!(
-            fs::read(w.rotated_path(1)).unwrap(),
+            fs::read(rotated(&path, 1)).unwrap(),
             [line(1), line(2)].concat()
         );
     }
@@ -190,13 +192,13 @@ mod tests {
         for n in 0..20 {
             w.write_all(&line(n)).unwrap();
         }
-        for p in [path.clone(), w.rotated_path(1), w.rotated_path(2)] {
+        for p in [path.clone(), rotated(&path, 1), rotated(&path, 2)] {
             assert!(fs::metadata(&p).unwrap().len() <= 30, "{p:?}");
         }
-        assert!(!w.rotated_path(3).exists());
+        assert!(!rotated(&path, 3).exists());
         assert_eq!(fs::read(&path).unwrap(), [line(18), line(19)].concat());
         assert_eq!(
-            fs::read(w.rotated_path(2)).unwrap(),
+            fs::read(rotated(&path, 2)).unwrap(),
             [line(12), line(13), line(14)].concat()
         );
     }
@@ -210,7 +212,25 @@ mod tests {
             w.write_all(&line(n)).unwrap();
         }
         assert_eq!(fs::read(&path).unwrap(), line(4));
-        assert!(!w.rotated_path(1).exists());
+        assert!(!rotated(&path, 1).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stream.log");
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut w = RotatingFileWriter::new(&path, 15, 1);
+        for n in 0..3 {
+            w.write_all(&line(n)).unwrap();
+        }
+        for p in [path.clone(), rotated(&path, 1)] {
+            let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{p:?}");
+        }
     }
 
     #[test]
@@ -319,6 +339,6 @@ mod tests {
         let current = fs::read_to_string(&path).unwrap();
         assert!(current.contains("n=49"), "{current}");
         assert!(fs::metadata(&path).unwrap().len() <= 400);
-        assert!(fs::metadata(file.rotated_path(1)).unwrap().len() <= 400);
+        assert!(fs::metadata(rotated(&path, 1)).unwrap().len() <= 400);
     }
 }

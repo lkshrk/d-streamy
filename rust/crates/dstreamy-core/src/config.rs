@@ -65,26 +65,29 @@ impl Config {
             path: path.to_owned(),
             source,
         })?;
-        config
-            .stream
-            .validate()
-            .map_err(|source| ConfigError::Invalid {
-                path: path.to_owned(),
-                source,
-            })?;
+        config.validate().map_err(|source| ConfigError::Invalid {
+            path: path.to_owned(),
+            source,
+        })?;
         Ok(config)
     }
 
     /// Written owner-only because a portal restore token may be stored in it.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
-        self.stream
-            .validate()
-            .map_err(|source| ConfigError::Invalid {
-                path: path.to_owned(),
-                source,
-            })?;
+        self.validate().map_err(|source| ConfigError::Invalid {
+            path: path.to_owned(),
+            source,
+        })?;
         let text = toml::to_string_pretty(self)?;
         write_private(path, text.as_bytes())
+    }
+
+    pub fn validate(&self) -> Result<(), InvalidStreamConfig> {
+        self.stream.validate()?;
+        if let Some(crop) = self.crop {
+            crop.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -154,25 +157,16 @@ fn resolve_token(env: Option<&str>, token_file: &Path) -> Result<Option<String>,
 /// Atomically replaces `path` with an owner-only (0600 on unix) file.
 fn write_private(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
     create_parent(path)?;
-    let mut tmp_name = path.file_name().unwrap_or_default().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = path.with_file_name(tmp_name);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options.open(&tmp).map_err(io_err(&tmp))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // mode() only applies on creation, so tighten a leftover temp file too.
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(io_err(&tmp))?;
-    }
-    file.write_all(contents)
-        .and_then(|()| file.sync_all())
-        .map_err(io_err(&tmp))?;
-    fs::rename(&tmp, path).map_err(io_err(path))
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(io_err(dir))?;
+    tmp.write_all(contents)
+        .and_then(|()| tmp.as_file().sync_all())
+        .map_err(io_err(path))?;
+    tmp.persist(path).map_err(|e| io_err(path)(e.error))?;
+    Ok(())
 }
 
 fn create_parent(path: &Path) -> Result<(), ConfigError> {
@@ -239,6 +233,8 @@ mod tests {
             "[stream]\nbitrate_kbps = 50000\n",
             "[stream]\nfps = 24\n",
             "[stream]\nbogus = 1\n",
+            "[crop]\nx = 0\ny = 0\nwidth = 0\nheight = 10\n",
+            "[crop]\nx = 4294967295\ny = 0\nwidth = 2\nheight = 10\n",
         ] {
             fs::write(&paths.config_file, text).unwrap();
             assert!(Config::load(&paths.config_file).is_err(), "{text}");
@@ -274,6 +270,14 @@ mod tests {
         let (_dir, paths) = paths();
         let mut config = Config::default();
         config.stream.audio_gain = f32::NAN;
+        assert!(matches!(
+            config.save(&paths.config_file),
+            Err(ConfigError::Invalid { .. })
+        ));
+        let config = Config {
+            crop: Some(CropRect::new(0, 0, 10, 0)),
+            ..Config::default()
+        };
         assert!(matches!(
             config.save(&paths.config_file),
             Err(ConfigError::Invalid { .. })
