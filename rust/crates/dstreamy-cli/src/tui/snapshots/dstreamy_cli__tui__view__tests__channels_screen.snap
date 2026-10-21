@@ -1,0 +1,28 @@
+---
+source: crates/dstreamy-cli/src/tui/view.rs
+expression: render(&app)
+---
+"dstreamy  ·  logged in as mockuser                                              "
+"┌ Voice channels in Mock Guild ────────────────────────────────────────────────┐"
+"│  General                                                                     │"
+"│› Gaming                                                                      │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                                                "
+"↑↓ select · Enter next · Esc back · q quit                                      "

@@ -1,0 +1,28 @@
+---
+source: crates/dstreamy-cli/src/tui/view.rs
+expression: render(&app)
+---
+"dstreamy  ·  logged in as mockuser                                              "
+"┌ Capture target ──────────────────────────────────────────────────────────────┐"
+"│  display  Display 1  1920x1080                                               │"
+"│› display  Test pattern  1920x1080                                            │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                                                "
+"↑↓ select · Enter next · Esc back · q quit                                      "

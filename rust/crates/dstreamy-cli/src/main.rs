@@ -1,26 +1,21 @@
 //! `dstreamy`: stream a window or display to a Discord voice channel from the command line.
 
-mod capture;
-mod discord;
-mod output;
-mod stream;
-
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{ArgAction, Parser, Subcommand};
-use dstreamy_core::{ConfigError, ConfigPaths, InvalidStreamConfig, TOKEN_ENV};
-use dstreamy_discord::{DEFAULT_GATEWAY_URL, GatewayError, VoiceChannelKind};
-use dstreamy_media::MediaError;
+use dstreamy_cli::discord::{self, Persistence};
+use dstreamy_cli::output::{Out, table};
+use dstreamy_cli::{CliError, Ctx, capture, stream, tui};
+use dstreamy_core::{ConfigPaths, RotatingFileWriter};
+use dstreamy_discord::{DEFAULT_GATEWAY_URL, VoiceChannelKind};
 use serde::Serialize;
 use tracing::Level;
 use tracing_subscriber::filter::Targets;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-
-use crate::discord::Persistence;
-use crate::output::{Out, table};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -62,41 +57,13 @@ enum Command {
     },
     /// Go Live in a voice channel until interrupted
     Stream(stream::StreamArgs),
-}
-
-pub struct Ctx {
-    pub paths: ConfigPaths,
-    pub gateway_url: String,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum CliError {
-    #[error(transparent)]
-    Config(#[from] ConfigError),
-    #[error(transparent)]
-    InvalidStreamConfig(#[from] InvalidStreamConfig),
-    #[error("not logged in: run `dstreamy login` or set {TOKEN_ENV}")]
-    NotLoggedIn,
-    #[error("no token given on stdin")]
-    EmptyToken,
-    #[error("reading the token: {0}")]
-    ReadToken(std::io::Error),
-    #[error(transparent)]
-    Gateway(#[from] GatewayError),
-    #[error("unknown guild {0}; see `dstreamy guilds`")]
-    UnknownGuild(String),
-    #[error("guild {0} is unavailable right now")]
-    GuildUnavailable(String),
-    #[error("no voice channel {channel} in guild {guild}; see `dstreamy channels {guild}`")]
-    UnknownChannel { guild: String, channel: String },
-    #[error("screen capture is not supported on this platform; use --target test-pattern")]
-    NoPlatformCapture,
-    #[error(transparent)]
-    Media(#[from] MediaError),
-    #[error("{0}")]
-    Session(String),
-    #[error("stream stopped: {0}")]
-    Stopped(String),
+    /// Pick a channel and target, adjust settings and watch stream health interactively
+    ///
+    /// Logs go to dstreamy.log in the config directory while the TUI runs.
+    Tui {
+        #[arg(long, hide = true)]
+        skip_platform: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -114,7 +81,15 @@ fn main() -> ExitCode {
         }
     };
     let out = Out::new(cli.json);
-    init_logging(&out, cli.verbose);
+    let ctx = match context(&cli) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            out.error(e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let log_file = matches!(cli.command, Command::Tui { .. }).then(|| tui::log_file(&ctx));
+    init_logging(&out, cli.verbose, log_file);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -125,7 +100,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = runtime.block_on(run(cli, &out));
+    let result = runtime.block_on(run(cli.command, &ctx, &out));
     // Background tasks (webrtc, the gateway) must not keep the process alive after the command.
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     match result {
@@ -137,7 +112,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn init_logging(out: &Out, verbose: u8) {
+fn init_logging(out: &Out, verbose: u8, file: Option<PathBuf>) {
     let (ours, others) = match verbose {
         0 => (Level::WARN, Level::ERROR),
         1 => (Level::INFO, Level::WARN),
@@ -147,32 +122,54 @@ fn init_logging(out: &Out, verbose: u8) {
         .with_target("dstreamy", ours)
         .with_target("discord_stream_rs", ours)
         .with_default(others);
-    let stderr = out.stderr_writer();
+    let writer = match file {
+        Some(path) => {
+            if let Some(dir) = path.parent() {
+                // A missing directory only costs the log file; the writer swallows its own errors.
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let file = RotatingFileWriter::with_defaults(path);
+            BoxMakeWriter::new(move || file.clone())
+        }
+        None => {
+            let stderr = out.stderr_writer();
+            BoxMakeWriter::new(move || stderr.clone())
+        }
+    };
     let _ = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(move || stderr.clone()),
+                .with_writer(writer),
         )
         .with(filter)
         .try_init();
 }
 
-async fn run(cli: Cli, out: &Out) -> Result<ExitCode, CliError> {
+fn context(cli: &Cli) -> Result<Ctx, CliError> {
     let paths = match &cli.config_dir {
         Some(dir) => ConfigPaths::in_dir(dir),
         None => ConfigPaths::discover()?,
     };
-    let ctx = Ctx {
+    Ok(Ctx {
         paths,
-        gateway_url: cli.gateway_url,
-    };
-    match cli.command {
-        Command::Login => login(&ctx, out).await,
-        Command::Guilds => guilds(&ctx, out).await,
-        Command::Channels { guild } => channels(&ctx, out, &guild).await,
+        gateway_url: cli.gateway_url.clone(),
+    })
+}
+
+async fn run(command: Command, ctx: &Ctx, out: &Out) -> Result<ExitCode, CliError> {
+    match command {
+        Command::Login => login(ctx, out).await,
+        Command::Guilds => guilds(ctx, out).await,
+        Command::Channels { guild } => channels(ctx, out, &guild).await,
         Command::Targets { skip_platform } => targets(out, !skip_platform).await,
-        Command::Stream(args) => stream::run(&ctx, out, args).await,
+        Command::Stream(args) => stream::run(ctx, out, args).await,
+        Command::Tui { skip_platform } => {
+            let opts = tui::Options {
+                include_platform: !skip_platform,
+            };
+            tui::run(ctx, opts).await
+        }
     }
 }
 

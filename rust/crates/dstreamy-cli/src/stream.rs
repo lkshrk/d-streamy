@@ -8,18 +8,17 @@ use dstreamy_discord::{
     DiscordClient, Session, SessionEvent, SessionOptions, SessionState, StopReason, StreamOptions,
 };
 use dstreamy_media::{CaptureConfig, VideoCodec};
-#[cfg(unix)]
-use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 
 use crate::discord::{self, Persistence};
 use crate::output::Out;
+use crate::signals::Signals;
 use crate::{CliError, Ctx, capture};
 
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Exit status after a second interrupt cut the shutdown short, as for a shell's SIGINT.
-const FORCED_EXIT: i32 = 130;
+pub const FORCED_EXIT: i32 = 130;
 
 #[derive(Debug, Args)]
 pub struct StreamArgs {
@@ -52,7 +51,7 @@ pub struct StreamArgs {
     pub gain: Option<f32>,
 }
 
-fn parse_crop(s: &str) -> Result<CropRect, String> {
+pub fn parse_crop(s: &str) -> Result<CropRect, String> {
     let parts: Vec<u32> = s
         .split(',')
         .map(|p| p.trim().parse::<u32>())
@@ -90,25 +89,33 @@ impl StreamArgs {
     }
 
     fn capture_config(&self, stream: &StreamConfig, crop: Option<CropRect>) -> CaptureConfig {
-        CaptureConfig {
-            target_id: Some(self.target.clone()),
-            crop: crop.map(|c| dstreamy_media::CropRect {
-                x: c.x,
-                y: c.y,
-                width: c.width,
-                height: c.height,
-            }),
-            width: stream.resolution.width(),
-            height: stream.resolution.height(),
-            fps: stream.fps.get(),
-            bitrate_bps: stream.bitrate_kbps * 1000,
-            codec: match stream.codec {
-                Codec::H264 => VideoCodec::H264,
-                Codec::H265 => VideoCodec::H265,
-            },
-            audio: true,
-            audio_gain: stream.audio_gain,
-        }
+        capture_config(&self.target, stream, crop)
+    }
+}
+
+pub fn capture_config(
+    target: &str,
+    stream: &StreamConfig,
+    crop: Option<CropRect>,
+) -> CaptureConfig {
+    CaptureConfig {
+        target_id: Some(target.to_owned()),
+        crop: crop.map(|c| dstreamy_media::CropRect {
+            x: c.x,
+            y: c.y,
+            width: c.width,
+            height: c.height,
+        }),
+        width: stream.resolution.width(),
+        height: stream.resolution.height(),
+        fps: stream.fps.get(),
+        bitrate_bps: stream.bitrate_kbps * 1000,
+        codec: match stream.codec {
+            Codec::H264 => VideoCodec::H264,
+            Codec::H265 => VideoCodec::H265,
+        },
+        audio: true,
+        audio_gain: stream.audio_gain,
     }
 }
 
@@ -121,7 +128,11 @@ pub async fn run(ctx: &Ctx, out: &Out, args: StreamArgs) -> Result<ExitCode, Cli
     let config = Config::load(&ctx.paths.config_file)?;
     let stream = args.stream_config(config.stream)?;
     let capture = args.capture_config(&stream, args.crop.or(config.crop));
-    let source = capture::source_for(&args.target)?;
+    let restore_token = capture::restore_token(&config);
+    let capture::Picked {
+        source,
+        portal_token,
+    } = capture::source_for(&args.target, restore_token.clone())?;
 
     let client = Arc::new(discord::connect(ctx, Persistence::Long).await?);
     let channels = match discord::voice_channels(&client, &args.guild).await {
@@ -188,6 +199,11 @@ pub async fn run(ctx: &Ctx, out: &Out, args: StreamArgs) -> Result<ExitCode, Cli
         print_event(out, &event);
     }
     close(client).await;
+    if let Err(e) =
+        capture::remember_portal_token(&ctx.paths, restore_token.as_deref(), &portal_token)
+    {
+        out.warn(format_args!("saving the portal restore token: {e}"));
+    }
 
     match outcome {
         Outcome::Interrupted
@@ -198,44 +214,12 @@ pub async fn run(ctx: &Ctx, out: &Out, args: StreamArgs) -> Result<ExitCode, Cli
     }
 }
 
-async fn close(client: Arc<DiscordClient>) {
+pub async fn close(client: Arc<DiscordClient>) {
     match Arc::try_unwrap(client) {
         Ok(client) => {
             let _ = timeout(CLOSE_TIMEOUT, client.close()).await;
         }
         Err(_) => tracing::debug!("client still shared; dropping it without a close frame"),
-    }
-}
-
-/// SIGINT and SIGTERM, registered once so that a press during shutdown is never lost.
-struct Signals {
-    #[cfg(unix)]
-    streams: Option<(Signal, Signal)>,
-}
-
-impl Signals {
-    fn new() -> Self {
-        #[cfg(unix)]
-        {
-            let streams = signal(SignalKind::interrupt())
-                .and_then(|int| Ok((int, signal(SignalKind::terminate())?)))
-                .ok();
-            Self { streams }
-        }
-        #[cfg(not(unix))]
-        Self {}
-    }
-
-    async fn recv(&mut self) {
-        #[cfg(unix)]
-        if let Some((int, term)) = &mut self.streams {
-            tokio::select! {
-                _ = int.recv() => {}
-                _ = term.recv() => {}
-            }
-            return;
-        }
-        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

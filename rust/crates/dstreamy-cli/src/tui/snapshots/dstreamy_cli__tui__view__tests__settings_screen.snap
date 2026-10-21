@@ -1,0 +1,28 @@
+---
+source: crates/dstreamy-cli/src/tui/view.rs
+expression: render(&app)
+---
+"dstreamy  ·  logged in as mockuser                                              "
+"┌ Stream settings ─────────────────────────────────────────────────────────────┐"
+"│  Resolution    1920x1080                                                     │"
+"│  Frame rate    30 fps                                                        │"
+"│› Bitrate       ◂ 6500 kbps ▸                                                 │"
+"│  Codec         H264                                                          │"
+"│  Audio gain    1.0                                                           │"
+"│  Crop X,Y,W,H  none                                                          │"
+"│                                                                              │"
+"│Enter goes live in General with Test pattern                                  │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                                                "
+"↑↓ field · ←→ change · 0-9 , crop · Enter go live · Esc back · q quit           "

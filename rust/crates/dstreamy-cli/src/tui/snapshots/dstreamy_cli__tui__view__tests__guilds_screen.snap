@@ -1,0 +1,28 @@
+---
+source: crates/dstreamy-cli/src/tui/view.rs
+expression: render(&app)
+---
+"dstreamy  ·  logged in as mockuser                                              "
+"┌ Guilds ──────────────────────────────────────────────────────────────────────┐"
+"│  Mock Guild                                                                  │"
+"│› Outage (unavailable)                                                        │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"Outage is unavailable right now                                                 "
+"↑↓ select · Enter open · q quit                                                 "

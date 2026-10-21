@@ -1,0 +1,28 @@
+---
+source: crates/dstreamy-cli/src/tui/view.rs
+expression: render(&streaming())
+---
+"dstreamy  ·  logged in as mockuser                                              "
+"streaming  ·  Mock Guild › General  ·  Test pattern                             "
+"┌ Health ──────────────────────────────────────────────────────────────────────┐"
+"│Video  87% good    Audio 100% good                                            │"
+"│FPS, last 30s                          Audio frames/s                         │"
+"│███▂██████▂██████▂██████▂█████         █▇█▇█▇█▇█▇█▇█▇█▇█▇█▇█▇█▇█▇█▇█▇         │"
+"│██████████████████████████████         ██████████████████████████████         │"
+"│FPS       30 / 30                                                             │"
+"│Jitter    p95 34 ms, max 41 ms                                                │"
+"│Drops     0 this second, 3 total                                              │"
+"│Audio     49 / 50 frames/s, 0 not ready, 0 errors                             │"
+"│Bitrate   5800 kbps                                                           │"
+"│Keyframes 1 viewer requests, 0 resumes                                        │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌ Events ──────────────────────────────────────────────────────────────────────┐"
+"│streaming                                                                     │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                                                "
+"s stop · q stop and quit                                                        "
