@@ -101,12 +101,7 @@ pub fn capture_config(
 ) -> CaptureConfig {
     CaptureConfig {
         target_id: Some(target.to_owned()),
-        crop: crop.map(|c| dstreamy_media::CropRect {
-            x: c.x,
-            y: c.y,
-            width: c.width,
-            height: c.height,
-        }),
+        crop,
         width: stream.resolution.width(),
         height: stream.resolution.height(),
         fps: stream.fps.get(),
@@ -375,7 +370,6 @@ mod tests {
         assert_eq!(c.bitrate_bps, 8_000_000);
         assert_eq!(c.codec, VideoCodec::H265);
         assert_eq!(c.audio_gain, 1.5);
-        let crop = c.crop.unwrap();
-        assert_eq!((crop.x, crop.y, crop.width, crop.height), (1, 2, 30, 40));
+        assert_eq!(c.crop, Some(CropRect::new(1, 2, 30, 40)));
     }
 }

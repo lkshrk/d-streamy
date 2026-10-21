@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+pub use dstreamy_core::CropRect;
 use tokio::sync::mpsc;
 
 use crate::{CaptureTarget, MediaError, MediaFrame, VideoCodec};
@@ -7,14 +8,6 @@ pub const FRAME_CHANNEL_CAPACITY: usize = 64;
 
 /// Frames in presentation order per kind; the channel closes when the source stops.
 pub type FrameReceiver = mpsc::Receiver<MediaFrame>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CropRect {
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaptureConfig {

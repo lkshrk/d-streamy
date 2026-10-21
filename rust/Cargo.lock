@@ -1141,6 +1141,7 @@ name = "dstreamy-media"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dstreamy-core",
  "openh264",
  "thiserror 2.0.21",
  "tokio",
