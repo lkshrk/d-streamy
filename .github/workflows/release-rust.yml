@@ -17,7 +17,12 @@ jobs:
     outputs:
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: rustup toolchain install
       - name: Check the tag matches the crate version
         id: check
         working-directory: rust
@@ -35,13 +40,15 @@ jobs:
   check:
     strategy:
       matrix:
-        os: [macos-26, ubuntu-24.04]
+        os: [macos-26, ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - name: Install system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -50,9 +57,8 @@ jobs:
             libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
             libopus-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -79,7 +85,9 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
       ARCHIVE: dstreamy-${{ needs.version.outputs.version }}-${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - name: Install system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -87,9 +95,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config \
             libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libopus-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
       - run: cargo build --release --locked -p dstreamy-cli --target ${{ matrix.target }}
       - name: Install Rosetta
         if: matrix.rosetta
@@ -103,7 +112,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/dstreamy" ../README.md "dist/$ARCHIVE/"
           tar -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
           (cd dist && shasum -a 256 "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256")
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.ARCHIVE }}
           path: |
@@ -112,21 +121,43 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: dstreamy-*
           path: dist
           merge-multiple: true
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+      - name: Create or update the GitHub release
         run: |
+          set -euo pipefail
           cat dist/*.sha256 | tee -a "$GITHUB_STEP_SUMMARY"
-          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "dstreamy ${TAG#rs-v} (Rust preview)" --generate-notes --prerelease --latest=false
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag \
+              --title "dstreamy ${TAG#rs-v} (Rust preview)" --generate-notes --prerelease --latest=false
+          fi
+          gh release upload "$TAG" dist/* --clobber
+      - name: Fill the Homebrew formula
+        run: |
+          set -euo pipefail
+          arm="$(cut -d' ' -f1 "dist/dstreamy-$VERSION-aarch64-apple-darwin.tar.gz.sha256")"
+          x86="$(cut -d' ' -f1 "dist/dstreamy-$VERSION-x86_64-apple-darwin.tar.gz.sha256")"
+          awk -v v="$VERSION" -v arm="$arm" -v x86="$x86" '
+            /^  version "/ { sub(/"[^"]*"/, "\"" v "\"") }
+            /aarch64-apple-darwin/ { h = arm }
+            /x86_64-apple-darwin/ { h = x86 }
+            /sha256 "/ && h != "" { sub(/"[^"]*"/, "\"" h "\""); h = "" }
+            { print }
+          ' Formula/dstreamy.rb > "$RUNNER_TEMP/dstreamy.rb"
+          { echo; echo '### Formula/dstreamy.rb'; echo '```ruby'; cat "$RUNNER_TEMP/dstreamy.rb"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

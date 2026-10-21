@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libopus-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
+ARG RUST_TOOLCHAIN=1.99.0
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable -c rustfmt,clippy \
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN" -c rustfmt,clippy \
     && chmod -R a+w $RUSTUP_HOME $CARGO_HOME
