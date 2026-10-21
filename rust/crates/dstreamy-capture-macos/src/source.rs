@@ -1,10 +1,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use dstreamy_media::{
     CaptureConfig, CaptureSource, CaptureTarget, FRAME_CHANNEL_CAPACITY, FrameReceiver, MediaError,
-    MediaFrame, OPUS_CHANNELS, OPUS_SAMPLE_RATE, OpusEncoder, TargetKind, VideoEncoder,
+    MediaFrame, OPUS_CHANNELS, OPUS_SAMPLE_RATE, OpusEncoder, TargetKind,
 };
 use objc2_core_video::CVPixelBuffer;
 use screencapturekit::cg::CGRect;
@@ -22,9 +23,13 @@ use tokio::sync::mpsc::error::TrySendError;
 use crate::audio::{AudioPacketizer, SourceBuffer, stereo_i16_from_f32};
 use crate::dimensions::CaptureDimensions;
 use crate::targets::{TargetId, is_user_window};
+use crate::video::VideoState;
 use crate::vt::{VtEncoder, VtEncoderConfig};
 
 const AUDIO_BITRATE_BPS: u32 = 128_000;
+const REFRESH_POLL: Duration = Duration::from_millis(50);
+/// One more than the default so the retained last frame does not starve the capture queue.
+const QUEUE_DEPTH: u32 = 4;
 
 type SharedSender = Arc<Mutex<Option<mpsc::Sender<MediaFrame>>>>;
 
@@ -277,7 +282,7 @@ fn start(
         clock: Mutex::new(None),
         failure: Mutex::new(None),
         audio_gain: config.audio_gain,
-        video: Mutex::new(Some(encoder)),
+        video: Mutex::new(Some(VideoState::new(encoder))),
         audio: Mutex::new(AudioPacketizer::new(OpusEncoder::new(AUDIO_BITRATE_BPS)?)),
     });
 
@@ -285,6 +290,7 @@ fn start(
         .with_width(dims.output_width)
         .with_height(dims.output_height)
         .with_pixel_format(PixelFormat::BGRA)
+        .with_queue_depth(QUEUE_DEPTH)
         .with_scales_to_fit(true)
         .with_shows_cursor(false)
         .with_minimum_frame_interval(&CMTime::new(
@@ -317,14 +323,30 @@ fn start(
             .map_err(backend)?;
     }
     stream.start_capture().map_err(backend)?;
-    Ok((
-        Running {
-            stream,
-            pipeline,
-            stopped: false,
-        },
-        rx,
-    ))
+    let running = Running {
+        stream,
+        pipeline,
+        stopped: false,
+    };
+    spawn_refresher(Arc::downgrade(&running.pipeline))?;
+    Ok((running, rx))
+}
+
+/// Serves keyframe requests and idle refreshes while ScreenCaptureKit sends no frames; ends with the pipeline.
+fn spawn_refresher(pipeline: Weak<Pipeline>) -> Result<(), MediaError> {
+    std::thread::Builder::new()
+        .name("sck-keyframe".to_owned())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(REFRESH_POLL);
+                match pipeline.upgrade() {
+                    Some(pipeline) if pipeline.refresh() => {}
+                    _ => break,
+                }
+            }
+        })
+        .map(drop)
+        .map_err(backend)
 }
 
 /// Returns false when the frame was dropped because the receiver is full.
@@ -342,7 +364,7 @@ struct Pipeline {
     clock: Mutex<Option<i128>>,
     failure: Mutex<Option<String>>,
     audio_gain: f32,
-    video: Mutex<Option<VtEncoder>>,
+    video: Mutex<Option<VideoState>>,
     audio: Mutex<AudioPacketizer<OpusEncoder>>,
 }
 
@@ -372,13 +394,29 @@ impl Pipeline {
         };
         // SAFETY: the sample buffer retains its image buffer for as long as `sample` is borrowed.
         let frame = unsafe { &*image.cast::<CVPixelBuffer>() };
-        let force = self.keyframe_requested.swap(false, Ordering::Relaxed);
         let mut video = self.video.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(encoder) = video.as_mut()
-            && encoder.encode(frame, pts_us, force).is_err()
+        let Some(video) = video.as_mut() else {
+            return;
+        };
+        let force = self.keyframe_requested.swap(false, Ordering::Relaxed);
+        if video.encode(frame, pts_us, force, Instant::now()).is_err() {
+            self.keyframe_requested.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns false once the pipeline has finished.
+    fn refresh(&self) -> bool {
+        let mut video = self.video.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(video) = video.as_mut() else {
+            return false;
+        };
+        if video
+            .refresh(&self.keyframe_requested, Instant::now())
+            .is_err()
         {
             self.keyframe_requested.store(true, Ordering::Relaxed);
         }
+        true
     }
 
     fn on_audio(&self, sample: &CMSampleBuffer) {

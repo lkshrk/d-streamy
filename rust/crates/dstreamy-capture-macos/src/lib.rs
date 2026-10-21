@@ -5,6 +5,7 @@ mod audio;
 mod dimensions;
 mod source;
 mod targets;
+mod video;
 mod vt;
 
 pub use audio::{AudioPacketizer, SourceBuffer, stereo_i16_from_f32};
