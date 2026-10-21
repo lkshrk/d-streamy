@@ -13,3 +13,11 @@ Depends: 07
 - Global gates from PRD
 
 ## Comments
+- Carried from 07 (coordinator, 2026-10-21):
+  - Health is poll-only (`StreamHandle::stats`). Add a status watch / `closed()` future with typed reason.
+  - Split frame pump from Discord session so reconnect/channel move doesn't restart the source.
+  - Return the source from `stop()` and on errors so retries can reuse it.
+  - Route viewer PLI to `request_keyframe` (vendored transport ignores PLI today).
+  - Timebase offset shared across tracks; a single-track restart shifts the other.
+  - Streamer holds one Go Live session; supervisor must own exactly one live handle.
+  - Vault pitfall `davey-first-frame-nonce`: first video keyframe can be lost at start; request a keyframe shortly after DAVE becomes active.
