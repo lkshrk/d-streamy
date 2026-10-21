@@ -257,6 +257,7 @@ fn start(
 
     let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
     let sender: SharedSender = Arc::new(Mutex::new(Some(tx)));
+    let frame_dropped = Arc::new(AtomicBool::new(false));
     let encoder = VtEncoder::with_sink(
         VtEncoderConfig {
             width: dims.output_width,
@@ -267,10 +268,10 @@ fn start(
         },
         {
             let sender = Arc::clone(&sender);
-            let keyframe_requested = Arc::clone(&keyframe_requested);
+            let frame_dropped = Arc::clone(&frame_dropped);
             move |frame| {
                 if !send(&sender, MediaFrame::Video(frame)) {
-                    keyframe_requested.store(true, Ordering::Relaxed);
+                    frame_dropped.store(true, Ordering::Relaxed);
                 }
             }
         },
@@ -279,6 +280,7 @@ fn start(
     let pipeline = Arc::new(Pipeline {
         sender,
         keyframe_requested,
+        frame_dropped,
         clock: Mutex::new(None),
         failure: Mutex::new(None),
         audio_gain: config.audio_gain,
@@ -361,6 +363,8 @@ fn send(sender: &SharedSender, frame: MediaFrame) -> bool {
 struct Pipeline {
     sender: SharedSender,
     keyframe_requested: Arc<AtomicBool>,
+    /// Set on backpressure; only a new frame serves it, so a stalled receiver cannot drive idle re-encodes.
+    frame_dropped: Arc<AtomicBool>,
     clock: Mutex<Option<i128>>,
     failure: Mutex<Option<String>>,
     audio_gain: f32,
@@ -398,7 +402,8 @@ impl Pipeline {
         let Some(video) = video.as_mut() else {
             return;
         };
-        let force = self.keyframe_requested.swap(false, Ordering::Relaxed);
+        let force = self.keyframe_requested.swap(false, Ordering::Relaxed)
+            | self.frame_dropped.swap(false, Ordering::Relaxed);
         if video.encode(frame, pts_us, force, Instant::now()).is_err() {
             self.keyframe_requested.store(true, Ordering::Relaxed);
         }
