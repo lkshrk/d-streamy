@@ -5,6 +5,33 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+dstreamy-core = { path = "../dstreamy-core" }
+dstreamy-discord = { path = "../dstreamy-discord" }
+dstreamy-media = { path = "../dstreamy-media" }
+rpassword = "7"
+secrecy = "0.10"
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "registry"] }
+url = "2"
+webrtc = "0.14"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dstreamy-capture-macos = { path = "../dstreamy-capture-macos" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dstreamy-capture-linux = { path = "../dstreamy-capture-linux" }
+
+[dev-dependencies]
+assert_cmd = "2"
+dstreamy-mock-discord = { path = "../dstreamy-mock-discord" }
+serde_json = "1"
+tempfile.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

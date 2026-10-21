@@ -471,9 +471,12 @@ fn build(
     link_chain(&pipeline, &chain)?;
 
     if let Some(input) = audio {
+        let volume = make("volume")?;
+        volume.set_property("volume", f64::from(config.audio_gain));
         let chain = [
             audio_source(input)?,
             make("audioconvert")?,
+            volume,
             make("audioresample")?,
             audio_sink(output.clone())?.upcast(),
         ];

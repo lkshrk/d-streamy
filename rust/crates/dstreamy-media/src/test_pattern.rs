@@ -104,6 +104,7 @@ impl CaptureSource for TestPatternSource {
             keyframe_requested: self.keyframe_requested.clone(),
             realtime: self.realtime,
             fps: config.fps,
+            audio_gain: config.audio_gain,
             frame: I420Frame::new(config.width, config.height),
             video,
             audio,
@@ -146,6 +147,7 @@ struct Generator {
     keyframe_requested: Arc<AtomicBool>,
     realtime: bool,
     fps: u32,
+    audio_gain: f32,
     frame: I420Frame,
     video: OpenH264Encoder,
     audio: Option<OpusEncoder>,
@@ -169,7 +171,7 @@ impl Generator {
                 }
             }
             let frames = if audio_due {
-                fill_tone(&mut pcm, audio_index);
+                fill_tone(&mut pcm, audio_index, self.audio_gain);
                 audio_index += 1;
                 self.encode_audio(&pcm, pts)
             } else {
@@ -217,7 +219,8 @@ impl Generator {
     }
 }
 
-fn fill_tone(pcm: &mut [i16], frame_index: u64) {
+fn fill_tone(pcm: &mut [i16], frame_index: u64, gain: f32) {
+    let amplitude = TONE_AMPLITUDE * gain.max(0.0) * f32::from(i16::MAX);
     let first = frame_index * OPUS_FRAME_SAMPLES as u64;
     for (i, pair) in pcm
         .as_chunks_mut::<OPUS_CHANNELS>()
@@ -227,7 +230,7 @@ fn fill_tone(pcm: &mut [i16], frame_index: u64) {
     {
         let n = (first + i as u64) % u64::from(OPUS_SAMPLE_RATE);
         let phase = TAU * TONE_HZ * n as f32 / OPUS_SAMPLE_RATE as f32;
-        let sample = (phase.sin() * TONE_AMPLITUDE * f32::from(i16::MAX)) as i16;
+        let sample = (phase.sin() * amplitude) as i16;
         pair.fill(sample);
     }
 }
@@ -252,4 +255,24 @@ fn draw_pattern(frame: &mut I420Frame, index: u64) {
     let band = (index / 30) as u8;
     u.fill(128u8.wrapping_add(band.wrapping_mul(16)));
     v.fill(128u8.wrapping_sub(band.wrapping_mul(16)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peak(gain: f32) -> i16 {
+        let mut pcm = vec![0i16; OPUS_FRAME_SAMPLES * OPUS_CHANNELS];
+        fill_tone(&mut pcm, 0, gain);
+        pcm.iter().map(|s| s.saturating_abs()).max().unwrap()
+    }
+
+    #[test]
+    fn tone_scales_with_gain() {
+        assert_eq!(peak(0.0), 0);
+        let unity = peak(1.0);
+        assert!(unity > 6_000, "{unity}");
+        assert!((i32::from(peak(2.0)) - 2 * i32::from(unity)).abs() <= 2);
+        assert_eq!(peak(-1.0), 0);
+    }
 }

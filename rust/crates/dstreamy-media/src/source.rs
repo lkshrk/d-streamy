@@ -16,7 +16,7 @@ pub struct CropRect {
     pub height: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CaptureConfig {
     /// `None` lets the backend choose (main display, or the portal picker on Wayland).
     pub target_id: Option<String>,
@@ -27,6 +27,8 @@ pub struct CaptureConfig {
     pub bitrate_bps: u32,
     pub codec: VideoCodec,
     pub audio: bool,
+    /// Linear gain applied to captured audio before encoding.
+    pub audio_gain: f32,
 }
 
 impl Default for CaptureConfig {
@@ -40,6 +42,7 @@ impl Default for CaptureConfig {
             bitrate_bps: 2_500_000,
             codec: VideoCodec::H264,
             audio: true,
+            audio_gain: 1.0,
         }
     }
 }

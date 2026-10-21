@@ -25,7 +25,6 @@ use crate::targets::{TargetId, is_user_window};
 use crate::vt::{VtEncoder, VtEncoderConfig};
 
 const AUDIO_BITRATE_BPS: u32 = 128_000;
-const AUDIO_GAIN: f32 = 1.0;
 
 type SharedSender = Arc<Mutex<Option<mpsc::Sender<MediaFrame>>>>;
 
@@ -277,6 +276,7 @@ fn start(
         keyframe_requested,
         clock: Mutex::new(None),
         failure: Mutex::new(None),
+        audio_gain: config.audio_gain,
         video: Mutex::new(Some(encoder)),
         audio: Mutex::new(AudioPacketizer::new(OpusEncoder::new(AUDIO_BITRATE_BPS)?)),
     });
@@ -341,6 +341,7 @@ struct Pipeline {
     keyframe_requested: Arc<AtomicBool>,
     clock: Mutex<Option<i128>>,
     failure: Mutex<Option<String>>,
+    audio_gain: f32,
     video: Mutex<Option<VtEncoder>>,
     audio: Mutex<AudioPacketizer<OpusEncoder>>,
 }
@@ -410,7 +411,7 @@ impl Pipeline {
                 samples,
             })
             .collect();
-        let Some(pcm) = stereo_i16_from_f32(frames, &buffers, AUDIO_GAIN) else {
+        let Some(pcm) = stereo_i16_from_f32(frames, &buffers, self.audio_gain) else {
             return;
         };
         let packets = self
