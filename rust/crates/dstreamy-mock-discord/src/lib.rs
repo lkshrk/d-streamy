@@ -186,6 +186,40 @@ impl MockDiscord {
         sent
     }
 
+    /// Send a viewer FIR (full intra request) for the video SSRC of every peer connection of `kind`.
+    pub async fn send_fir(&self, kind: VoiceKind, sequence_number: u8) -> bool {
+        let conns: Vec<_> = self.shared.state().voice_conns.values().cloned().collect();
+        let mut sent = false;
+        for conn in conns {
+            let c = conn.lock().await;
+            if c.kind == kind {
+                sent |= c.send_fir(sequence_number).await;
+            }
+        }
+        sent
+    }
+
+    /// VOICE_STATE_UPDATE for the user from another of their sessions (another device); `None` leaves voice.
+    pub fn voice_state_from_other_session(&self, guild_id: &str, channel_id: Option<&str>) -> bool {
+        let mut state = self.shared.state();
+        let Some(mut other) = state.voice.clone() else {
+            return false;
+        };
+        other.guild_id = guild_id.to_owned();
+        other.channel_id = channel_id.unwrap_or_default().to_owned();
+        other.session_id = util::random_hex(16);
+        other.self_stream = false;
+        let mut payload = other.dispatch(&self.shared.config.user.id);
+        if channel_id.is_none() {
+            payload["channel_id"] = serde_json::Value::Null;
+        }
+        self.shared
+            .dispatch(&mut state, "VOICE_STATE_UPDATE", payload);
+        drop(state);
+        self.shared.notify();
+        true
+    }
+
     /// Close the voice WebSocket of `kind`; `None` drops TCP without a close frame. The connection stays resumable.
     pub fn drop_voice(&self, kind: VoiceKind, close_code: Option<u16>) -> bool {
         let state = self.shared.state();

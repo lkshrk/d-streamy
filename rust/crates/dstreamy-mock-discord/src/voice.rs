@@ -103,7 +103,7 @@ impl VoiceConn {
         };
         let fir = FullIntraRequest {
             sender_ssrc: 0,
-            media_ssrc: self.video_ssrc,
+            media_ssrc: 0,
             fir: vec![FirEntry {
                 ssrc: self.video_ssrc,
                 sequence_number,
