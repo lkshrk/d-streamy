@@ -1,6 +1,7 @@
 //! Shared pieces of the `dstreamy` command line and its terminal UI.
 
 pub mod capture;
+pub mod daemon;
 pub mod discord;
 pub mod output;
 pub mod signals;
@@ -41,6 +42,8 @@ pub enum CliError {
     NoPlatformCapture,
     #[error(transparent)]
     Media(#[from] MediaError),
+    #[error("a stream is already running")]
+    AlreadyStreaming,
     #[error("{0}")]
     Session(String),
     #[error("stream stopped: {0}")]

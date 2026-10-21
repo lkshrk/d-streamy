@@ -1,4 +1,4 @@
-{"type":"error","id":null,"code":"malformed","message":"malformed line: expected value at line 1 column 1"}
+{"type":"error","id":null,"code":"malformed","message":"malformed line: expected ident at line 1 column 2"}
 {"type":"error","id":"2","code":"unknown_cmd","message":"unknown command \"bogus\""}
 {"type":"error","id":null,"code":"malformed","message":"malformed line: missing string field \"id\""}
 {"type":"error","id":"4","code":"invalid_params","message":"missing field `guild_id`"}

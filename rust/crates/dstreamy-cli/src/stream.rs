@@ -5,7 +5,8 @@ use std::time::Duration;
 use clap::Args;
 use dstreamy_core::{Codec, Config, CropRect, Fps, Resolution, StreamConfig};
 use dstreamy_discord::{
-    DiscordClient, Session, SessionEvent, SessionOptions, SessionState, StopReason, StreamOptions,
+    DiscordClient, Session, SessionError, SessionEvent, SessionOptions, SessionState, StopReason,
+    StreamOptions,
 };
 use dstreamy_media::{CaptureConfig, CaptureSource, VideoCodec};
 use tokio::sync::broadcast::error::RecvError;
@@ -65,7 +66,7 @@ pub fn parse_crop(s: &str) -> Result<CropRect, String> {
     }
 }
 
-fn parse_codec(s: &str) -> Result<Codec, String> {
+pub fn parse_codec(s: &str) -> Result<Codec, String> {
     s.to_ascii_uppercase()
         .parse()
         .map_err(|_| "expected h264 or h265".to_owned())
@@ -230,7 +231,10 @@ pub async fn start(
     session
         .start(Some(guild), channel, source, options)
         .await
-        .map_err(|e| CliError::Session(e.error.to_string()))
+        .map_err(|e| match e.error {
+            SessionError::AlreadyRunning => CliError::AlreadyStreaming,
+            error => CliError::Session(error.to_string()),
+        })
 }
 
 pub async fn teardown(session: Session, client: Arc<DiscordClient>) {

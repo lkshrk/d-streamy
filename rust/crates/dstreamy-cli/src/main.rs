@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use clap::{ArgAction, Parser, Subcommand};
 use dstreamy_cli::discord::{self, Persistence};
 use dstreamy_cli::output::{Out, table};
-use dstreamy_cli::{CliError, Ctx, capture, stream, tui};
+use dstreamy_cli::{CliError, Ctx, capture, daemon, stream, tui};
 use dstreamy_core::{ConfigPaths, RotatingFileWriter};
 use dstreamy_discord::{DEFAULT_GATEWAY_URL, VoiceChannelKind};
 use serde::Serialize;
@@ -70,6 +70,13 @@ enum Command {
         #[arg(long, hide = true)]
         skip_platform: bool,
     },
+    /// Serve the JSON protocol of the macOS menu bar app on stdin and stdout
+    ///
+    /// Logs go to dstreamy.log in the config directory, and to stderr with -v.
+    Daemon {
+        #[arg(long, hide = true)]
+        skip_platform: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -94,8 +101,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let log_file = matches!(cli.command, Command::Tui { .. }).then(|| tui::log_file(&ctx));
-    init_logging(&out, cli.verbose, log_file);
+    let (log_file, to_stderr) = match cli.command {
+        Command::Tui { .. } => (Some(tui::log_file(&ctx)), false),
+        Command::Daemon { .. } => (Some(tui::log_file(&ctx)), cli.verbose > 0),
+        _ => (None, true),
+    };
+    init_logging(&out, cli.verbose, log_file, to_stderr);
     let token = match cli.command {
         Command::Login => match read_token() {
             Ok(token) => Some(token),
@@ -128,7 +139,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn init_logging(out: &Out, verbose: u8, file: Option<PathBuf>) {
+fn init_logging(out: &Out, verbose: u8, file: Option<PathBuf>, to_stderr: bool) {
     let (ours, others) = match verbose {
         0 => (Level::WARN, Level::ERROR),
         1 => (Level::INFO, Level::WARN),
@@ -138,26 +149,25 @@ fn init_logging(out: &Out, verbose: u8, file: Option<PathBuf>) {
         .with_target("dstreamy", ours)
         .with_target("discord_stream_rs", ours)
         .with_default(others);
-    let writer = match file {
-        Some(path) => {
-            if let Some(dir) = path.parent() {
-                // A missing directory only costs the log file; the writer swallows its own errors.
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let file = RotatingFileWriter::with_defaults(path);
-            BoxMakeWriter::new(move || file.clone())
+    let file = file.map(|path| {
+        if let Some(dir) = path.parent() {
+            // A missing directory only costs the log file; the writer swallows its own errors.
+            let _ = std::fs::create_dir_all(dir);
         }
-        None => {
-            let stderr = out.stderr_writer();
-            BoxMakeWriter::new(move || stderr.clone())
-        }
-    };
+        let file = RotatingFileWriter::with_defaults(path);
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(BoxMakeWriter::new(move || file.clone()))
+    });
+    let stderr = to_stderr.then(|| {
+        let stderr = out.stderr_writer();
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(BoxMakeWriter::new(move || stderr.clone()))
+    });
     let _ = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(writer),
-        )
+        .with(file)
+        .with(stderr)
         .with(filter)
         .try_init();
 }
@@ -185,6 +195,12 @@ async fn run(
         Command::Channels { guild } => channels(ctx, out, &guild).await,
         Command::Targets { skip_platform } => targets(out, !skip_platform).await,
         Command::Stream(args) => stream::run(ctx, out, args).await,
+        Command::Daemon { skip_platform } => {
+            let opts = daemon::Options {
+                include_platform: !skip_platform,
+            };
+            daemon::run(ctx, out, opts).await
+        }
         Command::Tui { skip_platform } => {
             let opts = tui::Options {
                 include_platform: !skip_platform,
