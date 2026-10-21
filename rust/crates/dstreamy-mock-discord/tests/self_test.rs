@@ -2,7 +2,7 @@ mod common;
 
 use common::{Client, T};
 use discord_stream_rs::voice::VideoAttributes;
-use discord_stream_rs::{rewrite_sps_vui, split_nalu};
+use discord_stream_rs::{MediaConnection, rewrite_sps_vui, split_nalu};
 use dstreamy_media::{CaptureConfig, CaptureSource, MediaFrame, TestPatternSource};
 use dstreamy_mock_discord::depacketize::{annexb, nal_units};
 use dstreamy_mock_discord::opcodes::{gateway as gw, voice as vo};
@@ -25,6 +25,19 @@ fn expected_nalus(au: &[u8]) -> Vec<Vec<u8>> {
             }
         })
         .collect()
+}
+
+async fn send(conn: &MediaConnection, frame: &MediaFrame) {
+    match frame {
+        MediaFrame::Video(v) => conn
+            .send_video_frame_at(&v.data, Duration::from_micros(v.pts_us))
+            .await
+            .unwrap(),
+        MediaFrame::Audio(a) => conn
+            .send_audio_frame_at(&a.data, Duration::from_micros(a.pts_us))
+            .await
+            .unwrap(),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -84,25 +97,28 @@ async fn streams_test_pattern_bit_identical_with_dave() {
     assert!(video[0].keyframe);
     assert!(audio.len() >= 50);
 
-    let mut frames: Vec<MediaFrame> = video
+    // Audio overtaking the paced first keyframe would make davey reject it (shared nonce sequence).
+    send(&conn, &MediaFrame::Video(video[0].clone())).await;
+    mock.wait_for(T, |r| {
+        r.video
+            .iter()
+            .any(|f| f.kind == VoiceKind::Stream)
+            .then_some(())
+    })
+    .await
+    .expect("first keyframe recorded");
+    let mut frames: Vec<MediaFrame> = video[1..]
         .iter()
         .cloned()
         .map(MediaFrame::Video)
         .chain(audio.iter().cloned().map(MediaFrame::Audio))
         .collect();
     frames.sort_by_key(MediaFrame::pts_us);
+    let start = tokio::time::Instant::now();
+    let first_pts = frames[0].pts_us();
     for frame in &frames {
-        match frame {
-            MediaFrame::Video(v) => conn
-                .send_video_frame_at(&v.data, Duration::from_micros(v.pts_us))
-                .await
-                .unwrap(),
-            MediaFrame::Audio(a) => conn
-                .send_audio_frame_at(&a.data, Duration::from_micros(a.pts_us))
-                .await
-                .unwrap(),
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        tokio::time::sleep_until(start + Duration::from_micros(frame.pts_us() - first_pts)).await;
+        send(&conn, frame).await;
     }
 
     let (n_video, n_audio) = (video.len(), audio.len());
