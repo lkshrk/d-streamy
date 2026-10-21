@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, warn};
@@ -99,6 +99,7 @@ struct Shared {
     webrtc: Mutex<WebRtcWrapper>,
     params: StdMutex<Option<WebRtcParams>>,
     dave: Arc<StdMutex<DaveHandler>>,
+    keyframe_requests: watch::Receiver<u64>,
 }
 
 /// Cloneable handle to a running connection, like `WebRtcConnWrapper` plus its `mediaConnection` in JS.
@@ -135,6 +136,11 @@ impl MediaConnection {
 
     pub fn dave_ready(&self) -> bool {
         lock(&self.shared.dave).is_ready()
+    }
+
+    /// Bumped for every viewer PLI or FIR; the sender should emit a keyframe.
+    pub fn keyframe_requests(&self) -> watch::Receiver<u64> {
+        self.shared.keyframe_requests.clone()
     }
 
     pub fn voice_privacy_code(&self) -> Option<String> {
@@ -393,14 +399,15 @@ impl VoiceConnection {
     pub fn start(mut self) -> (MediaConnection, ReadyReceiver, JoinHandle<()>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
+        let webrtc = self
+            .webrtc
+            .take()
+            .unwrap_or_else(|| WebRtcWrapper::new(self.dave.clone()));
         let shared = Arc::new(Shared {
             kind: self.kind.clone(),
             cmd_tx,
-            webrtc: Mutex::new(
-                self.webrtc
-                    .take()
-                    .unwrap_or_else(|| WebRtcWrapper::new(self.dave.clone())),
-            ),
+            keyframe_requests: webrtc.keyframe_requests(),
+            webrtc: Mutex::new(webrtc),
             params: StdMutex::new(None),
             dave: self.dave.clone(),
         });

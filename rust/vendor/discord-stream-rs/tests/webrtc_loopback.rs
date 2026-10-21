@@ -7,6 +7,7 @@ use discord_stream_rs::voice::{WebRtcParams, codec_payload};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtp::packetizer::Depacketizer;
 
 const AUDIO_SSRC: u32 = 1111;
@@ -92,6 +93,18 @@ async fn sends_rtp_on_discord_ssrcs_and_payload_types() {
         rebuilt.extend_from_slice(&depacketizer.depacketize(&p.payload).unwrap());
     }
     assert_eq!(rebuilt, frame);
+
+    let mut keyframe_requests = client.keyframe_requests();
+    let pli = PictureLossIndication {
+        sender_ssrc: 0,
+        media_ssrc: VIDEO_SSRC,
+    };
+    server.write_rtcp(&[Box::new(pli)]).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), keyframe_requests.changed())
+        .await
+        .expect("PLI not surfaced")
+        .unwrap();
+    assert_eq!(*keyframe_requests.borrow(), 1);
 
     client.close().await;
     server.close().await.unwrap();

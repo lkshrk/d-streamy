@@ -14,7 +14,7 @@ use std::any::Any;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -32,7 +32,9 @@ use webrtc::{
         peer_connection_state::RTCPeerConnectionState,
         sdp::session_description::RTCSessionDescription,
     },
-    rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication,
+    rtcp::payload_feedbacks::{
+        full_intra_request::FullIntraRequest, picture_loss_indication::PictureLossIndication,
+    },
     rtp::packet::Packet,
     rtp_transceiver::{
         RTCPFeedback, SSRC,
@@ -210,6 +212,7 @@ pub struct WebRtcWrapper {
     ice_servers: Vec<String>,
     setting_engine: SettingEngine,
     dave: Arc<StdMutex<DaveHandler>>,
+    keyframe_requests: Arc<watch::Sender<u64>>,
 }
 
 impl WebRtcWrapper {
@@ -225,7 +228,13 @@ impl WebRtcWrapper {
             ice_servers: DEFAULT_ICE_SERVERS.iter().map(|s| s.to_string()).collect(),
             setting_engine: SettingEngine::default(),
             dave,
+            keyframe_requests: Arc::new(watch::channel(0).0),
         }
+    }
+
+    /// Count of PLI and FIR packets received from viewers, across peer connection restarts.
+    pub fn keyframe_requests(&self) -> watch::Receiver<u64> {
+        self.keyframe_requests.subscribe()
     }
 
     pub fn set_setting_engine(&mut self, engine: SettingEngine) {
@@ -320,14 +329,16 @@ impl WebRtcWrapper {
         let tracks: [Arc<dyn TrackLocal + Send + Sync>; 2] = [audio.clone(), video.clone()];
         for track in tracks {
             let sender = pc.add_track(track).await.map_err(webrtc_err)?;
+            let keyframe_requests = self.keyframe_requests.clone();
             // RTCP must be read for the NACK responder and report interceptors to run.
             tokio::spawn(async move {
                 while let Ok((packets, _)) = sender.read_rtcp().await {
-                    if packets
-                        .iter()
-                        .any(|p| p.as_any().is::<PictureLossIndication>())
-                    {
-                        debug!("PLI received");
+                    if packets.iter().any(|p| {
+                        p.as_any().is::<PictureLossIndication>()
+                            || p.as_any().is::<FullIntraRequest>()
+                    }) {
+                        debug!("PLI/FIR received");
+                        keyframe_requests.send_modify(|n| *n += 1);
                     }
                 }
             });
