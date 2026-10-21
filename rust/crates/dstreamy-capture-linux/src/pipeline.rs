@@ -28,6 +28,7 @@ pub(crate) enum VideoInput {
     PipeWire {
         fd: RawFd,
         node_id: u32,
+        size: Option<(u32, u32)>,
     },
     #[cfg(test)]
     Test {
@@ -205,7 +206,7 @@ fn set_if_present(element: &gst::Element, name: &str, value: &str) -> bool {
 
 fn video_source(input: &VideoInput, fps: u32) -> Result<Vec<gst::Element>, MediaError> {
     match input {
-        VideoInput::PipeWire { fd, node_id } => {
+        VideoInput::PipeWire { fd, node_id, .. } => {
             let src = make("pipewiresrc")?;
             src.set_property("fd", *fd);
             set_if_present(&src, "path", &node_id.to_string());
@@ -435,6 +436,8 @@ fn audio_sink(output: Arc<Output>) -> Result<gst_app::AppSink, MediaError> {
 struct Built {
     pipeline: gst::Pipeline,
     video_source: gst::Element,
+    /// Only used to explain a failure, never to reject a crop up front: the portal may report logical size.
+    size_hint: Option<(u32, u32)>,
     video_sink: gst_app::AppSink,
     audio: Vec<gst::Element>,
 }
@@ -514,9 +517,15 @@ fn build(
         ];
         link_chain(&pipeline, &audio_chain)?;
     }
+    let size_hint = match video {
+        VideoInput::PipeWire { size, .. } => *size,
+        #[cfg(test)]
+        VideoInput::Test { .. } => None,
+    };
     Ok(Built {
         pipeline,
         video_source,
+        size_hint,
         video_sink: sink,
         audio: audio_chain,
     })
@@ -537,7 +546,7 @@ enum StartError {
 
 fn classify(err: &gst::message::Error, built: &Built, crop: Option<CropRect>) -> StartError {
     if let Some(crop) = crop
-        && let Some((width, height)) = fixed_source_size(&built.video_source)
+        && let Some((width, height)) = fixed_source_size(&built.video_source).or(built.size_hint)
         && let Err(e) = check_crop_fits(crop, width, height)
     {
         return StartError::Fatal(e);

@@ -34,6 +34,8 @@ pub(crate) struct PortalStream {
     session: Option<Session<Screencast>>,
     runtime: Handle,
     pub(crate) node_id: u32,
+    /// The stream size the portal reports, in compositor coordinates that may differ from frame pixels.
+    pub(crate) size: Option<(u32, u32)>,
     pub(crate) restore_token: Option<String>,
 }
 
@@ -57,12 +59,14 @@ impl PortalStream {
             session: Some(session),
             runtime: Handle::current(),
             node_id: 0,
+            size: None,
             restore_token: None,
         };
         let negotiated = stream.negotiate(sources, restore_token).await;
         match negotiated {
-            Ok((fd, node_id, restore_token)) => {
+            Ok((fd, node_id, size, restore_token)) => {
                 stream.node_id = node_id;
+                stream.size = size;
                 stream.restore_token = restore_token;
                 Ok((stream, fd))
             }
@@ -77,7 +81,7 @@ impl PortalStream {
         &self,
         sources: PortalSources,
         restore_token: Option<&str>,
-    ) -> Result<(OwnedFd, u32, Option<String>), MediaError> {
+    ) -> Result<(OwnedFd, u32, Option<(u32, u32)>, Option<String>), MediaError> {
         let proxy = &self.proxy;
         let session = self
             .session
@@ -101,16 +105,24 @@ impl PortalStream {
             .map_err(portal_err("start"))?
             .response()
             .map_err(portal_err("start"))?;
-        let node_id = streams
+        let stream = streams
             .streams()
             .first()
-            .ok_or_else(|| MediaError::Backend("ScreenCast portal returned no stream".into()))?
-            .pipe_wire_node_id();
+            .ok_or_else(|| MediaError::Backend("ScreenCast portal returned no stream".into()))?;
+        let node_id = stream.pipe_wire_node_id();
+        let size = stream
+            .size()
+            .and_then(|(w, h)| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?)));
         let fd = proxy
             .open_pipe_wire_remote(session, OpenPipeWireRemoteOptions::default())
             .await
             .map_err(portal_err("open PipeWire remote"))?;
-        Ok((fd, node_id, streams.restore_token().map(str::to_owned)))
+        Ok((
+            fd,
+            node_id,
+            size,
+            streams.restore_token().map(str::to_owned),
+        ))
     }
 
     pub(crate) async fn close(mut self) {

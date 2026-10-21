@@ -126,12 +126,13 @@ impl CaptureSource for LinuxCaptureSource {
         let (portal, fd) = PortalStream::open(self.sources, self.restore_token.as_deref()).await?;
         // Replaced even by none and even if the pipeline fails: the portal spends the token it was given.
         self.restore_token.clone_from(&portal.restore_token);
-        let node_id = portal.node_id;
+        let (node_id, size) = (portal.node_id, portal.size);
         // The portal moves into the task so a cancelled start cannot end the session under a starting pipeline.
         let (started, pipewire_fd, portal) = tokio::task::spawn_blocking(move || {
             let video = VideoInput::PipeWire {
                 fd: fd.as_raw_fd(),
                 node_id,
+                size,
             };
             (
                 Capture::start(video, audio, &config, &candidates),
