@@ -1,6 +1,7 @@
 //! Server side of DAVE: Discord's MLS external sender plus a simulated participant the client adds.
 
 use std::num::NonZeroU16;
+use std::time::{Duration, Instant};
 
 use davey::{DaveSession, MediaType};
 use openmls::prelude::tls_codec::{
@@ -12,6 +13,9 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 use thiserror::Error;
 
 pub const DAVE_MAGIC: [u8; 2] = [0xFA, 0xFA];
+
+/// How long receivers still accept plaintext after a transition to E2EE (davey's default).
+pub const TRANSITION_EXPIRY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 pub enum DaveServerError {
@@ -43,6 +47,8 @@ pub struct DaveServer {
     external_sender: Vec<u8>,
     participant: Option<DaveSession>,
     next_transition: u16,
+    /// `None` until a transition executes: plaintext is accepted without limit.
+    pub(crate) plaintext_until: Option<Instant>,
 }
 
 impl DaveServer {
@@ -68,6 +74,7 @@ impl DaveServer {
             external_sender,
             participant: None,
             next_transition: 0,
+            plaintext_until: None,
         })
     }
 
@@ -132,6 +139,15 @@ impl DaveServer {
         let mut out = transition_id.to_be_bytes().to_vec();
         out.extend_from_slice(commit);
         Ok((transition_id, out))
+    }
+
+    pub fn execute_transition(&mut self) {
+        let until = Instant::now() + TRANSITION_EXPIRY;
+        self.plaintext_until = Some(self.plaintext_until.map_or(until, |t| t.min(until)));
+    }
+
+    pub fn accepts_plaintext(&self) -> bool {
+        self.plaintext_until.is_none_or(|t| Instant::now() < t)
     }
 
     pub fn is_active(&self) -> bool {

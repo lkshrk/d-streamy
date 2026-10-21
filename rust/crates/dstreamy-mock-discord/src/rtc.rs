@@ -18,10 +18,6 @@ use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
 };
 
-pub const OPUS_PAYLOAD_TYPE: u8 = 120;
-pub const H264_PAYLOAD_TYPE: u8 = 101;
-pub const H265_PAYLOAD_TYPE: u8 = 103;
-
 pub type RtcError = webrtc::Error;
 
 /// Loopback-only ICE over UDPv4; `answerer` makes this side the DTLS server, as Discord is.
@@ -40,6 +36,8 @@ pub fn loopback_settings(answerer: bool) -> SettingEngine {
 /// A webrtc-rs peer standing in for Discord's media server, accepting Opus and `video_codec`; RTP goes to the channel.
 pub async fn answerer_peer(
     video_codec: VideoCodec,
+    audio_payload_type: u8,
+    video_payload_type: u8,
 ) -> Result<(Arc<RTCPeerConnection>, mpsc::UnboundedReceiver<Packet>), RtcError> {
     let mut m = MediaEngine::default();
     // webrtc-rs drops a partially matched H264 (no fmtp in the offer) when another codec matches exactly.
@@ -48,14 +46,14 @@ pub async fn answerer_peer(
             MIME_TYPE_H264,
             90_000,
             0,
-            H264_PAYLOAD_TYPE,
+            video_payload_type,
             RTPCodecType::Video,
         ),
         VideoCodec::H265 => (
             "video/H265",
             90_000,
             0,
-            H265_PAYLOAD_TYPE,
+            video_payload_type,
             RTPCodecType::Video,
         ),
     };
@@ -64,7 +62,7 @@ pub async fn answerer_peer(
             MIME_TYPE_OPUS,
             48_000,
             2,
-            OPUS_PAYLOAD_TYPE,
+            audio_payload_type,
             RTPCodecType::Audio,
         ),
         video,
