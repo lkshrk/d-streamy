@@ -465,13 +465,14 @@ impl Runner {
                         .write()
                         .unwrap_or_else(PoisonError::into_inner) = Some(r.user.clone());
                     self.apply_cache(&name, &data);
-                    if let Some(tx) = self.ready_tx.take() {
-                        let _ = tx.send(Ok(r.user.clone()));
-                    }
+                    // Broadcast before `connect` returns, so later subscribers never see the first READY.
                     self.emit(GatewayEvent::Ready {
-                        user: r.user,
+                        user: r.user.clone(),
                         session_id: r.session_id,
                     });
+                    if let Some(tx) = self.ready_tx.take() {
+                        let _ = tx.send(Ok(r.user));
+                    }
                 }
                 Err(e) => warn!("gateway READY unreadable: {e}"),
             },

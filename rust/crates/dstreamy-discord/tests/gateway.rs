@@ -90,6 +90,22 @@ async fn identify_matches_the_user_client() {
     assert_eq!(conn.closed().await, Some(1000));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn subscribers_made_after_connect_never_see_the_first_ready() {
+    for _ in 0..20 {
+        let server = Server::bind().await;
+        let (client, mut conn) = connect(&server, options(&server.url)).await;
+        let mut events = client.subscribe();
+        conn.dispatch(2, "RESUMED", json!({})).await;
+        let first = wait_for(&mut events, |_| true).await;
+        assert!(
+            !matches!(first, GatewayEvent::Ready { .. }),
+            "first event after connect: {first:?}"
+        );
+        client.close().await;
+    }
+}
+
 #[tokio::test]
 async fn ready_and_guild_dispatches_fill_the_cache() {
     let server = Server::bind().await;
