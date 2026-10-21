@@ -1,0 +1,11 @@
+{"id":"1","cmd":"hello"}
+{"id":"2","cmd":"logged_in"}
+{"id":"3","cmd":"set_token","token":"mock-user-token"}
+{"id":"4","cmd":"logged_in"}
+{"id":"5","cmd":"guilds"}
+{"id":"6","cmd":"channels","guild_id":"200000000000000001"}
+{"id":"7","cmd":"targets"}
+{"id":"8","cmd":"start","guild_id":"200000000000000001","channel_id":"300000000000000001","target":"test-pattern","codec":"h264","fps":15,"resolution":"320x180","bitrate_kbps":1000,"gain":0.5}
+{"id":"9","cmd":"update","fps":30,"resolution":"640x360","bitrate_kbps":1500,"crop":{"x":0,"y":0,"width":640,"height":360}}
+{"id":"10","cmd":"stop"}
+{"id":"11","cmd":"shutdown"}

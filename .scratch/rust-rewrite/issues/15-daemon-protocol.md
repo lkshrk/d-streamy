@@ -15,3 +15,12 @@ Implement the `dstreamy daemon` subcommand exactly as specified in `docs/adr/000
 - Global gates from the PRD.
 
 ## Comments
+- Decision (wire details the ADR leaves open; the ADR's protocol section now lists them):
+  - `id` must be a string. A line without one, or with a non-string one, gets a `malformed` error with `"id":null`, like a line that is not a JSON object or has no string `cmd`.
+  - Error codes: `malformed`, `unknown_cmd`, `invalid_params` (missing or invalid fields, including stream settings and crop), `not_logged_in`, `invalid_token`, `gateway` (any other connection failure), `unknown_guild`, `guild_unavailable`, `unknown_channel`, `no_platform_capture`, `capture` (capture backend errors), `already_running`, `not_running`, `streaming` (`set_token` while a stream is live), `config` (config or token file errors), `internal`. Messages are for humans and may change.
+  - `codec` is `"h264"` or `"h265"` (case-insensitive), `resolution` is `"WIDTHxHEIGHT"` or `"720p"`/`"900p"`/`"1080p"`, `fps` is 15, 30 or 60, `bitrate_kbps` 1000–15000, `gain` 0.0–3.0, the same rules as the CLI flags.
+  - `start` neither reads nor writes `config.toml` `[target]`/`crop`; it only falls back to `[stream]` for missing settings, and never saves the app's choices (the app keeps its own preferences). A Linux portal restore token is still saved, as in the CLI.
+  - `stop` and `update` without a live stream fail with `not_running`. `stop` returns the `stats` of the last `health` event, or all-zero `StreamStats` when none arrived yet.
+  - `event` carries the `SessionEvent` exactly as `stream --json` prints it, so the inner object has its own `"event"` tag: `{"type":"event","event":{"event":"state","state":{"state":"streaming"}}}`.
+  - `hello.platform` is `std::env::consts::OS` (`"macos"` or `"linux"`); `version` is the `dstreamy` crate version.
+  - Commands run concurrently: each is handled on its own task and the reply is written when it finishes, so replies can arrive out of request order. `shutdown`, EOF on stdin, SIGINT and SIGTERM all stop any stream, close the gateway and exit 0; `shutdown`'s `null` reply is written after the stream is stopped.

@@ -1,0 +1,14 @@
+{"type":"error","id":null,"code":"malformed","message":"malformed line: expected value at line 1 column 1"}
+{"type":"error","id":"2","code":"unknown_cmd","message":"unknown command \"bogus\""}
+{"type":"error","id":null,"code":"malformed","message":"malformed line: missing string field \"id\""}
+{"type":"error","id":"4","code":"invalid_params","message":"missing field `guild_id`"}
+{"type":"error","id":"5","code":"not_running","message":"no stream is running"}
+{"type":"error","id":"6","code":"not_running","message":"no stream is running"}
+{"type":"error","id":"7","code":"not_logged_in","message":"not logged in; send set_token first"}
+{"type":"error","id":"8","code":"invalid_token","message":"Discord rejected the token"}
+{"type":"result","id":"9","data":null}
+{"type":"error","id":"10","code":"unknown_guild","message":"unknown guild 999"}
+{"type":"error","id":"11","code":"invalid_params","message":"invalid fps 24: expected 15, 30 or 60"}
+{"type":"error","id":"12","code":"unknown_channel","message":"no voice channel 999 in guild 200000000000000001"}
+{"type":"error","id":"13","code":"invalid_params","message":"invalid crop 0,0,0,10: width and height must be positive"}
+{"type":"result","id":"14","data":null}

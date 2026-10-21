@@ -34,6 +34,8 @@ Commands (app → daemon). Every command has a client-chosen `"id"` (string), ec
 
 Replies: `{"type":"result","id":…,"data":…}` or `{"type":"error","id":…,"code":"<snake_case>","message":"…"}`.
 
+Error codes: `malformed`, `unknown_cmd`, `invalid_params`, `not_logged_in`, `invalid_token`, `gateway`, `unknown_guild`, `guild_unavailable`, `unknown_channel`, `no_platform_capture`, `capture`, `already_running`, `not_running`, `streaming`, `config`, `internal`. `id` must be a string; a line without one is `malformed` with `"id":null`. Replies can arrive out of request order. `stop` and `update` without a live stream fail with `not_running`. Setting values follow the CLI flags (`codec` `"h264"`/`"h265"`, `resolution` `"WIDTHxHEIGHT"` or `"720p"`/`"900p"`/`"1080p"`, `fps` 15/30/60, `bitrate_kbps` 1000–15000, `gain` 0.0–3.0).
+
 Events (daemon → app, unsolicited): `{"type":"event","event":<SessionEvent>}`, using the existing `SessionEvent` serde form (state, health with metrics, channel_moved, resumed, error).
 
 EOF on stdin means the parent is gone: stop any stream and exit. An unknown `cmd` or malformed line returns an error reply (with id `null` when there was none) and keeps the daemon running.
