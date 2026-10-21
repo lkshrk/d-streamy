@@ -33,7 +33,13 @@ struct Cli {
     /// Log more on stderr (-v info, -vv debug)
     #[arg(short, long, global = true, action = ArgAction::Count)]
     verbose: u8,
-    #[arg(long, global = true, hide = true, default_value = DEFAULT_GATEWAY_URL)]
+    #[arg(
+        long,
+        global = true,
+        hide = true,
+        default_value = DEFAULT_GATEWAY_URL,
+        value_parser = discord::gateway_url
+    )]
     gateway_url: String,
     #[command(subcommand)]
     command: Command,
@@ -90,6 +96,16 @@ fn main() -> ExitCode {
     };
     let log_file = matches!(cli.command, Command::Tui { .. }).then(|| tui::log_file(&ctx));
     init_logging(&out, cli.verbose, log_file);
+    let token = match cli.command {
+        Command::Login => match read_token() {
+            Ok(token) => Some(token),
+            Err(e) => {
+                out.error(e);
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => None,
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -100,7 +116,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = runtime.block_on(run(cli.command, &ctx, &out));
+    let result = runtime.block_on(run(cli.command, token, &ctx, &out));
     // Background tasks (webrtc, the gateway) must not keep the process alive after the command.
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     match result {
@@ -157,9 +173,14 @@ fn context(cli: &Cli) -> Result<Ctx, CliError> {
     })
 }
 
-async fn run(command: Command, ctx: &Ctx, out: &Out) -> Result<ExitCode, CliError> {
+async fn run(
+    command: Command,
+    token: Option<String>,
+    ctx: &Ctx,
+    out: &Out,
+) -> Result<ExitCode, CliError> {
     match command {
-        Command::Login => login(ctx, out).await,
+        Command::Login => login(ctx, out, token.ok_or(CliError::EmptyToken)?).await,
         Command::Guilds => guilds(ctx, out).await,
         Command::Channels { guild } => channels(ctx, out, &guild).await,
         Command::Targets { skip_platform } => targets(out, !skip_platform).await,
@@ -200,8 +221,7 @@ struct LoginRow<'a> {
     token_file: &'a std::path::Path,
 }
 
-async fn login(ctx: &Ctx, out: &Out) -> Result<ExitCode, CliError> {
-    let token = read_token()?;
+async fn login(ctx: &Ctx, out: &Out, token: String) -> Result<ExitCode, CliError> {
     let client = discord::connect_with(ctx, token.clone(), Persistence::Brief).await?;
     let user = client.user().clone();
     client.close().await;

@@ -5,6 +5,12 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use clap::Parser;
+use dstreamy_cli::Ctx;
+use dstreamy_cli::output::Out;
+use dstreamy_cli::signals::Signals;
+use dstreamy_cli::stream::{self, StreamArgs};
+use dstreamy_core::ConfigPaths;
 use dstreamy_mock_discord::opcodes::gateway as gw;
 use dstreamy_mock_discord::{
     MOCK_GUILD_ID, MOCK_TEXT_CHANNEL_ID, MOCK_TOKEN, MOCK_USER_ID, MOCK_VOICE_CHANNEL_ID,
@@ -93,6 +99,21 @@ fn stderr_of_failure(cmd: &mut Command) -> String {
     let output = cmd.output().unwrap();
     assert!(!output.status.success());
     String::from_utf8(output.stderr).unwrap()
+}
+
+#[test]
+fn a_remote_gateway_url_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = bare_cmd()
+        .env("DSTREAMY_TOKEN", MOCK_TOKEN)
+        .arg("--config-dir")
+        .arg(dir.path())
+        .args(["--gateway-url", "ws://10.0.0.1:9", "guilds"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("loopback"), "{stderr}");
 }
 
 #[test]
@@ -467,18 +488,35 @@ fn stream_prints_text_by_default() {
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn a_second_sigint_cuts_the_shutdown_short() {
+fn a_second_interrupt_cuts_the_shutdown_short() {
+    #[derive(clap::Parser)]
+    struct Cmd {
+        #[command(flatten)]
+        args: StreamArgs,
+    }
     let h = Harness::new().logged_in();
-    let mut s = Streaming::spawn(&h, &[]);
-    s.lines
-        .until("streaming state", |l| l == "state: streaming");
-    s.sigint();
-    s.stderr.until("stopping note", |l| l.contains("stopping"));
-    s.sigint();
-    let (status, stderr, _) = s.wait();
-    assert!(matches!(status.code(), Some(0 | 130)), "{status}: {stderr}");
+    let ctx = Ctx {
+        paths: ConfigPaths::in_dir(h.config_dir()),
+        gateway_url: h.mock.gateway_url(),
+    };
+    let args = Cmd::parse_from(stream_args(MOCK_VOICE_CHANNEL_ID)).args;
+    let (interrupts, rx) = tokio::sync::mpsc::unbounded_channel();
+    let code = h.rt.block_on(async {
+        let run = tokio::spawn(async move {
+            stream::run_with(&ctx, &Out::new(true), args, || Signals::from_channel(rx)).await
+        });
+        let video = h
+            .mock
+            .wait_for(T, |r| (!r.video.is_empty()).then_some(()))
+            .await;
+        assert!(video.is_some(), "no video reached the mock");
+        interrupts.send(()).unwrap();
+        interrupts.send(()).unwrap();
+        tokio::time::timeout(T, run).await
+    });
+    let code = code.expect("the stream did not end").unwrap().unwrap();
+    assert_eq!(code, std::process::ExitCode::from(stream::FORCED_EXIT));
 }
 
 #[test]
@@ -497,17 +535,20 @@ fn stream_exits_with_failure_when_the_session_stops_by_itself() {
 }
 
 #[test]
-fn stream_rejects_an_unknown_guild_quickly() {
+fn stream_rejects_an_unknown_guild_after_one_identify() {
     let h = Harness::new().logged_in();
     let mut args = stream_args(MOCK_VOICE_CHANNEL_ID);
     args[2] = "999";
-    let started = Instant::now();
+    let identifies = || {
+        h.mock
+            .received_ops()
+            .iter()
+            .filter(|op| op.is(None, gw::OP_IDENTIFY))
+            .count()
+    };
+    let before = identifies();
     let err = stderr_of_failure(h.cmd().args(&args));
     assert!(err.contains("unknown guild 999"), "{err}");
-    assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "{:?}",
-        started.elapsed()
-    );
+    assert_eq!(identifies(), before + 1);
     assert!(h.mock.streams().is_empty());
 }

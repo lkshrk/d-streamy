@@ -25,10 +25,7 @@ impl From<CaptureTarget> for TargetRow {
     fn from(t: CaptureTarget) -> Self {
         Self {
             id: t.id,
-            kind: match t.kind {
-                TargetKind::Display => "display",
-                TargetKind::Window => "window",
-            },
+            kind: kind_label(t.kind),
             title: t.title,
             app: t.app,
             width: t.width,
@@ -37,12 +34,19 @@ impl From<CaptureTarget> for TargetRow {
     }
 }
 
-/// The portal restore token a source holds after its latest start.
+pub const fn kind_label(kind: TargetKind) -> &'static str {
+    match kind {
+        TargetKind::Display => "display",
+        TargetKind::Window => "window",
+    }
+}
+
+/// The portal restore token a source holds after its latest successful start; `None` before one.
 #[derive(Debug, Clone, Default)]
-pub struct PortalToken(Arc<Mutex<Option<String>>>);
+pub struct PortalToken(Arc<Mutex<Option<Option<String>>>>);
 
 impl PortalToken {
-    pub fn get(&self) -> Option<String> {
+    pub fn get(&self) -> Option<Option<String>> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -51,7 +55,7 @@ impl PortalToken {
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set(&self, token: Option<String>) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = token;
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(token);
     }
 }
 
@@ -73,7 +77,6 @@ fn platform_source(
     restore_token: Option<String>,
     token: &PortalToken,
 ) -> Option<Box<dyn CaptureSource>> {
-    token.set(restore_token.clone());
     let inner = dstreamy_capture_linux::LinuxCaptureSource::new().with_restore_token(restore_token);
     Some(Box::new(linux::TokenReporting {
         inner,
@@ -110,8 +113,10 @@ mod linux {
 
         async fn start(&mut self, config: CaptureConfig) -> Result<FrameReceiver, MediaError> {
             let started = self.inner.start(config).await;
-            self.token
-                .set(self.inner.restore_token().map(str::to_owned));
+            if started.is_ok() {
+                self.token
+                    .set(self.inner.restore_token().map(str::to_owned));
+            }
             started
         }
 
@@ -187,7 +192,7 @@ pub fn restore_token(config: &Config) -> Option<String> {
     }
 }
 
-/// Saves the token the portal handed out if it differs from `previous`; true when it saved.
+/// Saves the token the portal reported if it differs from `previous`, clearing a spent one; true when it saved.
 pub fn remember_portal_token(
     paths: &ConfigPaths,
     previous: Option<&str>,
@@ -196,12 +201,12 @@ pub fn remember_portal_token(
     let Some(token) = token.get() else {
         return Ok(false);
     };
-    if previous == Some(token.as_str()) {
+    if previous == token.as_deref() {
         return Ok(false);
     }
     let mut config = Config::load(&paths.config_file)?;
     config.target = Some(dstreamy_core::CaptureTarget::Portal {
-        restore_token: Some(token),
+        restore_token: token,
     });
     config.save(&paths.config_file)?;
     Ok(true)
@@ -221,7 +226,7 @@ impl PortalBook {
     pub fn save(&mut self, paths: &ConfigPaths) -> Result<bool, ConfigError> {
         let saved = remember_portal_token(paths, self.previous.as_deref(), &self.token)?;
         if saved {
-            self.previous = self.token.get();
+            self.previous = self.token.get().flatten();
         }
         Ok(saved)
     }
@@ -262,6 +267,26 @@ mod tests {
         let config = Config::load(&paths.config_file).unwrap();
         assert_eq!(restore_token(&config).as_deref(), Some("abc"));
         assert_eq!(config.stream, Default::default());
+    }
+
+    #[test]
+    fn a_spent_portal_token_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::in_dir(dir.path());
+        let token = PortalToken::default();
+        token.set(Some("old".into()));
+        assert!(remember_portal_token(&paths, None, &token).unwrap());
+
+        token.set(None);
+        assert!(!remember_portal_token(&paths, None, &token).unwrap());
+        assert!(remember_portal_token(&paths, Some("old"), &token).unwrap());
+        let config = Config::load(&paths.config_file).unwrap();
+        assert_eq!(
+            config.target,
+            Some(dstreamy_core::CaptureTarget::Portal {
+                restore_token: None
+            })
+        );
     }
 
     #[test]

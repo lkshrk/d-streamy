@@ -4,10 +4,10 @@ use dstreamy_core::{Codec, Config, CropRect, Fps, HealthLevel, Resolution, Strea
 use dstreamy_discord::{
     Guild, HealthSnapshot, SessionEvent, SessionState, StopReason, VoiceChannel, VoiceChannelKind,
 };
-use dstreamy_media::{CaptureTarget, TargetKind};
+use dstreamy_media::CaptureTarget;
 
 use crate::capture;
-use crate::stream::parse_crop;
+use crate::stream::{self, parse_crop};
 
 const LOG_LINES: usize = 6;
 const BITRATE_STEP: i64 = 500;
@@ -297,9 +297,7 @@ pub fn state_tone(state: &SessionState) -> Tone {
         SessionState::Idle | SessionState::Connecting | SessionState::Reconnecting { .. } => {
             Tone::Warn
         }
-        SessionState::Stopped {
-            reason: StopReason::Requested | StopReason::CaptureEnded,
-        } => Tone::Info,
+        SessionState::Stopped { reason } if stream::stopped_cleanly(reason) => Tone::Info,
         SessionState::Stopped { .. } => Tone::Bad,
     }
 }
@@ -321,14 +319,6 @@ pub struct HealthView {
     pub audio_max: u64,
 }
 
-fn level_name(level: HealthLevel) -> &'static str {
-    match level {
-        HealthLevel::Good => "good",
-        HealthLevel::Warn => "warn",
-        HealthLevel::Bad => "bad",
-    }
-}
-
 impl HealthView {
     pub fn new(snapshot: &HealthSnapshot, target_fps: u32) -> Self {
         let HealthSnapshot {
@@ -343,13 +333,13 @@ impl HealthView {
             video: Score {
                 label: "Video",
                 percent: h.video_score,
-                level: level_name(h.video_level),
+                level: h.video_level.label(),
                 tone: h.video_level.into(),
             },
             audio: Score {
                 label: "Audio",
                 percent: h.audio_score,
-                level: level_name(h.audio_level),
+                level: h.audio_level.label(),
                 tone: h.audio_level.into(),
             },
             rows: vec![
@@ -393,11 +383,7 @@ impl HealthView {
 }
 
 pub fn target_label(t: &CaptureTarget) -> String {
-    let kind = match t.kind {
-        TargetKind::Display => "display",
-        TargetKind::Window => "window",
-    };
-    let mut label = format!("{kind:<7}  {}", t.title);
+    let mut label = format!("{:<7}  {}", capture::kind_label(t.kind), t.title);
     if let Some(app) = &t.app {
         label.push_str(&format!(" ({app})"));
     }
@@ -443,6 +429,14 @@ impl App {
 
     pub fn streaming(&self) -> bool {
         self.live.as_ref().is_some_and(Live::active)
+    }
+
+    pub fn failed(&self) -> bool {
+        let stream_failed = self.live.as_ref().is_some_and(|l| match &l.state {
+            SessionState::Stopped { reason } => !stream::stopped_cleanly(reason),
+            _ => false,
+        });
+        stream_failed || matches!(self.connection, Connection::Failed(_))
     }
 
     pub fn update(&mut self, msg: Msg) -> Option<Effect> {

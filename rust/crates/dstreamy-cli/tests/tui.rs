@@ -1,9 +1,10 @@
+use std::process::ExitCode;
 use std::time::Duration;
 
 use dstreamy_cli::Ctx;
 use dstreamy_cli::tui::model::Key;
 use dstreamy_cli::tui::{Input, Options, drive};
-use dstreamy_core::{Config, ConfigPaths, Fps, Resolution, StreamConfig};
+use dstreamy_core::{Codec, Config, ConfigPaths, Fps, Resolution, StreamConfig};
 use dstreamy_mock_discord::opcodes::gateway as gw;
 use dstreamy_mock_discord::{MOCK_TOKEN, MockDiscord};
 use ratatui::Terminal;
@@ -22,15 +23,20 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
+        Self::with(MOCK_TOKEN, Codec::H264).await
+    }
+
+    async fn with(token: &str, codec: Codec) -> Self {
         let mock = MockDiscord::start().await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let paths = ConfigPaths::in_dir(dir.path());
-        paths.save_token(MOCK_TOKEN).unwrap();
+        paths.save_token(token).unwrap();
         Config {
             stream: StreamConfig {
                 resolution: Resolution::new(320, 180).unwrap(),
                 fps: Fps::Fps15,
                 bitrate_kbps: 1_000,
+                codec,
                 ..StreamConfig::default()
             },
             ..Config::default()
@@ -78,7 +84,10 @@ impl Script {
     }
 }
 
-async fn run_tui<F: Future<Output = ()>>(h: &Harness, script: impl FnOnce(Script) -> F) {
+async fn run_tui<F: Future<Output = ()>>(
+    h: &Harness,
+    script: impl FnOnce(Script) -> F,
+) -> ExitCode {
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
     let (keys, input) = mpsc::unbounded_channel();
     let (screen_tx, screen) = watch::channel(String::new());
@@ -93,14 +102,14 @@ async fn run_tui<F: Future<Output = ()>>(h: &Harness, script: impl FnOnce(Script
     })
     .await
     .expect("the TUI did not finish");
-    result.unwrap();
+    result.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keys_drive_a_test_pattern_stream_from_picker_to_stop() {
     let h = Harness::new().await;
     let mock = &h.mock;
-    run_tui(&h, |mut s| async move {
+    let code = run_tui(&h, |mut s| async move {
         s.until("Mock Guild").await;
         s.press(&[Key::Enter]);
         s.until("Voice channels in Mock Guild").await;
@@ -134,6 +143,7 @@ async fn keys_drive_a_test_pattern_stream_from_picker_to_stop() {
         s.press(&[Key::Char('q')]);
     })
     .await;
+    assert_eq!(code, ExitCode::SUCCESS);
 
     let config = h.config();
     assert_eq!(config.stream.bitrate_kbps, 1_500);
@@ -145,7 +155,7 @@ async fn keys_drive_a_test_pattern_stream_from_picker_to_stop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quitting_while_live_stops_the_stream() {
     let h = Harness::new().await;
-    run_tui(&h, |mut s| async move {
+    let code = run_tui(&h, |mut s| async move {
         s.until("Mock Guild").await;
         s.press(&[Key::Enter]);
         s.until("General").await;
@@ -158,6 +168,7 @@ async fn quitting_while_live_stops_the_stream() {
         s.press(&[Key::Interrupt]);
     })
     .await;
+    assert_eq!(code, ExitCode::SUCCESS);
     let deleted = h.mock.wait_for_op(None, gw::OP_STREAM_DELETE, 0, T).await;
     assert!(deleted.is_some(), "no STREAM_DELETE after quitting");
 }
@@ -165,11 +176,42 @@ async fn quitting_while_live_stops_the_stream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closed_input_quits() {
     let h = Harness::new().await;
-    run_tui(&h, |mut s| async move {
+    let code = run_tui(&h, |mut s| async move {
         s.until("Mock Guild").await;
         drop(s.keys);
     })
     .await;
+    assert_eq!(code, ExitCode::SUCCESS);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_connection_exits_with_failure() {
+    let h = Harness::with("wrong-token", Codec::H264).await;
+    let code = run_tui(&h, |mut s| async move {
+        s.until("connecting to Discord failed").await;
+        s.press(&[Key::Char('q')]);
+    })
+    .await;
+    assert_eq!(code, ExitCode::FAILURE);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_that_stops_by_itself_exits_with_failure() {
+    let h = Harness::with(MOCK_TOKEN, Codec::H265).await;
+    let code = run_tui(&h, |mut s| async move {
+        s.until("Mock Guild").await;
+        s.press(&[Key::Enter]);
+        s.until("General").await;
+        s.press(&[Key::Enter]);
+        s.until("Test pattern").await;
+        s.press(&[Key::Enter]);
+        s.until("Stream settings").await;
+        s.press(&[Key::Enter]);
+        s.until("stream stopped:").await;
+        s.press(&[Key::Char('q')]);
+    })
+    .await;
+    assert_eq!(code, ExitCode::FAILURE);
 }
 
 #[test]

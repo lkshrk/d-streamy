@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use dstreamy_core::Config;
-use dstreamy_discord::{DiscordClient, Session, SessionEvent, SessionOptions, StreamOptions};
+use dstreamy_discord::{DiscordClient, Session, SessionEvent};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -54,7 +54,7 @@ pub async fn run(ctx: &Ctx, opts: Options) -> Result<ExitCode, CliError> {
     let result = drive(&mut terminal, ctx, input, opts, Some(signals), |_| {}).await;
     reader.stop();
     drop(restore);
-    result.map(|()| ExitCode::SUCCESS)
+    result
 }
 
 pub fn log_file(ctx: &Ctx) -> std::path::PathBuf {
@@ -143,7 +143,7 @@ pub async fn drive<B: Backend>(
     opts: Options,
     mut signals: Option<Signals>,
     mut on_draw: impl FnMut(&Terminal<B>),
-) -> Result<(), CliError>
+) -> Result<ExitCode, CliError>
 where
     B::Error: Display,
 {
@@ -252,7 +252,7 @@ where
                             }));
                         }
                     }
-                    Some(Input::Key(Key::Interrupt)) = input.recv() => break Ok(()),
+                    () = next_interrupt(&mut input) => break Ok(()),
                     () = next_signal(&mut signals) => break Ok(()),
                 }
             }
@@ -262,18 +262,12 @@ where
 
     if let Some(mut signals) = signals.take() {
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    () = signals.recv() => break,
-                    key = input.recv() => match key {
-                        Some(Input::Key(Key::Interrupt)) => break,
-                        Some(_) => {}
-                        None => std::future::pending().await,
-                    },
-                }
+            tokio::select! {
+                () = signals.recv() => {}
+                () = next_interrupt(&mut input) => {}
             }
             ratatui::restore();
-            std::process::exit(FORCED_EXIT);
+            std::process::exit(i32::from(FORCED_EXIT));
         });
     }
     if app.streaming() {
@@ -286,18 +280,27 @@ where
     for task in tasks {
         task.abort();
     }
-    if let Some(mut l) = live.take() {
-        let portal = l.portal.take();
-        l.session.shutdown().await;
-        drop(l.events);
-        stream::close(l.client).await;
+    if let Some(Live {
+        client,
+        session,
+        portal,
+        ..
+    }) = live.take()
+    {
+        stream::teardown(session, client).await;
         if let Some(mut book) = portal
             && let Err(e) = book.save(&ctx.paths)
         {
             tracing::warn!("saving the portal restore token: {e}");
         }
     }
-    result
+    result.map(|()| {
+        if app.failed() {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        }
+    })
 }
 
 fn render<B: Backend>(
@@ -319,6 +322,17 @@ async fn next_event(live: &mut Option<Live>) -> Result<SessionEvent, RecvError> 
     match live {
         Some(l) => l.events.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Skips other keys; a closed input never interrupts.
+async fn next_interrupt(input: &mut mpsc::UnboundedReceiver<Input>) {
+    loop {
+        match input.recv().await {
+            Some(Input::Key(Key::Interrupt)) => return,
+            Some(_) => {}
+            None => std::future::pending().await,
+        }
     }
 }
 
@@ -363,15 +377,15 @@ async fn start(
         .map_err(|e| e.to_string())?;
     let capture = stream::capture_config(&request.target_id, &request.stream, request.crop);
     l.portal = Some(PortalBook::new(restore_token, picked.portal_token));
-    l.session
-        .start(
-            Some(request.guild_id),
-            request.channel_id,
-            picked.source,
-            SessionOptions::new(StreamOptions::new(capture)),
-        )
-        .await
-        .map_err(|e| e.error.to_string())
+    stream::start(
+        &l.session,
+        request.guild_id,
+        request.channel_id,
+        picked.source,
+        capture,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// A saved portal restore token is kept while the portal target stays selected.

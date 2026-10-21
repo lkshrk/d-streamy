@@ -1,7 +1,9 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use dstreamy_discord::{DiscordClient, GatewayEvent, GatewayOptions, Guild, VoiceChannel};
+use dstreamy_discord::{
+    DEFAULT_GATEWAY_URL, DiscordClient, GatewayEvent, GatewayOptions, Guild, VoiceChannel,
+};
 use secrecy::SecretString;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Instant, timeout_at};
@@ -42,6 +44,15 @@ pub async fn connect_with(
         streamer.set_setting_engine(loopback_settings());
     }
     Ok(client)
+}
+
+/// Only the Discord gateway or a loopback mock may receive the token.
+pub fn gateway_url(url: &str) -> Result<String, String> {
+    if url == DEFAULT_GATEWAY_URL || is_loopback(url) {
+        Ok(url.to_owned())
+    } else {
+        Err("only the Discord gateway or a loopback address is allowed".to_owned())
+    }
 }
 
 /// A loopback gateway is a local mock, whose media server only offers loopback candidates.
@@ -87,17 +98,19 @@ pub async fn guilds(client: &DiscordClient) -> Vec<Guild> {
     settle(client, |guilds| guilds.iter().all(|g| g.available)).await
 }
 
+/// An unknown guild is settled once no guild is still unavailable, so it fails without waiting.
+fn guild_settled(guilds: &[Guild], guild_id: &str) -> bool {
+    match guilds.iter().find(|g| g.id == guild_id) {
+        Some(g) => g.available,
+        None => guilds.iter().all(|g| g.available),
+    }
+}
+
 pub async fn voice_channels(
     client: &DiscordClient,
     guild_id: &str,
 ) -> Result<Vec<VoiceChannel>, CliError> {
-    let guilds = settle(client, |guilds| {
-        match guilds.iter().find(|g| g.id == guild_id) {
-            Some(g) => g.available,
-            None => guilds.iter().all(|g| g.available),
-        }
-    })
-    .await;
+    let guilds = settle(client, |guilds| guild_settled(guilds, guild_id)).await;
     match guilds.iter().find(|g| g.id == guild_id) {
         Some(g) if g.available => Ok(client.voice_channels(guild_id)),
         Some(_) => Err(CliError::GuildUnavailable(guild_id.to_owned())),
@@ -120,6 +133,44 @@ mod tests {
         }
         for url in ["wss://gateway.discord.gg", "ws://10.0.0.1:1", "not a url"] {
             assert!(!is_loopback(url), "{url}");
+        }
+    }
+
+    fn guild(id: &str, available: bool) -> Guild {
+        Guild {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            available,
+        }
+    }
+
+    #[test]
+    fn guild_lookups_settle_as_soon_as_the_answer_is_known() {
+        let ready = [guild("a", true), guild("b", true)];
+        assert!(guild_settled(&ready, "a"));
+        assert!(guild_settled(&ready, "unknown"));
+        let pending = [guild("a", true), guild("b", false)];
+        assert!(guild_settled(&pending, "a"));
+        assert!(!guild_settled(&pending, "b"));
+        assert!(!guild_settled(&pending, "unknown"));
+    }
+
+    #[test]
+    fn only_discord_or_loopback_gateways_get_the_token() {
+        for url in [
+            DEFAULT_GATEWAY_URL,
+            "ws://127.0.0.1:1234",
+            "ws://localhost:1",
+        ] {
+            assert_eq!(gateway_url(url).as_deref(), Ok(url));
+        }
+        for url in [
+            "ws://gateway.discord.gg",
+            "wss://gateway.discord.gg.evil.example",
+            "wss://10.0.0.1",
+            "not a url",
+        ] {
+            assert!(gateway_url(url).is_err(), "{url}");
         }
     }
 }

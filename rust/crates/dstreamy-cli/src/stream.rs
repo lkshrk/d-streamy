@@ -3,11 +3,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Args;
-use dstreamy_core::{Codec, Config, CropRect, Fps, HealthLevel, Resolution, StreamConfig};
+use dstreamy_core::{Codec, Config, CropRect, Fps, Resolution, StreamConfig};
 use dstreamy_discord::{
     DiscordClient, Session, SessionEvent, SessionOptions, SessionState, StopReason, StreamOptions,
 };
-use dstreamy_media::{CaptureConfig, VideoCodec};
+use dstreamy_media::{CaptureConfig, CaptureSource, VideoCodec};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 
@@ -18,7 +18,7 @@ use crate::{CliError, Ctx, capture};
 
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Exit status after a second interrupt cut the shutdown short, as for a shell's SIGINT.
-pub const FORCED_EXIT: i32 = 130;
+pub const FORCED_EXIT: u8 = 130;
 
 #[derive(Debug, Args)]
 pub struct StreamArgs {
@@ -58,8 +58,9 @@ pub fn parse_crop(s: &str) -> Result<CropRect, String> {
         .collect::<Result<_, _>>()
         .map_err(|e| format!("{e}"))?;
     match parts[..] {
-        [x, y, w, h] if w > 0 && h > 0 => Ok(CropRect::new(x, y, w, h)),
-        [_, _, _, _] => Err("width and height must be positive".to_owned()),
+        [x, y, w, h] => CropRect::new(x, y, w, h)
+            .validate()
+            .map_err(|e| e.to_string()),
         _ => Err("expected four numbers X,Y,W,H".to_owned()),
     }
 }
@@ -125,6 +126,16 @@ enum Outcome {
 }
 
 pub async fn run(ctx: &Ctx, out: &Out, args: StreamArgs) -> Result<ExitCode, CliError> {
+    run_with(ctx, out, args, Signals::new).await
+}
+
+/// `signals` is called once the stream is live, so an earlier Ctrl-C still kills the process.
+pub async fn run_with(
+    ctx: &Ctx,
+    out: &Out,
+    args: StreamArgs,
+    signals: impl FnOnce() -> Signals,
+) -> Result<ExitCode, CliError> {
     let config = Config::load(&ctx.paths.config_file)?;
     let stream = args.stream_config(config.stream)?;
     let capture = args.capture_config(&stream, args.crop.or(config.crop));
@@ -152,17 +163,12 @@ pub async fn run(ctx: &Ctx, out: &Out, args: StreamArgs) -> Result<ExitCode, Cli
 
     let session = Session::new(client.clone());
     let mut events = session.subscribe();
-    let options = SessionOptions::new(StreamOptions::new(capture));
-    if let Err(e) = session
-        .start(Some(args.guild), args.channel, source, options)
-        .await
-    {
-        session.shutdown().await;
-        close(client).await;
-        return Err(CliError::Session(e.error.to_string()));
+    if let Err(e) = start(&session, args.guild, args.channel, source, capture).await {
+        teardown(session, client).await;
+        return Err(e);
     }
 
-    let mut signals = Signals::new();
+    let mut signals = signals();
     let outcome = loop {
         tokio::select! {
             () = signals.recv() => break Outcome::Interrupted,
@@ -187,18 +193,20 @@ pub async fn run(ctx: &Ctx, out: &Out, args: StreamArgs) -> Result<ExitCode, Cli
         }
     };
 
-    tokio::spawn(async move {
-        signals.recv().await;
-        std::process::exit(FORCED_EXIT);
-    });
     if !out.json {
         out.note("stopping…");
     }
-    session.shutdown().await;
+    let forced = tokio::select! {
+        biased;
+        () = signals.recv() => true,
+        () = teardown(session, client) => false,
+    };
+    if forced {
+        return Ok(ExitCode::from(FORCED_EXIT));
+    }
     while let Ok(event) = events.try_recv() {
         print_event(out, &event);
     }
-    close(client).await;
     if let Err(e) =
         capture::remember_portal_token(&ctx.paths, restore_token.as_deref(), &portal_token)
     {
@@ -206,15 +214,33 @@ pub async fn run(ctx: &Ctx, out: &Out, args: StreamArgs) -> Result<ExitCode, Cli
     }
 
     match outcome {
-        Outcome::Interrupted
-        | Outcome::Stopped(StopReason::Requested | StopReason::CaptureEnded) => {
-            Ok(ExitCode::SUCCESS)
+        Outcome::Stopped(reason) if !stopped_cleanly(&reason) => {
+            Err(CliError::Stopped(reason.to_string()))
         }
-        Outcome::Stopped(reason) => Err(CliError::Stopped(reason.to_string())),
+        Outcome::Interrupted | Outcome::Stopped(_) => Ok(ExitCode::SUCCESS),
     }
 }
 
-pub async fn close(client: Arc<DiscordClient>) {
+pub async fn start(
+    session: &Session,
+    guild: String,
+    channel: String,
+    source: Box<dyn CaptureSource>,
+    capture: CaptureConfig,
+) -> Result<(), CliError> {
+    let options = SessionOptions::new(StreamOptions::new(capture));
+    session
+        .start(Some(guild), channel, source, options)
+        .await
+        .map_err(|e| CliError::Session(e.error.to_string()))
+}
+
+pub async fn teardown(session: Session, client: Arc<DiscordClient>) {
+    session.shutdown().await;
+    close(client).await;
+}
+
+async fn close(client: Arc<DiscordClient>) {
     match Arc::try_unwrap(client) {
         Ok(client) => {
             let _ = timeout(CLOSE_TIMEOUT, client.close()).await;
@@ -223,12 +249,8 @@ pub async fn close(client: Arc<DiscordClient>) {
     }
 }
 
-fn level(level: HealthLevel) -> &'static str {
-    match level {
-        HealthLevel::Good => "good",
-        HealthLevel::Warn => "warn",
-        HealthLevel::Bad => "bad",
-    }
+pub fn stopped_cleanly(reason: &StopReason) -> bool {
+    matches!(reason, StopReason::Requested | StopReason::CaptureEnded)
 }
 
 fn print_event(out: &Out, event: &SessionEvent) {
@@ -242,9 +264,9 @@ fn print_event(out: &Out, event: &SessionEvent) {
             "{} fps  {} kbps  video {} ({})  audio {} ({})  dropped {}  viewer keyframe requests {}",
             h.metrics.fps,
             h.metrics.bitrate_kbps,
-            level(h.health.video_level),
+            h.health.video_level.label(),
             h.health.video_score,
-            level(h.health.audio_level),
+            h.health.audio_level.label(),
             h.health.audio_score,
             h.stats.video_frames_dropped,
             h.stats.viewer_keyframe_requests,
