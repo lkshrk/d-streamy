@@ -2,7 +2,8 @@ mod common;
 
 use common::{annexb, answer_like_discord, fake_discord_peer, loopback_settings};
 use discord_stream_rs::voice::VideoAttributes;
-use discord_stream_rs::{GatewayEvent, GatewayPayload, Streamer, VoiceEvent};
+use discord_stream_rs::voice::connection::ConnectionError;
+use discord_stream_rs::{GatewayEvent, GatewayPayload, Streamer, StreamerError, VoiceEvent};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -289,4 +290,48 @@ async fn missing_heartbeat_acks_trigger_resume() {
     let mut ws = accept(&listener).await;
     assert_eq!(recv_op(&mut ws, 7).await["session_id"], "sess");
     silent.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unusable_dave_channel_ids_fail_the_connection() {
+    let (gw_tx, mut gw_rx) = mpsc::unbounded_channel();
+    let mut streamer = Streamer::new("42".into(), gw_tx);
+    let mut voice = streamer.join_voice(Some("100".into()), "general".into());
+    assert!(matches!(
+        voice.ready().await,
+        Err(StreamerError::Connection(
+            ConnectionError::InvalidChannelId(_)
+        ))
+    ));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let _voice = streamer.join_voice(Some("100".into()), "200".into());
+    gateway_op(&mut gw_rx).await;
+    streamer.handle_event(dispatch(
+        "VOICE_STATE_UPDATE",
+        json!({ "user_id": "42", "session_id": "sess" }),
+    ));
+    let mut stream = streamer.create_stream().unwrap();
+    for rtc_server_id in ["0", "555"] {
+        streamer.handle_event(dispatch(
+            "STREAM_CREATE",
+            json!({ "stream_key": "guild:100:200:42", "rtc_server_id": rtc_server_id }),
+        ));
+    }
+    streamer.handle_event(dispatch(
+        "STREAM_SERVER_UPDATE",
+        json!({ "stream_key": "guild:100:200:42", "endpoint": endpoint, "token": "stok" }),
+    ));
+    assert!(matches!(
+        stream.ready().await,
+        Err(StreamerError::Connection(
+            ConnectionError::InvalidChannelId(_)
+        ))
+    ));
+    assert!(
+        timeout(Duration::from_millis(300), listener.accept())
+            .await
+            .is_err()
+    );
 }

@@ -7,7 +7,7 @@ use crate::voice::connection::{
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-use tracing::debug;
+use tracing::{debug, warn};
 use webrtc::api::setting_engine::SettingEngine;
 
 #[derive(Debug, Error)]
@@ -187,12 +187,21 @@ impl Streamer {
         self.leave_voice_connections();
         let (event_tx, events) = mpsc::unbounded_channel();
         let (ready_tx, ready) = oneshot::channel();
-        let conn = VoiceConnection::new(
+        let conn = match VoiceConnection::new(
             guild_id.clone(),
             channel_id.clone(),
             self.user_id.clone(),
             event_tx,
-        );
+        ) {
+            Ok(conn) => conn,
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return PendingConnection {
+                    ready: Some(ready),
+                    events,
+                };
+            }
+        };
         let slot = Slot::new(conn, ready_tx);
         self.voice = Some(VoiceState {
             guild_id,
@@ -276,6 +285,10 @@ impl Streamer {
                 if !stream.matches(&d.stream_key, &user_id) || stream.slot.is_some() {
                     return;
                 }
+                // Without a sender and a slot, an earlier STREAM_CREATE for this stream failed.
+                let Some(ready_tx) = stream.ready_tx.take() else {
+                    return;
+                };
                 let conn = VoiceConnection::new_stream(
                     stream.guild_id.clone(),
                     stream.channel_id.clone(),
@@ -283,10 +296,14 @@ impl Streamer {
                     d.rtc_server_id,
                     stream.event_tx.clone(),
                 );
-                let ready_tx = stream
-                    .ready_tx
-                    .take()
-                    .unwrap_or_else(|| oneshot::channel().0);
+                let conn = match conn {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        warn!("Gateway: STREAM_CREATE rejected: {e}");
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
                 let mut slot = Slot::new(conn, ready_tx);
                 slot.set_session(stream.session_id.clone());
                 if let Some((endpoint, token)) = stream.endpoint.take() {

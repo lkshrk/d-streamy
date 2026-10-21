@@ -52,6 +52,8 @@ pub enum ConnectionError {
     Closed,
     #[error("Not connected")]
     NotConnected,
+    #[error("Invalid DAVE channel id from {0:?}")]
+    InvalidChannelId(String),
 }
 
 /// The WebRTC + SSRC parameters received in the Ready message.
@@ -312,14 +314,18 @@ impl VoiceConnection {
         channel_id: String,
         bot_id: String,
         event_tx: mpsc::UnboundedSender<VoiceEvent>,
-    ) -> Self {
-        Self::with_kind(
+    ) -> Result<Self, ConnectionError> {
+        let dave_channel = channel_id
+            .parse()
+            .map_err(|_| ConnectionError::InvalidChannelId(channel_id.clone()))?;
+        Ok(Self::with_kind(
             ConnectionKind::Voice,
+            dave_channel,
             guild_id,
             channel_id,
             bot_id,
             event_tx,
-        )
+        ))
     }
 
     pub fn new_stream(
@@ -328,28 +334,28 @@ impl VoiceConnection {
         bot_id: String,
         rtc_server_id: String,
         event_tx: mpsc::UnboundedSender<VoiceEvent>,
-    ) -> Self {
-        Self::with_kind(
+    ) -> Result<Self, ConnectionError> {
+        let dave_channel = dave_channel_id(&rtc_server_id)
+            .ok_or_else(|| ConnectionError::InvalidChannelId(rtc_server_id.clone()))?;
+        Ok(Self::with_kind(
             ConnectionKind::Stream { rtc_server_id },
+            dave_channel,
             guild_id,
             channel_id,
             bot_id,
             event_tx,
-        )
+        ))
     }
 
     fn with_kind(
         kind: ConnectionKind,
+        dave_channel: u64,
         guild_id: Option<String>,
         channel_id: String,
         bot_id: String,
         event_tx: mpsc::UnboundedSender<VoiceEvent>,
     ) -> Self {
         let user_id: u64 = bot_id.parse().unwrap_or(0);
-        let dave_channel = match &kind {
-            ConnectionKind::Voice => channel_id.parse().unwrap_or(0),
-            ConnectionKind::Stream { rtc_server_id } => dave_channel_id(rtc_server_id).unwrap_or(0),
-        };
         let dave = Arc::new(StdMutex::new(DaveHandler::new(user_id, dave_channel)));
         Self {
             kind,
@@ -1021,7 +1027,7 @@ mod tests {
 
     fn conn() -> VoiceConnection {
         let (tx, _rx) = mpsc::unbounded_channel();
-        VoiceConnection::new(Some("1".into()), "2".into(), "3".into(), tx)
+        VoiceConnection::new(Some("1".into()), "2".into(), "3".into(), tx).unwrap()
     }
 
     #[test]
@@ -1035,9 +1041,22 @@ mod tests {
     fn stream_identifies_with_rtc_server_id() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let c =
-            VoiceConnection::new_stream(Some("1".into()), "2".into(), "3".into(), "999".into(), tx);
+            VoiceConnection::new_stream(Some("1".into()), "2".into(), "3".into(), "999".into(), tx)
+                .unwrap();
         let v: Value = serde_json::from_str(&c.build_identify()).unwrap();
         assert_eq!(v["d"]["server_id"], "999");
+    }
+
+    #[test]
+    fn unusable_dave_channel_ids_are_rejected() {
+        for id in ["0", "x"] {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let c = VoiceConnection::new_stream(None, "2".into(), "3".into(), id.into(), tx);
+            assert!(matches!(c, Err(ConnectionError::InvalidChannelId(_))));
+        }
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let c = VoiceConnection::new(None, "x".into(), "3".into(), tx);
+        assert!(matches!(c, Err(ConnectionError::InvalidChannelId(_))));
     }
 
     #[test]
