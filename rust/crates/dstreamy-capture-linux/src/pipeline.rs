@@ -502,7 +502,20 @@ fn build(
     chain.push(capsfilter(parsed_caps(config.codec))?);
     let sink = video_sink(config.codec, output.clone());
     chain.push(sink.clone().upcast());
-    link_chain(&pipeline, &chain)?;
+    let size_hint = match video {
+        VideoInput::PipeWire { size, .. } => *size,
+        #[cfg(test)]
+        VideoInput::Test { .. } => None,
+    };
+    if let Err(e) = link_chain(&pipeline, &chain) {
+        // A crop larger than fixed source caps already fails here, at link time.
+        if let Some(crop) = config.crop
+            && let Some((width, height)) = fixed_source_size(&video_source).or(size_hint)
+        {
+            check_crop_fits(crop, width, height)?;
+        }
+        return Err(e);
+    }
 
     let mut audio_chain = Vec::new();
     if let Some(input) = audio {
@@ -517,11 +530,6 @@ fn build(
         ];
         link_chain(&pipeline, &audio_chain)?;
     }
-    let size_hint = match video {
-        VideoInput::PipeWire { size, .. } => *size,
-        #[cfg(test)]
-        VideoInput::Test { .. } => None,
-    };
     Ok(Built {
         pipeline,
         video_source,
@@ -632,7 +640,10 @@ impl Capture {
         spec: &EncoderSpec,
         output: Arc<Output>,
     ) -> Result<Self, StartError> {
-        let built = build(video, audio, config, spec, &output).map_err(StartError::Retry)?;
+        let built = build(video, audio, config, spec, &output).map_err(|e| match e {
+            MediaError::InvalidConfig(_) => StartError::Fatal(e),
+            e => StartError::Retry(e),
+        })?;
         let mut capture = Self {
             pipeline: built.pipeline.clone(),
             video_sink: built.video_sink.clone(),
