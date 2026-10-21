@@ -172,6 +172,19 @@ impl MockDiscord {
         None
     }
 
+    /// Send a viewer PLI for the video SSRC of every peer connection of `kind`.
+    pub async fn send_pli(&self, kind: VoiceKind) -> bool {
+        let conns: Vec<_> = self.shared.state().voice_conns.values().cloned().collect();
+        let mut sent = false;
+        for conn in conns {
+            let c = conn.lock().await;
+            if c.kind == kind {
+                sent |= c.send_pli().await;
+            }
+        }
+        sent
+    }
+
     /// Close the voice WebSocket of `kind`; `None` drops TCP without a close frame. The connection stays resumable.
     pub fn drop_voice(&self, kind: VoiceKind, close_code: Option<u16>) -> bool {
         let state = self.shared.state();

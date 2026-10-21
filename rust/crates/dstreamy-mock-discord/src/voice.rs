@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, accept_async};
 use tracing::{debug, warn};
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 
 use crate::dave::DaveServer;
 use crate::depacketize::VideoCodec;
@@ -77,6 +78,17 @@ impl VoiceConn {
         lock_dave(&self.dave)
             .as_ref()
             .and_then(DaveServer::privacy_code)
+    }
+
+    pub(crate) async fn send_pli(&self) -> bool {
+        let Some((pc, _)) = &self.peer else {
+            return false;
+        };
+        let pli = PictureLossIndication {
+            sender_ssrc: 0,
+            media_ssrc: self.video_ssrc,
+        };
+        pc.write_rtcp(&[Box::new(pli)]).await.is_ok()
     }
 
     pub(crate) async fn close_peer(&mut self) {
