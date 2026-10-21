@@ -2,6 +2,14 @@ import XCTest
 @testable import DStreamyApp
 
 final class DaemonClientTests: XCTestCase {
+    private func capture<T>(_ body: () async throws -> T) async -> Result<T, Error> {
+        do {
+            return .success(try await body())
+        } catch {
+            return .failure(error)
+        }
+    }
+
     private func shell(_ script: String) -> DaemonClient {
         DaemonClient(executableURL: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", script])
     }
@@ -28,8 +36,8 @@ final class DaemonClientTests: XCTestCase {
         try client.launch()
         defer { client.terminate() }
 
-        async let first = Result { try await client.request(.loggedIn, as: LoggedInInfo.self, timeout: .seconds(5)) }
-        async let second = Result { try await client.request(.loggedIn, as: LoggedInInfo.self, timeout: .seconds(5)) }
+        async let first = capture { try await client.request(.loggedIn, as: LoggedInInfo.self, timeout: .seconds(5)) }
+        async let second = capture { try await client.request(.loggedIn, as: LoggedInInfo.self, timeout: .seconds(5)) }
         let results = await [first, second]
 
         XCTAssertEqual(results.compactMap { try? $0.get() }, [LoggedInInfo(loggedIn: false)])
