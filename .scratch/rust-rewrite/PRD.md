@@ -9,7 +9,7 @@ See `docs/adr/0001-rust-rewrite.md` for the decision. This PRD is written for **
 ## Non-goals
 
 - Windows (keep the traits open for it, but don't implement it).
-- A GUI or tray. The core exposes a `Session` API so one can be added later.
+- A Linux GUI or tray. On macOS the existing SwiftUI menu bar app stays as a frontend over `dstreamy daemon` (ADR 0003).
 - Bot-account support.
 
 ## Workspace layout (`rust/`)
@@ -66,4 +66,4 @@ These are collected in `MANUAL-CHECKLIST.md` and never block other issues.
 - macOS Screen Recording permission plus a real ScreenCaptureKit capture.
 - The Wayland portal dialog and real PipeWire capture on a Linux desktop.
 - Hardware encoders (VA-API, NVENC) on real GPUs.
-- Final removal of the Swift and Bun code.
+- Final removal of the Bun daemon and Swift capture library (the SwiftUI app stays, ADR 0003).
