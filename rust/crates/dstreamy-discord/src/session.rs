@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dstreamy_core::{MetricsSampler, PipelineStats, StreamHealth, StreamMetrics};
-use dstreamy_media::CaptureSource;
+use dstreamy_media::{CaptureConfig, CaptureSource};
 use rand::Rng;
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -165,6 +165,8 @@ pub enum SessionError {
     NotRunning,
     #[error("the session task has ended")]
     Gone,
+    #[error("changing the codec needs a new stream")]
+    CodecChange,
     #[error(transparent)]
     Stream(#[from] StreamError),
 }
@@ -203,6 +205,10 @@ enum Command {
     },
     UpdateVideo {
         attrs: VideoAttributes,
+        reply: Reply<Result<(), SessionError>>,
+    },
+    Reconfigure {
+        capture: Box<CaptureConfig>,
         reply: Reply<Result<(), SessionError>>,
     },
     RequestKeyframe,
@@ -310,6 +316,16 @@ impl Session {
         let _ = self.commands.send(Command::RequestKeyframe);
     }
 
+    /// Restarts the source with `capture` inside the live Go Live, or on the next connection while reconnecting.
+    pub async fn reconfigure(&self, capture: CaptureConfig) -> Result<(), SessionError> {
+        let (reply, rx) = oneshot::channel();
+        let capture = Box::new(capture);
+        self.commands
+            .send(Command::Reconfigure { capture, reply })
+            .map_err(|_| SessionError::Gone)?;
+        rx.await.map_err(|_| SessionError::Gone)?
+    }
+
     /// Stops any stream and waits for the supervisor task to end.
     pub async fn shutdown(self) -> Option<Box<dyn CaptureSource>> {
         let source = self.stop().await.ok().flatten();
@@ -365,7 +381,7 @@ impl Actor {
                         self.retained = source;
                     }
                 }
-                Command::UpdateVideo { reply, .. } => {
+                Command::UpdateVideo { reply, .. } | Command::Reconfigure { reply, .. } => {
                     let _ = reply.send(Err(SessionError::NotRunning));
                 }
                 Command::RequestKeyframe => {}
@@ -439,6 +455,8 @@ struct Run {
     voice: Option<(MediaConnection, Events)>,
     stream: Option<(MediaConnection, Events)>,
     pump: Option<MediaPump>,
+    /// The pump runs an older capture config and restarts on the next connection.
+    reconfigure_pending: bool,
     sampler: MetricsSampler,
     history: Vec<StreamMetrics>,
 }
@@ -460,6 +478,7 @@ impl Run {
             voice: None,
             stream: None,
             pump: None,
+            reconfigure_pending: false,
             sampler: MetricsSampler::new(),
             history: Vec::new(),
         }
@@ -494,6 +513,35 @@ impl Run {
                             pump.request_keyframe();
                         }
                     }
+                    Some(Command::Reconfigure { capture, reply }) => {
+                        if capture.codec != self.options.stream.capture.codec {
+                            let _ = reply.send(Err(SessionError::CodecChange));
+                            continue;
+                        }
+                        self.options.stream.capture = *capture;
+                        self.attrs = initial_attributes(&self.options.stream);
+                        let live = match (&phase, &self.stream) {
+                            (Phase::Streaming, Some((conn, _))) if self.pump.is_some() => Some(conn.clone()),
+                            _ => None,
+                        };
+                        let Some(conn) = live else {
+                            self.reconfigure_pending = self.pump.is_some();
+                            let _ = reply.send(Ok(()));
+                            continue;
+                        };
+                        match self.restart_pump(conn).await {
+                            Ok(()) => {
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err((src, e)) => {
+                                source = src;
+                                let message = e.to_string();
+                                actor.error(format!("capture source failed to restart: {message}"), true);
+                                let _ = reply.send(Err(SessionError::Stream(e)));
+                                break (StopReason::SourceFailed { message }, None, false);
+                            }
+                        }
+                    }
                 },
                 step = advance(&mut phase) => match step {
                     Step::Due { redo, attempt } => {
@@ -512,6 +560,14 @@ impl Run {
                                 actor.error(format!("announcing video attributes: {e}"), false);
                             }
                             match self.pump.as_ref() {
+                                Some(_) if self.reconfigure_pending => {
+                                    if let Err((src, e)) = self.restart_pump(conn).await {
+                                        source = src;
+                                        let message = e.to_string();
+                                        actor.error(format!("capture source failed to restart: {message}"), true);
+                                        break (StopReason::SourceFailed { message }, None, false);
+                                    }
+                                }
                                 Some(pump) => {
                                     pump.attach(conn);
                                     pump.take_frame_intervals();
@@ -759,6 +815,47 @@ impl Run {
             }
             _ => None,
         }
+    }
+
+    /// Restarts the source with the current capture config on `conn`, continuing the pump's timeline.
+    async fn restart_pump(
+        &mut self,
+        conn: MediaConnection,
+    ) -> Result<(), (Option<Box<dyn CaptureSource>>, StreamError)> {
+        self.reconfigure_pending = false;
+        let Some(pump) = self.pump.take() else {
+            return Ok(());
+        };
+        let (source, resume, stopped) = pump.stop_resumable().await;
+        if let Err(e) = stopped {
+            warn!(%e, "stopping the capture source for a restart");
+        }
+        let Some(source) = source else {
+            return Err((
+                None,
+                StreamError::Timeout("handing back the capture source"),
+            ));
+        };
+        let start = MediaPump::start_resumed(
+            source,
+            &self.options.stream,
+            Some(conn.clone()),
+            Some(resume),
+        );
+        let pump = match timeout(self.options.stream.step_timeout, start).await {
+            Ok(Ok(pump)) => pump,
+            Ok(Err((source, e))) => return Err((Some(source), e)),
+            // The source is lost with the cancelled start.
+            Err(_) => return Err((None, StreamError::Timeout("restarting the capture source"))),
+        };
+        if let Err(e) = conn.set_video_attributes(Some(self.attrs)) {
+            warn!(%e, "announcing video attributes after a restart");
+        }
+        pump.request_keyframe();
+        pump.take_frame_intervals();
+        self.sampler.reset();
+        self.pump = Some(pump);
+        Ok(())
     }
 
     fn is_other_session(&self, state: &VoiceState) -> bool {

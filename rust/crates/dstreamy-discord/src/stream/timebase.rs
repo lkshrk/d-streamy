@@ -36,6 +36,16 @@ impl Timebase {
         }
     }
 
+    /// Continues a timeline that last mapped a frame at `last_us`, one frame step later.
+    pub fn continuing(fps: u32, last_us: u64) -> Self {
+        let mut timebase = Self::new(fps);
+        let start = i64::try_from(last_us)
+            .unwrap_or(i64::MAX)
+            .saturating_add(timebase.video_step_us);
+        timebase.offset = [start; 2];
+        timebase
+    }
+
     pub fn set_fps(&mut self, fps: u32) {
         self.video_step_us = step_for(fps);
     }
@@ -137,6 +147,14 @@ mod tests {
         assert_eq!(us(tb.map(Track::Audio, 5_020_000)), 5_020_000);
         assert_eq!(us(tb.map(Track::Video, 33_333)), 5_066_666);
         assert_eq!(us(tb.map(Track::Audio, 5_040_000)), 5_040_000);
+    }
+
+    #[test]
+    fn a_continued_timeline_starts_one_step_after_the_last_frame() {
+        let mut tb = Timebase::continuing(30, 9_000_000);
+        assert_eq!(us(tb.map(Track::Video, 123_000)), 9_033_333);
+        assert_eq!(us(tb.map(Track::Audio, 123_000)), 9_033_333);
+        assert_eq!(us(tb.map(Track::Video, 156_333)), 9_066_666);
     }
 
     #[test]

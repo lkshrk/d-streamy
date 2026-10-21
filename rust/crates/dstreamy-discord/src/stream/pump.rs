@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,8 @@ struct Shared {
     frame_ready: Notify,
     stats: Mutex<StatsState>,
     configured_fps: AtomicU32,
+    /// Latest mapped pts in µs plus one, 0 before the first frame.
+    last_pts: AtomicU64,
     source: RwLock<Option<Box<dyn CaptureSource>>>,
 }
 
@@ -88,6 +90,11 @@ impl Shared {
         }
     }
 
+    fn note_pts(&self, pts: Duration) {
+        let us = u64::try_from(pts.as_micros()).unwrap_or(u64::MAX - 1);
+        self.last_pts.fetch_max(us + 1, Ordering::Relaxed);
+    }
+
     fn error(&self, error: impl ToString) {
         self.stats().stats.last_error = Some(error.to_string());
     }
@@ -110,6 +117,12 @@ impl StatsUpdater {
     }
 }
 
+/// Where a restarted pump picks up on the same connection: after the old timeline, with its counters.
+pub(crate) struct Resume {
+    last_pts_us: Option<u64>,
+    stats: StreamStats,
+}
+
 /// Capture source plus the tasks that move its frames to whichever stream connection is attached.
 pub(crate) struct MediaPump {
     shared: Arc<Shared>,
@@ -122,13 +135,36 @@ pub(crate) struct MediaPump {
 impl MediaPump {
     /// Starts the source; on failure the source is handed back for a retry.
     pub(crate) async fn start(
+        source: Box<dyn CaptureSource>,
+        options: &StreamOptions,
+        conn: Option<MediaConnection>,
+    ) -> Result<Self, (Box<dyn CaptureSource>, StreamError)> {
+        Self::start_resumed(source, options, conn, None).await
+    }
+
+    pub(crate) async fn start_resumed(
         mut source: Box<dyn CaptureSource>,
         options: &StreamOptions,
         conn: Option<MediaConnection>,
+        resume: Option<Resume>,
     ) -> Result<Self, (Box<dyn CaptureSource>, StreamError)> {
         let frames = match source.start(options.capture.clone()).await {
             Ok(frames) => frames,
             Err(e) => return Err((source, e.into())),
+        };
+        let fps = options.capture.fps;
+        let (timebase, stats) = match resume {
+            Some(Resume { last_pts_us, stats }) => (
+                last_pts_us.map_or_else(
+                    || Timebase::new(fps),
+                    |last| Timebase::continuing(fps, last),
+                ),
+                StatsState {
+                    stats,
+                    ..StatsState::default()
+                },
+            ),
+            None => (Timebase::new(fps), StatsState::default()),
         };
         let shared = Arc::new(Shared {
             queue: Mutex::new(FrameQueue::new(
@@ -136,15 +172,16 @@ impl MediaPump {
                 options.max_queued_audio,
             )),
             frame_ready: Notify::new(),
-            stats: Mutex::new(StatsState::default()),
+            stats: Mutex::new(stats),
             configured_fps: AtomicU32::new(options.capture.fps),
+            last_pts: AtomicU64::new(0),
             source: RwLock::new(Some(source)),
         });
         let (conn, conn_rx) = watch::channel(conn);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let tasks = vec![
             tokio::spawn(read_frames(frames, shared.clone(), shutdown_rx.clone())),
-            tokio::spawn(send_frames(conn_rx.clone(), shared.clone())),
+            tokio::spawn(send_frames(conn_rx.clone(), shared.clone(), timebase)),
             tokio::spawn(watch_keyframes(conn_rx, shared.clone(), shutdown_rx)),
         ];
         Ok(Self {
@@ -204,6 +241,23 @@ impl MediaPump {
     /// Frames are dropped until the next `attach`.
     pub(crate) fn detach(&self) {
         self.conn.send_replace(None);
+    }
+
+    /// Like `stop`, plus what a pump restarted on the same connection needs to continue.
+    pub(crate) async fn stop_resumable(
+        self,
+    ) -> (
+        Option<Box<dyn CaptureSource>>,
+        Resume,
+        Result<StreamStats, StreamError>,
+    ) {
+        let shared = self.shared.clone();
+        let (source, result) = self.stop().await;
+        let resume = Resume {
+            last_pts_us: shared.last_pts.load(Ordering::Relaxed).checked_sub(1),
+            stats: shared.stats().stats.clone(),
+        };
+        (source, resume, result)
     }
 
     pub(crate) async fn stop(
@@ -288,9 +342,12 @@ async fn read_frames(
     shared.frame_ready.notify_one();
 }
 
-async fn send_frames(mut conn: watch::Receiver<Option<MediaConnection>>, shared: Arc<Shared>) {
+async fn send_frames(
+    mut conn: watch::Receiver<Option<MediaConnection>>,
+    shared: Arc<Shared>,
+    mut timebase: Timebase,
+) {
     let mut fps = shared.configured_fps.load(Ordering::Relaxed);
-    let mut timebase = Timebase::new(fps);
     loop {
         let next = {
             let mut queue = shared.queue();
@@ -316,6 +373,7 @@ async fn send_frames(mut conn: watch::Receiver<Option<MediaConnection>>, shared:
                     timebase.set_fps(fps);
                 }
                 let pts = timebase.map(Track::Video, video.pts_us);
+                shared.note_pts(pts);
                 match current.send_video_frame_at(&video.data, pts).await {
                     Ok(()) => shared.stats().video_sent(video.data.len(), Instant::now()),
                     Err(e) => {
@@ -328,6 +386,7 @@ async fn send_frames(mut conn: watch::Receiver<Option<MediaConnection>>, shared:
             }
             MediaFrame::Audio(audio) => {
                 let pts = timebase.map(Track::Audio, audio.pts_us);
+                shared.note_pts(pts);
                 match current.send_audio_frame_at(&audio.data, pts).await {
                     Ok(()) => {
                         let mut state = shared.stats();

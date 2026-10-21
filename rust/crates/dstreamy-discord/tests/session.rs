@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -63,6 +63,7 @@ fn options() -> SessionOptions {
 #[derive(Default)]
 struct Counters {
     starts: AtomicUsize,
+    configs: Mutex<Vec<CaptureConfig>>,
     keyframe_requests: AtomicUsize,
 }
 
@@ -106,6 +107,7 @@ impl CaptureSource for Counted {
 
     async fn start(&mut self, config: CaptureConfig) -> Result<FrameReceiver, MediaError> {
         self.counters.starts.fetch_add(1, Ordering::SeqCst);
+        self.counters.configs.lock().unwrap().push(config.clone());
         let mut frames = match self.behaviour {
             Behaviour::FailStart => return Err(MediaError::AlreadyRunning),
             Behaviour::HangStart => std::future::pending().await,
@@ -922,4 +924,123 @@ async fn viewer_fir_and_pli_each_count_once() {
     );
     drop(conn);
     f.finish().await;
+}
+
+fn smaller_capture() -> CaptureConfig {
+    CaptureConfig {
+        width: 160,
+        height: 90,
+        fps: 15,
+        bitrate_bps: 200_000,
+        codec: VideoCodec::H264,
+        ..CaptureConfig::default()
+    }
+}
+
+fn stream_video(
+    r: &dstreamy_mock_discord::Recorded,
+) -> Vec<dstreamy_mock_discord::RecordedVideoFrame> {
+    r.video
+        .iter()
+        .filter(|v| v.kind == VoiceKind::Stream)
+        .cloned()
+        .collect()
+}
+
+fn announced(r: &dstreamy_mock_discord::Recorded, width: u64, fps: u64) -> bool {
+    r.ops
+        .iter()
+        .rev()
+        .filter(|o| o.is(Some(VoiceKind::Stream), vo::OP_VIDEO))
+        .find_map(|o| o.json().map(|d| d["streams"][0].clone()))
+        .is_some_and(|s| s["max_resolution"]["width"] == width && s["max_framerate"] == fps)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconfigure_restarts_the_source_inside_go_live() {
+    let f = Fixture::streaming().await;
+    let mut h265 = smaller_capture();
+    h265.codec = VideoCodec::H265;
+    let err = f.session.reconfigure(h265).await.unwrap_err();
+    assert!(matches!(err, SessionError::CodecChange), "{err}");
+
+    let before = stream_video(&f.mock.recorded()).len();
+    f.session.reconfigure(smaller_capture()).await.unwrap();
+    assert_eq!(*f.state.borrow(), SessionState::Streaming);
+    f.mock
+        .wait_for(T, |r| announced(r, 160, 15).then_some(()))
+        .await
+        .expect("op 12 with the new attributes");
+    let recorded = f
+        .mock
+        .wait_for(T, |r| {
+            (stream_video(r).len() >= before + 25).then(|| r.clone())
+        })
+        .await
+        .expect("video after the reconfigure");
+
+    assert_eq!(f.starts(), 2);
+    assert_eq!(
+        f.counters.configs.lock().unwrap().last(),
+        Some(&smaller_capture())
+    );
+    let video = stream_video(&recorded);
+    assert!(
+        video
+            .windows(2)
+            .all(|w| w[1].rtp_timestamp.wrapping_sub(w[0].rtp_timestamp) as i32 > 0),
+        "RTP timestamps went backwards across the restart"
+    );
+    let mut steps: Vec<u32> = video[before + 5..]
+        .windows(2)
+        .map(|w| w[1].rtp_timestamp.wrapping_sub(w[0].rtp_timestamp))
+        .collect();
+    steps.sort_unstable();
+    let median = steps[steps.len() / 2];
+    assert!(
+        median.abs_diff(6000) <= 600,
+        "median RTP step {median} at 15 fps"
+    );
+    assert_eq!(f.voice_joins(), [MOCK_VOICE_CHANNEL_ID]);
+    assert_eq!(f.gateway_ops(gw::OP_STREAM_CREATE), 1);
+    assert_eq!(f.gateway_ops(gw::OP_STREAM_DELETE), 0);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconfigure_while_reconnecting_applies_on_the_next_connection() {
+    let mut options = options();
+    options.backoff.base = Duration::from_millis(600);
+    options.backoff.max = Duration::from_millis(600);
+    let mut f = Fixture::streaming_with(options).await;
+    assert!(
+        f.mock
+            .drop_voice(VoiceKind::Stream, Some(vo::CLOSE_SESSION_NO_LONGER_VALID))
+    );
+    wait_state(&mut f.state, |s| {
+        matches!(s, SessionState::Reconnecting { .. })
+    })
+    .await;
+    f.session.reconfigure(smaller_capture()).await.unwrap();
+    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    f.mock
+        .wait_for(T, |r| announced(r, 160, 15).then_some(()))
+        .await
+        .expect("op 12 with the new attributes on the new connection");
+    f.video_flowing().await;
+    assert_eq!(f.starts(), 2);
+    assert_eq!(
+        f.counters.configs.lock().unwrap().last(),
+        Some(&smaller_capture())
+    );
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconfigure_needs_a_running_session() {
+    let mock = MockDiscord::start().await.unwrap();
+    let (client, session, _) = idle_session(&mock).await;
+    let err = session.reconfigure(smaller_capture()).await.unwrap_err();
+    assert!(matches!(err, SessionError::NotRunning), "{err}");
+    close(client, session, mock).await;
 }
