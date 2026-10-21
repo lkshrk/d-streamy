@@ -56,6 +56,8 @@ pub enum StreamError {
     Connection(#[from] ConnectionError),
     #[error(transparent)]
     Media(#[from] MediaError),
+    #[error("the capture source was not handed back")]
+    SourceLost,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]

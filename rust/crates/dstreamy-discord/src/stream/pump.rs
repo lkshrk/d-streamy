@@ -27,6 +27,7 @@ struct StatsState {
     stats: StreamStats,
     video_sent_at: VecDeque<Instant>,
     intervals: FrameIntervalTracker,
+    last_frame_at: Option<Instant>,
 }
 
 impl StatsState {
@@ -59,8 +60,8 @@ struct Shared {
     frame_ready: Notify,
     stats: Mutex<StatsState>,
     configured_fps: AtomicU32,
-    /// Latest mapped pts in µs plus one, 0 before the first frame.
-    last_pts: AtomicU64,
+    /// Latest mapped pts per track (video, audio) in µs plus one, 0 before the first frame.
+    last_pts: [AtomicU64; 2],
     source: RwLock<Option<Box<dyn CaptureSource>>>,
 }
 
@@ -90,9 +91,10 @@ impl Shared {
         }
     }
 
-    fn note_pts(&self, pts: Duration) {
+    fn note_pts(&self, track: Track, pts: Duration) {
         let us = u64::try_from(pts.as_micros()).unwrap_or(u64::MAX - 1);
-        self.last_pts.fetch_max(us + 1, Ordering::Relaxed);
+        self.last_pts[track as usize].fetch_max(us + 1, Ordering::Relaxed);
+        self.stats().last_frame_at = Some(Instant::now());
     }
 
     fn error(&self, error: impl ToString) {
@@ -119,8 +121,12 @@ impl StatsUpdater {
 
 /// Where a restarted pump picks up on the same connection: after the old timeline, with its counters.
 pub(crate) struct Resume {
-    last_pts_us: Option<u64>,
+    last_pts_us: [Option<u64>; 2],
+    last_frame_at: Option<Instant>,
     stats: StreamStats,
+    video_sent_at: VecDeque<Instant>,
+    /// DAVE already came up on this connection, so its keyframe request is not repeated.
+    pub(crate) same_connection: bool,
 }
 
 /// Capture source plus the tasks that move its frames to whichever stream connection is attached.
@@ -153,18 +159,30 @@ impl MediaPump {
             Err(e) => return Err((source, e.into())),
         };
         let fps = options.capture.fps;
-        let (timebase, stats) = match resume {
-            Some(Resume { last_pts_us, stats }) => (
-                last_pts_us.map_or_else(
-                    || Timebase::new(fps),
-                    |last| Timebase::continuing(fps, last),
-                ),
-                StatsState {
+        let (timebase, stats, dave_seen) = match resume {
+            Some(resume) => {
+                let timebase = if resume.last_pts_us.iter().any(Option::is_some) {
+                    let gap = resume.last_frame_at.map_or(0, |t| t.elapsed().as_micros());
+                    Timebase::continuing(
+                        fps,
+                        resume.last_pts_us,
+                        u64::try_from(gap).unwrap_or(u64::MAX),
+                    )
+                } else {
+                    Timebase::new(fps)
+                };
+                let mut stats = resume.stats;
+                stats.capture_ended = false;
+                stats.last_error = None;
+                let state = StatsState {
                     stats,
+                    video_sent_at: resume.video_sent_at,
+                    last_frame_at: resume.last_frame_at,
                     ..StatsState::default()
-                },
-            ),
-            None => (Timebase::new(fps), StatsState::default()),
+                };
+                (timebase, state, resume.same_connection)
+            }
+            None => (Timebase::new(fps), StatsState::default(), false),
         };
         let shared = Arc::new(Shared {
             queue: Mutex::new(FrameQueue::new(
@@ -174,7 +192,7 @@ impl MediaPump {
             frame_ready: Notify::new(),
             stats: Mutex::new(stats),
             configured_fps: AtomicU32::new(options.capture.fps),
-            last_pts: AtomicU64::new(0),
+            last_pts: [AtomicU64::new(0), AtomicU64::new(0)],
             source: RwLock::new(Some(source)),
         });
         let (conn, conn_rx) = watch::channel(conn);
@@ -182,7 +200,12 @@ impl MediaPump {
         let tasks = vec![
             tokio::spawn(read_frames(frames, shared.clone(), shutdown_rx.clone())),
             tokio::spawn(send_frames(conn_rx.clone(), shared.clone(), timebase)),
-            tokio::spawn(watch_keyframes(conn_rx, shared.clone(), shutdown_rx)),
+            tokio::spawn(watch_keyframes(
+                conn_rx,
+                shared.clone(),
+                shutdown_rx,
+                dave_seen,
+            )),
         ];
         Ok(Self {
             shared,
@@ -253,10 +276,18 @@ impl MediaPump {
     ) {
         let shared = self.shared.clone();
         let (source, result) = self.stop().await;
+        let state = shared.stats();
         let resume = Resume {
-            last_pts_us: shared.last_pts.load(Ordering::Relaxed).checked_sub(1),
-            stats: shared.stats().stats.clone(),
+            last_pts_us: shared
+                .last_pts
+                .each_ref()
+                .map(|p| p.load(Ordering::Relaxed).checked_sub(1)),
+            last_frame_at: state.last_frame_at,
+            stats: state.stats.clone(),
+            video_sent_at: state.video_sent_at.clone(),
+            same_connection: false,
         };
+        drop(state);
         (source, resume, result)
     }
 
@@ -373,7 +404,7 @@ async fn send_frames(
                     timebase.set_fps(fps);
                 }
                 let pts = timebase.map(Track::Video, video.pts_us);
-                shared.note_pts(pts);
+                shared.note_pts(Track::Video, pts);
                 match current.send_video_frame_at(&video.data, pts).await {
                     Ok(()) => shared.stats().video_sent(video.data.len(), Instant::now()),
                     Err(e) => {
@@ -386,7 +417,7 @@ async fn send_frames(
             }
             MediaFrame::Audio(audio) => {
                 let pts = timebase.map(Track::Audio, audio.pts_us);
-                shared.note_pts(pts);
+                shared.note_pts(Track::Audio, pts);
                 match current.send_audio_frame_at(&audio.data, pts).await {
                     Ok(()) => {
                         let mut state = shared.stats();
@@ -408,13 +439,19 @@ async fn watch_keyframes(
     mut conn: watch::Receiver<Option<MediaConnection>>,
     shared: Arc<Shared>,
     mut shutdown: watch::Receiver<bool>,
+    mut dave_seen: bool,
 ) {
     let mut poll = interval(DAVE_POLL);
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         let current = conn.borrow_and_update().clone();
-        let mut viewer_requests = current.as_ref().map(MediaConnection::keyframe_requests);
-        let mut dave_ready = false;
+        let mut viewer_requests = current.as_ref().map(|c| {
+            let mut requests = c.keyframe_requests();
+            requests.borrow_and_update();
+            requests
+        });
+        let mut dave_ready = std::mem::take(&mut dave_seen)
+            && current.as_ref().is_some_and(MediaConnection::dave_ready);
         let mut due: Option<Instant> = None;
         let mut last_viewer_request: Option<Instant> = None;
         loop {

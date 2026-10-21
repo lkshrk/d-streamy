@@ -36,13 +36,16 @@ impl Timebase {
         }
     }
 
-    /// Continues a timeline that last mapped a frame at `last_us`, one frame step later.
-    pub fn continuing(fps: u32, last_us: u64) -> Self {
+    /// Continues a timeline whose tracks last mapped `last_us`, `gap_us` (at least a frame) later.
+    pub fn continuing(fps: u32, last_us: [Option<u64>; 2], gap_us: u64) -> Self {
         let mut timebase = Self::new(fps);
-        let start = i64::try_from(last_us)
+        let last = last_us.map(|l| l.map(|us| i64::try_from(us).unwrap_or(i64::MAX)));
+        let latest = last.iter().flatten().max().copied().unwrap_or(0);
+        let gap = i64::try_from(gap_us)
             .unwrap_or(i64::MAX)
-            .saturating_add(timebase.video_step_us);
-        timebase.offset = [start; 2];
+            .max(timebase.video_step_us);
+        timebase.offset = [latest.saturating_add(gap); 2];
+        timebase.last = last;
         timebase
     }
 
@@ -150,11 +153,22 @@ mod tests {
     }
 
     #[test]
-    fn a_continued_timeline_starts_one_step_after_the_last_frame() {
-        let mut tb = Timebase::continuing(30, 9_000_000);
-        assert_eq!(us(tb.map(Track::Video, 123_000)), 9_033_333);
-        assert_eq!(us(tb.map(Track::Audio, 123_000)), 9_033_333);
-        assert_eq!(us(tb.map(Track::Video, 156_333)), 9_066_666);
+    fn a_continued_timeline_starts_after_the_last_frame_and_the_gap() {
+        let mut tb = Timebase::continuing(30, [Some(9_000_000), Some(9_010_000)], 0);
+        assert_eq!(us(tb.map(Track::Video, 123_000)), 9_043_333);
+        assert_eq!(us(tb.map(Track::Audio, 123_000)), 9_043_333);
+        assert_eq!(us(tb.map(Track::Video, 156_333)), 9_076_666);
+
+        let mut tb = Timebase::continuing(30, [Some(9_000_000), None], 500_000);
+        assert_eq!(us(tb.map(Track::Audio, 0)), 9_500_000);
+    }
+
+    #[test]
+    fn a_continued_track_stays_strictly_increasing() {
+        let mut tb = Timebase::continuing(30, [Some(1_000_000), Some(9_000_000)], 0);
+        assert_eq!(us(tb.map(Track::Video, 0)), 9_033_333);
+        assert_eq!(us(tb.map(Track::Audio, 0)), 9_033_333);
+        assert!(us(tb.map(Track::Audio, 0)) > 9_033_333);
     }
 
     #[test]

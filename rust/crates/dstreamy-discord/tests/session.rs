@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use dstreamy_core::StreamHealth;
 use dstreamy_discord::{
     Backoff, DiscordClient, GatewayOptions, Session, SessionError, SessionEvent, SessionOptions,
-    SessionState, StopReason, StreamOptions,
+    SessionState, StopReason, StreamError, StreamOptions,
 };
 use dstreamy_media::{
     CaptureConfig, CaptureSource, CaptureTarget, FRAME_CHANNEL_CAPACITY, FrameReceiver, MediaError,
@@ -72,6 +72,7 @@ enum Behaviour {
     Normal,
     FailStart,
     HangStart,
+    FailRestart,
     EndAfter(usize),
 }
 
@@ -111,6 +112,9 @@ impl CaptureSource for Counted {
         let mut frames = match self.behaviour {
             Behaviour::FailStart => return Err(MediaError::AlreadyRunning),
             Behaviour::HangStart => std::future::pending().await,
+            Behaviour::FailRestart if self.counters.starts.load(Ordering::SeqCst) > 1 => {
+                return Err(MediaError::AlreadyRunning);
+            }
             _ => self.inner.start(config).await?,
         };
         let Behaviour::EndAfter(n) = self.behaviour else {
@@ -958,13 +962,16 @@ fn announced(r: &dstreamy_mock_discord::Recorded, width: u64, fps: u64) -> bool 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reconfigure_restarts_the_source_inside_go_live() {
-    let f = Fixture::streaming().await;
+    let mut f = Fixture::streaming().await;
+    let dave_requested = |e: &SessionEvent| matches!(e, SessionEvent::Health(h) if h.stats.dave_keyframe_requests == 1);
+    f.wait_event(dave_requested).await;
     let mut h265 = smaller_capture();
     h265.codec = VideoCodec::H265;
     let err = f.session.reconfigure(h265).await.unwrap_err();
     assert!(matches!(err, SessionError::CodecChange), "{err}");
 
     let before = stream_video(&f.mock.recorded()).len();
+    let audio_before = f.mock.recorded().audio.len();
     f.session.reconfigure(smaller_capture()).await.unwrap();
     assert_eq!(*f.state.borrow(), SessionState::Streaming);
     f.mock
@@ -1001,10 +1008,63 @@ async fn reconfigure_restarts_the_source_inside_go_live() {
         median.abs_diff(6000) <= 600,
         "median RTP step {median} at 15 fps"
     );
+    let audio: Vec<u32> = recorded
+        .audio
+        .iter()
+        .filter(|a| a.kind == VoiceKind::Stream)
+        .map(|a| a.rtp_timestamp)
+        .collect();
+    assert!(audio.len() > audio_before, "no audio after the reconfigure");
+    assert!(
+        audio.windows(2).all(|w| w[1].wrapping_sub(w[0]) as i32 > 0),
+        "audio RTP timestamps went backwards across the restart"
+    );
     assert_eq!(f.voice_joins(), [MOCK_VOICE_CHANNEL_ID]);
     assert_eq!(f.gateway_ops(gw::OP_STREAM_CREATE), 1);
     assert_eq!(f.gateway_ops(gw::OP_STREAM_DELETE), 0);
+
+    // Two snapshots after the restart cover the 500 ms DAVE delay a fresh pump would wait.
+    for _ in 0..2 {
+        let SessionEvent::Health(h) = f.wait_event(|e| matches!(e, SessionEvent::Health(_))).await
+        else {
+            unreachable!()
+        };
+        assert_eq!(h.stats.dave_keyframe_requests, 1, "{h:?}");
+        assert_eq!(h.stats.viewer_keyframe_requests, 0, "{h:?}");
+    }
     f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_that_fails_to_restart_stops_the_session() {
+    let mock = MockDiscord::start().await.unwrap();
+    let (client, session, mut state) = idle_session(&mock).await;
+    let (source, counters) = Counted::with(Behaviour::FailRestart);
+    session
+        .start(
+            Some(MOCK_GUILD_ID.into()),
+            MOCK_VOICE_CHANNEL_ID.into(),
+            source,
+            options(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("start: {e}"));
+    wait_state(&mut state, |s| *s == SessionState::Streaming).await;
+    let err = session.reconfigure(smaller_capture()).await.unwrap_err();
+    assert!(
+        matches!(err, SessionError::Stream(StreamError::Media(_))),
+        "{err}"
+    );
+    wait_state(&mut state, |s| matches!(s, SessionState::Stopped { .. })).await;
+    assert!(matches!(
+        &*state.borrow(),
+        SessionState::Stopped {
+            reason: StopReason::SourceFailed { .. }
+        }
+    ));
+    assert_eq!(counters.starts.load(Ordering::SeqCst), 2);
+    assert!(timeout(T, session.stop()).await.unwrap().unwrap().is_some());
+    close(client, session, mock).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

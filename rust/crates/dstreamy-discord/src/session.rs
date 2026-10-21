@@ -316,7 +316,7 @@ impl Session {
         let _ = self.commands.send(Command::RequestKeyframe);
     }
 
-    /// Restarts the source with `capture` inside the live Go Live, or on the next connection while reconnecting.
+    /// Restarts the source with `capture` live (replacing `update_video` attributes), or on the next connection.
     pub async fn reconfigure(&self, capture: CaptureConfig) -> Result<(), SessionError> {
         let (reply, rx) = oneshot::channel();
         let capture = Box::new(capture);
@@ -529,7 +529,7 @@ impl Run {
                             let _ = reply.send(Ok(()));
                             continue;
                         };
-                        match self.restart_pump(conn).await {
+                        match self.restart_pump(conn, true).await {
                             Ok(()) => {
                                 let _ = reply.send(Ok(()));
                             }
@@ -555,13 +555,14 @@ impl Run {
                             let conn = connected.stream.0.clone();
                             self.stream = Some(connected.stream);
                             if connected.attrs != self.attrs
+                                && !self.reconfigure_pending
                                 && let Err(e) = conn.set_video_attributes(Some(self.attrs))
                             {
                                 actor.error(format!("announcing video attributes: {e}"), false);
                             }
                             match self.pump.as_ref() {
                                 Some(_) if self.reconfigure_pending => {
-                                    if let Err((src, e)) = self.restart_pump(conn).await {
+                                    if let Err((src, e)) = self.restart_pump(conn, false).await {
                                         source = src;
                                         let message = e.to_string();
                                         actor.error(format!("capture source failed to restart: {message}"), true);
@@ -821,21 +822,20 @@ impl Run {
     async fn restart_pump(
         &mut self,
         conn: MediaConnection,
+        same_connection: bool,
     ) -> Result<(), (Option<Box<dyn CaptureSource>>, StreamError)> {
         self.reconfigure_pending = false;
         let Some(pump) = self.pump.take() else {
             return Ok(());
         };
-        let (source, resume, stopped) = pump.stop_resumable().await;
-        if let Err(e) = stopped {
-            warn!(%e, "stopping the capture source for a restart");
-        }
+        let (source, mut resume, stopped) = pump.stop_resumable().await;
         let Some(source) = source else {
-            return Err((
-                None,
-                StreamError::Timeout("handing back the capture source"),
-            ));
+            return Err((None, StreamError::SourceLost));
         };
+        if let Err(e) = stopped {
+            return Err((Some(source), e));
+        }
+        resume.same_connection = same_connection;
         let start = MediaPump::start_resumed(
             source,
             &self.options.stream,
@@ -852,8 +852,8 @@ impl Run {
             warn!(%e, "announcing video attributes after a restart");
         }
         pump.request_keyframe();
-        pump.take_frame_intervals();
         self.sampler.reset();
+        self.history.clear();
         self.pump = Some(pump);
         Ok(())
     }
