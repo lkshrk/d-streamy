@@ -66,7 +66,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang libclang-dev \
             libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
-            libopus-dev libssl-dev
+            libopus-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

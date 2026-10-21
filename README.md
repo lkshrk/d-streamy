@@ -57,14 +57,14 @@ Targets: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gn
 Requirements:
 
 - macOS 14+ with Screen Recording permission for the terminal that runs `dstreamy`.
-- Linux (Wayland, PipeWire and xdg-desktop-portal) with GStreamer. On Debian or Ubuntu 24.04+:
+- Linux with glibc 2.39+ (Debian 13, Ubuntu 24.04 or newer), PipeWire, a D-Bus session and xdg-desktop-portal with a ScreenCast backend (GNOME, KDE or wlroots), plus GStreamer:
 
   ```bash
   sudo apt-get install gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
     gstreamer1.0-plugins-ugly gstreamer1.0-pipewire gstreamer1.0-pulseaudio
   ```
 
-  Add `gstreamer1.0-vaapi` for VA-API hardware encoding.
+  Hardware encoding is used when available: VA-API needs a VA driver for your GPU (and `gstreamer1.0-vaapi` for the older elements), NVENC needs the NVIDIA driver. Otherwise `x264enc` encodes in software.
 
 ### Build from source
 
@@ -80,7 +80,7 @@ Linux additionally needs the GStreamer and PipeWire development packages:
 
 ```bash
 sudo apt-get install clang libclang-dev pkg-config libpipewire-0.3-dev \
-  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libopus-dev libssl-dev
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libopus-dev
 cd rust
 cargo build --release -p dstreamy-cli
 ```

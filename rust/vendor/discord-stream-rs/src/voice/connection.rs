@@ -10,12 +10,12 @@ use crate::voice::webrtc::{WebRtcError, WebRtcWrapper};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{Connector, connect_async_tls_with_config, tungstenite::Message};
 use tracing::{debug, error, warn};
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 
@@ -24,6 +24,19 @@ pub const MAX_CONNECT_ATTEMPTS: u32 = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_UNACKED_HEARTBEATS: u32 = 3;
+
+// An explicit provider keeps working if another crate also enables rustls' aws-lc-rs backend.
+static TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Arc::new(config)
+});
 
 #[derive(Debug, Error)]
 pub enum ConnectionError {
@@ -428,7 +441,17 @@ impl VoiceConnection {
                 break;
             };
             let url = ws_url(&server);
-            let ws = match tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&url)).await {
+            let ws = match tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                connect_async_tls_with_config(
+                    &url,
+                    None,
+                    false,
+                    Some(Connector::Rustls(TLS_CONFIG.clone())),
+                ),
+            )
+            .await
+            {
                 Ok(Ok((ws, _))) => ws,
                 Ok(Err(e)) => {
                     warn!("Voice WS connect to {} failed: {}", url, e);
@@ -1096,5 +1119,10 @@ mod tests {
             "wss://c-ams.discord.media:443/?v=8"
         );
         assert_eq!(ws_url("ws://127.0.0.1:9000/"), "ws://127.0.0.1:9000/?v=8");
+    }
+
+    #[test]
+    fn tls_config_builds_with_ring() {
+        assert!(!TLS_CONFIG.crypto_provider().cipher_suites.is_empty());
     }
 }
