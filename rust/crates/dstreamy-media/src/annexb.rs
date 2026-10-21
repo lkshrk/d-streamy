@@ -12,9 +12,7 @@ pub fn append_nalu(out: &mut Vec<u8>, nalu: &[u8]) {
     out.extend_from_slice(nalu);
 }
 
-/// Converts AVCC (4-byte big-endian length-prefixed) NAL units to Annex B, appending to `out`.
-///
-/// Stops at the first zero or truncated length, keeping the units converted before it.
+/// Appends AVCC (4-byte length-prefixed) NAL units to `out` as Annex B, up to the first zero or truncated length.
 pub fn append_avcc_nalus(avcc: &[u8], out: &mut Vec<u8>) {
     let mut rest = avcc;
     while let Some((len, tail)) = rest.split_first_chunk::<4>() {

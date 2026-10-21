@@ -65,6 +65,13 @@ impl VideoEncoder for OpenH264Encoder {
             )));
         }
         let (w, h) = (self.width as usize, self.height as usize);
+        let expected = w * h + 2 * (w / 2) * (h / 2);
+        if frame.data.len() != expected {
+            return Err(MediaError::Encoder(format!(
+                "I420 frame has {} bytes, expected {expected}",
+                frame.data.len()
+            )));
+        }
         let (y, uv) = frame.data.split_at(w * h);
         let (u, v) = uv.split_at((w / 2) * (h / 2));
         let yuv = YUVSlices::new((y, u, v), (w, h), (w, w / 2, w / 2));
@@ -94,5 +101,28 @@ impl VideoEncoder for OpenH264Encoder {
 
     fn flush(&mut self) -> Result<Vec<EncodedVideoFrame>, MediaError> {
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_or_long_frame_data_is_an_error() {
+        let mut encoder = OpenH264Encoder::new(16, 16, 30, 500_000, 60).unwrap();
+        for len in [0, 16 * 16, 16 * 16 * 3 / 2 + 1] {
+            let frame = I420Frame {
+                width: 16,
+                height: 16,
+                data: vec![0; len],
+            };
+            assert!(
+                matches!(encoder.encode(&frame, 0, true), Err(MediaError::Encoder(_))),
+                "{len} bytes"
+            );
+        }
+        let frame = I420Frame::new(16, 16);
+        assert!(encoder.encode(&frame, 0, true).is_ok());
     }
 }
