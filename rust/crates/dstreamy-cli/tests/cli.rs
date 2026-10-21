@@ -528,6 +528,10 @@ fn stream_exits_with_failure_when_the_session_stops_by_itself() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("stream stopped"), "{stderr}");
+    assert!(
+        stderr.contains("warning: H.265 is experimental"),
+        "{stderr}"
+    );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let last: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
     assert!(is_state(&last, "stopped"), "{stdout}");

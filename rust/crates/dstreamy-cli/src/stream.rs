@@ -34,7 +34,7 @@ pub struct StreamArgs {
     /// Crop rectangle in source pixels
     #[arg(long, value_name = "X,Y,W,H", value_parser = parse_crop)]
     pub crop: Option<CropRect>,
-    /// Video codec: h264 or h265
+    /// Video codec: h264, or h265 (experimental: most viewers see no video)
     #[arg(long, value_parser = parse_codec)]
     pub codec: Option<Codec>,
     /// Frames per second: 15, 30 or 60
@@ -138,6 +138,9 @@ pub async fn run_with(
 ) -> Result<ExitCode, CliError> {
     let config = Config::load(&ctx.paths.config_file)?;
     let stream = args.stream_config(config.stream)?;
+    if let Some(warning) = stream.codec.viewer_warning() {
+        out.warn(warning);
+    }
     let capture = args.capture_config(&stream, args.crop.or(config.crop));
     let restore_token = capture::restore_token(&config);
     let capture::Picked {

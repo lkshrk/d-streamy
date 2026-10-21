@@ -206,6 +206,9 @@ impl Settings {
             Field::Resolution => s.resolution.to_string(),
             Field::Fps => format!("{} fps", s.fps),
             Field::Bitrate => format!("{} kbps", s.bitrate_kbps),
+            Field::Codec if s.codec.viewer_warning().is_some() => {
+                format!("{} (experimental: most viewers see no video)", s.codec)
+            }
             Field::Codec => s.codec.to_string(),
             Field::Gain => format!("{:.1}", s.audio_gain),
             Field::Crop if self.crop_text.is_empty() => "none".to_owned(),

@@ -101,7 +101,7 @@ dstreamy targets                    # list capturable displays and windows
 dstreamy stream --guild <GUILD> --channel <CHANNEL> --target display:1
 ```
 
-`DSTREAMY_TOKEN` overrides the stored token. `stream` runs until Ctrl-C and takes `--codec h264|h265`, `--fps 15|30|60`, `--res 720p|900p|1080p|WIDTHxHEIGHT`, `--bitrate <kbps>`, `--gain <0.0-3.0>` and `--crop X,Y,W,H`; `--target test-pattern` streams a test pattern without capturing anything. Add `--json` for machine-readable output and `-v`/`-vv` for logs. On Linux, use `--target portal` and pick the window or screen in the portal dialog. See `dstreamy <command> --help` for details.
+`DSTREAMY_TOKEN` overrides the stored token. `stream` runs until Ctrl-C and takes `--codec h264|h265` (h265 is experimental: most Discord viewers can't decode it), `--fps 15|30|60`, `--res 720p|900p|1080p|WIDTHxHEIGHT`, `--bitrate <kbps>`, `--gain <0.0-3.0>` and `--crop X,Y,W,H`; `--target test-pattern` streams a test pattern without capturing anything. Add `--json` for machine-readable output and `-v`/`-vv` for logs. On Linux, use `--target portal` and pick the window or screen in the portal dialog. See `dstreamy <command> --help` for details.
 
 ## Disclaimer
 

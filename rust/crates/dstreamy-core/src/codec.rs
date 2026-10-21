@@ -30,6 +30,15 @@ impl Codec {
         }
     }
 
+    pub const fn viewer_warning(self) -> Option<&'static str> {
+        match self {
+            Self::H264 => None,
+            Self::H265 => {
+                Some("H.265 is experimental: most Discord viewers can't decode it and see no video")
+            }
+        }
+    }
+
     /// Lenient parse: anything but an exact `"H265"` falls back to H.264.
     pub fn normalize(raw: Option<&str>) -> Self {
         match raw {
@@ -60,6 +69,12 @@ impl FromStr for Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_h265_carries_a_viewer_warning() {
+        assert_eq!(Codec::H264.viewer_warning(), None);
+        assert!(Codec::H265.viewer_warning().is_some());
+    }
 
     #[test]
     fn raw_values_match_ipc_strings() {
