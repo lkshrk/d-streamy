@@ -234,19 +234,27 @@ async fn wait_sent(stats: impl Fn() -> StreamStats, video: u64) {
 }
 
 /// Received items found in `sent` in the same order; gaps on either side are skipped.
-fn matched_in_order<T: PartialEq>(sent: &[T], got: &[T]) -> usize {
+fn delivered_in_order<T: PartialEq>(sent: &[T], got: &[T]) -> Vec<bool> {
+    let mut delivered = vec![false; sent.len()];
     let mut next = 0;
-    let mut matched = 0;
     for item in got {
         if let Some(i) = sent[next..].iter().position(|s| s == item) {
+            delivered[next + i] = true;
             next += i + 1;
-            matched += 1;
         }
     }
-    matched
+    delivered
 }
 
-fn matched_video(codec: VideoCodec, sent: &[EncodedVideoFrame], recorded: &Recorded) -> usize {
+fn matched_in_order<T: PartialEq>(sent: &[T], got: &[T]) -> usize {
+    delivered_in_order(sent, got).iter().filter(|&&d| d).count()
+}
+
+fn delivered_video(
+    codec: VideoCodec,
+    sent: &[EncodedVideoFrame],
+    recorded: &Recorded,
+) -> Vec<bool> {
     let want: Vec<Vec<Vec<u8>>> = sent
         .iter()
         .map(|f| expected_nalus(codec, &f.data))
@@ -257,7 +265,7 @@ fn matched_video(codec: VideoCodec, sent: &[EncodedVideoFrame], recorded: &Recor
         .filter(|f| f.kind == VoiceKind::Stream)
         .map(|f| nal_units(&f.data).into_iter().map(<[u8]>::to_vec).collect())
         .collect();
-    matched_in_order(&want, &got)
+    delivered_in_order(&want, &got)
 }
 
 async fn streams_end_to_end(
@@ -350,13 +358,24 @@ async fn streams_end_to_end(
             MediaFrame::Audio(_) => None,
         })
         .collect();
-    let matched = matched_video(codec, &sent_video, &recorded);
+    let delivered = delivered_video(codec, &sent_video, &recorded);
+    let matched = delivered.iter().filter(|&&d| d).count();
     assert!(
         matched as f64 >= 0.95 * stats.video_frames_sent as f64,
         "{matched} bit-identical of {stats:?}"
     );
+    // After a loss, video may only resume at a keyframe.
+    let first = delivered.iter().position(|&d| d).unwrap();
+    for i in first + 1..delivered.len() {
+        if delivered[i] && !delivered[i - 1] {
+            assert!(
+                sent_video[i].keyframe,
+                "frame {i} delivered after a loss: {stats:?}"
+            );
+        }
+    }
     assert!(
-        stats.video_frames_dropped * 20 <= stats.video_frames_sent,
+        stats.video_frames_dropped == 0 || stats.keyframe_requests > 0,
         "{stats:?}"
     );
 
