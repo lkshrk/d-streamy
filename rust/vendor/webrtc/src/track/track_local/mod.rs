@@ -127,8 +127,7 @@ pub trait TrackLocal {
 
     fn as_any(&self) -> &dyn Any;
 
-    /// SSRC the sender must use for this track instead of a random one, e.g. one
-    /// assigned by a signalling server.
+    /// SSRC the sender must use instead of a random one, e.g. one assigned by signalling.
     fn preferred_ssrc(&self) -> Option<SSRC> {
         None
     }

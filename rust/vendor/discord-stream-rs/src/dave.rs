@@ -225,14 +225,12 @@ impl DaveHandler {
         }
     }
 
-    /// Mirrors `daveReady` in the JS reference: E2EE is active only while the
-    /// negotiated protocol version is non-zero and the MLS group is ready.
+    /// `daveReady`: a non-zero negotiated protocol version and a ready MLS group.
     pub fn is_ready(&self) -> bool {
         self.protocol_version != 0 && self.inner.as_ref().is_some_and(|s| s.is_ready())
     }
 
-    /// Switch the active protocol version when a transition executes, without
-    /// touching the MLS session.
+    /// Switch the protocol version on transition without touching the MLS session.
     pub fn set_protocol_version(&mut self, protocol_version: u16) {
         self.protocol_version = protocol_version;
     }

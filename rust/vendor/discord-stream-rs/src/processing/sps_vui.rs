@@ -8,11 +8,7 @@
 /// <https://webrtc.googlesource.com/src/+/5f2c9278/common_video/h264/sps_vui_rewriter.cc>
 use super::annexb_rw::{AnnexBBitstreamReader, AnnexBBitstreamWriter};
 
-/// Rewrite the SPS NALU VUI timing info in-place and return the patched bytes.
-///
-/// `buffer` must start with the NAL unit header byte (NAL ref IDC + type 7).
-///
-/// A truncated or out-of-spec SPS is returned unchanged instead of panicking.
+/// Rewrite the VUI of an SPS starting at its NAL header; a malformed SPS comes back unchanged.
 pub fn rewrite_sps_vui(buffer: &[u8]) -> Vec<u8> {
     try_rewrite_sps_vui(buffer).unwrap_or_else(|| buffer.to_vec())
 }

@@ -23,8 +23,7 @@ impl<'a> AnnexBBitstreamReader<'a> {
         }
     }
 
-    /// True once a read ran past the end of the buffer or hit an invalid
-    /// Exp-Golomb code; every later read returns 0.
+    /// Set by a read past the end or a bad Exp-Golomb code; later reads return 0.
     pub fn overrun(&self) -> bool {
         self.overrun
     }
