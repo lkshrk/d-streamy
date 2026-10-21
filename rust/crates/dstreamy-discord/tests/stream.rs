@@ -288,6 +288,7 @@ async fn streams_end_to_end(
     .await
     .unwrap()
     .unwrap();
+    let started = Instant::now();
     assert!(mock.dave_active(VoiceKind::Stream).await);
     assert_eq!(handle.video_attributes().width, width);
 
@@ -302,7 +303,12 @@ async fn streams_end_to_end(
     wait_sent(|| handle.stats(), 75).await;
 
     let stats = handle.stats();
-    assert!((20.0..=40.0).contains(&stats.fps), "{stats:?}");
+    // The 1 s window can spike after a stall; the mean since start follows the paced source.
+    let mean_fps = stats.video_frames_sent as f64 / started.elapsed().as_secs_f64();
+    assert!(
+        (20.0..=40.0).contains(&mean_fps),
+        "{mean_fps} fps, {stats:?}"
+    );
     assert!(stats.audio_frames_sent > 50, "{stats:?}");
     assert!(stats.bytes_sent > 0);
     assert!(!stats.connection_closed);

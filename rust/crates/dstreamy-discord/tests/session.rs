@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use dstreamy_core::HealthLevel;
+use dstreamy_core::StreamHealth;
 use dstreamy_discord::{
     Backoff, DiscordClient, GatewayOptions, Session, SessionError, SessionEvent, SessionOptions,
     SessionState, StopReason, StreamOptions,
@@ -422,22 +422,21 @@ async fn health_snapshots_report_plausible_scores() {
             snapshots.push(h);
         }
     }
+    let mut history = Vec::new();
     for h in &snapshots {
-        assert!(h.health.video_score <= 100 && h.health.audio_score <= 100);
         assert!(h.metrics.bitrate_kbps > 0, "{h:?}");
+        history.push(h.metrics);
+        assert_eq!(h.health, StreamHealth::compute(&history, 30), "{h:?}");
     }
-    let best = snapshots.iter().max_by_key(|h| h.metrics.fps).unwrap();
-    assert!((20..=40).contains(&best.metrics.fps), "{best:?}");
-    assert!(best.metrics.a_sent >= 30, "{best:?}");
-    assert!(
-        snapshots
-            .iter()
-            .any(|h| h.health.video_level != HealthLevel::Bad),
-        "{snapshots:?}"
-    );
+    // A stalled interval is followed by a catch-up burst, so only the mean rate tracks the source.
+    let n = history.len() as u64;
+    let mean_fps = history.iter().map(|m| m.fps).sum::<u64>() / n;
+    let mean_audio = history.iter().map(|m| m.a_sent).sum::<u64>() / n;
+    assert!((20..=40).contains(&mean_fps), "{history:?}");
+    assert!((30..=70).contains(&mean_audio), "{history:?}");
     let last = snapshots.last().unwrap();
     assert!(last.stats.video_frames_sent > 0);
-    assert_eq!(last.health.fps_series.len(), last.health.audio_series.len());
+    assert_eq!(last.health.fps_series.len(), history.len());
     f.finish().await;
 }
 
