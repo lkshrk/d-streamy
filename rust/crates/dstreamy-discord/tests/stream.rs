@@ -296,7 +296,6 @@ async fn streams_end_to_end(
     .await
     .unwrap()
     .unwrap();
-    let started = Instant::now();
     assert!(mock.dave_active(VoiceKind::Stream).await);
     assert_eq!(handle.video_attributes().width, width);
 
@@ -311,12 +310,6 @@ async fn streams_end_to_end(
     wait_sent(|| handle.stats(), 75).await;
 
     let stats = handle.stats();
-    // The 1 s window can spike after a stall; the mean since start follows the paced source.
-    let mean_fps = stats.video_frames_sent as f64 / started.elapsed().as_secs_f64();
-    assert!(
-        (20.0..=40.0).contains(&mean_fps),
-        "{mean_fps} fps, {stats:?}"
-    );
     assert!(stats.audio_frames_sent > 50, "{stats:?}");
     assert!(stats.bytes_sent > 0);
     assert!(!stats.connection_closed);
@@ -390,6 +383,32 @@ async fn streams_end_to_end(
             .windows(2)
             .all(|w| w[1].rtp_timestamp.wrapping_sub(w[0].rtp_timestamp) as i32 > 0),
         "video RTP timestamps not increasing"
+    );
+    let median = |mut v: Vec<u64>| {
+        v.sort_unstable();
+        v[v.len() / 2]
+    };
+    let pts_step_us = median(
+        sent_video
+            .windows(2)
+            .map(|w| w[1].pts_us.saturating_sub(w[0].pts_us))
+            .collect(),
+    );
+    let rtp_step = median(
+        rec_video
+            .windows(2)
+            .map(|w| u64::from(w[1].rtp_timestamp.wrapping_sub(w[0].rtp_timestamp)))
+            .collect(),
+    );
+    let expected = pts_step_us * 90 / 1000;
+    assert!(
+        rtp_step.abs_diff(expected) <= expected / 10,
+        "median RTP step {rtp_step}, expected {expected} from the source pts"
+    );
+    assert!(
+        stats.video_frames_sent + stats.video_frames_dropped <= sent_video.len() as u64,
+        "{stats:?} vs {} source frames",
+        sent_video.len()
     );
 
     let sent_audio: Vec<&[u8]> = seen
