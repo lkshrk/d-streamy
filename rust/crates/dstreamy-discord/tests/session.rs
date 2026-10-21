@@ -1,0 +1,798 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use dstreamy_core::HealthLevel;
+use dstreamy_discord::{
+    Backoff, DiscordClient, GatewayOptions, Session, SessionError, SessionEvent, SessionOptions,
+    SessionState, StopReason, StreamOptions,
+};
+use dstreamy_media::{
+    CaptureConfig, CaptureSource, CaptureTarget, FRAME_CHANNEL_CAPACITY, FrameReceiver, MediaError,
+    TestPatternSource, VideoCodec,
+};
+use dstreamy_mock_discord::opcodes::gateway as gw;
+use dstreamy_mock_discord::opcodes::voice as vo;
+use dstreamy_mock_discord::{
+    MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID, MOCK_TOKEN, MOCK_VOICE_CHANNEL_ID, MockDiscord,
+    VoiceKind, rtc,
+};
+use secrecy::SecretString;
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, sleep, timeout};
+
+const T: Duration = Duration::from_secs(20);
+
+async fn client(mock: &MockDiscord) -> Arc<DiscordClient> {
+    let mut opts = GatewayOptions::new(SecretString::from(MOCK_TOKEN)).with_url(mock.gateway_url());
+    opts.reconnect_delay_min = Duration::from_millis(10);
+    opts.reconnect_delay_max = Duration::from_millis(50);
+    opts.invalid_session_delay = Duration::from_millis(50);
+    let client = timeout(T, DiscordClient::connect(opts))
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let mut streamer = client.streamer();
+        streamer.set_ice_servers(vec![]);
+        streamer.set_setting_engine(rtc::loopback_settings(false));
+    }
+    Arc::new(client)
+}
+
+fn options() -> SessionOptions {
+    let capture = CaptureConfig {
+        width: 320,
+        height: 180,
+        fps: 30,
+        bitrate_bps: 400_000,
+        codec: VideoCodec::H264,
+        ..CaptureConfig::default()
+    };
+    let mut options = SessionOptions::new(StreamOptions::new(capture));
+    options.backoff = Backoff {
+        base: Duration::from_millis(20),
+        max: Duration::from_millis(200),
+        max_attempts: 5,
+    };
+    options
+}
+
+#[derive(Default)]
+struct Counters {
+    starts: AtomicUsize,
+    keyframe_requests: AtomicUsize,
+    first_keyframe_request: Mutex<Option<Instant>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Behaviour {
+    Normal,
+    FailStart,
+    EndAfter(usize),
+}
+
+struct Counted {
+    inner: TestPatternSource,
+    counters: Arc<Counters>,
+    behaviour: Behaviour,
+    forward: Option<JoinHandle<()>>,
+}
+
+impl Counted {
+    fn boxed() -> (Box<dyn CaptureSource>, Arc<Counters>) {
+        Self::with(Behaviour::Normal)
+    }
+
+    fn with(behaviour: Behaviour) -> (Box<dyn CaptureSource>, Arc<Counters>) {
+        let counters = Arc::new(Counters::default());
+        let source = Self {
+            inner: TestPatternSource::new(),
+            counters: counters.clone(),
+            behaviour,
+            forward: None,
+        };
+        (Box::new(source), counters)
+    }
+}
+
+#[async_trait]
+impl CaptureSource for Counted {
+    async fn list_targets(&self) -> Result<Vec<CaptureTarget>, MediaError> {
+        self.inner.list_targets().await
+    }
+
+    async fn start(&mut self, config: CaptureConfig) -> Result<FrameReceiver, MediaError> {
+        self.counters.starts.fetch_add(1, Ordering::SeqCst);
+        let mut frames = match self.behaviour {
+            Behaviour::FailStart => return Err(MediaError::AlreadyRunning),
+            _ => self.inner.start(config).await?,
+        };
+        let Behaviour::EndAfter(n) = self.behaviour else {
+            return Ok(frames);
+        };
+        let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+        self.forward = Some(tokio::spawn(async move {
+            for _ in 0..n {
+                let Some(frame) = frames.recv().await else {
+                    return;
+                };
+                if tx.send(frame).await.is_err() {
+                    return;
+                }
+            }
+        }));
+        Ok(rx)
+    }
+
+    async fn stop(&mut self) -> Result<(), MediaError> {
+        if let Some(forward) = self.forward.take() {
+            forward.abort();
+        }
+        self.inner.stop().await
+    }
+
+    fn request_keyframe(&self) {
+        self.counters
+            .keyframe_requests
+            .fetch_add(1, Ordering::SeqCst);
+        self.counters
+            .first_keyframe_request
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Instant::now);
+        self.inner.request_keyframe();
+    }
+}
+
+struct Fixture {
+    mock: MockDiscord,
+    client: Arc<DiscordClient>,
+    session: Session,
+    state: watch::Receiver<SessionState>,
+    events: broadcast::Receiver<SessionEvent>,
+    counters: Arc<Counters>,
+    streaming_at: Instant,
+}
+
+impl Fixture {
+    async fn streaming() -> Self {
+        Self::streaming_with(options()).await
+    }
+
+    async fn streaming_with(options: SessionOptions) -> Self {
+        let mock = MockDiscord::start().await.unwrap();
+        let client = client(&mock).await;
+        let session = Session::new(client.clone());
+        let events = session.subscribe();
+        let mut state = session.state();
+        let (source, counters) = Counted::boxed();
+        session
+            .start(
+                Some(MOCK_GUILD_ID.into()),
+                MOCK_VOICE_CHANNEL_ID.into(),
+                source,
+                options,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("start: {e}"));
+        wait_state(&mut state, |s| *s == SessionState::Streaming).await;
+        let fixture = Self {
+            mock,
+            client,
+            session,
+            state,
+            events,
+            counters,
+            streaming_at: Instant::now(),
+        };
+        fixture.video_flowing().await;
+        fixture
+    }
+
+    /// At least 10 more video frames reach the mock.
+    async fn video_flowing(&self) {
+        let seen = self.mock.recorded().video.len();
+        self.mock
+            .wait_for(T, |r| (r.video.len() >= seen + 10).then_some(()))
+            .await
+            .unwrap_or_else(|| panic!("video stalled at {seen} frames"));
+    }
+
+    fn gateway_ops(&self, op: u8) -> usize {
+        self.mock
+            .received_ops()
+            .iter()
+            .filter(|o| o.is(None, op))
+            .count()
+    }
+
+    fn voice_joins(&self) -> Vec<String> {
+        self.mock
+            .received_ops()
+            .iter()
+            .filter(|o| o.is(None, gw::OP_VOICE_STATE_UPDATE))
+            .filter_map(|o| o.json().unwrap()["channel_id"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn starts(&self) -> usize {
+        self.counters.starts.load(Ordering::SeqCst)
+    }
+
+    /// The states entered since the fixture started, without blocking.
+    fn states_seen(&mut self) -> Vec<SessionState> {
+        let mut states = Vec::new();
+        while let Ok(event) = self.events.try_recv() {
+            if let SessionEvent::State { state: s } = event {
+                states.push(s);
+            }
+        }
+        states
+    }
+
+    async fn wait_event(&mut self, f: impl Fn(&SessionEvent) -> bool) -> SessionEvent {
+        timeout(T, async {
+            loop {
+                match self.events.recv().await {
+                    Ok(event) if f(&event) => return event,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(e) => panic!("session events: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("session event")
+    }
+
+    async fn finish(self) {
+        let source = timeout(T, self.session.shutdown()).await.unwrap();
+        assert!(source.is_some(), "source handed back");
+        Arc::try_unwrap(self.client).ok().unwrap().close().await;
+        self.mock.shutdown().await;
+    }
+}
+
+async fn wait_state(state: &mut watch::Receiver<SessionState>, f: impl Fn(&SessionState) -> bool) {
+    let waited = timeout(T, state.wait_for(|s| f(s)))
+        .await
+        .map(|r| r.is_ok());
+    assert_eq!(waited, Ok(true), "state stuck at {:?}", *state.borrow());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn voice_ws_drop_resumes_in_place() {
+    let mut f = Fixture::streaming().await;
+    f.states_seen();
+    assert!(f.mock.drop_voice(VoiceKind::Stream, None));
+    f.mock
+        .wait_for_op(Some(VoiceKind::Stream), vo::OP_RESUME, 0, T)
+        .await
+        .expect("stream RESUME");
+    f.wait_event(|e| matches!(e, SessionEvent::Resumed)).await;
+    f.video_flowing().await;
+
+    assert_eq!(f.states_seen(), []);
+    assert_eq!(*f.state.borrow(), SessionState::Streaming);
+    assert_eq!(f.gateway_ops(gw::OP_STREAM_CREATE), 1);
+    assert_eq!(f.starts(), 1);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_stream_connection_recreates_go_live_with_the_same_source() {
+    let mut f = Fixture::streaming().await;
+    assert!(
+        f.mock
+            .drop_voice(VoiceKind::Stream, Some(vo::CLOSE_SESSION_NO_LONGER_VALID))
+    );
+    wait_state(&mut f.state, |s| {
+        matches!(s, SessionState::Reconnecting { .. })
+    })
+    .await;
+    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    f.video_flowing().await;
+
+    assert_eq!(f.gateway_ops(gw::OP_STREAM_CREATE), 2);
+    assert_eq!(f.voice_joins(), [MOCK_VOICE_CHANNEL_ID]);
+    assert_eq!(f.starts(), 1);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_voice_connection_rejoins_with_the_same_source() {
+    let mut f = Fixture::streaming().await;
+    assert!(
+        f.mock
+            .drop_voice(VoiceKind::Voice, Some(vo::CLOSE_SESSION_NO_LONGER_VALID))
+    );
+    wait_state(&mut f.state, |s| {
+        matches!(s, SessionState::Reconnecting { .. })
+    })
+    .await;
+    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    f.video_flowing().await;
+
+    assert_eq!(
+        f.voice_joins(),
+        [MOCK_VOICE_CHANNEL_ID, MOCK_VOICE_CHANNEL_ID]
+    );
+    assert_eq!(f.gateway_ops(gw::OP_STREAM_CREATE), 2);
+    assert_eq!(f.starts(), 1);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_move_recreates_go_live_without_rejoining() {
+    let mut f = Fixture::streaming().await;
+    assert!(
+        f.mock
+            .move_to_channel(MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID)
+    );
+    let moved = f
+        .wait_event(|e| matches!(e, SessionEvent::ChannelMoved { .. }))
+        .await;
+    let SessionEvent::ChannelMoved { channel_id, .. } = moved else {
+        unreachable!()
+    };
+    assert_eq!(channel_id, MOCK_OTHER_VOICE_CHANNEL_ID);
+    f.mock
+        .wait_for_op(None, gw::OP_STREAM_CREATE, 1, T)
+        .await
+        .expect("second STREAM_CREATE");
+    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    f.video_flowing().await;
+
+    let ops = f.mock.received_ops();
+    let creates: Vec<_> = ops
+        .iter()
+        .filter(|o| o.is(None, gw::OP_STREAM_CREATE))
+        .map(|o| o.json().unwrap()["channel_id"].clone())
+        .collect();
+    assert_eq!(creates[1], MOCK_OTHER_VOICE_CHANNEL_ID);
+    let deleted: Vec<_> = ops
+        .iter()
+        .filter(|o| o.is(None, gw::OP_STREAM_DELETE))
+        .map(|o| o.json().unwrap()["stream_key"].clone())
+        .collect();
+    assert_eq!(deleted.len(), 1);
+    assert!(deleted[0].as_str().unwrap().contains(MOCK_VOICE_CHANNEL_ID));
+    assert_eq!(f.voice_joins(), [MOCK_VOICE_CHANNEL_ID]);
+    assert!(
+        f.mock
+            .streams()
+            .iter()
+            .any(|s| s.stream_key.contains(MOCK_OTHER_VOICE_CHANNEL_ID))
+    );
+    assert_eq!(f.starts(), 1);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_drop_resumes_and_leaves_the_stream_alone() {
+    let mut f = Fixture::streaming().await;
+    f.states_seen();
+    assert!(f.mock.drop_gateway(Some(4000)));
+    f.mock
+        .wait_for_op(None, gw::OP_RESUME, 0, T)
+        .await
+        .expect("gateway RESUME");
+    f.video_flowing().await;
+    sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(f.states_seen(), []);
+    assert_eq!(f.gateway_ops(gw::OP_STREAM_CREATE), 1);
+    assert_eq!(f.voice_joins(), [MOCK_VOICE_CHANNEL_ID]);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_session_rejoins_and_recovers() {
+    let mut f = Fixture::streaming().await;
+    assert!(f.mock.invalidate_session(false));
+    f.mock
+        .wait_for_op(None, gw::OP_IDENTIFY, 1, T)
+        .await
+        .expect("second IDENTIFY");
+    wait_state(&mut f.state, |s| {
+        matches!(s, SessionState::Reconnecting { .. })
+    })
+    .await;
+    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    f.video_flowing().await;
+
+    assert_eq!(
+        f.voice_joins(),
+        [MOCK_VOICE_CHANNEL_ID, MOCK_VOICE_CHANNEL_ID]
+    );
+    assert_eq!(f.starts(), 1);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn health_snapshots_report_plausible_scores() {
+    let mut f = Fixture::streaming().await;
+    let mut snapshots = Vec::new();
+    while snapshots.len() < 3 {
+        if let SessionEvent::Health(h) =
+            f.wait_event(|e| matches!(e, SessionEvent::Health(_))).await
+        {
+            snapshots.push(h);
+        }
+    }
+    for h in &snapshots {
+        assert!(h.health.video_score <= 100 && h.health.audio_score <= 100);
+        assert!(h.metrics.bitrate_kbps > 0, "{h:?}");
+    }
+    let best = snapshots.iter().max_by_key(|h| h.metrics.fps).unwrap();
+    assert!((20..=40).contains(&best.metrics.fps), "{best:?}");
+    assert!(best.metrics.a_sent >= 30, "{best:?}");
+    assert!(
+        snapshots
+            .iter()
+            .any(|h| h.health.video_level != HealthLevel::Bad),
+        "{snapshots:?}"
+    );
+    let last = snapshots.last().unwrap();
+    assert!(last.stats.video_frames_sent > 0);
+    assert_eq!(last.health.fps_series.len(), last.health.audio_series.len());
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keyframes_are_requested_after_dave_and_on_viewer_pli() {
+    let mut f = Fixture::streaming().await;
+    assert!(f.mock.dave_active(VoiceKind::Stream).await);
+    timeout(T, async {
+        while f.counters.keyframe_requests.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("keyframe after DAVE");
+    let first = f.counters.first_keyframe_request.lock().unwrap().unwrap();
+    assert!(
+        first >= f.streaming_at + Duration::from_millis(400),
+        "requested {:?} after streaming",
+        first.saturating_duration_since(f.streaming_at)
+    );
+    sleep(Duration::from_millis(300)).await;
+
+    let before = f.counters.keyframe_requests.load(Ordering::SeqCst);
+    assert!(f.mock.send_pli(VoiceKind::Stream).await);
+    timeout(T, async {
+        while f.counters.keyframe_requests.load(Ordering::SeqCst) == before {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("keyframe after PLI");
+    f.wait_event(|e| matches!(e, SessionEvent::Health(h) if h.stats.viewer_keyframe_requests == 1))
+        .await;
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_video_announces_op_12_and_survives_reconnects() {
+    let mut f = Fixture::streaming().await;
+    f.session.update_video(160, 90, 15).await.unwrap();
+    let has_attrs = |o: &dstreamy_mock_discord::ReceivedOp| {
+        o.json()
+            .is_some_and(|v| v["streams"][0]["max_resolution"]["width"] == 160)
+    };
+    f.mock
+        .wait_for(T, |r| {
+            r.ops
+                .iter()
+                .filter(|o| o.is(Some(VoiceKind::Stream), vo::OP_VIDEO))
+                .any(has_attrs)
+                .then_some(())
+        })
+        .await
+        .expect("op 12 with the new attributes");
+    let announced = |ops: &[dstreamy_mock_discord::ReceivedOp]| {
+        ops.iter()
+            .filter(|o| o.is(Some(VoiceKind::Stream), vo::OP_VIDEO))
+            .filter(|o| has_attrs(o))
+            .count()
+    };
+    let once = announced(&f.mock.received_ops());
+    assert!(
+        f.mock
+            .drop_voice(VoiceKind::Stream, Some(vo::CLOSE_SESSION_NO_LONGER_VALID))
+    );
+    wait_state(&mut f.state, |s| {
+        matches!(s, SessionState::Reconnecting { .. })
+    })
+    .await;
+    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    f.mock
+        .wait_for(T, |r| (announced(&r.ops) > once).then_some(()))
+        .await
+        .expect("new attributes after the reconnect");
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gives_up_and_stops_when_voice_never_connects() {
+    let mock = MockDiscord::start().await.unwrap();
+    let client = client(&mock).await;
+    let session = Session::new(client.clone());
+    let mut state = session.state();
+    let mut options = options();
+    options.stream.step_timeout = Duration::from_millis(100);
+    options.backoff.max_attempts = 2;
+    let (source, counters) = Counted::boxed();
+    session
+        .start(Some(MOCK_GUILD_ID.into()), "999".into(), source, options)
+        .await
+        .unwrap_or_else(|e| panic!("start: {e}"));
+    wait_state(&mut state, |s| matches!(s, SessionState::Stopped { .. })).await;
+    assert_eq!(
+        *state.borrow(),
+        SessionState::Stopped {
+            reason: StopReason::GaveUp { attempts: 2 }
+        }
+    );
+    assert_eq!(counters.starts.load(Ordering::SeqCst), 0);
+    assert!(timeout(T, session.stop()).await.unwrap().unwrap().is_some());
+    timeout(T, session.shutdown()).await.unwrap();
+    Arc::try_unwrap(client).ok().unwrap().close().await;
+    mock.shutdown().await;
+}
+
+#[test]
+fn stop_hands_the_source_back_and_ends_every_task() {
+    let mock_runtime = tokio::runtime::Runtime::new().unwrap();
+    let mock = mock_runtime.block_on(MockDiscord::start()).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = client(&mock).await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        sleep(Duration::from_millis(200)).await;
+        let baseline = metrics.num_alive_tasks();
+
+        let session = Session::new(client.clone());
+        let mut state = session.state();
+        let (source, _) = Counted::boxed();
+        session
+            .start(
+                Some(MOCK_GUILD_ID.into()),
+                MOCK_VOICE_CHANNEL_ID.into(),
+                source,
+                options(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("start: {e}"));
+        wait_state(&mut state, |s| *s == SessionState::Streaming).await;
+        mock.wait_for(T, |r| (r.video.len() >= 10).then_some(()))
+            .await
+            .expect("video");
+
+        let source = timeout(T, session.stop()).await.unwrap().unwrap();
+        assert!(source.is_some());
+        assert_eq!(
+            *state.borrow(),
+            SessionState::Stopped {
+                reason: StopReason::Requested
+            }
+        );
+        mock.wait_for_op(None, gw::OP_STREAM_DELETE, 0, T)
+            .await
+            .expect("STREAM_DELETE");
+        timeout(T, session.shutdown()).await.unwrap();
+
+        timeout(T, async {
+            while metrics.num_alive_tasks() > baseline {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{} tasks alive after stop, {baseline} before start",
+                metrics.num_alive_tasks()
+            )
+        });
+        Arc::try_unwrap(client).ok().unwrap().close().await;
+    });
+    mock_runtime.block_on(mock.shutdown());
+}
+
+async fn idle_session(
+    mock: &MockDiscord,
+) -> (Arc<DiscordClient>, Session, watch::Receiver<SessionState>) {
+    let client = client(mock).await;
+    let session = Session::new(client.clone());
+    let state = session.state();
+    (client, session, state)
+}
+
+async fn close(client: Arc<DiscordClient>, session: Session, mock: MockDiscord) {
+    timeout(T, session.shutdown()).await.unwrap();
+    Arc::try_unwrap(client).ok().unwrap().close().await;
+    mock.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_while_reconnecting_hands_the_source_back() {
+    let mock = MockDiscord::start().await.unwrap();
+    let (client, session, mut state) = idle_session(&mock).await;
+    let mut options = options();
+    options.stream.step_timeout = Duration::from_millis(100);
+    options.backoff.base = Duration::from_secs(5);
+    options.backoff.max = Duration::from_secs(5);
+    let (source, _) = Counted::boxed();
+    session
+        .start(Some(MOCK_GUILD_ID.into()), "999".into(), source, options)
+        .await
+        .unwrap_or_else(|e| panic!("start: {e}"));
+    wait_state(&mut state, |s| {
+        matches!(s, SessionState::Reconnecting { .. })
+    })
+    .await;
+    let source = timeout(T, session.stop()).await.unwrap().unwrap();
+    assert!(source.is_some());
+    assert_eq!(
+        *state.borrow(),
+        SessionState::Stopped {
+            reason: StopReason::Requested
+        }
+    );
+    assert!(timeout(T, session.stop()).await.unwrap().unwrap().is_none());
+    close(client, session, mock).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_start_is_refused_with_its_source() {
+    let f = Fixture::streaming().await;
+    let (source, counters) = Counted::boxed();
+    let err = f
+        .session
+        .start(
+            Some(MOCK_GUILD_ID.into()),
+            MOCK_VOICE_CHANNEL_ID.into(),
+            source,
+            options(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err.error, SessionError::AlreadyRunning), "{err}");
+    assert!(err.source.is_some());
+    assert_eq!(counters.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(f.starts(), 1);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_that_fails_to_start_stops_the_session_and_comes_back() {
+    let mock = MockDiscord::start().await.unwrap();
+    let (client, session, mut state) = idle_session(&mock).await;
+    let (source, _) = Counted::with(Behaviour::FailStart);
+    session
+        .start(
+            Some(MOCK_GUILD_ID.into()),
+            MOCK_VOICE_CHANNEL_ID.into(),
+            source,
+            options(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("start: {e}"));
+    wait_state(&mut state, |s| matches!(s, SessionState::Stopped { .. })).await;
+    assert!(matches!(
+        &*state.borrow(),
+        SessionState::Stopped {
+            reason: StopReason::SourceFailed { .. }
+        }
+    ));
+    mock.wait_for_op(None, gw::OP_STREAM_DELETE, 0, T)
+        .await
+        .expect("Go Live ended");
+    assert!(timeout(T, session.stop()).await.unwrap().unwrap().is_some());
+    close(client, session, mock).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ended_capture_stops_the_session() {
+    let mock = MockDiscord::start().await.unwrap();
+    let (client, session, mut state) = idle_session(&mock).await;
+    let (source, _) = Counted::with(Behaviour::EndAfter(30));
+    let mut options = options();
+    options.health_interval = Duration::from_millis(100);
+    session
+        .start(
+            Some(MOCK_GUILD_ID.into()),
+            MOCK_VOICE_CHANNEL_ID.into(),
+            source,
+            options,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("start: {e}"));
+    wait_state(&mut state, |s| matches!(s, SessionState::Stopped { .. })).await;
+    assert_eq!(
+        *state.borrow(),
+        SessionState::Stopped {
+            reason: StopReason::CaptureEnded
+        }
+    );
+    assert!(timeout(T, session.stop()).await.unwrap().unwrap().is_some());
+    close(client, session, mock).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_gateway_stops_the_session() {
+    let mut f = Fixture::streaming().await;
+    assert!(f.mock.drop_gateway(Some(gw::CLOSE_AUTHENTICATION_FAILED)));
+    wait_state(&mut f.state, |s| matches!(s, SessionState::Stopped { .. })).await;
+    assert_eq!(
+        *f.state.borrow(),
+        SessionState::Stopped {
+            reason: StopReason::GatewayClosed
+        }
+    );
+    assert!(
+        timeout(T, f.session.stop())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_some()
+    );
+    timeout(T, f.session.shutdown()).await.unwrap();
+    Arc::try_unwrap(f.client).ok().unwrap().close().await;
+    f.mock.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_video_while_reconnecting_reaches_the_new_connection() {
+    let mut options = options();
+    options.backoff.base = Duration::from_millis(600);
+    options.backoff.max = Duration::from_millis(600);
+    let mut f = Fixture::streaming_with(options).await;
+    assert!(
+        f.mock
+            .drop_voice(VoiceKind::Stream, Some(vo::CLOSE_SESSION_NO_LONGER_VALID))
+    );
+    wait_state(&mut f.state, |s| {
+        matches!(s, SessionState::Reconnecting { .. })
+    })
+    .await;
+    f.session.update_video(160, 90, 15).await.unwrap();
+    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    let last_width = |r: &dstreamy_mock_discord::Recorded| {
+        r.ops
+            .iter()
+            .rev()
+            .filter(|o| o.is(Some(VoiceKind::Stream), vo::OP_VIDEO))
+            .find_map(|o| o.json()?["streams"][0]["max_resolution"]["width"].as_u64())
+    };
+    f.mock
+        .wait_for(T, |r| (last_width(r) == Some(160)).then_some(()))
+        .await
+        .unwrap_or_else(|| panic!("last op 12 width {:?}", last_width(&f.mock.recorded())));
+    f.video_flowing().await;
+    f.finish().await;
+}
+
+#[test]
+fn session_state_and_events_serialize_for_json_output() {
+    let state = SessionState::Stopped {
+        reason: StopReason::GaveUp { attempts: 3 },
+    };
+    assert_eq!(
+        serde_json::to_value(&state).unwrap(),
+        serde_json::json!({ "state": "stopped", "reason": { "reason": "gave_up", "attempts": 3 } })
+    );
+    assert_eq!(
+        state.to_string(),
+        "stopped: gave up after 3 reconnect attempts"
+    );
+    let event = SessionEvent::State {
+        state: SessionState::Reconnecting { attempt: 2 },
+    };
+    assert_eq!(
+        serde_json::to_value(&event).unwrap(),
+        serde_json::json!({ "event": "state", "state": { "state": "reconnecting", "attempt": 2 } })
+    );
+}

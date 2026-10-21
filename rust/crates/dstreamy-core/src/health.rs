@@ -2,7 +2,8 @@ use crate::metrics::StreamMetrics;
 
 pub const AUDIO_FRAMES_PER_SEC: f64 = 50.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HealthLevel {
     Bad,
     Warn,
@@ -83,7 +84,7 @@ impl From<&StreamMetrics> for HealthSample {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct StreamHealth {
     /// Session-average score, 0–100.
     pub video_score: u32,

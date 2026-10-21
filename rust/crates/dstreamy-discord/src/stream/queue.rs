@@ -105,6 +105,18 @@ impl FrameQueue {
         effects
     }
 
+    /// A new connection needs a keyframe: drop queued video and ask for one now.
+    pub fn require_keyframe(&mut self, now: Instant) -> Effects {
+        let dropped_video = self.drop_video_before(self.frames.len());
+        self.awaiting_keyframe = true;
+        self.last_request = Some(now);
+        Effects {
+            dropped_video,
+            dropped_audio: 0,
+            request_keyframe: true,
+        }
+    }
+
     /// Refuses further frames; queued ones can still be popped.
     pub fn close(&mut self) {
         self.closed = true;
@@ -192,6 +204,21 @@ mod tests {
         std::iter::from_fn(|| q.pop())
             .map(|f| (matches!(f, MediaFrame::Video(_)), f.pts_us()))
             .collect()
+    }
+
+    #[test]
+    fn require_keyframe_drops_queued_video_and_waits_for_the_next_keyframe() {
+        let now = Instant::now();
+        let mut q = FrameQueue::new(4, 4);
+        q.push(video(0, true), now);
+        q.push(audio(0), now);
+        q.push(video(33, false), now);
+        let e = q.require_keyframe(now);
+        assert_eq!((e.dropped_video, e.request_keyframe), (2, true));
+        let e = q.push(video(66, false), now);
+        assert_eq!((e.dropped_video, e.request_keyframe), (1, false));
+        q.push(video(100, true), now);
+        assert_eq!(drain(&mut q), [(false, 0), (true, 100)]);
     }
 
     #[test]

@@ -153,7 +153,7 @@ pub struct PipelineStats {
 }
 
 /// Per-interval stream metrics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct StreamMetrics {
     pub fps: u64,
     pub gap_p95_ms: u64,

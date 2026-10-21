@@ -528,7 +528,7 @@ async fn transport_lag_drops_video_until_a_requested_keyframe() {
     let requests = source.keyframe_requests.clone();
     let handle = start(&client, source).await;
     timeout(T, async {
-        while handle.stats().keyframe_requests == 0 {
+        while handle.stats().keyframe_requests == 0 || handle.stats().video_frames_dropped == 0 {
             sleep(Duration::from_millis(20)).await;
         }
     })

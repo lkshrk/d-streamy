@@ -18,8 +18,10 @@ pub enum Track {
 #[derive(Debug)]
 pub struct Timebase {
     origin: Option<i64>,
-    offset: i64,
+    offset: [i64; 2],
     last: [Option<i64>; 2],
+    /// The latest rebase offset, adopted by the other track when it restarts too.
+    rebase: Option<i64>,
     video_step_us: i64,
 }
 
@@ -27,8 +29,9 @@ impl Timebase {
     pub fn new(fps: u32) -> Self {
         Self {
             origin: None,
-            offset: 0,
+            offset: [0; 2],
             last: [None; 2],
+            rebase: None,
             video_step_us: step_for(fps),
         }
     }
@@ -40,21 +43,32 @@ impl Timebase {
     pub fn map(&mut self, track: Track, pts_us: u64) -> Duration {
         let pts = i64::try_from(pts_us).unwrap_or(i64::MAX);
         let origin = *self.origin.get_or_insert(pts);
-        let mut rel = pts.saturating_add(self.offset).saturating_sub(origin);
-        let slot = &mut self.last[track as usize];
+        let t = track as usize;
+        let mut rel = pts.saturating_add(self.offset[t]).saturating_sub(origin);
         let (step, tick) = match track {
             Track::Video => (self.video_step_us, VIDEO_TICK_US),
             Track::Audio => (OPUS_FRAME_DURATION_US as i64, AUDIO_TICK_US),
         };
-        match *slot {
+        match self.last[t] {
             Some(last) if rel < last + tick && last - rel > REBASE_THRESHOLD_US => {
-                self.offset += last + step - rel;
-                rel = last + step;
+                let shared = self
+                    .rebase
+                    .filter(|&o| o != self.offset[t])
+                    .map(|o| (o, pts.saturating_add(o).saturating_sub(origin)))
+                    .filter(|&(_, r)| r >= last + tick);
+                if let Some((offset, r)) = shared {
+                    self.offset[t] = offset;
+                    rel = r;
+                } else {
+                    self.offset[t] += last + step - rel;
+                    self.rebase = Some(self.offset[t]);
+                    rel = last + step;
+                }
             }
             Some(last) if rel < last + tick => rel = last + tick,
             _ => rel = rel.max(0),
         }
-        *slot = Some(rel);
+        self.last[t] = Some(rel);
         Duration::from_micros(rel as u64)
     }
 }
@@ -110,6 +124,19 @@ mod tests {
         assert_eq!(us(tb.map(Track::Audio, 0)), 5_033_333);
         assert_eq!(us(tb.map(Track::Audio, 20_000)), 5_053_333);
         assert_eq!(us(tb.map(Track::Video, 33_333)), 5_066_666);
+    }
+
+    #[test]
+    fn a_single_track_restart_leaves_the_other_track_alone() {
+        let mut tb = Timebase::new(30);
+        tb.map(Track::Video, 0);
+        tb.map(Track::Audio, 0);
+        assert_eq!(us(tb.map(Track::Audio, 5_000_000)), 5_000_000);
+        assert_eq!(us(tb.map(Track::Video, 5_000_000)), 5_000_000);
+        assert_eq!(us(tb.map(Track::Video, 0)), 5_033_333);
+        assert_eq!(us(tb.map(Track::Audio, 5_020_000)), 5_020_000);
+        assert_eq!(us(tb.map(Track::Video, 33_333)), 5_066_666);
+        assert_eq!(us(tb.map(Track::Audio, 5_040_000)), 5_040_000);
     }
 
     #[test]

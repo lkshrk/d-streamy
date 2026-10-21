@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 discord-stream-rs = { path = "../../vendor/discord-stream-rs", default-features = false }
+dstreamy-core = { path = "../dstreamy-core" }
 dstreamy-media = { path = "../dstreamy-media" }
 flate2 = "1"
 futures-util = "0.3"

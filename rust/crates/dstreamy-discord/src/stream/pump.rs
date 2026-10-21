@@ -1,0 +1,397 @@
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+use dstreamy_core::{FrameIntervalSnapshot, FrameIntervalTracker};
+use dstreamy_media::{CaptureSource, FrameReceiver, MediaFrame};
+use tokio::sync::{Notify, RwLock, watch};
+use tokio::task::JoinHandle;
+use tokio::time::{MissedTickBehavior, interval, timeout};
+
+use super::queue::{Effects, FrameQueue};
+use super::timebase::{Timebase, Track};
+use super::{StreamError, StreamOptions, StreamStats};
+use crate::transport::MediaConnection;
+
+pub(crate) const TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+const FPS_WINDOW: Duration = Duration::from_secs(1);
+const DAVE_POLL: Duration = Duration::from_millis(100);
+/// davey can reject the first keyframe after DAVE comes up (audio overtakes video), so ask again.
+const DAVE_KEYFRAME_DELAY: Duration = Duration::from_millis(500);
+/// Viewer PLIs arrive per viewer; one keyframe answers them all.
+const VIEWER_KEYFRAME_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Default)]
+struct StatsState {
+    stats: StreamStats,
+    video_sent_at: VecDeque<Instant>,
+    intervals: FrameIntervalTracker,
+}
+
+impl StatsState {
+    fn apply(&mut self, effects: Effects) {
+        self.stats.video_frames_dropped += effects.dropped_video;
+        self.stats.audio_frames_dropped += effects.dropped_audio;
+    }
+
+    fn video_sent(&mut self, bytes: usize, now: Instant) {
+        self.stats.video_frames_sent += 1;
+        self.stats.bytes_sent += bytes as u64;
+        self.video_sent_at.push_back(now);
+        self.intervals.record(now);
+        self.prune(now);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .video_sent_at
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= FPS_WINDOW)
+        {
+            self.video_sent_at.pop_front();
+        }
+    }
+}
+
+struct Shared {
+    queue: Mutex<FrameQueue>,
+    frame_ready: Notify,
+    stats: Mutex<StatsState>,
+    configured_fps: AtomicU32,
+    source: RwLock<Option<Box<dyn CaptureSource>>>,
+}
+
+impl Shared {
+    fn queue(&self) -> MutexGuard<'_, FrameQueue> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn stats(&self) -> MutexGuard<'_, StatsState> {
+        self.stats.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn handle(&self, effects: Effects) {
+        self.stats().apply(effects);
+        if effects.request_keyframe {
+            self.request_keyframe();
+        }
+    }
+
+    fn request_keyframe(&self) {
+        // Only `stop` holds the write lock, and then a keyframe is moot.
+        if let Ok(source) = self.source.try_read()
+            && let Some(source) = source.as_ref()
+        {
+            source.request_keyframe();
+            self.stats().stats.keyframe_requests += 1;
+        }
+    }
+
+    fn error(&self, error: impl ToString) {
+        self.stats().stats.last_error = Some(error.to_string());
+    }
+
+    // `attach` asks for a keyframe, so a detached pump only counts what it drops.
+    fn discard(&self, frame: MediaFrame) {
+        let mut state = self.stats();
+        match frame {
+            MediaFrame::Video(_) => state.stats.video_frames_dropped += 1,
+            MediaFrame::Audio(_) => state.stats.audio_frames_dropped += 1,
+        }
+    }
+}
+
+pub(crate) struct StatsUpdater(Arc<Shared>);
+
+impl StatsUpdater {
+    pub(crate) fn update(&self, f: impl FnOnce(&mut StreamStats)) {
+        f(&mut self.0.stats().stats);
+    }
+}
+
+/// Capture source plus the tasks that move its frames to whichever stream connection is attached.
+pub(crate) struct MediaPump {
+    shared: Arc<Shared>,
+    conn: watch::Sender<Option<MediaConnection>>,
+    shutdown: watch::Sender<bool>,
+    tasks: Vec<JoinHandle<()>>,
+    stopped: bool,
+}
+
+impl MediaPump {
+    /// Starts the source; on failure the source is handed back for a retry.
+    pub(crate) async fn start(
+        mut source: Box<dyn CaptureSource>,
+        options: &StreamOptions,
+        conn: Option<MediaConnection>,
+    ) -> Result<Self, (Box<dyn CaptureSource>, StreamError)> {
+        let frames = match source.start(options.capture.clone()).await {
+            Ok(frames) => frames,
+            Err(e) => return Err((source, e.into())),
+        };
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(FrameQueue::new(
+                options.max_queued_video,
+                options.max_queued_audio,
+            )),
+            frame_ready: Notify::new(),
+            stats: Mutex::new(StatsState::default()),
+            configured_fps: AtomicU32::new(options.capture.fps),
+            source: RwLock::new(Some(source)),
+        });
+        let (conn, conn_rx) = watch::channel(conn);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let tasks = vec![
+            tokio::spawn(read_frames(frames, shared.clone(), shutdown_rx.clone())),
+            tokio::spawn(send_frames(conn_rx.clone(), shared.clone())),
+            tokio::spawn(watch_keyframes(conn_rx, shared.clone(), shutdown_rx)),
+        ];
+        Ok(Self {
+            shared,
+            conn,
+            shutdown,
+            tasks,
+            stopped: false,
+        })
+    }
+
+    pub(crate) fn stats(&self) -> StreamStats {
+        let mut state = self.shared.stats();
+        state.prune(Instant::now());
+        let mut stats = state.stats.clone();
+        stats.fps = state.video_sent_at.len() as f64 / FPS_WINDOW.as_secs_f64();
+        stats
+    }
+
+    pub(crate) fn update_stats(&self, f: impl FnOnce(&mut StreamStats)) {
+        f(&mut self.shared.stats().stats);
+    }
+
+    pub(crate) fn stats_updater(&self) -> StatsUpdater {
+        StatsUpdater(self.shared.clone())
+    }
+
+    /// Send times of video frames since the last call.
+    pub(crate) fn take_frame_intervals(&self) -> FrameIntervalSnapshot {
+        self.shared.stats().intervals.drain()
+    }
+
+    pub(crate) fn capture_ended(&self) -> bool {
+        self.shared.stats().stats.capture_ended
+    }
+
+    pub(crate) fn set_fps(&self, fps: u32) {
+        self.shared.configured_fps.store(fps, Ordering::Relaxed);
+    }
+
+    pub(crate) fn request_keyframe(&self) {
+        self.shared.request_keyframe();
+    }
+
+    /// Switches to a new stream connection; video resumes at the next keyframe, which is requested now.
+    pub(crate) fn attach(&self, conn: MediaConnection) {
+        let effects = self.shared.queue().require_keyframe(Instant::now());
+        self.conn.send_replace(Some(conn));
+        self.shared.handle(effects);
+    }
+
+    /// Frames are dropped until the next `attach`.
+    pub(crate) fn detach(&self) {
+        self.conn.send_replace(None);
+    }
+
+    pub(crate) async fn stop(
+        mut self,
+    ) -> (
+        Option<Box<dyn CaptureSource>>,
+        Result<StreamStats, StreamError>,
+    ) {
+        self.stopped = true;
+        self.detach();
+        let _ = self.shutdown.send(true);
+        {
+            let mut queue = self.shared.queue();
+            queue.close();
+            queue.clear();
+        }
+        self.shared.frame_ready.notify_one();
+        for task in &mut self.tasks {
+            if timeout(TASK_JOIN_TIMEOUT, &mut *task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        let source = self.shared.source.write().await.take();
+        let Some(mut source) = source else {
+            return (None, Ok(self.stats()));
+        };
+        let result = match timeout(TASK_JOIN_TIMEOUT, source.stop()).await {
+            Ok(Ok(())) => Ok(self.stats()),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_) => Err(StreamError::Timeout("stopping the capture source")),
+        };
+        (Some(source), result)
+    }
+}
+
+impl Drop for MediaPump {
+    fn drop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        let _ = self.shutdown.send(true);
+        for task in &self.tasks {
+            task.abort();
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let shared = self.shared.clone();
+            runtime.spawn(async move {
+                if let Some(source) = shared.source.write().await.as_mut() {
+                    let _ = source.stop().await;
+                }
+            });
+        }
+    }
+}
+
+async fn read_frames(
+    mut frames: FrameReceiver,
+    shared: Arc<Shared>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            frame = frames.recv() => match frame {
+                Some(frame) => {
+                    let effects = shared.queue().push(frame, Instant::now());
+                    shared.handle(effects);
+                    shared.frame_ready.notify_one();
+                }
+                None => {
+                    let mut state = shared.stats();
+                    state.stats.capture_ended = true;
+                    state.stats.last_error = Some("capture source ended".to_owned());
+                    break;
+                }
+            },
+        }
+    }
+    shared.queue().close();
+    shared.frame_ready.notify_one();
+}
+
+async fn send_frames(mut conn: watch::Receiver<Option<MediaConnection>>, shared: Arc<Shared>) {
+    let mut fps = shared.configured_fps.load(Ordering::Relaxed);
+    let mut timebase = Timebase::new(fps);
+    loop {
+        let next = {
+            let mut queue = shared.queue();
+            match queue.pop() {
+                Some(frame) => Some(frame),
+                None if queue.is_closed() => return,
+                None => None,
+            }
+        };
+        let Some(frame) = next else {
+            shared.frame_ready.notified().await;
+            continue;
+        };
+        let Some(current) = conn.borrow_and_update().clone() else {
+            shared.discard(frame);
+            continue;
+        };
+        match frame {
+            MediaFrame::Video(video) => {
+                let configured = shared.configured_fps.load(Ordering::Relaxed);
+                if configured != fps {
+                    fps = configured;
+                    timebase.set_fps(fps);
+                }
+                let pts = timebase.map(Track::Video, video.pts_us);
+                match current.send_video_frame_at(&video.data, pts).await {
+                    Ok(()) => shared.stats().video_sent(video.data.len(), Instant::now()),
+                    Err(e) => {
+                        let effects = shared.queue().video_lost(Instant::now());
+                        shared.stats().stats.video_frames_dropped += 1;
+                        shared.error(e);
+                        shared.handle(effects);
+                    }
+                }
+            }
+            MediaFrame::Audio(audio) => {
+                let pts = timebase.map(Track::Audio, audio.pts_us);
+                match current.send_audio_frame_at(&audio.data, pts).await {
+                    Ok(()) => {
+                        let mut state = shared.stats();
+                        state.stats.audio_frames_sent += 1;
+                        state.stats.bytes_sent += audio.data.len() as u64;
+                    }
+                    Err(e) => {
+                        shared.stats().stats.audio_frames_dropped += 1;
+                        shared.error(e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Turns viewer PLI/FIR and DAVE coming up on the attached connection into keyframe requests.
+async fn watch_keyframes(
+    mut conn: watch::Receiver<Option<MediaConnection>>,
+    shared: Arc<Shared>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut poll = interval(DAVE_POLL);
+    poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        let current = conn.borrow_and_update().clone();
+        let mut viewer_requests = current.as_ref().map(MediaConnection::keyframe_requests);
+        let mut dave_ready = false;
+        let mut due: Option<Instant> = None;
+        let mut last_viewer_request: Option<Instant> = None;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => return,
+                changed = conn.changed() => match changed {
+                    Ok(()) => break,
+                    Err(_) => return,
+                },
+                () = next_request(&mut viewer_requests) => {
+                    shared.stats().stats.viewer_keyframe_requests += 1;
+                    let now = Instant::now();
+                    if last_viewer_request.is_none_or(|t| now.duration_since(t) >= VIEWER_KEYFRAME_INTERVAL) {
+                        last_viewer_request = Some(now);
+                        shared.request_keyframe();
+                    }
+                }
+                _ = poll.tick() => {
+                    let now = Instant::now();
+                    let ready = current.as_ref().is_some_and(MediaConnection::dave_ready);
+                    if ready && !dave_ready {
+                        due = Some(now + DAVE_KEYFRAME_DELAY);
+                    }
+                    dave_ready = ready;
+                    if due.is_some_and(|at| now >= at) {
+                        due = None;
+                        shared.request_keyframe();
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn next_request(requests: &mut Option<watch::Receiver<u64>>) {
+    if let Some(rx) = requests.as_mut()
+        && rx.changed().await.is_ok()
+    {
+        return;
+    }
+    *requests = None;
+    std::future::pending().await
+}
