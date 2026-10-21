@@ -42,3 +42,6 @@ Rework the SwiftUI app (`App/`, `AppTests/`, `Package.swift`) to be a pure front
   - Not tested here: the GUI itself and Screen Recording attribution (MANUAL-CHECKLIST), the signed and notarised release run (needs a `v*` tag), and the CI run on `macos-26` (not pushed).
 
 - Commit: d3eb493.
+- Decision (team lead, review #13/#14): the app is built universal like `dstreamy`. `release.sh` fails unless `DSTREAMY_DAEMON` points at a universal (arm64 and x86_64) binary, then sets `UNIVERSAL=1` itself. The nested `dstreamy` is signed with the hardened runtime and no entitlements. Screen Recording and ScreenCaptureKit system audio go through TCC, which attributes them to the app as the responsible process; no entitlement covers them. No microphone path exists. The only non-system library `dstreamy` links is `@rpath/libswift_Concurrency.dylib`, which resolves to `/usr/lib/swift` (an OS library), so library validation passes without `disable-library-validation`. The manual checklist verifies this on the notarised build.
+- Daemon wire changes after the review (93d7b7b: `internal` "daemon shutting down" for in-flight commands, `already_running`, `malformed` for non-UTF-8) need no app change. They surface as `DaemonError` messages.
+

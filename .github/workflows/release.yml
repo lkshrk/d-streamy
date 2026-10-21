@@ -115,7 +115,6 @@ jobs:
         run: |
           export VERSION="${TAG#v}"
           export DSTREAMY_DAEMON="$PWD/rust/target/universal/dstreamy"
-          export UNIVERSAL=1
           bash scripts/release.sh
           lipo -verify_arch bin/D-Streamy.app/Contents/MacOS/D-Streamy arm64 x86_64
 

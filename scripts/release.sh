@@ -35,9 +35,11 @@ APP_NAME="D-Streamy"
 VERSION="${VERSION:-${TAG:-0.1.0}}"
 VERSION="${VERSION#v}"
 
-if [ -z "${DSTREAMY_DAEMON:-}" ]; then
-    echo "warning: DSTREAMY_DAEMON is not set; bundling a dstreamy built for this Mac only" >&2
+if [ -z "${DSTREAMY_DAEMON:-}" ] || ! lipo "$DSTREAMY_DAEMON" -verify_arch arm64 x86_64; then
+    echo "error: set DSTREAMY_DAEMON to a universal (arm64 + x86_64) dstreamy" >&2
+    exit 1
 fi
+export UNIVERSAL=1
 
 echo "==> Building release (version $VERSION)..."
 SKIP_SIGN=1 "$SCRIPT_DIR/build.sh"
