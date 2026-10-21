@@ -57,3 +57,9 @@ Five read-only reviewers. No high findings. Owners: A = discord, B = vendor+mock
 - LOW release-rust.yml:131: release create isn't idempotent. Use view || create, then upload --clobber.
 - LOW release.yml:22: Rust jobs gate the Swift workflow_run release. Move the rust jobs to their own workflow (rust-ci.yml).
 - LOW Formula: hashes are maintained by hand. Have the release job emit a filled formula in the step summary.
+
+## Outcome
+All sections are fixed and pushed. CI and Rust CI are green at f8b52fd. Nothing was rejected. Deferred, each as a Decision in its issue: the CropRect/CaptureTarget unification (D), and a hard portal-size crop pre-check, which HiDPI logical coordinates rule out (C).
+
+## Open follow-up
+- The vendor offers Opus with fmtp `minptime=10;useinbandfec=1;usedtx=1`, while libdatachannel's default (used by the JS reference) is `minptime=10;maxaveragebitrate=96000;stereo=1;sprop-stereo=1;useinbandfec=1`. Align them, and check the answer side for partial-match the same way as the H264 fmtp (c43f9ea).
