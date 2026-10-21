@@ -277,7 +277,7 @@ impl WebRtcWrapper {
                             mime_type: video_mime(vc).to_owned(),
                             clock_rate: vc.clock_rate,
                             channels: 0,
-                            sdp_fmtp_line: String::new(),
+                            sdp_fmtp_line: vc.fmtp.to_owned(),
                             rtcp_feedback: vec![
                                 feedback("ccm", "fir"),
                                 feedback("nack", ""),
@@ -680,6 +680,10 @@ pub fn build_answer_sdp(discord_sdp: &str) -> String {
             .replace("{MID}", "a=mid:1\r\n");
     for c in ALL_VIDEO_CODECS {
         let (pt, rtx) = (c.payload_type, c.rtx_payload_type);
+        // webrtc-rs drops partially matched codecs whenever another one matches exactly.
+        if !c.fmtp.is_empty() {
+            video += &format!("a=fmtp:{pt} {}\r\n", c.fmtp);
+        }
         video += &format!(
             "a=rtpmap:{pt} {}/90000\r\n\
              a=rtpmap:{rtx} rtx/90000\r\n\
@@ -725,6 +729,9 @@ mod tests {
         }
         assert!(sdp.contains("a=candidate:1 1 UDP 4261412862 203.0.113.7 50003 typ host\r\n"));
         assert!(sdp.contains("a=rtpmap:103 H265/90000\r\n"));
+        assert!(sdp.contains(
+            "a=fmtp:101 profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1\r\n"
+        ));
         assert!(
             sdp.contains(
                 "a=extmap:5 http://www.webrtc.org/experiments/rtp-hdrext/playout-delay\r\n"

@@ -15,6 +15,8 @@ pub struct VideoCodecInfo {
     pub payload_type: u8,
     pub rtx_payload_type: u8,
     pub priority: u16,
+    /// libdatachannel's default `a=fmtp` for the codec; empty when it has none.
+    pub fmtp: &'static str,
 }
 
 pub const OPUS: AudioCodecInfo = AudioCodecInfo {
@@ -29,6 +31,7 @@ pub const H264: VideoCodecInfo = VideoCodecInfo {
     priority: 1000,
     payload_type: 101,
     rtx_payload_type: 102,
+    fmtp: "profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1",
 };
 
 pub const H265: VideoCodecInfo = VideoCodecInfo {
@@ -37,6 +40,7 @@ pub const H265: VideoCodecInfo = VideoCodecInfo {
     priority: 1000,
     payload_type: 103,
     rtx_payload_type: 104,
+    fmtp: "",
 };
 
 pub const VP8: VideoCodecInfo = VideoCodecInfo {
@@ -45,6 +49,7 @@ pub const VP8: VideoCodecInfo = VideoCodecInfo {
     priority: 1000,
     payload_type: 105,
     rtx_payload_type: 106,
+    fmtp: "",
 };
 
 pub const VP9: VideoCodecInfo = VideoCodecInfo {
@@ -53,6 +58,7 @@ pub const VP9: VideoCodecInfo = VideoCodecInfo {
     priority: 1000,
     payload_type: 107,
     rtx_payload_type: 108,
+    fmtp: "",
 };
 
 pub const AV1: VideoCodecInfo = VideoCodecInfo {
@@ -61,6 +67,7 @@ pub const AV1: VideoCodecInfo = VideoCodecInfo {
     priority: 1000,
     payload_type: 109,
     rtx_payload_type: 110,
+    fmtp: "",
 };
 
 pub const ALL_VIDEO_CODECS: &[VideoCodecInfo] = &[H264, H265, VP8, VP9, AV1];
