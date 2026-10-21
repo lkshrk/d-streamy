@@ -131,14 +131,8 @@ impl DaveHandler {
             _ => ProposalsOperationType::APPEND,
         };
 
-        let expected: Option<&[u64]> = if connected_users.is_empty() {
-            None
-        } else {
-            Some(connected_users)
-        };
-
         let result = session
-            .process_proposals(operation, proposals, expected)
+            .process_proposals(operation, proposals, Some(connected_users))
             .map_err(|e| DaveError::ProcessProposals(e.to_string()))?;
 
         debug!("DAVE: Processed MLS proposals");
