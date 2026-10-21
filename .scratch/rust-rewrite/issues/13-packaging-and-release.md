@@ -16,3 +16,4 @@ Release builds for aarch64/x86_64 macOS and x86_64/aarch64 Linux via GitHub Acti
 
 ## Comments
 - Note: `screencapturekit` 11 depends on `apple-metal`, which needs the Xcode 26 SDK (`MTLTensor*`). macOS release jobs must run on `macos-26` (as `rust-macos` CI does since 998aa8e); macos-15 fails with `cannot find 'MTLTensorDataType' in scope`.
+- Note: the binary crate is `rust/crates/dstreamy-cli` (bin `dstreamy`); its `build.rs` already sets the Swift rpath on macOS. Issue 10 (TUI) edits that crate in parallel, so don't touch `rust/crates/dstreamy-cli/src/`. Any `Cargo.toml` change there (e.g. release profile metadata) goes in the workspace `rust/Cargo.toml` instead.
