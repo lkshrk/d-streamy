@@ -68,6 +68,8 @@ pub struct StreamStats {
     pub keyframe_requests: u64,
     /// PLI or FIR packets from viewers, each forwarded as a keyframe request.
     pub viewer_keyframe_requests: u64,
+    /// Keyframes requested because DAVE became ready on the attached connection.
+    pub dave_keyframe_requests: u64,
     /// Voice or stream connection resumes after a voice WS drop.
     pub resumes: u64,
     /// Video frames sent during the last second.

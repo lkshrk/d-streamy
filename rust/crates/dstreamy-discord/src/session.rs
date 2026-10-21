@@ -72,6 +72,8 @@ impl fmt::Display for StopReason {
     }
 }
 
+// Health is the most frequent event; boxing it would add an allocation per event for no saving.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum SessionEvent {
@@ -426,7 +428,7 @@ struct Run {
     channel_id: String,
     options: SessionOptions,
     attrs: VideoAttributes,
-    gateway: broadcast::Receiver<GatewayEvent>,
+    gateway: mpsc::UnboundedReceiver<GatewayEvent>,
     voice: Option<(MediaConnection, Events)>,
     stream: Option<(MediaConnection, Events)>,
     pump: Option<MediaPump>,
@@ -447,7 +449,7 @@ impl Run {
             channel_id,
             attrs: initial_attributes(&options.stream),
             options,
-            gateway: actor.client.subscribe(),
+            gateway: actor.client.subscribe_unbounded(),
             voice: None,
             stream: None,
             pump: None,
@@ -510,15 +512,25 @@ impl Run {
                                 }
                                 None => {
                                     let Some(src) = source.take() else { unreachable!() };
-                                    match MediaPump::start(src, &self.options.stream, Some(conn)).await {
-                                        Ok(pump) => {
+                                    let started = timeout(
+                                        self.options.stream.step_timeout,
+                                        MediaPump::start(src, &self.options.stream, Some(conn)),
+                                    );
+                                    match started.await {
+                                        Ok(Ok(pump)) => {
                                             self.pump = Some(pump);
                                             self.sampler.reset();
                                         }
-                                        Err((src, e)) => {
+                                        Ok(Err((src, e))) => {
                                             source = Some(src);
                                             actor.error(format!("capture source failed to start: {e}"), true);
                                             break (StopReason::SourceFailed { message: e.to_string() }, None, false);
+                                        }
+                                        // The source is lost with the cancelled start; stopping must not hang on it.
+                                        Err(_) => {
+                                            let message = "timed out starting the capture source".to_owned();
+                                            actor.error(message.clone(), true);
+                                            break (StopReason::SourceFailed { message }, None, false);
                                         }
                                     }
                                 }
@@ -549,22 +561,21 @@ impl Run {
                     }
                 }
                 event = self.gateway.recv() => match event {
-                    Ok(GatewayEvent::Closed(e)) => {
+                    Some(GatewayEvent::Closed(e)) => {
                         actor.error(format!("gateway closed: {e}"), true);
                         break (StopReason::GatewayClosed, None, false);
                     }
-                    Ok(GatewayEvent::Ready { .. }) => {
+                    Some(GatewayEvent::Ready { .. }) => {
                         debug!("new gateway session; joining voice again");
                         phase = self.reconnect(actor, &phase, Redo::Voice);
                     }
-                    Ok(GatewayEvent::VoiceStateUpdate(state)) => {
+                    Some(GatewayEvent::VoiceStateUpdate(state)) => {
                         if let Some(next) = self.on_voice_state(actor, &phase, state) {
                             phase = next;
                         }
                     }
-                    Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(n)) => debug!(n, "gateway events lagged"),
-                    Err(broadcast::error::RecvError::Closed) => {
+                    Some(_) => {}
+                    None => {
                         actor.error("gateway closed", true);
                         break (StopReason::GatewayClosed, None, false);
                     }

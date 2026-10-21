@@ -313,10 +313,8 @@ async fn authentication_failure_is_fatal() {
 
 #[tokio::test]
 async fn unreachable_gateway_gives_up_after_the_attempt_limit() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
-    drop(listener);
-    let mut opts = options(&url);
+    // Port 1 is privileged and unused, so the dial is refused without racing other tests' binds.
+    let mut opts = options("ws://127.0.0.1:1");
     opts.max_failed_attempts = 3;
     let result = timeout(STEP, GatewayClient::connect(opts)).await.unwrap();
     assert_eq!(result.err(), Some(GatewayError::Exhausted(3)));
@@ -434,4 +432,59 @@ async fn missing_ready_counts_as_a_failed_attempt() {
     }
     let result = timeout(STEP, client).await.unwrap().unwrap();
     assert_eq!(result.err(), Some(GatewayError::Exhausted(2)));
+}
+
+#[tokio::test]
+async fn reconnect_before_ready_counts_as_a_failed_attempt() {
+    let server = Server::bind().await;
+    let mut opts = options(&server.url);
+    opts.max_failed_attempts = 2;
+    let client = tokio::spawn(GatewayClient::connect(opts));
+    for _ in 0..2 {
+        let mut conn = server.accept().await;
+        conn.hello(45_000).await;
+        conn.recv_op(2).await;
+        conn.send(json!({"op": 7, "d": null})).await;
+        assert_eq!(conn.closed().await, Some(4000));
+    }
+    let result = timeout(STEP, client).await.unwrap().unwrap();
+    assert_eq!(result.err(), Some(GatewayError::Exhausted(2)));
+}
+
+#[tokio::test]
+async fn a_huge_heartbeat_interval_is_clamped() {
+    let server = Server::bind().await;
+    let client = tokio::spawn(GatewayClient::connect(options(&server.url)));
+    let mut conn = server.accept().await;
+    conn.hello(u64::MAX).await;
+    conn.recv_op(2).await;
+    conn.ready(1, &format!("{}/resume", server.url)).await;
+    let client = timeout(STEP, client).await.unwrap().unwrap().unwrap();
+    assert!(!client.is_closed());
+    client.close().await;
+}
+
+#[tokio::test]
+async fn unbounded_subscribers_never_lag() {
+    let server = Server::bind().await;
+    let (client, mut conn) = connect(&server, options(&server.url)).await;
+    let mut lossless = client.subscribe_unbounded();
+    for seq in 2..602 {
+        conn.dispatch(seq, "SESSIONS_REPLACE", json!([])).await;
+    }
+    conn.dispatch(602, "RESUMED", json!({})).await;
+    let mut seen = 0;
+    timeout(STEP, async {
+        while let Some(event) = lossless.recv().await {
+            match event {
+                GatewayEvent::Dispatch(d) if d.name == "SESSIONS_REPLACE" => seen += 1,
+                GatewayEvent::Resumed => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(seen, 600);
+    client.close().await;
 }

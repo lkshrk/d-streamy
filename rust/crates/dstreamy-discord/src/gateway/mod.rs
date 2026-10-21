@@ -39,6 +39,7 @@ pub(crate) struct Shared {
     cache: RwLock<cache::Cache>,
     user: RwLock<Option<CurrentUser>>,
     latency: Mutex<Option<Duration>>,
+    lossless: Mutex<Vec<mpsc::UnboundedSender<GatewayEvent>>>,
 }
 
 /// User-account main gateway connection; reconnects and resumes on its own until closed.
@@ -88,6 +89,17 @@ impl GatewayClient {
 
     pub fn subscribe(&self) -> broadcast::Receiver<GatewayEvent> {
         self.events.subscribe()
+    }
+
+    /// Like `subscribe`, but never lags: for consumers that must see every voice state and READY.
+    pub fn subscribe_unbounded(&self) -> mpsc::UnboundedReceiver<GatewayEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.shared
+            .lossless
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(tx);
+        rx
     }
 
     pub fn guilds(&self) -> Vec<Guild> {

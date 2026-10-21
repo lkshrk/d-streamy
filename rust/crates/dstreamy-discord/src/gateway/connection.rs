@@ -38,6 +38,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const RATE_LIMIT: u32 = 120;
 const RATE_RESERVED: u32 = 10;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Caps HELLO's interval so `Instant` arithmetic cannot overflow.
+const MAX_HEARTBEAT_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Deserialize)]
 struct Packet {
@@ -387,7 +389,7 @@ impl Runner {
                     .get("heartbeat_interval")
                     .and_then(Value::as_u64)
                     .unwrap_or(41_250)
-                    .max(1);
+                    .clamp(1, MAX_HEARTBEAT_INTERVAL_MS);
                 let interval = Duration::from_millis(ms);
                 let jitter = rand::rng().random_range(0.0..1.0);
                 *heartbeat = Some(Heartbeat {
@@ -421,7 +423,7 @@ impl Runner {
                 return Ok(Some(End::Reconnect {
                     code: None,
                     resume: true,
-                    healthy: true,
+                    healthy: *ready,
                 }));
             }
             OP_INVALID_SESSION => {
@@ -548,6 +550,11 @@ impl Runner {
     }
 
     fn emit(&self, event: GatewayEvent) {
+        self.shared
+            .lossless
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|tx| tx.send(event.clone()).is_ok());
         let _ = self.events.send(event);
     }
 }

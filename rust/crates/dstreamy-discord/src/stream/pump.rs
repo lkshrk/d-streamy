@@ -191,8 +191,13 @@ impl MediaPump {
 
     /// Switches to a new stream connection; video resumes at the next keyframe, which is requested now.
     pub(crate) fn attach(&self, conn: MediaConnection) {
-        let effects = self.shared.queue().require_keyframe(Instant::now());
-        self.conn.send_replace(Some(conn));
+        let effects = {
+            // Swapped under the queue lock so no frame popped before the swap reaches the new connection.
+            let mut queue = self.shared.queue();
+            let effects = queue.require_keyframe(Instant::now());
+            self.conn.send_replace(Some(conn));
+            effects
+        };
         self.shared.handle(effects);
     }
 
@@ -290,16 +295,16 @@ async fn send_frames(mut conn: watch::Receiver<Option<MediaConnection>>, shared:
         let next = {
             let mut queue = shared.queue();
             match queue.pop() {
-                Some(frame) => Some(frame),
+                Some(frame) => Some((frame, conn.borrow_and_update().clone())),
                 None if queue.is_closed() => return,
                 None => None,
             }
         };
-        let Some(frame) = next else {
+        let Some((frame, current)) = next else {
             shared.frame_ready.notified().await;
             continue;
         };
-        let Some(current) = conn.borrow_and_update().clone() else {
+        let Some(current) = current else {
             shared.discard(frame);
             continue;
         };
@@ -378,6 +383,7 @@ async fn watch_keyframes(
                     dave_ready = ready;
                     if due.is_some_and(|at| now >= at) {
                         due = None;
+                        shared.stats().stats.dave_keyframe_requests += 1;
                         shared.request_keyframe();
                     }
                 }

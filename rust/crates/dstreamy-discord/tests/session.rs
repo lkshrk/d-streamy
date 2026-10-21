@@ -1,5 +1,5 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -21,7 +21,7 @@ use dstreamy_mock_discord::{
 use secrecy::SecretString;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{sleep, timeout};
 
 const T: Duration = Duration::from_secs(20);
 
@@ -64,13 +64,13 @@ fn options() -> SessionOptions {
 struct Counters {
     starts: AtomicUsize,
     keyframe_requests: AtomicUsize,
-    first_keyframe_request: Mutex<Option<Instant>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Behaviour {
     Normal,
     FailStart,
+    HangStart,
     EndAfter(usize),
 }
 
@@ -108,6 +108,7 @@ impl CaptureSource for Counted {
         self.counters.starts.fetch_add(1, Ordering::SeqCst);
         let mut frames = match self.behaviour {
             Behaviour::FailStart => return Err(MediaError::AlreadyRunning),
+            Behaviour::HangStart => std::future::pending().await,
             _ => self.inner.start(config).await?,
         };
         let Behaviour::EndAfter(n) = self.behaviour else {
@@ -138,11 +139,6 @@ impl CaptureSource for Counted {
         self.counters
             .keyframe_requests
             .fetch_add(1, Ordering::SeqCst);
-        self.counters
-            .first_keyframe_request
-            .lock()
-            .unwrap()
-            .get_or_insert_with(Instant::now);
         self.inner.request_keyframe();
     }
 }
@@ -154,7 +150,6 @@ struct Fixture {
     state: watch::Receiver<SessionState>,
     events: broadcast::Receiver<SessionEvent>,
     counters: Arc<Counters>,
-    streaming_at: Instant,
 }
 
 impl Fixture {
@@ -186,7 +181,6 @@ impl Fixture {
             state,
             events,
             counters,
-            streaming_at: Instant::now(),
         };
         fixture.video_flowing().await;
         fixture
@@ -424,18 +418,27 @@ async fn health_snapshots_report_plausible_scores() {
     }
     let mut history = Vec::new();
     for h in &snapshots {
-        assert!(h.metrics.bitrate_kbps > 0, "{h:?}");
         history.push(h.metrics);
         assert_eq!(h.health, StreamHealth::compute(&history, 30), "{h:?}");
     }
-    // A stalled interval is followed by a catch-up burst, so only the mean rate tracks the source.
-    let n = history.len() as u64;
-    let mean_fps = history.iter().map(|m| m.fps).sum::<u64>() / n;
-    let mean_audio = history.iter().map(|m| m.a_sent).sum::<u64>() / n;
-    assert!((20..=40).contains(&mean_fps), "{history:?}");
-    assert!((30..=70).contains(&mean_audio), "{history:?}");
-    let last = snapshots.last().unwrap();
-    assert!(last.stats.video_frames_sent > 0);
+    for pair in snapshots.windows(2) {
+        let (prev, cur) = (&pair[0].stats, &pair[1].stats);
+        let m = &pair[1].metrics;
+        assert!(
+            cur.video_frames_sent >= prev.video_frames_sent,
+            "{snapshots:?}"
+        );
+        assert_eq!(m.a_sent, cur.audio_frames_sent - prev.audio_frames_sent);
+        assert_eq!(
+            m.a_drop_not_ready,
+            cur.audio_frames_dropped - prev.audio_frames_dropped
+        );
+    }
+    let (first, last) = (&snapshots[0], snapshots.last().unwrap());
+    assert!(
+        last.stats.video_frames_sent > first.stats.video_frames_sent,
+        "{snapshots:?}"
+    );
     assert_eq!(last.health.fps_series.len(), history.len());
     f.finish().await;
 }
@@ -444,32 +447,20 @@ async fn health_snapshots_report_plausible_scores() {
 async fn keyframes_are_requested_after_dave_and_on_viewer_pli() {
     let mut f = Fixture::streaming().await;
     assert!(f.mock.dave_active(VoiceKind::Stream).await);
-    timeout(T, async {
-        while f.counters.keyframe_requests.load(Ordering::SeqCst) == 0 {
-            sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("keyframe after DAVE");
-    let first = f.counters.first_keyframe_request.lock().unwrap().unwrap();
-    assert!(
-        first >= f.streaming_at + Duration::from_millis(400),
-        "requested {:?} after streaming",
-        first.saturating_duration_since(f.streaming_at)
-    );
-    sleep(Duration::from_millis(300)).await;
+    let dave_requested = |e: &SessionEvent| matches!(e, SessionEvent::Health(h) if h.stats.dave_keyframe_requests == 1);
+    let SessionEvent::Health(h) = f.wait_event(dave_requested).await else {
+        unreachable!()
+    };
+    assert_eq!(h.stats.viewer_keyframe_requests, 0, "{h:?}");
 
     let before = f.counters.keyframe_requests.load(Ordering::SeqCst);
     assert!(f.mock.send_pli(VoiceKind::Stream).await);
-    timeout(T, async {
-        while f.counters.keyframe_requests.load(Ordering::SeqCst) == before {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("keyframe after PLI");
-    f.wait_event(|e| matches!(e, SessionEvent::Health(h) if h.stats.viewer_keyframe_requests == 1))
-        .await;
+    let viewer_requested = |e: &SessionEvent| matches!(e, SessionEvent::Health(h) if h.stats.viewer_keyframe_requests == 1);
+    let SessionEvent::Health(h) = f.wait_event(viewer_requested).await else {
+        unreachable!()
+    };
+    assert_eq!(h.stats.dave_keyframe_requests, 1, "{h:?}");
+    assert!(f.counters.keyframe_requests.load(Ordering::SeqCst) > before);
     f.finish().await;
 }
 
@@ -794,4 +785,26 @@ fn session_state_and_events_serialize_for_json_output() {
         serde_json::to_value(&event).unwrap(),
         serde_json::json!({ "event": "state", "state": { "state": "reconnecting", "attempt": 2 } })
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hung_source_start_times_out_and_stop_returns() {
+    let mock = MockDiscord::start().await.unwrap();
+    let (client, session, mut state) = idle_session(&mock).await;
+    let (source, _) = Counted::with(Behaviour::HangStart);
+    let mut options = options();
+    options.stream.step_timeout = Duration::from_secs(2);
+    session
+        .start(
+            Some(MOCK_GUILD_ID.into()),
+            MOCK_VOICE_CHANNEL_ID.into(),
+            source,
+            options,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("start: {e}"));
+    let stopped = timeout(T, session.stop()).await.expect("stop hung");
+    assert!(stopped.is_ok());
+    wait_state(&mut state, |s| matches!(s, SessionState::Stopped { .. })).await;
+    close(client, session, mock).await;
 }

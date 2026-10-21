@@ -60,6 +60,10 @@ impl DiscordClient {
         self.gateway.subscribe()
     }
 
+    pub fn subscribe_unbounded(&self) -> mpsc::UnboundedReceiver<GatewayEvent> {
+        self.gateway.subscribe_unbounded()
+    }
+
     pub fn guilds(&self) -> Vec<Guild> {
         self.gateway.guilds()
     }

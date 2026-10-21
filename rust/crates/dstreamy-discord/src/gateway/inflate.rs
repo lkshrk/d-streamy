@@ -20,6 +20,10 @@ impl ZlibStream {
 
     /// Returns the decompressed message once its last frame has arrived.
     pub(crate) fn push(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        if self.buffer.len() + frame.len() > MAX_MESSAGE {
+            self.buffer.clear();
+            return Err("compressed message exceeds 64 MiB".into());
+        }
         self.buffer.extend_from_slice(frame);
         if !self.buffer.ends_with(&ZLIB_SUFFIX) {
             return Ok(None);
@@ -72,6 +76,21 @@ mod tests {
             out.reserve(1024);
         }
         out
+    }
+
+    #[test]
+    fn an_unterminated_message_is_capped() {
+        let mut z = ZlibStream::new();
+        let chunk = vec![0x55u8; 1024 * 1024];
+        let mut result = Ok(None);
+        for _ in 0..=MAX_MESSAGE / chunk.len() {
+            result = z.push(&chunk);
+            if result.is_err() {
+                break;
+            }
+        }
+        assert!(result.is_err());
+        assert!(z.buffer.is_empty());
     }
 
     #[test]
