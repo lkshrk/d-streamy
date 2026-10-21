@@ -24,3 +24,7 @@ todo = "warn"
 
 [patch.crates-io]
 webrtc = { path = "vendor/webrtc" }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

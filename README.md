@@ -38,6 +38,71 @@ Output: `bin/D-Streamy.app`
 4. Pick a window to stream
 5. Click Start
 
+## dstreamy CLI (Rust rewrite, preview)
+
+`dstreamy` is a single binary for macOS and Linux that replaces the menu bar app and the Bun daemon. It lives in `rust/` and is released from `rs-v*` tags; the app above stays the supported release until the rewrite is signed off.
+
+### Install
+
+Download `dstreamy-<version>-<target>.tar.gz` for your platform from the GitHub release, check it against the `.sha256` file next to it (`sha256sum -c` works too), and put `dstreamy` on your `PATH`:
+
+```bash
+shasum -a 256 -c dstreamy-0.1.0-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf dstreamy-0.1.0-aarch64-apple-darwin.tar.gz
+install -m 755 dstreamy-0.1.0-aarch64-apple-darwin/dstreamy ~/.local/bin/
+```
+
+Targets: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`. A tarball downloaded with a browser on macOS is quarantined; clear it with `xattr -d com.apple.quarantine ~/.local/bin/dstreamy`.
+
+Requirements:
+
+- macOS 14+ with Screen Recording permission for the terminal that runs `dstreamy`.
+- Linux (Wayland, PipeWire and xdg-desktop-portal) with GStreamer. On Debian or Ubuntu 24.04+:
+
+  ```bash
+  sudo apt-get install gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly gstreamer1.0-pipewire gstreamer1.0-pulseaudio
+  ```
+
+  Add `gstreamer1.0-vaapi` for VA-API hardware encoding.
+
+### Build from source
+
+macOS needs Xcode 26 (its SDK is required by `screencapturekit`) and a Rust toolchain:
+
+```bash
+cd rust
+cargo build --release -p dstreamy-cli
+./target/release/dstreamy --version
+```
+
+Linux additionally needs the GStreamer and PipeWire development packages:
+
+```bash
+sudo apt-get install clang libclang-dev pkg-config libpipewire-0.3-dev \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libopus-dev libssl-dev
+cd rust
+cargo build --release -p dstreamy-cli
+```
+
+Or build the Linux binary in Docker from any host (the output lands in the `dstreamy-linux-target` volume, not in `rust/target`):
+
+```bash
+rust/ci/linux.sh cargo build --release -p dstreamy-cli
+```
+
+### Usage
+
+```bash
+dstreamy login                      # paste the Discord user token; it is checked, then stored
+dstreamy guilds                     # list servers
+dstreamy channels <GUILD>           # list voice channels of a server
+dstreamy targets                    # list capturable displays and windows
+dstreamy stream --guild <GUILD> --channel <CHANNEL> --target display:1
+```
+
+`DSTREAMY_TOKEN` overrides the stored token. `stream` runs until Ctrl-C and takes `--codec h264|h265`, `--fps 15|30|60`, `--res 720p|900p|1080p|WIDTHxHEIGHT`, `--bitrate <kbps>`, `--gain <0.0-3.0>` and `--crop X,Y,W,H`; `--target test-pattern` streams a test pattern without capturing anything. Add `--json` for machine-readable output and `-v`/`-vv` for logs. On Linux, use `--target portal` and pick the window or screen in the portal dialog. See `dstreamy <command> --help` for details.
+
 ## Disclaimer
 
 Use at your own risk. This project uses a self-bot (user token automation) which violates Discord's Terms of Service. Your account may be suspended or banned. The authors take no responsibility for any consequences.

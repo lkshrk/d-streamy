@@ -1,0 +1,132 @@
+name: Release (Rust)
+
+on:
+  push:
+    tags: ["rs-v*"]
+
+concurrency:
+  group: release-rust-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check the tag matches the crate version
+        id: check
+        working-directory: rust
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          crate="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "dstreamy-cli") | .version')"
+          if [ "${TAG#rs-v}" != "$crate" ]; then
+            echo "::error::Tag $TAG does not match dstreamy-cli version $crate"
+            exit 1
+          fi
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+
+  check:
+    strategy:
+      matrix:
+        os: [macos-26, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config \
+            libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+            libopus-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  build:
+    needs: [version, check]
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-26
+          - target: x86_64-apple-darwin
+            os: macos-26
+            rosetta: true
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      ARCHIVE: dstreamy-${{ needs.version.outputs.version }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config \
+            libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libopus-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked -p dstreamy-cli --target ${{ matrix.target }}
+      - name: Install Rosetta
+        if: matrix.rosetta
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+      - name: Smoke test
+        run: ${{ matrix.rosetta && 'arch -x86_64' || '' }} target/${{ matrix.target }}/release/dstreamy --version
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/$ARCHIVE"
+          cp "target/${{ matrix.target }}/release/dstreamy" ../README.md "dist/$ARCHIVE/"
+          tar -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
+          (cd dist && shasum -a 256 "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: |
+            rust/dist/${{ env.ARCHIVE }}.tar.gz
+            rust/dist/${{ env.ARCHIVE }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dstreamy-*
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat dist/*.sha256 | tee -a "$GITHUB_STEP_SUMMARY"
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "dstreamy ${TAG#rs-v} (Rust preview)" --generate-notes --prerelease --latest=false
