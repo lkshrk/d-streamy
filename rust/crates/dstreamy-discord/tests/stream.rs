@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use discord_stream_rs::{rewrite_sps_vui, split_nalu};
-use dstreamy_discord::{DiscordClient, GatewayOptions, StreamOptions, StreamStats, start_stream};
+use dstreamy_discord::{
+    DiscordClient, GatewayEvent, GatewayOptions, StreamError, StreamOptions, StreamStats,
+    start_stream,
+};
 use dstreamy_media::{
     AudioEncoder, AudioFrame, CaptureConfig, CaptureSource, CaptureTarget, EncodedVideoFrame,
     FRAME_CHANNEL_CAPACITY, FrameReceiver, MediaError, MediaFrame, OPUS_CHANNELS,
@@ -473,6 +476,7 @@ struct FloodSource {
     task: Option<JoinHandle<()>>,
     keyframe_requests: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
+    fail_start: bool,
 }
 
 impl FloodSource {
@@ -482,6 +486,7 @@ impl FloodSource {
             task: None,
             keyframe_requests: Arc::default(),
             stopped: Arc::default(),
+            fail_start: false,
         }
     }
 }
@@ -493,6 +498,10 @@ impl CaptureSource for FloodSource {
     }
 
     async fn start(&mut self, _config: CaptureConfig) -> Result<FrameReceiver, MediaError> {
+        if self.fail_start {
+            self.fail_start = false;
+            return Err(MediaError::AlreadyRunning);
+        }
         let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
         let size = self.size;
         let requests = self.keyframe_requests.clone();
@@ -552,16 +561,23 @@ async fn start(
     .unwrap()
 }
 
+fn voice_leaves(recorded: &Recorded) -> usize {
+    recorded
+        .ops
+        .iter()
+        .filter(|o| o.is(None, gw::OP_VOICE_STATE_UPDATE))
+        .filter(|o| o.json().unwrap()["channel_id"].is_null())
+        .count()
+}
+
 async fn left_voice(mock: &MockDiscord) {
-    mock.wait_for(T, |r| {
-        r.ops
-            .iter()
-            .filter(|o| o.is(None, gw::OP_VOICE_STATE_UPDATE))
-            .any(|o| o.json().unwrap()["channel_id"].is_null())
-            .then_some(())
-    })
-    .await
-    .expect("voice left");
+    left_voice_times(mock, 1).await;
+}
+
+async fn left_voice_times(mock: &MockDiscord, n: usize) {
+    mock.wait_for(T, |r| (voice_leaves(r) >= n).then_some(()))
+        .await
+        .expect("voice left");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -638,6 +654,87 @@ async fn cancelled_start_leaves_voice() {
     assert!(started.is_err(), "start finished within 1 ms");
     left_voice(&mock).await;
     assert!(mock.streams().is_empty());
+    Arc::try_unwrap(client).ok().unwrap().close().await;
+    mock.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_start_hands_the_source_back_for_a_retry() {
+    let mock = MockDiscord::start().await.unwrap();
+    let client = client(&mock).await;
+    let mut options = StreamOptions::new(capture(VideoCodec::H264, 320, 180));
+    options.step_timeout = Duration::from_millis(200);
+    let unreachable = start_stream(
+        client.clone(),
+        Some(MOCK_GUILD_ID.into()),
+        "999".into(),
+        Box::new(FloodSource::new(2_000)),
+        options.clone(),
+    );
+    let Err(err) = timeout(T, unreachable).await.unwrap() else {
+        panic!("start succeeded in an unknown channel")
+    };
+    assert!(matches!(err.error, StreamError::Timeout(_)), "{err:?}");
+
+    let mut failing = FloodSource::new(2_000);
+    failing.fail_start = true;
+    let leaves = voice_leaves(&mock.recorded());
+    let source_failed = start_stream(
+        client.clone(),
+        Some(MOCK_GUILD_ID.into()),
+        MOCK_VOICE_CHANNEL_ID.into(),
+        Box::new(failing),
+        StreamOptions::new(capture(VideoCodec::H264, 320, 180)),
+    );
+    let Err(err) = timeout(T, source_failed).await.unwrap() else {
+        panic!("start succeeded with a failing source")
+    };
+    assert!(matches!(err.error, StreamError::Media(_)), "{err:?}");
+    left_voice_times(&mock, leaves + 1).await;
+
+    let retried = start_stream(
+        client.clone(),
+        Some(MOCK_GUILD_ID.into()),
+        MOCK_VOICE_CHANNEL_ID.into(),
+        err.capture,
+        StreamOptions::new(capture(VideoCodec::H264, 320, 180)),
+    );
+    let handle = timeout(T, retried).await.unwrap().unwrap();
+    wait_sent(|| handle.stats(), 5).await;
+    timeout(T, handle.stop()).await.unwrap().unwrap();
+    Arc::try_unwrap(client).ok().unwrap().close().await;
+    mock.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_devices_voice_state_does_not_replace_our_voice_session() {
+    let mock = MockDiscord::start().await.unwrap();
+    let client = client(&mock).await;
+    let ours = client.session_id().unwrap();
+    let handle = start(&client, FloodSource::new(2_000)).await;
+    wait_sent(|| handle.stats(), 5).await;
+
+    let mut events = client.subscribe_unbounded();
+    assert!(mock.voice_state_from_other_session(MOCK_GUILD_ID, Some(MOCK_VOICE_CHANNEL_ID)));
+    timeout(T, async {
+        while let Some(event) = events.recv().await {
+            if let GatewayEvent::VoiceStateUpdate(v) = event
+                && v.session_id.as_deref().is_some_and(|id| id != ours)
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("foreign voice state delivered");
+
+    assert!(mock.drop_voice(VoiceKind::Voice, None));
+    let resume = mock
+        .wait_for_op(Some(VoiceKind::Voice), vo::OP_RESUME, 0, T)
+        .await
+        .expect("voice RESUME");
+    assert_eq!(resume.json().unwrap()["session_id"], ours.as_str());
+    timeout(T, handle.stop()).await.unwrap().unwrap();
     Arc::try_unwrap(client).ok().unwrap().close().await;
     mock.shutdown().await;
 }

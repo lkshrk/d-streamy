@@ -89,21 +89,49 @@ pub struct StreamHandle {
     attrs: Mutex<VideoAttributes>,
 }
 
+/// A failed `start_stream`, with the source handed back for a retry.
+#[derive(thiserror::Error)]
+#[error("starting the stream failed")]
+pub struct StreamStartError {
+    pub capture: Box<dyn CaptureSource>,
+    #[source]
+    pub error: StreamError,
+}
+
+impl std::fmt::Debug for StreamStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamStartError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
 pub async fn start_stream(
     client: Arc<DiscordClient>,
     guild_id: Option<String>,
     channel_id: String,
     source: Box<dyn CaptureSource>,
     options: StreamOptions,
-) -> Result<StreamHandle, StreamError> {
+) -> Result<StreamHandle, StreamStartError> {
     let attrs = initial_attributes(&options);
     let teardown = Teardown(Some(&client));
-    let (voice, voice_events) =
-        join_voice(&client, guild_id, channel_id, options.step_timeout).await?;
-    let (conn, stream_events) = open_stream(&client, &options, attrs).await?;
+    let connected = async {
+        let voice = join_voice(&client, guild_id, channel_id, options.step_timeout).await?;
+        let stream = open_stream(&client, &options, attrs).await?;
+        Ok::<_, StreamError>((voice, stream))
+    };
+    let ((voice, voice_events), (conn, stream_events)) = match connected.await {
+        Ok(connected) => connected,
+        Err(error) => {
+            return Err(StreamStartError {
+                capture: source,
+                error,
+            });
+        }
+    };
     let pump = MediaPump::start(source, &options, Some(conn.clone()))
         .await
-        .map_err(|(_, e)| e)?;
+        .map_err(|(capture, error)| StreamStartError { capture, error })?;
     teardown.defuse();
 
     let watcher = tokio::spawn(watch_connections(

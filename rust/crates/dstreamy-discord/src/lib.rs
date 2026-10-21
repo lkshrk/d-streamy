@@ -14,4 +14,6 @@ pub use session::{
     Backoff, HealthSnapshot, Session, SessionError, SessionEvent, SessionOptions, SessionState,
     StartError, StopReason,
 };
-pub use stream::{StreamError, StreamHandle, StreamOptions, StreamStats, start_stream};
+pub use stream::{
+    StreamError, StreamHandle, StreamOptions, StreamStartError, StreamStats, start_stream,
+};

@@ -56,8 +56,14 @@ pub enum StopReason {
     Requested,
     CaptureEnded,
     GatewayClosed,
-    GaveUp { attempts: u32 },
-    SourceFailed { message: String },
+    GaveUp {
+        attempts: u32,
+    },
+    SourceFailed {
+        message: String,
+    },
+    /// Another device of this account joined voice; Discord allows one voice connection per user.
+    VoiceTakenOver,
 }
 
 impl fmt::Display for StopReason {
@@ -68,6 +74,7 @@ impl fmt::Display for StopReason {
             Self::GatewayClosed => f.write_str("the gateway connection closed"),
             Self::GaveUp { attempts } => write!(f, "gave up after {attempts} reconnect attempts"),
             Self::SourceFailed { message } => write!(f, "the capture source failed: {message}"),
+            Self::VoiceTakenOver => f.write_str("another device of this account joined voice"),
         }
     }
 }
@@ -570,7 +577,14 @@ impl Run {
                         phase = self.reconnect(actor, &phase, Redo::Voice);
                     }
                     Some(GatewayEvent::VoiceStateUpdate(state)) => {
-                        if let Some(next) = self.on_voice_state(actor, &phase, state) {
+                        if self.is_other_session(&state) {
+                            if state.channel_id.is_some() {
+                                actor.error("another device of this account joined voice", true);
+                                break (StopReason::VoiceTakenOver, None, false);
+                            }
+                        } else if self.is_stale_session(&state) {
+                            debug!("voice state of an earlier gateway session ignored");
+                        } else if let Some(next) = self.on_voice_state(actor, &phase, state) {
                             phase = next;
                         }
                     }
@@ -595,8 +609,15 @@ impl Run {
         };
 
         drop(phase);
-        self.client.stop_stream();
-        self.client.leave_voice();
+        if reason == StopReason::VoiceTakenOver {
+            // Op 4 or STREAM_DELETE would act on the voice state and stream key the other device now uses.
+            let streamer = self.client.streamer();
+            streamer.stream_connection().map(MediaConnection::stop);
+            streamer.voice_connection().map(MediaConnection::stop);
+        } else {
+            self.client.stop_stream();
+            self.client.leave_voice();
+        }
         if let Some(pump) = self.pump.take() {
             let (stopped, result) = pump.stop().await;
             if let Err(e) = result {
@@ -738,6 +759,21 @@ impl Run {
             }
             _ => None,
         }
+    }
+
+    fn is_other_session(&self, state: &VoiceState) -> bool {
+        state.user_id == self.client.user().id
+            && self.client.session_id().is_some()
+            && state
+                .session_id
+                .as_deref()
+                .is_some_and(|id| !self.client.is_own_session(id))
+    }
+
+    fn is_stale_session(&self, state: &VoiceState) -> bool {
+        state.session_id.as_deref().is_some_and(|id| {
+            self.client.is_own_session(id) && self.client.session_id().as_deref() != Some(id)
+        })
     }
 
     fn update_video(&mut self, attrs: VideoAttributes) -> Result<(), SessionError> {

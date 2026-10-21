@@ -461,6 +461,7 @@ impl Runner {
                         id: r.session_id.clone(),
                         resume_url: r.resume_gateway_url,
                     });
+                    self.shared.set_session_id(r.session_id.clone());
                     *self
                         .shared
                         .user

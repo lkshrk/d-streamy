@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{STEP, Server, USER_ID, options};
+use common::{SESSION_ID, STEP, Server, USER_ID, options};
 use dstreamy_discord::DiscordClient;
 use dstreamy_discord::transport::StreamerError;
 use futures_util::{SinkExt, StreamExt};
@@ -44,7 +44,7 @@ async fn dispatches_reach_the_streamer_and_its_payloads_go_out() {
     conn.dispatch(
         3,
         "VOICE_STATE_UPDATE",
-        json!({"guild_id": GUILD, "channel_id": CHANNEL, "user_id": USER_ID, "session_id": "voice-session", "self_deaf": true}),
+        json!({"guild_id": GUILD, "channel_id": CHANNEL, "user_id": USER_ID, "session_id": SESSION_ID, "self_deaf": true}),
     )
     .await;
 
@@ -59,7 +59,7 @@ async fn dispatches_reach_the_streamer_and_its_payloads_go_out() {
     let identify = voice_identify(&voice_listener).await;
     assert_eq!(identify["server_id"], GUILD);
     assert_eq!(identify["user_id"], USER_ID);
-    assert_eq!(identify["session_id"], "voice-session");
+    assert_eq!(identify["session_id"], SESSION_ID);
     assert_eq!(identify["token"], "voice-token");
 
     let _stream = timeout(STEP, async {

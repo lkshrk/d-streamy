@@ -40,6 +40,40 @@ pub(crate) struct Shared {
     user: RwLock<Option<CurrentUser>>,
     latency: Mutex<Option<Duration>>,
     lossless: Mutex<Vec<mpsc::UnboundedSender<GatewayEvent>>>,
+    session_id: RwLock<Option<String>>,
+    past_sessions: RwLock<Vec<String>>,
+}
+
+impl Shared {
+    pub(crate) fn session_id(&self) -> Option<String> {
+        self.session_id
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_session_id(&self, id: String) {
+        let mut current = self
+            .session_id
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(old) = current.replace(id) {
+            self.past_sessions
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(old);
+        }
+    }
+
+    fn was_session(&self, id: &str) -> bool {
+        self.session_id().as_deref() == Some(id)
+            || self
+                .past_sessions
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|s| s == id)
+    }
 }
 
 /// User-account main gateway connection; reconnects and resumes on its own until closed.
@@ -89,6 +123,16 @@ impl GatewayClient {
 
     pub fn subscribe(&self) -> broadcast::Receiver<GatewayEvent> {
         self.events.subscribe()
+    }
+
+    /// The session id of the latest READY, which Discord also puts on this client's voice states.
+    pub fn session_id(&self) -> Option<String> {
+        self.shared.session_id()
+    }
+
+    /// Whether `id` is this client's current or an earlier gateway session (not another device's).
+    pub fn is_own_session(&self, id: &str) -> bool {
+        self.shared.was_session(id)
     }
 
     /// Like `subscribe`, but never lags: for consumers that must see every voice state and READY.
@@ -206,6 +250,10 @@ impl GatewayClient {
         {
             self.task.abort();
         }
+    }
+
+    pub(crate) fn shared(&self) -> Arc<Shared> {
+        self.shared.clone()
     }
 
     pub(crate) fn command_sender(&self) -> mpsc::UnboundedSender<Value> {

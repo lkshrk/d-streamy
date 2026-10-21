@@ -808,3 +808,118 @@ async fn a_hung_source_start_times_out_and_stop_returns() {
     wait_state(&mut state, |s| matches!(s, SessionState::Stopped { .. })).await;
     close(client, session, mock).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_device_joining_voice_stops_the_session_without_leaving() {
+    let mut f = Fixture::streaming().await;
+    assert!(
+        f.mock
+            .voice_state_from_other_session(MOCK_GUILD_ID, Some(MOCK_OTHER_VOICE_CHANNEL_ID))
+    );
+    wait_state(&mut f.state, |s| matches!(s, SessionState::Stopped { .. })).await;
+    assert_eq!(
+        *f.state.borrow(),
+        SessionState::Stopped {
+            reason: StopReason::VoiceTakenOver
+        }
+    );
+    // A marker op 4 on the same path as a leave would take: once it arrives, any leave would have too.
+    f.client.streamer().signal_video(false);
+    f.mock
+        .wait_for(T, |r| {
+            let joins = r
+                .ops
+                .iter()
+                .filter(|o| o.is(None, gw::OP_VOICE_STATE_UPDATE))
+                .filter(|o| o.json().is_some_and(|d| d["channel_id"].is_string()))
+                .count();
+            (joins == 2).then_some(())
+        })
+        .await
+        .expect("marker op 4");
+    let leaves = f
+        .mock
+        .received_ops()
+        .iter()
+        .filter(|o| o.is(None, gw::OP_VOICE_STATE_UPDATE))
+        .filter(|o| o.json().is_some_and(|d| d["channel_id"].is_null()))
+        .count();
+    assert_eq!(
+        leaves, 0,
+        "left the voice channel the other device now holds"
+    );
+    assert_eq!(f.gateway_ops(gw::OP_STREAM_DELETE), 0);
+    assert!(
+        timeout(T, f.session.stop())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_some()
+    );
+    timeout(T, f.session.shutdown()).await.unwrap();
+    Arc::try_unwrap(f.client).ok().unwrap().close().await;
+    f.mock.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_device_leaving_voice_is_ignored() {
+    let mut f = Fixture::streaming().await;
+    assert!(f.mock.voice_state_from_other_session(MOCK_GUILD_ID, None));
+    assert!(
+        f.mock
+            .move_to_channel(MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID)
+    );
+    let mut removed = false;
+    timeout(T, async {
+        loop {
+            match f.events.recv().await {
+                Ok(SessionEvent::ChannelMoved { .. }) => break,
+                Ok(SessionEvent::Error { message, .. }) => removed |= message.contains("removed"),
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("session events: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("ChannelMoved");
+    assert!(!removed, "another device leaving was taken as our removal");
+    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    f.video_flowing().await;
+    assert_eq!(f.voice_joins(), [MOCK_VOICE_CHANNEL_ID]);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn viewer_fir_and_pli_each_count_once() {
+    let mut f = Fixture::streaming().await;
+    let dave_requested = |e: &SessionEvent| matches!(e, SessionEvent::Health(h) if h.stats.dave_keyframe_requests == 1);
+    f.wait_event(dave_requested).await;
+    let conn = f.client.streamer().stream_connection().cloned().unwrap();
+    let mut requests = conn.keyframe_requests();
+    let base = *requests.borrow_and_update();
+    let before = f.counters.keyframe_requests.load(Ordering::SeqCst);
+
+    assert!(f.mock.send_fir(VoiceKind::Stream, 1).await);
+    timeout(T, requests.wait_for(|n| *n > base))
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(T, async {
+        while f.counters.keyframe_requests.load(Ordering::SeqCst) == before {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("keyframe after FIR");
+
+    assert!(f.mock.send_pli(VoiceKind::Stream).await);
+    let viewer_twice = |e: &SessionEvent| matches!(e, SessionEvent::Health(h) if h.stats.viewer_keyframe_requests == 2);
+    f.wait_event(viewer_twice).await;
+    assert_eq!(
+        *requests.borrow(),
+        base + 2,
+        "a viewer request counted more than once"
+    );
+    drop(conn);
+    f.finish().await;
+}

@@ -40,6 +40,7 @@ impl DiscordClient {
             dispatch_rx,
             payload_rx,
             gateway.command_sender(),
+            gateway.shared(),
         ));
         Ok(Self {
             gateway,
@@ -58,6 +59,14 @@ impl DiscordClient {
 
     pub fn subscribe(&self) -> broadcast::Receiver<GatewayEvent> {
         self.gateway.subscribe()
+    }
+
+    pub fn session_id(&self) -> Option<String> {
+        self.gateway.session_id()
+    }
+
+    pub fn is_own_session(&self, id: &str) -> bool {
+        self.gateway.is_own_session(id)
     }
 
     pub fn subscribe_unbounded(&self) -> mpsc::UnboundedReceiver<GatewayEvent> {
@@ -110,11 +119,16 @@ async fn bridge(
     mut dispatches: mpsc::UnboundedReceiver<Dispatch>,
     mut payloads: mpsc::UnboundedReceiver<transport::GatewayPayload>,
     commands: mpsc::UnboundedSender<serde_json::Value>,
+    gateway: Arc<crate::gateway::Shared>,
 ) {
     loop {
         tokio::select! {
             dispatch = dispatches.recv() => {
                 let Some(Dispatch { name, data, .. }) = dispatch else { break };
+                // The Streamer adopts any voice state of this user as its voice session; another device's is not ours.
+                if name == "VOICE_STATE_UPDATE" && is_foreign_session(&data, gateway.session_id().as_deref()) {
+                    continue;
+                }
                 let data = Arc::try_unwrap(data).unwrap_or_else(|shared| (*shared).clone());
                 let event = transport::GatewayEvent::from_dispatch(&name, data);
                 streamer.lock().unwrap_or_else(PoisonError::into_inner).handle_event(event);
@@ -125,5 +139,12 @@ async fn bridge(
                 }
             }
         }
+    }
+}
+
+fn is_foreign_session(data: &serde_json::Value, ours: Option<&str>) -> bool {
+    match (data["session_id"].as_str(), ours) {
+        (Some(theirs), Some(ours)) => theirs != ours,
+        _ => false,
     }
 }
