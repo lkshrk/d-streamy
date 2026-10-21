@@ -10,6 +10,7 @@ use dstreamy_core::{CropRect, Fps, Resolution, StreamConfig};
 use dstreamy_discord::{
     DiscordClient, GatewayError, Session, SessionError, SessionEvent, SessionState, StreamStats,
 };
+use dstreamy_media::CaptureConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
@@ -208,6 +209,25 @@ struct Running {
     target: String,
     stream: StreamConfig,
     crop: Option<CropRect>,
+}
+
+impl Running {
+    fn updated(&self, p: &UpdateParams) -> Result<(Self, CaptureConfig), Failure> {
+        let stream = StreamConfig {
+            resolution: p.resolution.unwrap_or(self.stream.resolution),
+            fps: p.fps.unwrap_or(self.stream.fps),
+            bitrate_kbps: p.bitrate_kbps.unwrap_or(self.stream.bitrate_kbps),
+            ..self.stream
+        };
+        stream.validate().map_err(invalid_params)?;
+        let next = Self {
+            target: self.target.clone(),
+            stream,
+            crop: p.crop.or(self.crop),
+        };
+        let capture = stream::capture_config(&next.target, &next.stream, next.crop);
+        Ok((next, capture))
+    }
 }
 
 struct Daemon {
@@ -528,27 +548,15 @@ impl Daemon {
             .filter(|c| c.live())
             .ok_or_else(not_running)?;
         let _updating = self.updating.lock().await;
-        let (target, settings, crop) = {
-            let running = lock(&self.running);
-            let running = running.as_ref().ok_or_else(not_running)?;
-            let settings = StreamConfig {
-                resolution: p.resolution.unwrap_or(running.stream.resolution),
-                fps: p.fps.unwrap_or(running.stream.fps),
-                bitrate_kbps: p.bitrate_kbps.unwrap_or(running.stream.bitrate_kbps),
-                ..running.stream
-            };
-            (running.target.clone(), settings, p.crop.or(running.crop))
-        };
-        settings.validate().map_err(invalid_params)?;
-        let capture = stream::capture_config(&target, &settings, crop);
+        let (next, capture) = lock(&self.running)
+            .as_ref()
+            .ok_or_else(not_running)?
+            .updated(&p)?;
         conn.session
             .reconfigure(capture)
             .await
             .map_err(session_failure)?;
-        if let Some(running) = lock(&self.running).as_mut() {
-            running.stream = settings;
-            running.crop = crop;
-        }
+        *lock(&self.running) = Some(next);
         Ok(Value::Null)
     }
 
@@ -629,6 +637,37 @@ mod tests {
         }
         let (id, code, _) = error("{\"id\":\"a\"}");
         assert_eq!((id.as_deref(), code), (Some("a"), "malformed"));
+    }
+
+    #[test]
+    fn an_update_carries_the_crop_and_keeps_the_rest() {
+        let running = Running {
+            target: "display:1".into(),
+            stream: StreamConfig::default(),
+            crop: None,
+        };
+        let crop = CropRect::new(10, 20, 640, 360);
+        let update = |line: &str| match parse(line.as_bytes()) {
+            Ok((_, Command::Update(p))) => p,
+            _ => panic!("{line}"),
+        };
+
+        let (next, capture) = running
+            .updated(&update(
+                r#"{"id":"u","cmd":"update","crop":{"x":10,"y":20,"width":640,"height":360}}"#,
+            ))
+            .unwrap();
+        assert_eq!(capture.crop, Some(crop));
+        assert_eq!(capture.target_id.as_deref(), Some("display:1"));
+        assert_eq!(capture.fps, running.stream.fps.get());
+        assert_eq!(next.crop, Some(crop));
+
+        let (next, capture) = next
+            .updated(&update(r#"{"id":"u","cmd":"update","fps":30}"#))
+            .unwrap();
+        assert_eq!(capture.crop, Some(crop));
+        assert_eq!(capture.fps, 30);
+        assert_eq!(next.stream.fps.get(), 30);
     }
 
     #[test]
