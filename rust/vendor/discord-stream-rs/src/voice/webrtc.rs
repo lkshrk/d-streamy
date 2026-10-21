@@ -260,7 +260,7 @@ impl WebRtcWrapper {
                         mime_type: MIME_TYPE_OPUS.to_owned(),
                         clock_rate: codec_payload::OPUS.clock_rate,
                         channels: 2,
-                        sdp_fmtp_line: "minptime=10;useinbandfec=1;usedtx=1".to_owned(),
+                        sdp_fmtp_line: codec_payload::OPUS.fmtp.to_owned(),
                         rtcp_feedback: vec![feedback("nack", "")],
                     },
                     payload_type: codec_payload::OPUS.payload_type,
@@ -648,7 +648,7 @@ pub fn build_answer_sdp(discord_sdp: &str) -> String {
     let common = format!(
         "{ip}\r\n{{EXT}}a=setup:passive\r\n{{MID}}a=recvonly\r\n{ufrag}\r\n{pwd}\r\n{fingerprint}\r\n{candidate}\r\na=rtcp-mux\r\n"
     );
-    let opus = codec_payload::OPUS.payload_type;
+    let (opus, opus_fmtp) = (codec_payload::OPUS.payload_type, codec_payload::OPUS.fmtp);
     let audio = format!("m=audio {port} UDP/TLS/RTP/SAVPF {opus}\r\n")
         + &common
             .replace(
@@ -659,7 +659,7 @@ pub fn build_answer_sdp(discord_sdp: &str) -> String {
             .replace("{MID}", "a=mid:0\r\na=maxptime:60\r\n")
         + &format!(
             "a=rtpmap:{opus} opus/48000/2\r\n\
-             a=fmtp:{opus} minptime=10;useinbandfec=1;usedtx=1\r\n\
+             a=fmtp:{opus} {opus_fmtp}\r\n\
              a=rtcp-fb:{opus} transport-cc\r\n\
              a=rtcp-fb:{opus} nack\r\n"
         );
@@ -731,6 +731,9 @@ mod tests {
         assert!(sdp.contains("a=rtpmap:103 H265/90000\r\n"));
         assert!(sdp.contains(
             "a=fmtp:101 profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1\r\n"
+        ));
+        assert!(sdp.contains(
+            "a=fmtp:120 minptime=10;maxaveragebitrate=96000;stereo=1;sprop-stereo=1;useinbandfec=1\r\n"
         ));
         assert!(
             sdp.contains(

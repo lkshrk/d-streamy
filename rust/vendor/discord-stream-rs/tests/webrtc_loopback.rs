@@ -34,6 +34,11 @@ async fn sends_rtp_on_discord_ssrcs_and_payload_types() {
         codec_payload::H264.payload_type,
         codec_payload::H264.fmtp
     )));
+    assert!(offer.contains(&format!(
+        "a=fmtp:{} {}\r\n",
+        codec_payload::OPUS.payload_type,
+        codec_payload::OPUS.fmtp
+    )));
 
     let (server, mut rtp_rx) = fake_discord_peer().await;
     let discord_sdp = answer_like_discord(&server, offer).await;

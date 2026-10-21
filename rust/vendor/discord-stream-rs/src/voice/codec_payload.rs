@@ -6,6 +6,8 @@ pub struct AudioCodecInfo {
     pub name: &'static str,
     pub clock_rate: u32,
     pub payload_type: u8,
+    /// libdatachannel's default `a=fmtp` for the codec.
+    pub fmtp: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -23,6 +25,7 @@ pub const OPUS: AudioCodecInfo = AudioCodecInfo {
     name: "opus",
     clock_rate: 48_000,
     payload_type: 120,
+    fmtp: "minptime=10;maxaveragebitrate=96000;stereo=1;sprop-stereo=1;useinbandfec=1",
 };
 
 pub const H264: VideoCodecInfo = VideoCodecInfo {
