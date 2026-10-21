@@ -20,7 +20,7 @@ struct PopoverView: View {
                     Text(state.authError == nil ? "Not logged in" : "Login failed")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Button(state.token.isEmpty ? "Login" : "Edit token") { showTokenInput = true }
+                    Button(state.authError == nil ? "Login" : "Edit token") { showTokenInput = true }
                         .font(.caption)
                         .buttonStyle(.bordered)
                         .controlSize(.small)
@@ -46,12 +46,9 @@ struct PopoverView: View {
                             .foregroundStyle(.green)
                     }
                     Menu {
-                        Button("Logout", role: .destructive) {
-                            state.clearToken()
-                            showTokenInput = false
-                        }
+                        Button("Change token") { showTokenInput = true }
                     } label: {
-                        Text(state.username.isEmpty ? "Logged in" : state.username)
+                        Text("Logged in")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -61,6 +58,15 @@ struct PopoverView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
+
+            if let daemonError = state.daemonError {
+                Text(daemonError)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            }
 
             if let authError = state.authError {
                 Text(authError)
@@ -82,9 +88,10 @@ struct PopoverView: View {
                             .controlSize(.small)
                         Button("Save") {
                             if !tokenInput.isEmpty {
-                                state.saveToken(tokenInput)
+                                let token = tokenInput
                                 tokenInput = ""
                                 showTokenInput = false
+                                Task { await state.saveToken(token) }
                             }
                         }
                         .buttonStyle(.borderedProminent)
@@ -149,6 +156,10 @@ struct PopoverView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
         }
+        .onAppear {
+            guard !state.streamState.canStop else { return }
+            Task { await state.refreshTargets() }
+        }
     }
 
 }
@@ -183,14 +194,14 @@ struct StreamButton: View {
 
     private var canStart: Bool {
         state.streamState.canStop ||
-        (state.isAuthenticated && state.captureFilter != nil && state.selectedGuild != nil && state.selectedChannel != nil)
+        (state.isAuthenticated && state.selectedTarget != nil && state.selectedGuild != nil && state.selectedChannel != nil)
     }
 
     private var missingInfo: String {
         if state.streamState.canStop { return "Stop streaming" }
         var missing: [String] = []
         if !state.isAuthenticated { missing.append("login") }
-        if state.captureFilter == nil { missing.append("source") }
+        if state.selectedTarget == nil { missing.append("source") }
         if state.selectedGuild == nil { missing.append("server") }
         if state.selectedChannel == nil { missing.append("channel") }
         if missing.isEmpty { return "Start streaming" }

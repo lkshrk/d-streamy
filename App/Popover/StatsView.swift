@@ -3,59 +3,58 @@ import SwiftUI
 struct StatsView: View {
     @EnvironmentObject var state: AppState
 
-    private var health: StreamHealth {
-        StreamHealth.compute(history: state.metricsHistory, targetFps: state.fps)
-    }
-    private var latest: MetricsPayload? { state.metricsHistory.last }
-
     var body: some View {
+        let snapshot = state.health
+        let health = snapshot?.health
+        let metrics = snapshot?.metrics
+        let videoLevel = health?.videoLevel ?? .good
+        let audioLevel = health?.audioLevel ?? .good
+
         VStack(spacing: 12) {
-            // Capture info + uptime
-            if !state.captureLabel.isEmpty {
+            if let target = state.selectedTarget {
                 HStack {
                     Image(systemName: "play.circle.fill")
                         .foregroundStyle(.green)
-                    Text(state.captureLabel)
+                    Text(target.label)
                         .font(.subheadline.bold())
                         .lineLimit(1)
                     Spacer()
-                    Text(formatUptime(state.stats.uptime))
+                    Text(formatUptime(state.streamStartedAt))
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
             }
 
-            // Stability headline: score + sparkline per A/V
             VStack(spacing: 6) {
-                HealthRow(label: "Video", score: health.videoScore,
-                          level: health.videoLevel, series: health.fpsSeries)
-                HealthRow(label: "Audio", score: health.audioScore,
-                          level: health.audioLevel, series: health.audioSeries)
+                HealthRow(label: "Video", score: health?.videoScore ?? 100,
+                          level: videoLevel, series: health?.fpsSeries ?? [])
+                HealthRow(label: "Audio", score: health?.audioScore ?? 100,
+                          level: audioLevel, series: health?.audioSeries ?? [])
             }
 
-            // Live per-interval detail
             LazyVGrid(columns: [
                 GridItem(.flexible()),
                 GridItem(.flexible()),
             ], spacing: 8) {
                 StatCard(label: "FPS",
-                         value: "\(latest?.fps ?? state.stats.fps)/\(state.fps)",
-                         valueColor: health.videoLevel.color)
+                         value: "\(metrics?.fps ?? 0)/\(state.fps)",
+                         valueColor: videoLevel.color)
                 StatCard(label: "Jitter p95/max",
-                         value: "\(latest?.gapP95Ms ?? 0)/\(latest?.gapMaxMs ?? 0) ms",
-                         valueColor: health.videoLevel.color)
-                StatCard(label: "Bitrate", value: formatBitrate(latest?.bitrateKbps ?? state.stats.bitrate))
-                StatCard(label: "Dropped", value: "\(state.stats.droppedFrames)",
-                         valueColor: (latest?.vDrop ?? 0) > 1 ? .yellow : .primary)
-                StatCard(label: "Audio/s", value: "\(latest?.aSent ?? 0)",
-                         valueColor: health.audioLevel.color)
-                StatCard(label: "Enc Err", value: "\(latest?.aEncErr ?? 0)",
-                         valueColor: (latest?.aEncErr ?? 0) > 0 ? .red : .primary)
+                         value: "\(metrics?.gapP95Ms ?? 0)/\(metrics?.gapMaxMs ?? 0) ms",
+                         valueColor: videoLevel.color)
+                StatCard(label: "Bitrate", value: formatBitrate(metrics?.bitrateKbps ?? 0))
+                StatCard(label: "Dropped", value: "\(snapshot?.stats.videoFramesDropped ?? 0)",
+                         valueColor: (metrics?.vDrop ?? 0) > 1 ? .yellow : .primary)
+                StatCard(label: "Audio/s", value: "\(metrics?.aSent ?? 0)",
+                         valueColor: audioLevel.color)
+                StatCard(label: "Enc Err", value: "\(metrics?.aEncErr ?? 0)",
+                         valueColor: (metrics?.aEncErr ?? 0) > 0 ? .red : .primary)
             }
         }
     }
 
-    private func formatUptime(_ seconds: Int) -> String {
+    private func formatUptime(_ start: Date?) -> String {
+        let seconds = start.map { max(0, Int(Date().timeIntervalSince($0))) } ?? 0
         let h = seconds / 3600
         let m = (seconds % 3600) / 60
         let s = seconds % 60

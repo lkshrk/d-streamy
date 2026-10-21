@@ -1,5 +1,4 @@
 import AppKit
-import ScreenCaptureKit
 
 /// Borderless, transparent floating NSPanel that sits over the target window
 /// and hosts CropOverlayView.

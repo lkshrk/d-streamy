@@ -5,7 +5,7 @@ final class CropOverlayView: NSView {
 
     // MARK: - Public
 
-    /// Called whenever the crop rect changes (in view-local coordinates, top-left origin).
+    /// Called whenever the crop rect changes (in view-local coordinates, bottom-left origin).
     var onCropChanged: ((CGRect) -> Void)?
     /// Called when Apply button is clicked.
     var onApply: (() -> Void)?

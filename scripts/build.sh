@@ -4,59 +4,29 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
 
-echo "==> Building CaptureLib + App (Swift)..."
-swift build -c release --package-path "$ROOT"
+SWIFT_FLAGS=(-c release --package-path "$ROOT")
+if [ "${UNIVERSAL:-0}" = "1" ]; then
+    SWIFT_FLAGS+=(--arch arm64 --arch x86_64)
+fi
 
-echo "==> Building daemon (Bun)..."
-cd "$ROOT"
-rm -rf .build/daemon-bundle
-bun build src/daemon/index.ts --outdir .build/daemon-bundle --target node \
-    --external ffmpeg-static \
-    --external ws \
-    --external @discordjs/opus \
-    --external opusscript \
-    --external @snazzah/davey-darwin-arm64 \
-    --external @seydx/node-av-darwin-arm64 \
-    --external @lng2004/node-datachannel
+echo "==> Building App (Swift)..."
+swift build "${SWIFT_FLAGS[@]}"
+
+# DSTREAMY_DAEMON points at a prebuilt (e.g. universal) dstreamy; otherwise build one for this Mac.
+if [ -z "${DSTREAMY_DAEMON:-}" ]; then
+    echo "==> Building dstreamy (Rust)..."
+    (cd "$ROOT/rust" && cargo build --release --locked -p dstreamy-cli)
+    DSTREAMY_DAEMON="$ROOT/rust/target/release/dstreamy"
+fi
 
 echo "==> Assembling D-Streamy.app..."
 APP="$ROOT/bin/D-Streamy.app"
+rm -rf "$APP/Contents/Resources/daemon" "$APP/Contents/Resources/bun"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-# Copy app binary
-cp "$(swift build -c release --package-path "$ROOT" --show-bin-path)/D-Streamy" "$APP/Contents/MacOS/D-Streamy"
-
-# Copy daemon bundle (JS + native .node addons)
-rm -rf "$APP/Contents/Resources/daemon"
-cp -R "$ROOT/.build/daemon-bundle/" "$APP/Contents/Resources/daemon/"
-
-# Copy native addons that can't be bundled
-copy_native_pkg() {
-    local pkg_path="$1"
-    if [ -d "$ROOT/node_modules/$pkg_path" ]; then
-        mkdir -p "$APP/Contents/Resources/daemon/node_modules/$pkg_path"
-        cp -R "$ROOT/node_modules/$pkg_path/" "$APP/Contents/Resources/daemon/node_modules/$pkg_path/"
-    fi
-}
-copy_native_pkg "@snazzah/davey-darwin-arm64"
-copy_native_pkg "@seydx/node-av-darwin-arm64"
-copy_native_pkg "@lng2004/node-datachannel"
-copy_native_pkg "ws"
-copy_native_pkg "@discordjs/opus"
-copy_native_pkg "opusscript"
-
-# Bundle the bun runtime so the app is self-contained (no external bun needed)
-BUN_BIN="${BUN_BIN:-$HOME/.bun/bin/bun}"
-if [ ! -x "$BUN_BIN" ]; then
-    BUN_BIN="$(command -v bun || true)"
-fi
-if [ -z "${BUN_BIN:-}" ] || [ ! -x "$BUN_BIN" ]; then
-    echo "error: bun binary not found (set BUN_BIN)" >&2
-    exit 1
-fi
-cp "$BUN_BIN" "$APP/Contents/Resources/bun"
-chmod +x "$APP/Contents/Resources/bun"
-
+cp "$(swift build "${SWIFT_FLAGS[@]}" --show-bin-path)/D-Streamy" "$APP/Contents/MacOS/D-Streamy"
+cp "$DSTREAMY_DAEMON" "$APP/Contents/MacOS/dstreamy"
+chmod +x "$APP/Contents/MacOS/dstreamy"
 
 # Compile and copy app icon
 echo "==> Compiling asset catalog..."
@@ -72,6 +42,7 @@ xcrun actool "$ROOT/App/Assets.xcassets" \
 # Developer ID identity). Override the dev identity via CODESIGN_IDENTITY.
 if [ "${SKIP_SIGN:-0}" != "1" ]; then
     SIGN_IDENTITY="${CODESIGN_IDENTITY:-Apple Development: dev@harke.me (L2GZ9Q95QW)}"
+    codesign --force --sign "$SIGN_IDENTITY" --identifier me.harke.d-streamy.dstreamy "$APP/Contents/MacOS/dstreamy"
     codesign --force --sign "$SIGN_IDENTITY" --identifier me.harke.d-streamy "$APP"
 fi
 

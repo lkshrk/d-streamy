@@ -61,7 +61,7 @@ jobs:
   release:
     needs: gate
     if: needs.gate.outputs.tag != ''
-    runs-on: macos-15
+    runs-on: macos-26
     env:
       DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
       SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
@@ -72,15 +72,25 @@ jobs:
           ref: ${{ needs.gate.outputs.tag }}
           fetch-depth: 0
 
-      - name: Select latest Xcode 16 (needs SDK >= 15.2 for SCContentFilter.includedWindows)
-        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
+      - name: Install toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: latest
-
-      - name: Install daemon dependencies
-        run: bun install
+      - name: Build universal dstreamy
+        working-directory: rust
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: |
+          cargo build --release --locked -p dstreamy-cli --target aarch64-apple-darwin
+          cargo build --release --locked -p dstreamy-cli --target x86_64-apple-darwin
+          mkdir -p target/universal
+          lipo -create -output target/universal/dstreamy \
+            target/aarch64-apple-darwin/release/dstreamy \
+            target/x86_64-apple-darwin/release/dstreamy
+          lipo -verify_arch target/universal/dstreamy arm64 x86_64
+          target/universal/dstreamy --version
 
       - name: Import signing certificate
         env:
@@ -88,24 +98,26 @@ jobs:
           CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
-          KEYCHAIN=$RUNNER_TEMP/signing.keychain-db
-          echo "$CERT_P12" | base64 --decode > $RUNNER_TEMP/cert.p12
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security import $RUNNER_TEMP/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
             -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | tr -d '"')
+          security list-keychain -d user | tr -d '"' | xargs security list-keychain -d user -s "$KEYCHAIN"
 
       - name: Build & sign (Developer ID, hardened, nested)
         env:
           CODESIGN_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
         run: |
           export VERSION="${TAG#v}"
-          export BUN_BIN="$(command -v bun)"
+          export DSTREAMY_DAEMON="$PWD/rust/target/universal/dstreamy"
+          export UNIVERSAL=1
           bash scripts/release.sh
+          lipo -verify_arch bin/D-Streamy.app/Contents/MacOS/D-Streamy arm64 x86_64
 
       - name: Notarize & staple
         id: pkg
@@ -115,10 +127,10 @@ jobs:
           NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
         run: |
           APP="bin/D-Streamy.app"
-          echo "$NOTARY_KEY_P8" | base64 --decode > $RUNNER_TEMP/notary.p8
+          echo "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
           ditto -c -k --sequesterRsrc --keepParent "$APP" D-Streamy.zip
           SUBMIT_JSON=$(xcrun notarytool submit D-Streamy.zip \
-            --key $RUNNER_TEMP/notary.p8 \
+            --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$NOTARY_KEY_ID" \
             --issuer "$NOTARY_ISSUER_ID" \
             --output-format json --wait)
@@ -127,7 +139,7 @@ jobs:
           STATUS=$(echo "$SUBMIT_JSON" | /usr/bin/python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')
           echo "Notarization status: $STATUS (id $SUBMIT_ID)"
           xcrun notarytool log "$SUBMIT_ID" \
-            --key $RUNNER_TEMP/notary.p8 \
+            --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$NOTARY_KEY_ID" \
             --issuer "$NOTARY_ISSUER_ID" || true
           if [ "$STATUS" != "Accepted" ]; then

@@ -1,43 +1,33 @@
 import AppKit
-import ScreenCaptureKit
 
 /// Manages the lifecycle of CropOverlayPanel: shows, hides, and tracks the target window.
 @MainActor
 final class CropOverlayController {
 
-    var onCropChanged: ((CGRect) -> Void)?
+    var onCropChanged: ((CGRect, CGSize) -> Void)?
     var onApply: (() -> Void)?
 
     private var panel: CropOverlayPanel?
     private var trackingTimer: Timer?
-    private var currentFilter: SCContentFilter?
 
     // MARK: - Show / Hide
 
-    func show(for filter: SCContentFilter, currentCrop: CGRect?) {
-        currentFilter = filter
+    @discardableResult
+    func show(windowID: CGWindowID, currentCrop: CGRect?) -> Bool {
+        guard let frame = cgWindowFrame(for: windowID) else { return false }
+        lastKnownWindowID = windowID
 
-        if #available(macOS 15.2, *), let window = filter.includedWindows.first {
-            lastKnownWindowID = window.windowID
-        } else {
-            lastKnownWindowID = 0
-        }
-
-        let frame = windowFrame(for: filter)
         let p = CropOverlayPanel(frame: frame)
 
-        // Set initial crop
         if let crop = currentCrop, crop != .zero {
-            // Convert from top-left (AppKit) stored crop to view coords.
-            // CropOverlayView uses NSView coordinates which are bottom-left on macOS,
-            // but we normalise in AppState, so just set directly.
             p.overlayView.cropRect = crop
         } else {
             p.overlayView.cropRect = CGRect(origin: .zero, size: frame.size)
         }
 
-        p.overlayView.onCropChanged = { [weak self] rect in
-            self?.onCropChanged?(rect)
+        p.overlayView.onCropChanged = { [weak self, weak p] rect in
+            guard let size = p?.overlayView.bounds.size else { return }
+            self?.onCropChanged?(rect, size)
         }
 
         p.onApply = { [weak self] in
@@ -48,13 +38,13 @@ final class CropOverlayController {
         self.panel = p
 
         startTracking()
+        return true
     }
 
     func hide() {
         stopTracking()
         panel?.close()
         panel = nil
-        currentFilter = nil
     }
 
     // MARK: - Window tracking
@@ -114,41 +104,7 @@ final class CropOverlayController {
         }
     }
 
-    // MARK: - Frame resolution
-
-    private func windowFrame(for filter: SCContentFilter) -> CGRect {
-        // Use primary screen height for CG→AppKit coord conversion (never changes)
-        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
-
-        // Try to get the live window frame via CGWindowListCopyWindowInfo
-        if #available(macOS 15.2, *), let window = filter.includedWindows.first {
-            if let frame = cgWindowFrame(for: window.windowID) {
-                return frame
-            }
-            // Fallback to contentRect (static from filter creation)
-            let contentRect = filter.contentRect
-            let y = screenHeight - contentRect.origin.y - contentRect.height
-            return CGRect(x: contentRect.origin.x, y: y, width: contentRect.width, height: contentRect.height)
-        }
-
-        // Legacy fallback
-        let contentRect = filter.contentRect
-        let y = screenHeight - contentRect.origin.y - contentRect.height
-        return CGRect(x: contentRect.origin.x, y: y, width: contentRect.width, height: contentRect.height)
-    }
-
     private func cgWindowFrame(for windowID: CGWindowID) -> CGRect? {
-        let list = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]]
-        guard let info = list?.first,
-              let boundsDict = info[kCGWindowBounds as String] as? [String: CGFloat],
-              let x = boundsDict["X"],
-              let y = boundsDict["Y"],
-              let w = boundsDict["Width"],
-              let h = boundsDict["Height"] else { return nil }
-
-        // CGWindowListCopyWindowInfo returns CG coords (top-left origin).
-        // Convert to NSScreen (bottom-left origin) using screens[0] (full display height).
-        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
-        return CGRect(x: x, y: screenHeight - y - h, width: w, height: h)
+        windowFrame(for: windowID, primaryScreenHeight: NSScreen.screens.first?.frame.height ?? 0)
     }
 }
