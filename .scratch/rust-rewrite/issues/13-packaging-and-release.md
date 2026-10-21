@@ -31,3 +31,4 @@ Release builds for aarch64/x86_64 macOS and x86_64/aarch64 Linux via GitHub Acti
   - README install steps reproduced locally: packaged the arm64 binary exactly like the workflow, `shasum -a 256 -c` → OK, `tar -xzf`, `install -m 755`, `--version` → ok. Usage commands run with an empty config dir: `guilds` and `stream --target test-pattern` → `not logged in` (exit 1, no network), `login` with empty stdin → `no token given on stdin`, `targets` → lists displays and windows.
   - Global gates on HEAD + this change: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` → all ok on macOS; same in the Linux container (`CARGO_BUILD_JOBS=2`) → all ok.
   - Not verifiable without a tag: the GitHub-hosted runs themselves (see MANUAL-CHECKLIST).
+- Commit: f20f40f (workflow, formula, README, release profile).
