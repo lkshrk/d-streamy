@@ -23,7 +23,7 @@ macOS menu bar app that streams any window to a Discord voice channel via Go Liv
 
 ## Build
 
-Needs Xcode 26 and a Rust toolchain (see [Build from source](#build-from-source)):
+Needs Xcode 27.1 and a Rust toolchain (see [Build from source](#build-from-source)):
 
 ```bash
 bash scripts/build.sh
@@ -69,7 +69,7 @@ Requirements:
 
 ### Build from source
 
-macOS needs Xcode 26 (its SDK is required by `screencapturekit`) and a Rust toolchain:
+macOS needs Xcode 27.1 (CI and releases build with it; `screencapturekit` needs at least the Xcode 26 SDK) and a Rust toolchain:
 
 ```bash
 cd rust
