@@ -5,7 +5,7 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 docker build -q -t dstreamy-linux-ci "$root/rust/ci" >/dev/null
 cmd=("$@")
 [ ${#cmd[@]} -eq 0 ] && cmd=(bash -c "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace")
-exec docker run --rm -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
+exec docker run --rm -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" -e CARGO_INCREMENTAL=0 \
   -v "$root":/w -w /w/rust \
   -v dstreamy-cargo-registry:/usr/local/cargo/registry \
   -v "${DSTREAMY_TARGET_VOLUME:-dstreamy-linux-target}":/w/rust/target \
