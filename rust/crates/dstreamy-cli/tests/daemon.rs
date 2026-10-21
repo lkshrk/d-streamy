@@ -200,7 +200,7 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// Replies in request order, then events; only the first health event, with its values zeroed.
+/// Replies in request order, then state events and the first health event with its values zeroed.
 fn normalize(messages: &[Value]) -> Vec<Value> {
     let mut replies = Vec::new();
     let mut events = Vec::new();
@@ -208,12 +208,13 @@ fn normalize(messages: &[Value]) -> Vec<Value> {
     for m in messages {
         let mut m = m.clone();
         if m["type"] == "event" {
-            if m["event"]["event"] == "health" {
-                if health {
-                    continue;
+            match m["event"]["event"].as_str() {
+                Some("health") if !health => {
+                    health = true;
+                    scrub(&mut m["event"]);
                 }
-                health = true;
-                scrub(&mut m["event"]);
+                Some("state") if m["event"]["state"]["state"] != "reconnecting" => {}
+                _ => continue,
             }
             events.push(m);
             continue;
@@ -294,10 +295,19 @@ fn session_scenario_matches_the_fixture_and_never_shows_the_token() {
             d.state("streaming");
             d.until("health event", |m| m["event"]["event"] == "health");
         }
+        if line.contains("\"cmd\":\"update\"") {
+            let announced =
+                h.rt.block_on(h.mock.wait_for(T, |r| announced(r, 640, 30).then_some(())));
+            assert!(announced.is_some(), "no op 12 for 640x360 at 30 fps");
+        }
     }
     let done = d.finish();
     assert!(done.status.success(), "{}: {}", done.status, done.stderr);
     check_fixture("session", &done.messages);
+    assert_eq!(
+        states(&done.messages),
+        ["connecting", "streaming", "stopped"]
+    );
     assert!(h.stream_deleted(), "no STREAM_DELETE");
 
     let log = std::fs::read_to_string(h.log_file()).unwrap();
@@ -323,9 +333,17 @@ fn errors_scenario_matches_the_fixture_and_keeps_running() {
     assert!(done.status.success(), "{}: {}", done.status, done.stderr);
     check_fixture("errors", &done.messages);
     assert!(h.mock.streams().is_empty());
-    for text in [&done.stdout, &done.stderr] {
-        assert!(!text.contains("wrong-token"));
-        assert!(!text.contains(MOCK_TOKEN));
+    let log = std::fs::read_to_string(h.log_file()).unwrap();
+    for (what, text) in [
+        ("stdout", &done.stdout),
+        ("stderr", &done.stderr),
+        ("log", &log),
+    ] {
+        assert!(
+            !text.contains("wrong-token"),
+            "the wrong token is in {what}"
+        );
+        assert!(!text.contains(MOCK_TOKEN), "the token is in {what}");
     }
 }
 
@@ -445,11 +463,25 @@ fn update_restarts_capture_inside_the_running_go_live() {
     let reply = d.request(&update.to_string());
     assert_eq!(reply["type"], "result", "{reply}");
     let after = h.rt.block_on(h.mock.wait_for(T, |r| {
-        (announced(r, 640, 30) && stream_video(r) >= before + 25).then_some(())
+        (announced(r, 640, 30) && stream_video(r) >= before + 40).then(|| r.clone())
     }));
+    let after = after.expect("no op 12 for 640x360 at 30 fps, or no video after it");
+    let timestamps: Vec<u32> = after
+        .video
+        .iter()
+        .filter(|v| v.kind == VoiceKind::Stream)
+        .skip(before + 10)
+        .map(|v| v.rtp_timestamp)
+        .collect();
+    let mut steps: Vec<u32> = timestamps
+        .windows(2)
+        .map(|w| w[1].wrapping_sub(w[0]))
+        .collect();
+    steps.sort_unstable();
+    let median = steps[steps.len() / 2];
     assert!(
-        after.is_some(),
-        "no op 12 for 640x360 at 30 fps, or no video after it"
+        median.abs_diff(3000) <= 300,
+        "median RTP step {median}: the source is not capturing at 30 fps"
     );
     let ops = h.mock.received_ops();
     let count = |op| ops.iter().filter(|o| o.is(None, op)).count();
@@ -461,11 +493,18 @@ fn update_restarts_capture_inside_the_running_go_live() {
     d.close_stdin();
     let done = d.finish();
     assert!(done.status.success(), "{}: {}", done.status, done.stderr);
-    let states: Vec<&Value> = done
-        .messages
+    assert_eq!(
+        states(&done.messages),
+        ["connecting", "streaming", "stopped"]
+    );
+}
+
+fn states(messages: &[Value]) -> Vec<String> {
+    messages
         .iter()
         .filter(|m| m["event"]["event"] == "state")
-        .map(|m| &m["event"]["state"]["state"])
-        .collect();
-    assert_eq!(states, ["connecting", "streaming", "stopped"], "{states:?}");
+        .filter_map(|m| m["event"]["state"]["state"].as_str())
+        .filter(|s| *s != "reconnecting")
+        .map(str::to_owned)
+        .collect()
 }

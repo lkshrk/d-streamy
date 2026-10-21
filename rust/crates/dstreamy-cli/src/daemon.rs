@@ -1,5 +1,6 @@
 //! `dstreamy daemon`: protocol 1 of ADR 0003, one JSON object per line on stdin and stdout.
 
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -161,15 +162,14 @@ struct UpdateParams {
     bitrate_kbps: Option<u32>,
 }
 
-/// A request line, or the error reply it earns before anything runs.
-fn parse(line: &str) -> Result<(String, Command), (Option<String>, Failure)> {
+fn parse(line: &[u8]) -> Result<(String, Command), (Option<String>, Failure)> {
     let malformed = |id: Option<String>, what: &str| {
         (
             id,
             Failure::new("malformed", format!("malformed line: {what}")),
         )
     };
-    let value: Value = serde_json::from_str(line).map_err(|e| malformed(None, &e.to_string()))?;
+    let value: Value = serde_json::from_slice(line).map_err(|e| malformed(None, &e.to_string()))?;
     let Value::Object(fields) = &value else {
         return Err(malformed(None, "expected a JSON object"));
     };
@@ -192,6 +192,7 @@ fn parse(line: &str) -> Result<(String, Command), (Option<String>, Failure)> {
 struct Conn {
     client: Arc<DiscordClient>,
     session: Session,
+    forwarder: JoinHandle<()>,
 }
 
 impl Conn {
@@ -203,7 +204,6 @@ impl Conn {
     }
 }
 
-/// The settings of the running stream, which `update` changes.
 struct Running {
     target: String,
     stream: StreamConfig,
@@ -212,12 +212,13 @@ struct Running {
 
 struct Daemon {
     ctx: Ctx,
-    out: Out,
     opts: Options,
+    writer: Mutex<Option<std::sync::mpsc::Sender<String>>>,
     conn: Mutex<Option<Arc<Conn>>>,
-    connecting: tokio::sync::Mutex<()>,
+    /// Held while the connection is created, replaced or torn down, and while a stream starts.
+    lifecycle: tokio::sync::Mutex<()>,
     updating: tokio::sync::Mutex<()>,
-    forwarder: Mutex<Option<JoinHandle<()>>>,
+    pending: Mutex<HashMap<u64, String>>,
     last_stats: Mutex<Option<StreamStats>>,
     running: Mutex<Option<Running>>,
     portal: Mutex<Option<PortalBook>>,
@@ -227,31 +228,51 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Lines from stdin until EOF or a read error; invalid UTF-8 still arrives as a line.
+fn read_stdin(lines: mpsc::UnboundedSender<Vec<u8>>) {
+    let mut stdin = std::io::stdin().lock();
+    loop {
+        let mut line = Vec::new();
+        match stdin.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if line.last() == Some(&b'\n') {
+                    line.pop();
+                }
+                if lines.send(line).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliError> {
     let (lines_tx, mut lines) = mpsc::unbounded_channel();
     // A detached thread: a blocked stdin read must not hold up the runtime's shutdown.
-    std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines() {
-            let Ok(line) = line else { break };
-            if lines_tx.send(line).is_err() {
-                break;
-            }
+    std::thread::spawn(move || read_stdin(lines_tx));
+    let (writer, written) = std::sync::mpsc::channel::<String>();
+    let writer_out = out.clone();
+    let writing = std::thread::spawn(move || {
+        for line in written {
+            writer_out.line(line);
         }
     });
     let daemon = Arc::new(Daemon {
         ctx: ctx.clone(),
-        out: out.clone(),
         opts,
+        writer: Mutex::new(Some(writer)),
         conn: Mutex::new(None),
-        connecting: tokio::sync::Mutex::new(()),
+        lifecycle: tokio::sync::Mutex::new(()),
         updating: tokio::sync::Mutex::new(()),
-        forwarder: Mutex::new(None),
+        pending: Mutex::new(HashMap::new()),
         last_stats: Mutex::new(None),
         running: Mutex::new(None),
         portal: Mutex::new(None),
     });
     let mut signals = Signals::new();
     let mut tasks = JoinSet::new();
+    let mut next_key = 0u64;
     let mut shutdown_id = None;
     loop {
         tokio::select! {
@@ -264,10 +285,15 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
                         break;
                     }
                     Ok((id, command)) => {
+                        let key = next_key;
+                        next_key += 1;
+                        lock(&daemon.pending).insert(key, id);
                         let daemon = daemon.clone();
                         tasks.spawn(async move {
                             let result = daemon.clone().handle(command).await;
-                            daemon.reply(Some(&id), result);
+                            if let Some(id) = lock(&daemon.pending).remove(&key) {
+                                daemon.reply(Some(&id), result);
+                            }
                         });
                     }
                 }
@@ -280,21 +306,43 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
         }
     }
     tasks.shutdown().await;
+    let unanswered: Vec<String> = lock(&daemon.pending).drain().map(|(_, id)| id).collect();
+    for id in unanswered {
+        daemon.reply(
+            Some(&id),
+            Err(Failure::new("internal", "daemon shutting down")),
+        );
+    }
     daemon.disconnect().await;
     if let Some(id) = shutdown_id {
         daemon.reply(Some(&id), Ok(Value::Null));
     }
+    drop(lock(&daemon.writer).take());
+    let _ = tokio::task::spawn_blocking(move || writing.join()).await;
     Ok(ExitCode::SUCCESS)
 }
 
 impl Daemon {
+    fn write(&self, message: &Message<'_>) {
+        let line = match serde_json::to_string(message) {
+            Ok(line) => line,
+            Err(e) => {
+                tracing::error!("serializing a protocol message: {e}");
+                return;
+            }
+        };
+        if let Some(writer) = lock(&self.writer).as_ref() {
+            let _ = writer.send(line);
+        }
+    }
+
     fn reply(&self, id: Option<&str>, result: Result<Value, Failure>) {
         let message = match (id, result) {
             (Some(id), Ok(data)) => Message::Result { id, data },
             (id, Ok(_)) => unreachable!("a result always answers a request with id {id:?}"),
             (id, Err(Failure { code, message })) => Message::Error { id, code, message },
         };
-        self.out.json_line(&message);
+        self.write(&message);
     }
 
     async fn handle(self: Arc<Self>, command: Command) -> Result<Value, Failure> {
@@ -353,16 +401,24 @@ impl Daemon {
         if let Some(conn) = self.current() {
             return Ok(conn);
         }
-        let _connecting = self.connecting.lock().await;
+        let _lifecycle = self.lifecycle.lock().await;
+        self.ensure_conn().await
+    }
+
+    /// Needs `lifecycle` held.
+    async fn ensure_conn(self: &Arc<Self>) -> Result<Arc<Conn>, CliError> {
         if let Some(conn) = self.current() {
             return Ok(conn);
         }
         let client = Arc::new(discord::connect(&self.ctx, Persistence::Long).await?);
         let session = Session::new(client.clone());
-        let events = session.subscribe();
-        let conn = Arc::new(Conn { client, session });
+        let forwarder = tokio::spawn(self.clone().forward(session.subscribe()));
+        let conn = Arc::new(Conn {
+            client,
+            session,
+            forwarder,
+        });
         *lock(&self.conn) = Some(conn.clone());
-        *lock(&self.forwarder) = Some(tokio::spawn(self.clone().forward(events)));
         Ok(conn)
     }
 
@@ -375,7 +431,7 @@ impl Daemon {
                         SessionEvent::State { .. } => self.remember_portal_token(),
                         _ => {}
                     }
-                    self.out.json_line(&Message::Event { event: &event });
+                    self.write(&Message::Event { event: &event });
                 }
                 Err(RecvError::Lagged(n)) => tracing::warn!(skipped = n, "session events lagged"),
                 Err(RecvError::Closed) => break,
@@ -396,6 +452,7 @@ impl Daemon {
         if token.is_empty() {
             return Err(CliError::EmptyToken.into());
         }
+        let _lifecycle = self.lifecycle.lock().await;
         if self.current().is_some_and(|c| c.live()) {
             return Err(Failure::new(
                 "streaming",
@@ -405,7 +462,7 @@ impl Daemon {
         let client = discord::connect_with(&self.ctx, token.clone(), Persistence::Brief).await?;
         client.close().await;
         self.ctx.paths.save_token(&token).map_err(CliError::from)?;
-        self.disconnect().await;
+        self.disconnect_locked().await;
         Ok(Value::Null)
     }
 
@@ -428,7 +485,11 @@ impl Daemon {
         if let Some(crop) = p.crop {
             crop.validate().map_err(invalid_params)?;
         }
-        let conn = self.conn().await?;
+        let _lifecycle = self.lifecycle.lock().await;
+        let conn = self.ensure_conn().await?;
+        if conn.live() {
+            return Err(CliError::AlreadyStreaming.into());
+        }
         let channels = discord::voice_channels(&conn.client, &p.guild_id).await?;
         if !channels.iter().any(|c| c.id == p.channel_id) {
             return Err(CliError::UnknownChannel {
@@ -440,8 +501,6 @@ impl Daemon {
         let restore_token = capture::restore_token(&config);
         let picked = capture::source_for(&p.target, restore_token.clone())?;
         let capture = stream::capture_config(&p.target, &settings, p.crop);
-        *lock(&self.last_stats) = None;
-        *lock(&self.portal) = Some(PortalBook::new(restore_token, picked.portal_token));
         stream::start(
             &conn.session,
             p.guild_id,
@@ -450,6 +509,8 @@ impl Daemon {
             capture,
         )
         .await?;
+        *lock(&self.last_stats) = None;
+        *lock(&self.portal) = Some(PortalBook::new(restore_token, picked.portal_token));
         *lock(&self.running) = Some(Running {
             target: p.target,
             stream: settings,
@@ -483,12 +544,7 @@ impl Daemon {
         conn.session
             .reconfigure(capture)
             .await
-            .map_err(|e| match e {
-                SessionError::NotRunning => not_running(),
-                SessionError::CodecChange => invalid_params(e),
-                SessionError::Stream(_) => Failure::new("capture", e.to_string()),
-                _ => Failure::new("internal", e.to_string()),
-            })?;
+            .map_err(session_failure)?;
         if let Some(running) = lock(&self.running).as_mut() {
             running.stream = settings;
             running.crop = crop;
@@ -501,33 +557,51 @@ impl Daemon {
             .current()
             .filter(|c| c.live())
             .ok_or_else(not_running)?;
-        conn.session
-            .stop()
-            .await
-            .map_err(|e| Failure::new("internal", e.to_string()))?;
+        let stopped = conn.session.stop().await.map_err(session_failure)?;
+        if stopped.is_none() {
+            return Err(not_running());
+        }
         *lock(&self.running) = None;
         let stats = lock(&self.last_stats).take().unwrap_or_default();
         serde_json::to_value(stats).map_err(|e| Failure::new("internal", e.to_string()))
     }
 
-    /// Stops any stream and closes the gateway; the session's last events are written first.
     async fn disconnect(&self) {
-        let conn = lock(&self.conn).take();
-        let forwarder = lock(&self.forwarder).take();
-        if let Some(conn) = conn {
-            match Arc::try_unwrap(conn) {
-                Ok(Conn { client, session }) => stream::teardown(session, client).await,
-                Err(shared) => {
-                    let _ = shared.session.stop().await;
+        let _lifecycle = self.lifecycle.lock().await;
+        self.disconnect_locked().await;
+    }
+
+    /// Needs `lifecycle` held; the session's last events are written before it returns.
+    async fn disconnect_locked(&self) {
+        let Some(conn) = lock(&self.conn).take() else {
+            return;
+        };
+        match Arc::try_unwrap(conn) {
+            Ok(Conn {
+                client,
+                session,
+                forwarder,
+            }) => {
+                stream::teardown(session, client).await;
+                if timeout(FORWARDER_DRAIN, forwarder).await.is_err() {
+                    tracing::debug!("session events still open; not waiting for the rest");
                 }
             }
+            Err(shared) => {
+                let _ = shared.session.stop().await;
+            }
         }
-        if let Some(forwarder) = forwarder
-            && timeout(FORWARDER_DRAIN, forwarder).await.is_err()
-        {
-            tracing::debug!("session events still open; not waiting for the rest");
-        }
+        *lock(&self.running) = None;
         self.remember_portal_token();
+    }
+}
+
+fn session_failure(e: SessionError) -> Failure {
+    match e {
+        SessionError::NotRunning => not_running(),
+        SessionError::CodecChange => invalid_params(e),
+        SessionError::Stream(_) => Failure::new("capture", e.to_string()),
+        _ => Failure::new("internal", e.to_string()),
     }
 }
 
@@ -536,7 +610,7 @@ mod tests {
     use super::*;
 
     fn error(line: &str) -> (Option<String>, &'static str, String) {
-        match parse(line) {
+        match parse(line.as_bytes()) {
             Err((id, f)) => (id, f.code, f.message),
             Ok(_) => panic!("{line} parsed"),
         }
@@ -558,6 +632,14 @@ mod tests {
     }
 
     #[test]
+    fn invalid_utf8_is_malformed() {
+        match parse(b"{\"id\":\"\xff\"}") {
+            Err((None, f)) => assert_eq!(f.code, "malformed"),
+            _ => panic!("invalid UTF-8 parsed"),
+        }
+    }
+
+    #[test]
     fn unknown_commands_and_bad_fields_keep_the_id() {
         let (id, code, message) = error("{\"id\":\"a\",\"cmd\":\"bogus\"}");
         assert_eq!((id.as_deref(), code), (Some("a"), "unknown_cmd"));
@@ -569,7 +651,7 @@ mod tests {
 
     #[test]
     fn extra_fields_are_ignored() {
-        let (id, command) = parse("{\"id\":\"x\",\"cmd\":\"stop\",\"later\":true}").unwrap();
+        let (id, command) = parse(b"{\"id\":\"x\",\"cmd\":\"stop\",\"later\":true}").unwrap();
         assert_eq!(id, "x");
         assert!(matches!(command, Command::Stop));
     }

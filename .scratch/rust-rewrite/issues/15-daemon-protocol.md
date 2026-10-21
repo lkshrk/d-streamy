@@ -29,3 +29,12 @@ Implement the `dstreamy daemon` subcommand exactly as specified in `docs/adr/000
 - Decision: the daemon logs to `dstreamy.log` in the config directory (the TUI's file), and also to stderr with `-v`.
 - Decision: a mock launcher for issue 16's Swift integration test: `cargo build -p dstreamy-mock-discord --bin mock-discord` builds `rust/target/debug/mock-discord`. It prints one JSON line `{"gateway_url","token","guild_id","channel_id"}` and serves until stdin reaches EOF, then exits 0. It is a test tool; `release-rust.yml` builds and packages only `-p dstreamy-cli`'s `dstreamy`. The source is `src/launcher.rs` with an explicit `[[bin]]`, because the repository `.gitignore` ignores every `bin/` directory.
 - Evidence (2026-10-21): `cargo fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` all ok on macOS; `cargo test -p dstreamy-cli --test daemon` 10/10 (6 tests: both fixture scenarios incl. the token never on stdout, stderr or the `-vv` log; EOF; SIGTERM; pipelined commands while streaming; live update); `cargo test -p dstreamy-mock-discord --test launcher` ok.
+- Review fixes (2026-10-21):
+  - stdin is read as bytes, so a line that is not UTF-8 gets a `malformed` reply instead of ending the daemon.
+  - One `lifecycle` lock covers creating the connection, `set_token` (check, validate, replace) and `start` (live check through `Session::start`), so a racing `start` can no longer be torn down by `set_token`.
+  - `start` checks `already_running` before building a source, and sets the stats, portal book and running settings only after the session accepted it.
+  - The event forwarder lives in the connection and is drained under the same lock when disconnecting.
+  - `stop` returning no source and `SessionError::NotRunning` both map to `not_running`; `CodecChange` is `invalid_params`, `Stream(..)` (including `SourceLost`) is `capture`.
+  - Commands still running at `shutdown`/EOF get an `internal` "daemon shutting down" reply.
+  - All stdout writes go through one writer thread.
+  - Tests: the fixture comparison keeps state events (without reconnecting) and the first health event, and the state sequence is checked on its own. The session test waits for op 12 with the updated attributes, the live-update test checks that the RTP step after the update matches 30 fps (so the source really runs with the new config), and the errors test also checks the `-vv` log for both tokens.

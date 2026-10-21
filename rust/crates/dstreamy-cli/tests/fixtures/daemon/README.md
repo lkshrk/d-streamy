@@ -10,6 +10,6 @@ The Rust test (`tests/daemon.rs`) sends one request at a time and waits for its 
 Normalisation, applied to the real output before comparing:
 
 - `hello`: `data.version` becomes `"<version>"` and `data.platform` becomes `"<platform>"` (really `"macos"` or `"linux"`).
-- Only the first `health` event is kept. Inside it, and inside the `stop` result (`StreamStats`), every number becomes `0`, every boolean `false`, `last_error` `null`, `*_level` `"good"` and `*_series` `[]`.
+- Only `state` events (without `reconnecting`) and the first `health` event are kept; other events are dropped. Inside it, and inside the `stop` result (`StreamStats`), every number becomes `0`, every boolean `false`, `last_error` `null`, `*_level` `"good"` and `*_series` `[]`.
 
 Regenerate with `DSTREAMY_UPDATE_FIXTURES=1 cargo test -p dstreamy-cli --test daemon`.
