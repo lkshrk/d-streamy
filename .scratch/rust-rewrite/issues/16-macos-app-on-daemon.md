@@ -41,3 +41,4 @@ Rework the SwiftUI app (`App/`, `AppTests/`, `Package.swift`) to be a pure front
   - Reviewer subagent: 17 findings. Fixed: the double daemon spawn, cancel during connecting, stdout being read to EOF before pending requests fail, health-event ordering, the stale target size for the crop, process state set before `run()`, the Keychain call off the main actor, crop changes during connecting, deinit failing pending requests, Int64 in JSONValue, two flaky test assumptions, the universal app build, the release.sh warning, the added banner comments, and setting the app delegate at launch. The live-crop `update` was a daemon-side gap, closed by issue 15 (91f1529).
   - Not tested here: the GUI itself and Screen Recording attribution (MANUAL-CHECKLIST), the signed and notarised release run (needs a `v*` tag), and the CI run on `macos-26` (not pushed).
 
+- Commit: d3eb493.
