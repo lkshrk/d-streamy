@@ -187,3 +187,14 @@ async fn select_protocol_without_the_servers_codec_closes_4020() {
     send(&mut ws, vo::OP_SELECT_PROTOCOL, select).await;
     assert_eq!(close_code(&mut ws).await, Some(vo::CLOSE_BAD_REQUEST));
 }
+
+#[tokio::test]
+async fn select_protocol_with_another_opus_fmtp_closes_4020() {
+    let mock = MockDiscord::start().await.unwrap();
+    let (_gw, mut ws, _) = voice(&mock).await;
+    let sdp =
+        "m=audio 9 UDP/TLS/RTP/SAVPF 120\r\na=fmtp:120 minptime=10;useinbandfec=1;usedtx=1\r\n";
+    let select = json!({ "protocol": "webrtc", "codecs": codecs("H264"), "sdp": sdp });
+    send(&mut ws, vo::OP_SELECT_PROTOCOL, select).await;
+    assert_eq!(close_code(&mut ws).await, Some(vo::CLOSE_BAD_REQUEST));
+}

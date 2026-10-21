@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, accept_async};
 use tracing::{debug, warn};
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::rtcp::payload_feedbacks::full_intra_request::{FirEntry, FullIntraRequest};
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtp::packet::Packet;
 
@@ -94,6 +95,21 @@ impl VoiceConn {
             media_ssrc: self.video_ssrc,
         };
         pc.write_rtcp(&[Box::new(pli)]).await.is_ok()
+    }
+
+    pub(crate) async fn send_fir(&self, sequence_number: u8) -> bool {
+        let Some((pc, _)) = &self.peer else {
+            return false;
+        };
+        let fir = FullIntraRequest {
+            sender_ssrc: 0,
+            media_ssrc: self.video_ssrc,
+            fir: vec![FirEntry {
+                ssrc: self.video_ssrc,
+                sequence_number,
+            }],
+        };
+        pc.write_rtcp(&[Box::new(fir)]).await.is_ok()
     }
 
     pub(crate) async fn close_peer(&mut self) {
@@ -403,6 +419,25 @@ fn check_video_ssrcs(c: &VoiceConn, d: &Value) -> Result<(), u16> {
     if ok { Ok(()) } else { Err(CLOSE_BAD_REQUEST) }
 }
 
+fn offered_fmtp(sdp: &str, payload_type: u8) -> Option<&str> {
+    let prefix = format!("a=fmtp:{payload_type} ");
+    sdp.lines()
+        .find_map(|l| l.trim_end().strip_prefix(prefix.as_str()))
+}
+
+fn same_params(a: &str, b: &str) -> bool {
+    let params = |s: &str| {
+        let mut p: Vec<String> = s
+            .split(';')
+            .map(|p| p.trim().to_ascii_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect();
+        p.sort();
+        p
+    };
+    params(a) == params(b)
+}
+
 fn announced_payload_type(d: &Value, kind: &str, name: &str) -> Option<u8> {
     d["codecs"]
         .as_array()?
@@ -442,6 +477,9 @@ async fn select_protocol(
         .or_else(|| d["data"].as_str())
         .unwrap_or_default()
         .to_owned();
+    if !offered_fmtp(&offer, audio_payload_type).is_some_and(|f| same_params(f, rtc::OPUS_FMTP)) {
+        return Err(CLOSE_BAD_REQUEST);
+    }
     c.close_peer().await;
     let answered = answer(video_codec, audio_payload_type, video_payload_type, offer).await;
     let (pc, rtp_rx, sdp) = match answered {
@@ -568,6 +606,27 @@ async fn send_binary(ws: &mut Ws, c: &mut VoiceConn, op: u8, payload: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opus_fmtp_must_be_libdatachannels_in_any_order() {
+        let sdp = |fmtp: &str| format!("m=audio 9 UDP/TLS/RTP/SAVPF 120\r\na=fmtp:120 {fmtp}\r\n");
+        let check =
+            |sdp: &str| offered_fmtp(sdp, 120).is_some_and(|f| same_params(f, rtc::OPUS_FMTP));
+        assert!(check(&sdp(rtc::OPUS_FMTP)));
+        assert!(check(&sdp(
+            "useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=96000;minptime=10"
+        )));
+        assert!(check(&sdp(
+            "MinPTime=10; maxaveragebitrate=96000;;stereo=1;sprop-stereo=1;useinbandfec=1;"
+        )));
+        assert!(!check(&sdp("minptime=10;useinbandfec=1;usedtx=1")));
+        let other_pt = format!(
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=fmtp:111 {}\r\n",
+            rtc::OPUS_FMTP
+        );
+        assert!(!check(&other_pt));
+        assert!(!check("m=audio 9 UDP/TLS/RTP/SAVPF 120\r\n"));
+    }
 
     #[test]
     fn seq_ack_may_trail_the_sent_seq_across_the_wrap() {

@@ -20,6 +20,10 @@ use webrtc::rtp_transceiver::rtp_codec::{
 
 pub type RtcError = webrtc::Error;
 
+/// libdatachannel's default Opus fmtp, which the JS reference offers.
+pub const OPUS_FMTP: &str =
+    "minptime=10;maxaveragebitrate=96000;stereo=1;sprop-stereo=1;useinbandfec=1";
+
 /// Loopback-only ICE over UDPv4; `answerer` makes this side the DTLS server, as Discord is.
 pub fn loopback_settings(answerer: bool) -> SettingEngine {
     let mut s = SettingEngine::default();
