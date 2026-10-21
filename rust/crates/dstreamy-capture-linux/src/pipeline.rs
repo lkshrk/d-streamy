@@ -112,6 +112,20 @@ pub(crate) fn validate(config: &CaptureConfig) -> Result<(), MediaError> {
     Ok(())
 }
 
+/// Errors if the crop, rounded down to even like [`crop_caps`], extends past a `width`x`height` source.
+pub(crate) fn check_crop_fits(crop: CropRect, width: u32, height: u32) -> Result<(), MediaError> {
+    let fits = |offset: u32, size: u32, limit: u32| {
+        u64::from(offset) + u64::from(size & !1).max(2) <= u64::from(limit)
+    };
+    if fits(crop.x, crop.width, width) && fits(crop.y, crop.height, height) {
+        return Ok(());
+    }
+    Err(MediaError::InvalidConfig(format!(
+        "crop {}x{} at ({}, {}) does not fit the {width}x{height} source",
+        crop.width, crop.height, crop.x, crop.y
+    )))
+}
+
 fn even(v: u32) -> i32 {
     i32::try_from(v & !1).unwrap_or(i32::MAX & !1).max(2)
 }
@@ -418,16 +432,33 @@ fn audio_sink(output: Arc<Output>) -> Result<gst_app::AppSink, MediaError> {
         .build())
 }
 
+struct Built {
+    pipeline: gst::Pipeline,
+    video_source: gst::Element,
+    video_sink: gst_app::AppSink,
+    audio: Vec<gst::Element>,
+}
+
+/// The frame size `source` can produce, if it is a single fixed size regardless of downstream.
+fn fixed_source_size(source: &gst::Element) -> Option<(u32, u32)> {
+    let caps = source.static_pad("src")?.query_caps(None);
+    let s = caps.structure(0)?;
+    let width = u32::try_from(s.get::<i32>("width").ok()?).ok()?;
+    let height = u32::try_from(s.get::<i32>("height").ok()?).ok()?;
+    Some((width, height))
+}
+
 fn build(
     video: &VideoInput,
     audio: Option<AudioInput>,
     config: &CaptureConfig,
     spec: &EncoderSpec,
     output: &Arc<Output>,
-) -> Result<(gst::Pipeline, gst_app::AppSink), MediaError> {
+) -> Result<Built, MediaError> {
     let pipeline = gst::Pipeline::new();
 
     let mut chain = video_source(video, config.fps)?;
+    let video_source = chain.last().expect("video source has elements").clone();
     chain.push(
         gst::ElementFactory::make("queue")
             .property("max-size-buffers", 3u32)
@@ -470,19 +501,25 @@ fn build(
     chain.push(sink.clone().upcast());
     link_chain(&pipeline, &chain)?;
 
+    let mut audio_chain = Vec::new();
     if let Some(input) = audio {
         let volume = make("volume")?;
         volume.set_property("volume", f64::from(config.audio_gain));
-        let chain = [
+        audio_chain = vec![
             audio_source(input)?,
             make("audioconvert")?,
             volume,
             make("audioresample")?,
             audio_sink(output.clone())?.upcast(),
         ];
-        link_chain(&pipeline, &chain)?;
+        link_chain(&pipeline, &audio_chain)?;
     }
-    Ok((pipeline, sink))
+    Ok(Built {
+        pipeline,
+        video_source,
+        video_sink: sink,
+        audio: audio_chain,
+    })
 }
 
 fn bus_error(err: &gst::message::Error) -> MediaError {
@@ -492,9 +529,38 @@ fn bus_error(err: &gst::message::Error) -> MediaError {
     MediaError::Backend(format!("{src}: {}", err.error()))
 }
 
+/// Why a candidate pipeline failed to start: only `Retry` moves on to the next encoder.
+enum StartError {
+    Retry(MediaError),
+    Fatal(MediaError),
+}
+
+fn classify(err: &gst::message::Error, built: &Built, crop: Option<CropRect>) -> StartError {
+    if let Some(crop) = crop
+        && let Some((width, height)) = fixed_source_size(&built.video_source)
+        && let Err(e) = check_crop_fits(crop, width, height)
+    {
+        return StartError::Fatal(e);
+    }
+    let from_audio = err.src().is_some_and(|src| {
+        built
+            .audio
+            .iter()
+            .any(|e| src == e.upcast_ref::<gst::Object>())
+    });
+    if from_audio {
+        StartError::Fatal(MediaError::Backend(format!(
+            "audio capture failed: {}",
+            bus_error(err)
+        )))
+    } else {
+        StartError::Retry(bus_error(err))
+    }
+}
+
 /// Waits until the first encoded frame arrives, the stream ends, or the pipeline fails.
-fn probe(pipeline: &gst::Pipeline, output: &Output) -> Result<(), MediaError> {
-    let bus = pipeline.bus().expect("pipeline has a bus");
+fn probe(built: &Built, output: &Output, crop: Option<CropRect>) -> Result<(), StartError> {
+    let bus = built.pipeline.bus().expect("pipeline has a bus");
     let types = [gst::MessageType::Error, gst::MessageType::Eos];
     let deadline = Instant::now() + PROBE_TIMEOUT;
     while Instant::now() < deadline && output.video_frames.load(Ordering::Relaxed) == 0 {
@@ -502,7 +568,9 @@ fn probe(pipeline: &gst::Pipeline, output: &Output) -> Result<(), MediaError> {
             continue;
         };
         match msg.view() {
-            gst::MessageView::Error(err) => return Err(bus_error(err)),
+            gst::MessageView::Error(err) => {
+                return Err(classify(err, built, crop));
+            }
             _ => {
                 output.close();
                 return Ok(());
@@ -535,13 +603,14 @@ impl Capture {
                 config.codec
             )));
         }
-        let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
         let mut last_err = None;
         for spec in candidates {
-            let output = Output::new(tx.clone());
-            match Self::try_start(&video, audio, config, spec, output) {
+            // A channel per candidate, so frames of a failed attempt never reach the receiver.
+            let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+            match Self::try_start(&video, audio, config, spec, Output::new(tx)) {
                 Ok(capture) => return Ok((capture, rx)),
-                Err(e) => last_err = Some(e),
+                Err(StartError::Fatal(e)) => return Err(e),
+                Err(StartError::Retry(e)) => last_err = Some(e),
             }
         }
         Err(last_err.expect("at least one candidate was tried"))
@@ -553,11 +622,11 @@ impl Capture {
         config: &CaptureConfig,
         spec: &EncoderSpec,
         output: Arc<Output>,
-    ) -> Result<Self, MediaError> {
-        let (pipeline, video_sink) = build(video, audio, config, spec, &output)?;
+    ) -> Result<Self, StartError> {
+        let built = build(video, audio, config, spec, &output).map_err(StartError::Retry)?;
         let mut capture = Self {
-            pipeline,
-            video_sink,
+            pipeline: built.pipeline.clone(),
+            video_sink: built.video_sink.clone(),
             output,
             bus_thread: None,
             encoder: spec.factory,
@@ -565,15 +634,20 @@ impl Capture {
         capture
             .pipeline
             .set_state(gst::State::Playing)
-            .map_err(|e| MediaError::Backend(format!("{} pipeline: {e}", spec.factory)))?;
-        probe(&capture.pipeline, &capture.output)?;
+            .map_err(|e| {
+                StartError::Retry(MediaError::Backend(format!(
+                    "{} pipeline: {e}",
+                    spec.factory
+                )))
+            })?;
+        probe(&built, &capture.output, config.crop)?;
         let bus = capture.pipeline.bus().expect("pipeline has a bus");
         let output = capture.output.clone();
         capture.bus_thread = Some(
             std::thread::Builder::new()
                 .name("gst-bus".to_owned())
                 .spawn(move || watch_bus(&bus, &output))
-                .map_err(|e| MediaError::Backend(e.to_string()))?,
+                .map_err(|e| StartError::Retry(MediaError::Backend(e.to_string())))?,
         );
         Ok(capture)
     }
@@ -719,6 +793,21 @@ mod tests {
         let s = caps.structure(0).unwrap();
         assert_eq!(s.get::<i32>("width").unwrap(), 100);
         assert_eq!(s.get::<i32>("height").unwrap(), 50);
+    }
+
+    #[test]
+    fn crop_must_fit_the_source_after_rounding_to_even() {
+        let crop = |x, y, width, height| CropRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        assert!(check_crop_fits(crop(0, 0, 320, 240), 320, 240).is_ok());
+        assert!(check_crop_fits(crop(100, 50, 221, 191), 320, 240).is_ok());
+        assert!(check_crop_fits(crop(100, 50, 222, 190), 320, 240).is_err());
+        assert!(check_crop_fits(crop(0, 1, 320, 240), 320, 240).is_err());
+        assert!(check_crop_fits(crop(u32::MAX, 0, 2, 2), 320, 240).is_err());
     }
 
     #[test]
@@ -946,6 +1035,33 @@ mod tests {
         let (decoded, size) = decode_all(&video_frames(&frames));
         assert!(decoded > 0);
         assert_eq!(size, (320, 240));
+    }
+
+    #[test]
+    fn crop_outside_the_source_is_a_config_error_without_fallback() {
+        init();
+        let cfg = CaptureConfig {
+            crop: Some(CropRect {
+                x: 200,
+                y: 0,
+                width: 200,
+                height: 100,
+            }),
+            ..config(320, 240)
+        };
+        let input = VideoInput::Test {
+            width: 320,
+            height: 240,
+            frames: 10,
+        };
+        let candidates = [x264(&cfg).remove(0), x264(&cfg).remove(0)];
+        let started = Instant::now();
+        match Capture::start(input, None, &cfg, &candidates) {
+            Err(MediaError::InvalidConfig(msg)) => assert!(msg.contains("320x240"), "{msg}"),
+            Err(e) => panic!("expected a crop error, got {e}"),
+            Ok(_) => panic!("crop outside the source started"),
+        }
+        assert!(started.elapsed() < PROBE_TIMEOUT);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use async_trait::async_trait;
 use dstreamy_media::{
@@ -19,8 +19,10 @@ pub struct LinuxCaptureSource {
     running: Option<Running>,
 }
 
+/// Fields drop in order: the pipeline stops before its PipeWire fd closes and the portal session ends.
 struct Running {
     capture: Capture,
+    _pipewire_fd: OwnedFd,
     portal: PortalStream,
 }
 
@@ -121,23 +123,31 @@ impl CaptureSource for LinuxCaptureSource {
             None
         };
 
-        let portal = PortalStream::open(self.sources, self.restore_token.as_deref()).await?;
-        // Kept even if the pipeline fails: the portal invalidates the token it was given.
-        if portal.restore_token.is_some() {
-            self.restore_token.clone_from(&portal.restore_token);
-        }
-        let video = VideoInput::PipeWire {
-            fd: portal.fd.as_raw_fd(),
-            node_id: portal.node_id,
-        };
-        let started =
-            tokio::task::spawn_blocking(move || Capture::start(video, audio, &config, &candidates))
-                .await
-                .map_err(|e| MediaError::Backend(e.to_string()))
-                .and_then(|r| r);
+        let (portal, fd) = PortalStream::open(self.sources, self.restore_token.as_deref()).await?;
+        // Replaced even by none and even if the pipeline fails: the portal spends the token it was given.
+        self.restore_token.clone_from(&portal.restore_token);
+        let node_id = portal.node_id;
+        // The portal moves into the task so a cancelled start cannot end the session under a starting pipeline.
+        let (started, pipewire_fd, portal) = tokio::task::spawn_blocking(move || {
+            let video = VideoInput::PipeWire {
+                fd: fd.as_raw_fd(),
+                node_id,
+            };
+            (
+                Capture::start(video, audio, &config, &candidates),
+                fd,
+                portal,
+            )
+        })
+        .await
+        .map_err(|e| MediaError::Backend(e.to_string()))?;
         match started {
             Ok((capture, rx)) => {
-                self.running = Some(Running { capture, portal });
+                self.running = Some(Running {
+                    capture,
+                    _pipewire_fd: pipewire_fd,
+                    portal,
+                });
                 Ok(rx)
             }
             Err(e) => {
@@ -148,12 +158,23 @@ impl CaptureSource for LinuxCaptureSource {
     }
 
     async fn stop(&mut self) -> Result<(), MediaError> {
-        let Some(Running { capture, portal }) = self.running.take() else {
+        let Some(Running {
+            capture,
+            _pipewire_fd: pipewire_fd,
+            portal,
+        }) = self.running.take()
+        else {
             return Ok(());
         };
-        let stopped = tokio::task::spawn_blocking(move || capture.stop()).await;
+        let portal = tokio::task::spawn_blocking(move || {
+            capture.stop();
+            drop(pipewire_fd);
+            portal
+        })
+        .await
+        .map_err(|e| MediaError::Backend(e.to_string()))?;
         portal.close().await;
-        stopped.map_err(|e| MediaError::Backend(e.to_string()))
+        Ok(())
     }
 
     fn request_keyframe(&self) {

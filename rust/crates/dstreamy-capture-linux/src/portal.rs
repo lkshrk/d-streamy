@@ -7,6 +7,7 @@ use ashpd::desktop::screencast::{
 };
 use ashpd::enumflags2::BitFlags;
 use dstreamy_media::MediaError;
+use tokio::runtime::Handle;
 
 /// What the ScreenCast portal dialog offers the user to pick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -27,11 +28,11 @@ impl PortalSources {
     }
 }
 
-/// An open ScreenCast session; the stream lives until [`PortalStream::close`].
+/// An open ScreenCast session; the stream lives until [`PortalStream::close`] or drop.
 pub(crate) struct PortalStream {
     proxy: Screencast,
-    session: Session<Screencast>,
-    pub(crate) fd: OwnedFd,
+    session: Option<Session<Screencast>>,
+    runtime: Handle,
     pub(crate) node_id: u32,
     pub(crate) restore_token: Option<String>,
 }
@@ -41,38 +42,47 @@ fn portal_err(context: &str) -> impl FnOnce(ashpd::Error) -> MediaError + '_ {
 }
 
 impl PortalStream {
-    /// Asks the portal for one stream; shows the picker unless `restore_token` is still valid.
+    /// Asks the portal for one stream and its PipeWire fd; shows the picker unless `restore_token` is still valid.
     pub(crate) async fn open(
         sources: PortalSources,
         restore_token: Option<&str>,
-    ) -> Result<Self, MediaError> {
+    ) -> Result<(Self, OwnedFd), MediaError> {
         let proxy = Screencast::new().await.map_err(portal_err("connect"))?;
         let session = proxy
             .create_session(Default::default())
             .await
             .map_err(portal_err("create session"))?;
-        match Self::negotiate(&proxy, &session, sources, restore_token).await {
-            Ok((fd, node_id, restore_token)) => Ok(Self {
-                proxy,
-                session,
-                fd,
-                node_id,
-                restore_token,
-            }),
+        let mut stream = Self {
+            proxy,
+            session: Some(session),
+            runtime: Handle::current(),
+            node_id: 0,
+            restore_token: None,
+        };
+        let negotiated = stream.negotiate(sources, restore_token).await;
+        match negotiated {
+            Ok((fd, node_id, restore_token)) => {
+                stream.node_id = node_id;
+                stream.restore_token = restore_token;
+                Ok((stream, fd))
+            }
             Err(e) => {
-                // Ignored: the session may already be gone after a failed or cancelled request.
-                let _ = session.close().await;
+                stream.close().await;
                 Err(e)
             }
         }
     }
 
     async fn negotiate(
-        proxy: &Screencast,
-        session: &Session<Screencast>,
+        &self,
         sources: PortalSources,
         restore_token: Option<&str>,
     ) -> Result<(OwnedFd, u32, Option<String>), MediaError> {
+        let proxy = &self.proxy;
+        let session = self
+            .session
+            .as_ref()
+            .expect("session is open until close or drop");
         let options = SelectSourcesOptions::default()
             .set_cursor_mode(CursorMode::Embedded)
             .set_sources(sources.flags())
@@ -103,9 +113,22 @@ impl PortalStream {
         Ok((fd, node_id, streams.restore_token().map(str::to_owned)))
     }
 
-    pub(crate) async fn close(self) {
-        // Ignored: the compositor may have ended the session already.
-        let _ = self.session.close().await;
-        drop(self.proxy);
+    pub(crate) async fn close(mut self) {
+        if let Some(session) = &self.session {
+            // Ignored: the compositor may have ended the session already.
+            let _ = session.close().await;
+        }
+        self.session = None;
+    }
+}
+
+impl Drop for PortalStream {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            // Ignored as in `close`; a runtime that already shut down cancels the task.
+            self.runtime.spawn(async move {
+                let _ = session.close().await;
+            });
+        }
     }
 }
