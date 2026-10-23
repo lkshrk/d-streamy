@@ -128,7 +128,7 @@ fn event_line(event: &EngineEvent) -> Option<String> {
     }
 }
 
-/// Until both channels close; `biased` writes every event already received before the next reply.
+/// Until both channels close; every event sent before a reply is written before it.
 async fn write_out(
     mut events: mpsc::UnboundedReceiver<EngineEvent>,
     mut replies: mpsc::UnboundedReceiver<Reply>,
@@ -149,7 +149,12 @@ async fn write_out(
                 None => events_open = false,
             },
             reply = replies.recv(), if replies_open => match reply {
-                Some((id, result)) => send(reply_line(id.as_deref(), result)),
+                Some((id, result)) => {
+                    while let Ok(event) = events.try_recv() {
+                        send(event_line(&event));
+                    }
+                    send(reply_line(id.as_deref(), result));
+                }
                 None => replies_open = false,
             },
         }
@@ -340,5 +345,32 @@ mod tests {
         assert_eq!(lines.len(), 4);
         assert_eq!(lines[0]["id"], "1");
         assert!(lines[1..].iter().all(|l| l["type"] == "event"));
+    }
+
+    #[test]
+    fn an_event_sent_just_before_a_reply_is_written_first() {
+        const N: usize = 20_000;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = mpsc::unbounded_channel::<Reply>();
+        let (out, lines) = std::sync::mpsc::channel();
+        let writer = runtime.spawn(write_out(event_rx, reply_rx, out));
+        for i in 0..N {
+            event_tx.send(resumed()).unwrap();
+            reply_tx
+                .send((Some(i.to_string()), Ok(Value::Null)))
+                .unwrap();
+            let event = lines.recv().unwrap();
+            assert!(
+                event.contains("\"event\""),
+                "reply {i} came before its event"
+            );
+            assert!(lines.recv().unwrap().contains(&format!("\"id\":\"{i}\"")));
+        }
+        drop((event_tx, reply_tx));
+        runtime.block_on(writer).unwrap();
     }
 }
