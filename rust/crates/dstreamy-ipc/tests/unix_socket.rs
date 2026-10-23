@@ -1,8 +1,10 @@
 #![cfg(unix)]
 
 use std::fs::{self, Permissions};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::sync::Arc;
 
 use dstreamy_ipc::{
     ControlCodec, Endpoint, Frame, IpcError, Kind, Listener, ProducerCodec, connect,
@@ -10,6 +12,7 @@ use dstreamy_ipc::{
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Barrier;
 use tokio_util::bytes::Bytes;
 use tokio_util::codec::{Framed, FramedRead};
 
@@ -203,22 +206,46 @@ async fn over_long_socket_path_is_refused() {
 }
 
 #[tokio::test]
+async fn a_held_lock_keeps_the_stale_socket_and_reports_already_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let endpoint = endpoint_in(tmp.path());
+    drop(Listener::bind(&endpoint).await.unwrap());
+    let lock = fs::File::options()
+        .read(true)
+        .write(true)
+        .open(endpoint.as_path().with_file_name("serve.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let err = Listener::bind(&endpoint).await.err().unwrap();
+    assert!(matches!(err, IpcError::AlreadyRunning(_)), "{err}");
+    assert!(
+        fs::symlink_metadata(endpoint.as_path())
+            .unwrap()
+            .file_type()
+            .is_socket(),
+        "the stale socket was removed while another process held the lock"
+    );
+    lock.unlock().unwrap();
+    Listener::bind(&endpoint).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_binds_leave_exactly_one_live_listener() {
-    for _ in 0..20 {
+    for _ in 0..500 {
         let tmp = tempfile::tempdir().unwrap();
         let endpoint = endpoint_in(tmp.path());
         drop(Listener::bind(&endpoint).await.unwrap());
-        let (a, b) = tokio::join!(
-            tokio::spawn({
-                let e = endpoint.clone();
-                async move { Listener::bind(&e).await }
-            }),
-            tokio::spawn({
-                let e = endpoint.clone();
-                async move { Listener::bind(&e).await }
-            }),
-        );
-        let results = [a.unwrap(), b.unwrap()];
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn = || {
+            let e = endpoint.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                Listener::bind(&e).await
+            })
+        };
+        let (a, b) = (spawn(), spawn());
+        let results = [a.await.unwrap(), b.await.unwrap()];
         let live: Vec<&Listener> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
         assert_eq!(
             live.len(),

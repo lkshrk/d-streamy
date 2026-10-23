@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{CStr, OsStr};
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions, TryLockError};
 use std::io::{self, ErrorKind};
 use std::os::unix::ffi::OsStrExt;
@@ -46,34 +46,95 @@ pub(crate) fn own_principal() -> Principal {
 }
 
 pub(crate) fn default_location() -> Result<PathBuf, IpcError> {
+    let uid = own_principal();
     resolve_location(
         std::env::var_os(RUNTIME_DIR_VAR).as_deref(),
-        std::env::home_dir().as_deref(),
+        passwd_home(uid).as_deref(),
+        |base| check_base(base, uid),
     )
 }
 
 pub(crate) fn resolve_location(
     runtime_dir: Option<&OsStr>,
     home: Option<&Path>,
+    trust: impl Fn(&Path) -> Result<(), String>,
 ) -> Result<PathBuf, IpcError> {
     let in_dir = |dir: &Path| dir.join(DIR_NAME).join(SOCKET_NAME);
     let runtime = runtime_dir
         .map(Path::new)
         .filter(|dir| dir.is_absolute())
-        .map(in_dir)
-        .filter(|path| fits_sun_path(path));
-    if let Some(path) = runtime {
-        return Ok(path);
+        .filter(|dir| fits_sun_path(&in_dir(dir)))
+        .filter(|dir| trust(dir).is_ok());
+    if let Some(dir) = runtime {
+        return Ok(in_dir(dir));
     }
     let home = home
         .filter(|home| home.is_absolute())
         .ok_or(IpcError::NoHomeDirectory)?;
-    let path = in_dir(&home.join(HOME_FALLBACK));
-    if fits_sun_path(&path) {
-        Ok(path)
-    } else {
-        Err(IpcError::PathTooLong(path))
+    let base = home.join(HOME_FALLBACK);
+    let path = in_dir(&base);
+    if !fits_sun_path(&path) {
+        return Err(IpcError::PathTooLong(path));
     }
+    trust(&base).map_err(|reason| IpcError::InsecureDirectory { path: base, reason })?;
+    Ok(path)
+}
+
+/// The home directory from the user database, not `$HOME`, which `sudo -E` carries over.
+fn passwd_home(uid: u32) -> Option<PathBuf> {
+    let mut buf = vec![0 as libc::c_char; 1024];
+    loop {
+        let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut found = std::ptr::null_mut();
+        // SAFETY: every pointer is valid for the stated length for the duration of the call.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                pwd.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || found.is_null() {
+            return None;
+        }
+        // SAFETY: on success `found` points at `pwd`, whose strings live in `buf`.
+        let dir = unsafe { (*found).pw_dir };
+        if dir.is_null() {
+            return None;
+        }
+        // SAFETY: pw_dir is a NUL-terminated string inside `buf`.
+        let dir = unsafe { CStr::from_ptr(dir) };
+        return Some(PathBuf::from(OsStr::from_bytes(dir.to_bytes())));
+    }
+}
+
+/// A base directory is trusted when it and every ancestor belong to us or root and no one else can write them.
+pub(crate) fn check_base(base: &Path, uid: u32) -> Result<(), String> {
+    let existing = base
+        .ancestors()
+        .find(|dir| dir.exists())
+        .ok_or_else(|| format!("{} has no existing ancestor", base.display()))?;
+    let canonical =
+        fs::canonicalize(existing).map_err(|e| format!("{}: {e}", existing.display()))?;
+    for dir in canonical.ancestors() {
+        let meta = fs::metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        if !meta.is_dir() {
+            return Err(format!("{} is not a directory", dir.display()));
+        }
+        if meta.uid() != uid && meta.uid() != 0 {
+            return Err(format!("{} is owned by uid {}", dir.display(), meta.uid()));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(format!("{} is writable by other users", dir.display()));
+        }
+    }
+    Ok(())
 }
 
 fn fits_sun_path(path: &Path) -> bool {
@@ -154,7 +215,10 @@ fn lock_dir(dir: &Path, socket: &Path) -> Result<File, IpcError> {
 
 fn prepare_private_dir(dir: &Path) -> Result<(), IpcError> {
     if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
+        DirBuilder::new()
+            .recursive(true)
+            .mode(PRIVATE_MODE)
+            .create(parent)?;
     }
     match DirBuilder::new().mode(PRIVATE_MODE).create(dir) {
         Ok(()) => fs::set_permissions(dir, Permissions::from_mode(PRIVATE_MODE))?,
@@ -169,10 +233,20 @@ pub(crate) fn check_private_dir(dir: &Path, uid: u32) -> Result<(), IpcError> {
         path: dir.to_owned(),
         reason,
     };
-    let meta = fs::symlink_metadata(dir)?;
-    if !meta.file_type().is_dir() {
-        return Err(insecure("not a directory".into()));
-    }
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir);
+    let meta = match opened {
+        Ok(file) => file.metadata()?,
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(insecure("is a symbolic link".into()));
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => {
+            return Err(insecure("not a directory".into()));
+        }
+        Err(e) => return Err(e.into()),
+    };
     if meta.uid() != uid {
         return Err(insecure(format!("owned by uid {}, not {uid}", meta.uid())));
     }
@@ -220,14 +294,22 @@ pub(crate) async fn connect(path: &Path) -> Result<Stream, IpcError> {
         }
         Err(e) => return Err(e.into()),
     };
-    let server = peer_of(&stream)?;
+    verify_server(path, own, peer_of(&stream))?;
+    Ok(stream)
+}
+
+fn verify_server(path: &Path, own: Principal, server: io::Result<Peer>) -> Result<(), IpcError> {
+    let server = server.map_err(|e| IpcError::UnverifiedServer {
+        path: path.to_owned(),
+        reason: e.to_string(),
+    })?;
     if !crate::authorize(&own, &server.principal()) {
         return Err(IpcError::ImpostorServer {
             path: path.to_owned(),
             uid: server.principal(),
         });
     }
-    Ok(stream)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -243,7 +325,17 @@ mod tests {
     }
 
     fn resolve(runtime: Option<&str>) -> PathBuf {
-        resolve_location(runtime.map(OsStr::new), Some(Path::new(HOME))).unwrap()
+        resolve_location(runtime.map(OsStr::new), Some(Path::new(HOME)), |_| Ok(())).unwrap()
+    }
+
+    fn trusted_tempdir() -> tempfile::TempDir {
+        let home = passwd_home(own_principal()).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix(".ipc")
+            .tempdir_in(home)
+            .unwrap();
+        fs::set_permissions(dir.path(), Permissions::from_mode(0o755)).unwrap();
+        dir
     }
 
     #[test]
@@ -282,15 +374,15 @@ mod tests {
     #[test]
     fn over_long_home_is_path_too_long() {
         let home = PathBuf::from(format!("/home/{}", "h".repeat(MAX_PATH_LEN)));
-        let err = resolve_location(None, Some(&home)).unwrap_err();
+        let err = resolve_location(None, Some(&home), |_| Ok(())).unwrap_err();
         assert!(matches!(err, IpcError::PathTooLong(p) if p.starts_with(&home)));
     }
 
     #[test]
     fn no_home_and_no_runtime_dir_is_an_error() {
-        let err = resolve_location(None, None).unwrap_err();
+        let err = resolve_location(None, None, |_| Ok(())).unwrap_err();
         assert!(matches!(err, IpcError::NoHomeDirectory), "{err}");
-        let err = resolve_location(None, Some(Path::new("relative"))).unwrap_err();
+        let err = resolve_location(None, Some(Path::new("relative")), |_| Ok(())).unwrap_err();
         assert!(matches!(err, IpcError::NoHomeDirectory), "{err}");
     }
 
@@ -303,5 +395,81 @@ mod tests {
         check_private_dir(&dir, own_principal()).unwrap();
         let err = check_private_dir(&dir, own_principal().wrapping_add(1)).unwrap_err();
         assert!(matches!(err, IpcError::InsecureDirectory { .. }), "{err}");
+    }
+
+    #[test]
+    fn tmp_is_never_a_trusted_base() {
+        let err = check_base(Path::new("/tmp"), own_principal()).unwrap_err();
+        assert!(err.contains("writable by other users"), "{err}");
+        assert!(check_base(Path::new("/tmp/dstreamy-base"), own_principal()).is_err());
+    }
+
+    #[test]
+    fn untrusted_runtime_dir_falls_back_to_the_home_base() {
+        let home = trusted_tempdir();
+        let uid = own_principal();
+        let path = resolve_location(Some(OsStr::new("/tmp")), Some(home.path()), |b| {
+            check_base(b, uid)
+        })
+        .unwrap();
+        assert_eq!(
+            path,
+            home.path().join(HOME_FALLBACK).join("dstreamy/serve.sock")
+        );
+    }
+
+    #[test]
+    fn base_owned_by_another_uid_is_skipped() {
+        let runtime = trusted_tempdir();
+        let home = Path::new("/home/u");
+        let uid = own_principal();
+        check_base(runtime.path(), uid).unwrap();
+        let other = check_base(runtime.path(), uid.wrapping_add(1)).unwrap_err();
+        assert!(other.contains("owned by uid"), "{other}");
+        let path = resolve_location(Some(runtime.path().as_os_str()), Some(home), |b| {
+            if b == runtime.path() {
+                check_base(b, uid.wrapping_add(1))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(path, home.join(HOME_FALLBACK).join("dstreamy/serve.sock"));
+    }
+
+    #[test]
+    fn writable_base_is_refused() {
+        for mode in [0o775, 0o757, 0o1777] {
+            let base = trusted_tempdir();
+            fs::set_permissions(base.path(), Permissions::from_mode(mode)).unwrap();
+            let err = check_base(&base.path().join("not-yet"), own_principal()).unwrap_err();
+            assert!(err.contains("writable by other users"), "{mode:o}: {err}");
+        }
+    }
+
+    #[test]
+    fn untrusted_home_base_is_insecure() {
+        let err =
+            resolve_location(None, Some(Path::new("/home/u")), |_| Err("nope".into())).unwrap_err();
+        assert!(matches!(err, IpcError::InsecureDirectory { .. }), "{err}");
+    }
+
+    #[test]
+    fn home_comes_from_the_user_database() {
+        let home = passwd_home(own_principal()).expect("current user has a passwd entry");
+        assert!(home.is_absolute(), "{}", home.display());
+    }
+
+    #[test]
+    fn server_check_fails_closed() {
+        let path = Path::new("/x/serve.sock");
+        let own = own_principal();
+        verify_server(path, own, Ok(Peer::new(own, None))).unwrap();
+        let err =
+            verify_server(path, own, Ok(Peer::new(own.wrapping_add(1), Some(7)))).unwrap_err();
+        assert!(matches!(err, IpcError::ImpostorServer { uid, .. } if uid == own.wrapping_add(1)));
+        let enotconn = io::Error::from_raw_os_error(libc::ENOTCONN);
+        let err = verify_server(path, own, Err(enotconn)).unwrap_err();
+        assert!(matches!(err, IpcError::UnverifiedServer { .. }), "{err}");
     }
 }

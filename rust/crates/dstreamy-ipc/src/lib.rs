@@ -10,6 +10,11 @@ mod unix;
 #[cfg(unix)]
 use unix as sys;
 
+#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!(
+    "the test-support feature opens the endpoint to every user and must not reach a release build"
+);
+
 #[cfg(not(unix))]
 compile_error!("dstreamy-ipc has no transport for this platform yet (named pipes: issue 15)");
 

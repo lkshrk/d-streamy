@@ -11,6 +11,8 @@ pub enum IpcError {
     InsecureDirectory { path: PathBuf, reason: String },
     #[error("the service at {path} runs as uid {uid}, not as this user")]
     ImpostorServer { path: PathBuf, uid: u32 },
+    #[error("could not verify who runs the service at {path}: {reason}")]
+    UnverifiedServer { path: PathBuf, reason: String },
     #[error("{0} exists and is not a socket")]
     NotASocket(PathBuf),
     #[error("endpoint path {0} is too long for a local socket")]
