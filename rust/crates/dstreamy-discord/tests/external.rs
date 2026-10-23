@@ -281,12 +281,25 @@ async fn a_producer_swap_keeps_streaming_with_continuous_decodable_media() {
     increasing(&audio.iter().map(|a| a.rtp_timestamp).collect::<Vec<_>>());
 
     let split = after_gap(&video);
+    assert_eq!(
+        recorded.dropped_frames.len(),
+        before.dropped_frames.len(),
+        "frames lost after the reattach: {:?}",
+        &recorded.dropped_frames[before.dropped_frames.len()..]
+    );
     // davey may reject the first keyframe after DAVE comes up; video then resumes at the next one.
     let start = video.iter().position(|v| is_keyframe(&v.data)).unwrap();
-    assert!(
-        start == 0 || !recorded.dropped_frames.is_empty(),
-        "video before the first keyframe without a DAVE loss"
-    );
+    if start > 0 {
+        assert!(
+            !before.dropped_frames.is_empty()
+                && before
+                    .dropped_frames
+                    .iter()
+                    .all(|d| d.starts_with("DAVE decrypt (video)")),
+            "video before the first keyframe; drops: {:?}",
+            before.dropped_frames
+        );
+    }
     assert!(split > start);
     assert!(
         is_keyframe(&video[split].data),
@@ -392,13 +405,33 @@ async fn silence_during_gap(idle: IdleMode) -> (Vec<u32>, Duration) {
     f.frames_after(20, 30).await;
     let detached = feeder.detach().await;
     sleep(GAP).await;
-    let gap = f.mock.recorded();
+    let sent_before = f.mock.recorded().audio.len();
     let feeder = f.attach().await;
     let reattached = detached.elapsed();
+    let producer_audio =
+        |a: &RecordedAudioFrame| a.kind == VoiceKind::Stream && a.data != OPUS_SILENCE_FRAME;
+    let gap = f
+        .mock
+        .wait_for(T, |r| {
+            r.audio[sent_before..]
+                .iter()
+                .any(producer_audio)
+                .then(|| r.clone())
+        })
+        .await
+        .expect("producer audio after the reattach");
+    let resumed = sent_before
+        + gap.audio[sent_before..]
+            .iter()
+            .position(producer_audio)
+            .unwrap();
     f.frames_after(gap.video.len() + 10, gap.audio.len() + 20)
         .await;
     feeder.detach().await;
-    let in_gap = stream_audio(&gap);
+    let in_gap: Vec<&RecordedAudioFrame> = gap.audio[..resumed]
+        .iter()
+        .filter(|a| a.kind == VoiceKind::Stream)
+        .collect();
     let mut silence: Vec<u32> = in_gap
         .iter()
         .rev()

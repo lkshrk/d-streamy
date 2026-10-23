@@ -175,7 +175,14 @@ impl Sink {
         server
             .decrypt(media_type, &frame)
             .map(|plain| (plain, true))
-            .map_err(|e| format!("DAVE decrypt: {e}"))
+            .map_err(|e| {
+                let track = if media_type == MediaType::VIDEO {
+                    "video"
+                } else {
+                    "audio"
+                };
+                format!("DAVE decrypt ({track}): {e}")
+            })
     }
 
     fn drop_frame(&self, reason: String) {
