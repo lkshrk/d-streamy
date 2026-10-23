@@ -1,0 +1,23 @@
+{
+    "libobs": "32.2.2",
+    "video_encoder": "obs_x264",
+    "video_codec": "h264",
+    "audio_encoder": "ffmpeg_opus",
+    "audio_codec": "opus",
+    "fps": 30,
+    "width": 1280,
+    "height": 720,
+    "sample_rate": 48000,
+    "audio_frame_size": 960,
+    "video_packets": 90,
+    "audio_packets": 149,
+    "bf_set": true,
+    "keyint_set": true,
+    "video_settings": {
+        "bf": 0,
+        "bitrate": 500,
+        "keyint_sec": 0,
+        "rate_control": "CBR",
+        "profile": "main"
+    }
+}
