@@ -6,6 +6,15 @@ on:
     paths:
       - "obs/**"
       - "rust/crates/dstreamy-test-producer/**"
+      - "rust/crates/dstreamy-media/**"
+      - "rust/Cargo.lock"
+      - ".github/workflows/obs-ci.yml"
+  pull_request:
+    branches: [rust-rewrite]
+    paths:
+      - "obs/**"
+      - "rust/crates/dstreamy-test-producer/**"
+      - "rust/crates/dstreamy-media/**"
       - "rust/Cargo.lock"
       - ".github/workflows/obs-ci.yml"
   workflow_dispatch:

@@ -74,9 +74,25 @@ fn load_all() -> Vec<Trace> {
         .map(|dir| {
             let read =
                 |f: &str| std::fs::read(dir.join(f)).unwrap_or_else(|e| panic!("{dir:?}/{f}: {e}"));
+            let provenance = String::from_utf8(read("PROVENANCE.md")).unwrap();
+            for field in [
+                "| libobs | 32.2.2 |",
+                "| OBS commit | ba2f32bdf791005443988a4955e963663e16b1ed |",
+                "| CI run | ",
+                "| OS | Linux",
+                "| Date (UTC) | ",
+                "| Video encoder | ",
+                "| Audio encoder | ",
+                "Command line:",
+            ] {
+                assert!(
+                    provenance.contains(field),
+                    "{dir:?}: PROVENANCE.md lacks {field:?}"
+                );
+            }
             assert!(
-                dir.join("PROVENANCE.md").is_file(),
-                "{dir:?} has no PROVENANCE.md"
+                !provenance.contains("| CI run | local |"),
+                "{dir:?} was not recorded on CI"
             );
             Trace {
                 name: dir.file_name().unwrap().to_string_lossy().into_owned(),
@@ -119,6 +135,13 @@ fn every_trace_is_complete_and_from_the_pinned_obs() {
     for t in &traces {
         assert_eq!(t.meta["libobs"], "32.2.2", "{}", t.name);
         assert_eq!(t.meta["video_codec"], "h264", "{}", t.name);
+        assert_eq!(
+            t.meta["obs_commit"], "ba2f32bdf791005443988a4955e963663e16b1ed",
+            "{}",
+            t.name
+        );
+        assert_eq!(t.meta["lagged_frames"], 0, "{}", t.name);
+        assert_eq!(t.meta["skipped_frames"], 0, "{}", t.name);
         let video = t.video().count() as i64;
         assert_eq!(
             video,
@@ -147,7 +170,7 @@ fn h264_is_annex_b_with_sps_pps_in_extra_data_and_every_idr() {
         );
 
         let fps = t.meta["fps"].as_u64().unwrap() as u32;
-        let mut keyframes = 0;
+        let mut keyframes = Vec::new();
         for p in t.video() {
             assert!(
                 p.data.starts_with(&[0, 0, 1]) || p.data.starts_with(&annexb::START_CODE),
@@ -164,7 +187,7 @@ fn h264_is_annex_b_with_sps_pps_in_extra_data_and_every_idr() {
             );
             assert_eq!(annexb::h264_is_keyframe(&p.data), p.keyframe, "{}", t.name);
             if p.keyframe {
-                keyframes += 1;
+                keyframes.push(p.dts);
                 assert!(
                     types.contains(&H264_NAL_SPS) && types.contains(&H264_NAL_PPS),
                     "{}: IDR without in-band SPS/PPS {types:?}",
@@ -177,7 +200,42 @@ fn h264_is_annex_b_with_sps_pps_in_extra_data_and_every_idr() {
             "{}: first packet is not an IDR",
             t.name
         );
-        assert!(keyframes >= 2, "{}", t.name);
+        assert!(!keyframes.is_empty(), "{}", t.name);
+    }
+}
+
+#[test]
+fn idr_spacing_follows_keyint_sec_with_scenecut_off() {
+    for t in load_all() {
+        assert_eq!(
+            t.setting("x264opts").and_then(|v| v.as_str()),
+            Some("scenecut=0"),
+            "{}",
+            t.name
+        );
+        if t.setting("bf").and_then(|v| v.as_i64()) != Some(0) {
+            continue;
+        }
+        let fps = t.meta["fps"].as_i64().unwrap();
+        let frames = t.video().count() as i64;
+        let idrs: Vec<i64> = t.video().filter(|p| p.keyframe).map(|p| p.dts).collect();
+        match t.setting("keyint_sec").and_then(|v| v.as_i64()) {
+            Some(0) => {
+                // keyint_sec=0 leaves x264's default keyint of 250 frames: one IDR in a few seconds.
+                let expected: Vec<i64> = (0..frames).step_by(250).collect();
+                assert_eq!(idrs, expected, "{}", t.name);
+            }
+            Some(k) => {
+                let expected: Vec<i64> = (0..frames).step_by((k * fps) as usize).collect();
+                assert!(
+                    expected.len() >= 2,
+                    "{}: trace too short for keyint {k}",
+                    t.name
+                );
+                assert_eq!(idrs, expected, "{}: IDRs not every {k} s", t.name);
+            }
+            None => panic!("{}: keyint_sec not set", t.name),
+        }
     }
 }
 
@@ -252,7 +310,21 @@ fn aac_trace_is_not_opus() {
         .filter(|t| t.meta["audio_codec"] == "aac")
         .collect();
     assert_eq!(aac.len(), 1);
-    assert_ne!(&aac[0].audio_extra[..], b"OpusHead");
+    let asc = &aac[0].audio_extra;
+    assert!(!asc.starts_with(b"OpusHead"));
+    // ISO/IEC 14496-3 AudioSpecificConfig: 5-bit object type, 4-bit sampling index, 4-bit channel configuration.
+    assert!(asc.len() >= 2, "AudioSpecificConfig too short");
+    assert_eq!(asc[0] >> 3, 2, "object type is not AAC LC");
+    assert_eq!(
+        ((asc[0] & 7) << 1) | (asc[1] >> 7),
+        3,
+        "sampling index is not 48 kHz"
+    );
+    assert_eq!(
+        (asc[1] >> 3) & 0xf,
+        2,
+        "channel configuration is not stereo"
+    );
     assert_eq!(aac[0].meta["audio_frame_size"], 1024);
 }
 

@@ -5,14 +5,14 @@ set -euo pipefail
 harness=$1
 check=$2
 out=$3
-seconds=3
+seconds=5
 mkdir -p "$out"
 
 record() {
   local name=$1 check_fps=$2
   shift 2
   echo "=== $name"
-  "$harness" --seconds "$seconds" --bitrate 500 --trace-dir "$out/$name" --note "$name" "$@"
+  "$harness" --seconds "$seconds" --bitrate 500 --x264opts scenecut=0 --trace-dir "$out/$name" --note "$name" "$@"
   if [[ $check_fps != - ]]; then
     "$check" "$out/$name" --fps "$check_fps" --seconds "$seconds"
   fi
