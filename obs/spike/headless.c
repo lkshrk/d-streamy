@@ -18,6 +18,7 @@ struct spike_args {
 	const char *audio_encoder;
 	const char *plugin_bin;
 	const char *plugin_data;
+	const char *modules;
 	int seconds;
 };
 
@@ -222,6 +223,7 @@ static bool parse_args(int argc, char **argv, struct spike_args *a)
 	a->video_encoder = "obs_x264";
 	a->audio_encoder = "ffmpeg_opus";
 	a->seconds = 3;
+	a->modules = "image-source,obs-x264,obs-ffmpeg,obs-outputs,mac-videotoolbox";
 
 	for (int i = 1; i < argc; i++) {
 		const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -239,6 +241,8 @@ static bool parse_args(int argc, char **argv, struct spike_args *a)
 			a->plugin_bin = v;
 		else if (strcmp(argv[i], "--plugin-data") == 0)
 			a->plugin_data = v;
+		else if (strcmp(argv[i], "--modules") == 0)
+			a->modules = v;
 		else if (strcmp(argv[i], "--seconds") == 0)
 			a->seconds = atoi(v);
 		else {
@@ -307,6 +311,12 @@ int main(int argc, char **argv)
 
 	if (args.plugin_bin && args.plugin_data)
 		obs_add_module_path(args.plugin_bin, args.plugin_data);
+
+	// Frontend plugins such as obs-websocket and frontend-tools abort without a QApplication.
+	char *mods = bstrdup(args.modules);
+	for (char *m = strtok(mods, ","); m; m = strtok(NULL, ","))
+		obs_add_safe_module(m);
+	bfree(mods);
 
 	struct obs_module_failure_info mfi;
 	obs_load_all_modules2(&mfi);
