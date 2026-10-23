@@ -215,7 +215,17 @@ jobs:
           "$app/MacOS/obs-headless-spike" --graphics "$app/Frameworks/libobs-opengl.dylib" \
             | tee "$SPIKE_LOGS/macos-spike-opengl.log"
 
+      - name: Backtrace spike (OpenGL) under lldb
+        if: failure()
+        continue-on-error: true
+        run: |
+          app="$OBS_PREFIX/OBS.app/Contents"
+          lldb --batch -o run -k "thread backtrace all" -k quit -- \
+            "$app/MacOS/obs-headless-spike" --graphics "$app/Frameworks/libobs-opengl.dylib" 2>&1 \
+            | tee "$SPIKE_LOGS/macos-spike-opengl-lldb.log" | grep -v '^SPIKE \(video\|audio\) packet bytes'
+
       - name: Run spike (Metal)
+        if: always()
         continue-on-error: true
         run: |
           set -o pipefail
@@ -224,6 +234,7 @@ jobs:
             | tee "$SPIKE_LOGS/macos-spike-metal.log"
 
       - name: Run spike (VideoToolbox H.264)
+        if: always()
         continue-on-error: true
         run: |
           set -o pipefail
@@ -237,6 +248,7 @@ jobs:
             | tee "$SPIKE_LOGS/macos-spike-videotoolbox.log"
 
       - name: Frontend with obs-websocket (stretch)
+        if: always()
         continue-on-error: true
         run: |
           set -o pipefail

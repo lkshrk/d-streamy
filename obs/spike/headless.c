@@ -272,6 +272,7 @@ int main(int argc, char **argv)
 	obs_encoder_t *aenc = NULL;
 	obs_output_t *output = NULL;
 	bool started = false;
+	bool initialized = false;
 
 	setvbuf(stdout, NULL, _IONBF, 0);
 	if (!parse_args(argc, argv, &args))
@@ -283,6 +284,7 @@ int main(int argc, char **argv)
 
 	if (!obs_startup("en-US", NULL, NULL))
 		FAIL("obs_startup");
+	initialized = true;
 	printf("SPIKE libobs version %s\n", obs_get_version_string());
 
 	struct obs_video_info ovi = {
@@ -415,10 +417,13 @@ cleanup:
 	obs_output_release(output);
 	obs_encoder_release(venc);
 	obs_encoder_release(aenc);
-	obs_set_output_source(0, NULL);
-	obs_scene_release(scene);
-	obs_source_release(color);
-	obs_shutdown();
+	if (initialized) {
+		obs_set_output_source(0, NULL);
+		obs_scene_release(scene);
+		obs_source_release(color);
+		printf("SPIKE calling obs_shutdown\n");
+		obs_shutdown();
+	}
 	printf("SPIKE shutdown complete, leaked allocations=%ld\n", bnum_allocs());
 	os_event_destroy(stopped_event);
 	printf("SPIKE result=%s\n", rc == 0 ? "PASS" : "FAIL");
