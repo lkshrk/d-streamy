@@ -42,6 +42,15 @@ pub enum SyncError {
     },
     #[error("beep at {beep_us} µs has no flash within {tolerance_us} µs")]
     UnmatchedBeep { beep_us: i64, tolerance_us: i64 },
+    #[error(
+        "beep - flash offset {offset_us} µs at flash {flash_us} µs is not {expected_us} ± {tolerance_us} µs"
+    )]
+    OffsetOutOfRange {
+        flash_us: i64,
+        offset_us: i64,
+        expected_us: i64,
+        tolerance_us: i64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -137,8 +146,7 @@ pub fn quiet_spans<'a>(
     spans
 }
 
-/// Pairs every flash with a beep within `tolerance_us`. Only markers whose partner could lie inside the other
-/// track's time range (`video_span_us` for beeps, `audio_span_us` for flashes) are required to have one.
+/// Pairs flashes with beeps within `tolerance_us`; only markers inside the other track's span need a partner.
 pub fn align(
     flashes: &[i64],
     beeps: &[i64],
@@ -183,6 +191,26 @@ pub fn align(
         return Err(SyncError::NoFlashes);
     }
     Ok(pairs)
+}
+
+/// Checks every beep - flash offset is within `tolerance_us` of `expected_us` (half a frame for the harness).
+pub fn check_offsets(
+    pairs: &[MarkerPair],
+    expected_us: i64,
+    tolerance_us: i64,
+) -> Result<(), SyncError> {
+    match pairs
+        .iter()
+        .find(|p| (p.offset_us() - expected_us).abs() > tolerance_us)
+    {
+        Some(p) => Err(SyncError::OffsetOutOfRange {
+            flash_us: p.flash_us,
+            offset_us: p.offset_us(),
+            expected_us,
+            tolerance_us,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Decodes H.264 Annex B access units to their mean luma.
@@ -460,6 +488,36 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn pair(flash_us: i64, offset_us: i64) -> MarkerPair {
+        MarkerPair {
+            flash_us,
+            beep_us: flash_us + offset_us,
+        }
+    }
+
+    #[test]
+    fn offsets_near_half_a_frame_pass() {
+        let pairs = [
+            pair(1_000_000, FRAME_US / 2),
+            pair(2_000_000, FRAME_US / 2 + 2_000),
+        ];
+        assert_eq!(check_offsets(&pairs, FRAME_US / 2, FRAME_US / 4), Ok(()));
+    }
+
+    #[test]
+    fn a_one_frame_regression_fails_although_align_accepts_it() {
+        let flashes = [1_000_000];
+        let beeps = [1_000_000 - FRAME_US / 2];
+        let pairs = align(&flashes, &beeps, (0, 2_000_000), (0, 2_000_000), FRAME_US).unwrap();
+        let err = check_offsets(&pairs, FRAME_US / 2, FRAME_US / 4).unwrap_err();
+        assert!(
+            matches!(err, SyncError::OffsetOutOfRange { offset_us, .. } if offset_us == -FRAME_US / 2),
+            "{err:?}"
+        );
+        let late = [pair(1_000_000, FRAME_US / 2 + FRAME_US / 4 + 1)];
+        assert!(check_offsets(&late, FRAME_US / 2, FRAME_US / 4).is_err());
     }
 
     #[test]

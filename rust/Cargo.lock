@@ -1267,6 +1267,7 @@ name = "dstreamy-test-producer"
 version = "0.1.0"
 dependencies = [
  "openh264",
+ "serde_json",
  "thiserror 2.0.21",
  "unsafe-libopus",
 ]

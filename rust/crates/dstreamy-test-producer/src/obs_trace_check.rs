@@ -79,6 +79,22 @@ fn check(dir: &Path, fps: i64, seconds: i64) -> Result<(), String> {
     let bytes = std::fs::read(dir.join("packets.bin")).map_err(|e| format!("packets.bin: {e}"))?;
     let extra = std::fs::read(dir.join("video-extra.bin")).unwrap_or_default();
     let packets = parse(&bytes)?;
+    let meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("trace.json")).map_err(|e| format!("trace.json: {e}"))?,
+    )
+    .map_err(|e| format!("trace.json: {e}"))?;
+    let lagged = meta["lagged_frames"]
+        .as_i64()
+        .ok_or("trace.json has no lagged_frames")?;
+    let skipped = meta["skipped_frames"]
+        .as_i64()
+        .ok_or("trace.json has no skipped_frames")?;
+    println!("video: {lagged} lagged and {skipped} skipped frames while recording");
+    if lagged != 0 || skipped != 0 {
+        return Err(format!(
+            "{lagged} lagged and {skipped} skipped frames: markers may be misplaced"
+        ));
+    }
 
     let mut video = H264LumaDecoder::new().map_err(|e| e.to_string())?;
     let mut frames: Vec<LumaFrame> = Vec::new();
@@ -88,6 +104,7 @@ fn check(dir: &Path, fps: i64, seconds: i64) -> Result<(), String> {
     let mut opus = OpusMonoDecoder::new().map_err(|e| e.to_string())?;
     let mut pcm = Vec::new();
     let mut audio_start_us = None;
+    let mut next_audio_pts = None;
     let mut video_packets = 0;
     for p in &packets {
         if p.video {
@@ -99,7 +116,17 @@ fn check(dir: &Path, fps: i64, seconds: i64) -> Result<(), String> {
             );
         } else {
             audio_start_us.get_or_insert(p.pts_us());
-            pcm.extend(opus.decode(p.data).map_err(|e| e.to_string())?);
+            if next_audio_pts.is_some_and(|n| n != p.pts) {
+                return Err(format!(
+                    "audio pts {} after {next_audio_pts:?}: packet lost",
+                    p.pts
+                ));
+            }
+            let samples = opus.decode(p.data).map_err(|e| e.to_string())?;
+            next_audio_pts = Some(
+                p.pts + samples.len() as i64 * p.timebase.1 / i64::from(SAMPLE_RATE) / p.timebase.0,
+            );
+            pcm.extend(samples);
         }
     }
     frames.extend(video.finish().map_err(|e| e.to_string())?);
@@ -177,7 +204,9 @@ fn check(dir: &Path, fps: i64, seconds: i64) -> Result<(), String> {
         ));
     }
     let offsets: Vec<i64> = pairs.iter().map(|p| p.offset_us()).collect();
-    println!("sync: beep - flash offsets {offsets:?} µs (tolerance {frame_us} µs)");
+    let (expected, tolerance) = (frame_us / 2, frame_us / 4);
+    println!("sync: beep - flash offsets {offsets:?} µs (expected {expected} ± {tolerance} µs)");
+    sync::check_offsets(&pairs, expected, tolerance).map_err(|e| e.to_string())?;
     Ok(())
 }
 

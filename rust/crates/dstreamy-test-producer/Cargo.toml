@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 openh264 = "0.9"
+serde_json = "1"
 thiserror = "2"
 unsafe-libopus = "0.2"
 
