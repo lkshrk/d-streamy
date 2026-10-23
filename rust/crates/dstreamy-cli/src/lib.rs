@@ -3,6 +3,7 @@
 pub mod capture;
 pub mod daemon;
 pub mod discord;
+pub mod engine;
 pub mod lock;
 pub mod output;
 pub mod signals;
