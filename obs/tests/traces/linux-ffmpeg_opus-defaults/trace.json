@@ -9,15 +9,20 @@
     "height": 720,
     "sample_rate": 48000,
     "audio_frame_size": 960,
-    "video_packets": 90,
-    "audio_packets": 149,
+    "video_packets": 150,
+    "audio_packets": 249,
     "bf_set": true,
     "keyint_set": true,
+    "lagged_frames": 0,
+    "skipped_frames": 0,
+    "obs_commit": "ba2f32bdf791005443988a4955e963663e16b1ed",
+    "ci_run": "40028252651",
     "video_settings": {
         "bf": 0,
         "bitrate": 500,
         "keyint_sec": 2,
         "rate_control": "CBR",
-        "profile": "main"
+        "profile": "main",
+        "x264opts": "scenecut=0"
     }
 }
