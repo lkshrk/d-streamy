@@ -32,11 +32,27 @@ fn default_endpoint_uses_a_trusted_runtime_dir_or_the_passwd_home() {
     // SAFETY: no other thread exists that reads the environment.
     unsafe { std::env::set_var("HOME", "/home/not-the-user") };
 
+    let runtime = tempfile::Builder::new()
+        .prefix(".ipc-env")
+        .tempdir_in(passwd_home())
+        .unwrap();
+    std::fs::set_permissions(
+        runtime.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     // SAFETY: as above.
-    unsafe { std::env::set_var(VAR, "/run/user/test") };
+    unsafe { std::env::set_var(VAR, runtime.path()) };
+    assert_eq!(default_path(), runtime.path().join("dstreamy/serve.sock"));
+
+    let missing = runtime.path().join("not-created");
+    // SAFETY: as above.
+    unsafe { std::env::set_var(VAR, &missing) };
     assert_eq!(
         default_path(),
-        PathBuf::from("/run/user/test/dstreamy/serve.sock")
+        fallback,
+        "{VAR}={} does not exist",
+        missing.display()
     );
 
     for untrusted in ["/tmp", "/tmp/", "/tmp/dstreamy-base"] {

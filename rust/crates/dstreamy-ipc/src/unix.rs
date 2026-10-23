@@ -51,6 +51,7 @@ pub(crate) fn default_location() -> Result<PathBuf, IpcError> {
         std::env::var_os(RUNTIME_DIR_VAR).as_deref(),
         passwd_home(uid).as_deref(),
         |base| check_base(base, uid),
+        Path::is_dir,
     )
 }
 
@@ -58,12 +59,14 @@ pub(crate) fn resolve_location(
     runtime_dir: Option<&OsStr>,
     home: Option<&Path>,
     trust: impl Fn(&Path) -> Result<PathBuf, String>,
+    exists: impl Fn(&Path) -> bool,
 ) -> Result<PathBuf, IpcError> {
     let in_dir = |dir: &Path| dir.join(DIR_NAME).join(SOCKET_NAME);
     let runtime = runtime_dir
         .map(Path::new)
         .filter(|dir| dir.is_absolute())
         .and_then(|dir| trust(dir).ok())
+        .filter(|dir| exists(dir))
         .map(|dir| in_dir(&dir))
         .filter(|path| fits_sun_path(path));
     if let Some(path) = runtime {
@@ -123,13 +126,13 @@ pub(crate) fn check_base(base: &Path, uid: u32) -> Result<PathBuf, String> {
     if base.components().any(|c| c == Component::ParentDir) {
         return Err(format!("{} contains ..", base.display()));
     }
-    check_components(base, uid, 0)
+    check_components(base, uid, &mut 0)
 }
 
-fn check_components(path: &Path, uid: u32, depth: u32) -> Result<PathBuf, String> {
-    if depth > 8 {
-        return Err(format!("{}: too many symbolic links", path.display()));
-    }
+/// Total symlinks followed per check, as Linux's MAXSYMLINKS; bounds fan-out across nested targets.
+const MAX_SYMLINKS: u32 = 40;
+
+fn check_components(path: &Path, uid: u32, links: &mut u32) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!("{} is not absolute", path.display()));
     }
@@ -170,7 +173,11 @@ fn check_components(path: &Path, uid: u32, depth: u32) -> Result<PathBuf, String
             let target =
                 fs::read_link(&current).map_err(|e| format!("{}: {e}", current.display()))?;
             let target = current.parent().unwrap_or(Path::new("/")).join(target);
-            current = check_components(&target, uid, depth + 1)?;
+            *links += 1;
+            if *links > MAX_SYMLINKS {
+                return Err(format!("{}: too many symbolic links", path.display()));
+            }
+            current = check_components(&target, uid, links)?;
             if !current.is_dir() {
                 return Err(format!("{} does not lead to a directory", target.display()));
             }
@@ -391,9 +398,12 @@ mod tests {
     }
 
     fn resolve(runtime: Option<&str>) -> PathBuf {
-        resolve_location(runtime.map(OsStr::new), Some(Path::new(HOME)), |b| {
-            Ok(b.to_owned())
-        })
+        resolve_location(
+            runtime.map(OsStr::new),
+            Some(Path::new(HOME)),
+            |b| Ok(b.to_owned()),
+            |_| true,
+        )
         .unwrap()
     }
 
@@ -443,16 +453,22 @@ mod tests {
     #[test]
     fn over_long_home_is_path_too_long() {
         let home = PathBuf::from(format!("/home/{}", "h".repeat(MAX_PATH_LEN)));
-        let err = resolve_location(None, Some(&home), |b| Ok(b.to_owned())).unwrap_err();
+        let err =
+            resolve_location(None, Some(&home), |b| Ok(b.to_owned()), Path::is_dir).unwrap_err();
         assert!(matches!(err, IpcError::PathTooLong(p) if p.starts_with(&home)));
     }
 
     #[test]
     fn no_home_and_no_runtime_dir_is_an_error() {
-        let err = resolve_location(None, None, |b| Ok(b.to_owned())).unwrap_err();
+        let err = resolve_location(None, None, |b| Ok(b.to_owned()), Path::is_dir).unwrap_err();
         assert!(matches!(err, IpcError::NoHomeDirectory), "{err}");
-        let err =
-            resolve_location(None, Some(Path::new("relative")), |b| Ok(b.to_owned())).unwrap_err();
+        let err = resolve_location(
+            None,
+            Some(Path::new("relative")),
+            |b| Ok(b.to_owned()),
+            Path::is_dir,
+        )
+        .unwrap_err();
         assert!(matches!(err, IpcError::NoHomeDirectory), "{err}");
     }
 
@@ -478,9 +494,12 @@ mod tests {
     fn untrusted_runtime_dir_falls_back_to_the_home_base() {
         let home = trusted_tempdir();
         let uid = own_principal();
-        let path = resolve_location(Some(OsStr::new("/tmp")), Some(home.path()), |b| {
-            check_base(b, uid)
-        })
+        let path = resolve_location(
+            Some(OsStr::new("/tmp")),
+            Some(home.path()),
+            |b| check_base(b, uid),
+            Path::is_dir,
+        )
         .unwrap();
         assert_eq!(
             path,
@@ -496,13 +515,18 @@ mod tests {
         check_base(runtime.path(), uid).unwrap();
         let other = check_base(runtime.path(), uid.wrapping_add(1)).unwrap_err();
         assert!(other.contains("owned by uid"), "{other}");
-        let path = resolve_location(Some(runtime.path().as_os_str()), Some(home), |b| {
-            if b == runtime.path() {
-                check_base(b, uid.wrapping_add(1))
-            } else {
-                Ok(b.to_owned())
-            }
-        })
+        let path = resolve_location(
+            Some(runtime.path().as_os_str()),
+            Some(home),
+            |b| {
+                if b == runtime.path() {
+                    check_base(b, uid.wrapping_add(1))
+                } else {
+                    Ok(b.to_owned())
+                }
+            },
+            Path::is_dir,
+        )
         .unwrap();
         assert_eq!(path, home.join(HOME_FALLBACK).join("dstreamy/serve.sock"));
     }
@@ -519,8 +543,13 @@ mod tests {
 
     #[test]
     fn untrusted_home_base_is_insecure() {
-        let err =
-            resolve_location(None, Some(Path::new("/home/u")), |_| Err("nope".into())).unwrap_err();
+        let err = resolve_location(
+            None,
+            Some(Path::new("/home/u")),
+            |_| Err("nope".into()),
+            Path::is_dir,
+        )
+        .unwrap_err();
         assert!(matches!(err, IpcError::InsecureDirectory { .. }), "{err}");
     }
 
@@ -621,9 +650,12 @@ mod tests {
         assert!(err.contains("contains .."), "{err}");
         let uid = own_principal();
         let fallback = trusted_tempdir();
-        let path = resolve_location(Some(probe.as_os_str()), Some(fallback.path()), |b| {
-            check_base(b, uid)
-        })
+        let path = resolve_location(
+            Some(probe.as_os_str()),
+            Some(fallback.path()),
+            |b| check_base(b, uid),
+            Path::is_dir,
+        )
         .unwrap();
         assert!(!path.starts_with("/tmp"), "{}", path.display());
         assert!(
@@ -681,16 +713,89 @@ mod tests {
         let link = root.path().join("link");
         std::os::unix::fs::symlink("real", &link).unwrap();
         let uid = own_principal();
-        let path = resolve_location(Some(link.as_os_str()), Some(Path::new("/home/u")), |b| {
-            check_base(b, uid)
-        })
+        let path = resolve_location(
+            Some(link.as_os_str()),
+            Some(Path::new("/home/u")),
+            |b| check_base(b, uid),
+            Path::is_dir,
+        )
         .unwrap();
         assert_eq!(path, real.join(DIR_NAME).join(SOCKET_NAME));
         let home = trusted_tempdir();
         let state = home.path().join(HOME_FALLBACK);
         fs::create_dir_all(state.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&real, &state).unwrap();
-        let path = resolve_location(None, Some(home.path()), |b| check_base(b, uid)).unwrap();
+        let path = resolve_location(
+            None,
+            Some(home.path()),
+            |b| check_base(b, uid),
+            Path::is_dir,
+        )
+        .unwrap();
         assert_eq!(path, real.join(DIR_NAME).join(SOCKET_NAME));
+    }
+
+    /// `D/e{n}` points at `D/e{n-1}` repeated `fan` times and `e0` at `D`: 1 + fan·cost(n-1) links per level.
+    fn link_tree(root: &Path, levels: usize, fan: usize) -> PathBuf {
+        let dir = root.join("D");
+        fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("e0")).unwrap();
+        for n in 1..=levels {
+            let target = (0..fan).fold(dir.clone(), |p, _| p.join(format!("e{}", n - 1)));
+            std::os::unix::fs::symlink(target, dir.join(format!("e{n}"))).unwrap();
+        }
+        dir.join(format!("e{levels}"))
+    }
+
+    #[test]
+    fn symlink_total_is_bounded_across_nesting_levels() {
+        let root = trusted_tempdir();
+        let wide = link_tree(root.path(), 7, 6);
+        let started = std::time::Instant::now();
+        let err = check_base(&wide, own_principal()).unwrap_err();
+        assert!(err.contains("too many symbolic links"), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        let small = trusted_tempdir();
+        let narrow = link_tree(small.path(), 2, 3);
+        assert_eq!(
+            check_base(&narrow, own_principal()).unwrap(),
+            small.path().join("D")
+        );
+    }
+
+    #[test]
+    fn missing_runtime_dir_falls_back_to_the_home_base() {
+        let parent = trusted_tempdir();
+        let missing = parent.path().join("1000");
+        let uid = own_principal();
+        let path = resolve_location(
+            Some(missing.as_os_str()),
+            Some(Path::new("/home/u")),
+            |b| check_base(b, uid),
+            Path::is_dir,
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            Path::new("/home/u")
+                .join(HOME_FALLBACK)
+                .join("dstreamy/serve.sock")
+        );
+        fs::write(&missing, b"").unwrap();
+        let path = resolve_location(
+            Some(missing.as_os_str()),
+            Some(Path::new("/home/u")),
+            |b| check_base(b, uid),
+            Path::is_dir,
+        )
+        .unwrap();
+        assert!(
+            path.starts_with("/home/u"),
+            "a file was used as the runtime dir"
+        );
     }
 }
