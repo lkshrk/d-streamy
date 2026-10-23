@@ -240,12 +240,18 @@ jobs:
           set -o pipefail
           app="$OBS_PREFIX/OBS.app/Contents"
           grep 'SPIKE encoder-type' "$SPIKE_LOGS/macos-spike-opengl.log" | tee "$SPIKE_LOGS/macos-encoder-types.log"
-          vt=$(grep -o 'encoder-type: com\.apple\.videotoolbox[^ ]*' "$SPIKE_LOGS/macos-spike-opengl.log" \
-            | sed 's/encoder-type: //' | grep -i -E 'avc|h264' | head -n 1)
-          echo "VideoToolbox H.264 encoder id: ${vt:-none}"
-          test -n "$vt"
-          "$app/MacOS/obs-headless-spike" --graphics "$app/Frameworks/libobs-opengl.dylib" --video-encoder "$vt" \
-            | tee "$SPIKE_LOGS/macos-spike-videotoolbox.log"
+          rc=1
+          grep -o 'encoder-type: [^ ]*videotoolbox[^ ]* codec=h264' "$SPIKE_LOGS/macos-spike-opengl.log" \
+            | awk '{print $2}' > "$RUNNER_TEMP/vt-ids.txt"
+          while read -r vt; do
+            echo "=== VideoToolbox H.264 encoder id: $vt"
+            log="$SPIKE_LOGS/macos-spike-vt-$(echo "$vt" | tr ':/' '__').log"
+            if "$app/MacOS/obs-headless-spike" --verbose --graphics "$app/Frameworks/libobs-opengl.dylib" \
+              --video-encoder "$vt" | tee "$log"; then
+              rc=0
+            fi
+          done < "$RUNNER_TEMP/vt-ids.txt"
+          exit "$rc"
 
       - name: Frontend with obs-websocket (stretch)
         if: always()

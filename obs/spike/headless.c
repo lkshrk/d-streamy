@@ -35,11 +35,12 @@ static volatile long video_pts_ne_dts;
 static volatile long audio_first_frames_logged;
 static volatile long video_first_frames_logged;
 static os_event_t *stopped_event;
+static int log_max_level = LOG_INFO;
 
 static void log_handler(int lvl, const char *msg, va_list args, void *param)
 {
 	UNUSED_PARAMETER(param);
-	if (lvl > LOG_INFO)
+	if (lvl > log_max_level)
 		return;
 	const char *tag = lvl <= LOG_ERROR ? "error" : lvl == LOG_WARNING ? "warn" : "info";
 	char buf[4096];
@@ -226,6 +227,10 @@ static bool parse_args(int argc, char **argv, struct spike_args *a)
 	a->modules = "image-source,obs-x264,obs-ffmpeg,obs-outputs,mac-videotoolbox";
 
 	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--verbose") == 0) {
+			log_max_level = LOG_DEBUG;
+			continue;
+		}
 		const char *v = i + 1 < argc ? argv[i + 1] : NULL;
 		if (!v) {
 			fprintf(stderr, "missing value for %s\n", argv[i]);
@@ -380,7 +385,10 @@ int main(int argc, char **argv)
 
 	if (!obs_output_start(output)) {
 		const char *err = obs_output_get_last_error(output);
-		FAIL("obs_output_start: %s", err ? err : "(no error)");
+		const char *verr = obs_encoder_get_last_error(venc);
+		const char *aerr = obs_encoder_get_last_error(aenc);
+		FAIL("obs_output_start: %s (video encoder: %s, audio encoder: %s)", err ? err : "(no error)",
+		     verr ? verr : "-", aerr ? aerr : "-");
 	}
 	started = true;
 
@@ -419,6 +427,11 @@ cleanup:
 	obs_encoder_release(aenc);
 	if (initialized) {
 		obs_set_output_source(0, NULL);
+		// Sources on the main canvas outlive their last release until removed, racing obs_free_data.
+		if (scene)
+			obs_source_remove(obs_scene_get_source(scene));
+		if (color)
+			obs_source_remove(color);
 		obs_scene_release(scene);
 		obs_source_release(color);
 		// Deferred destroys enqueue more destroys; drain like frontend/widgets/OBSBasic_SceneCollections.cpp:1626.
