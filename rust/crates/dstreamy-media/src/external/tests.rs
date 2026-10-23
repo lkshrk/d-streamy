@@ -21,7 +21,6 @@ fn options(idle: IdleMode) -> ExternalOptions {
         grace: GRACE,
         stall: STALL,
         idle,
-        fps: FPS,
     }
 }
 
@@ -43,21 +42,25 @@ struct Marker {
     attachment: u8,
     pts_in: i64,
     sent_us: i64,
+    skew_us: i64,
 }
 
 impl Marker {
     fn encode(&self) -> Vec<u8> {
         let mut data = vec![self.attachment];
-        data.extend_from_slice(&self.pts_in.to_be_bytes());
-        data.extend_from_slice(&self.sent_us.to_be_bytes());
+        for v in [self.pts_in, self.sent_us, self.skew_us] {
+            data.extend_from_slice(&v.to_be_bytes());
+        }
         data
     }
 
     fn decode(data: &[u8]) -> Option<Self> {
-        (data.len() == 17).then(|| Self {
+        let field = |i: usize| i64::from_be_bytes(data[1 + 8 * i..9 + 8 * i].try_into().unwrap());
+        (data.len() == 25).then(|| Self {
             attachment: data[0],
-            pts_in: i64::from_be_bytes(data[1..9].try_into().unwrap()),
-            sent_us: i64::from_be_bytes(data[9..17].try_into().unwrap()),
+            pts_in: field(0),
+            sent_us: field(1),
+            skew_us: field(2),
         })
     }
 }
@@ -97,6 +100,11 @@ impl Received {
 
     fn sent_us(&self) -> i64 {
         self.marker().map_or(self.at_us, |m| m.sent_us)
+    }
+
+    /// The wall time this frame's pts stands for: a skewed track is ahead or behind its send time.
+    fn wall_us(&self) -> i64 {
+        self.marker().map_or(self.at_us, |m| m.sent_us + m.skew_us)
     }
 }
 
@@ -216,6 +224,7 @@ impl Producer {
             attachment: self.tag,
             pts_in: self.start_pts + t + skew,
             sent_us: us(Instant::now() - self.epoch),
+            skew_us: skew,
         };
         let index = self.next[VIDEO];
         let frame = match track {
@@ -231,7 +240,7 @@ impl Producer {
         };
         match self.attachment.send(frame) {
             Ok(()) => self.last_sent.set(Some(Instant::now())),
-            Err(SendError::Closed) => {
+            Err(SendError::Closed(_)) => {
                 self.refused_at
                     .set(self.refused_at.get().or(Some(Instant::now())));
             }
@@ -333,7 +342,7 @@ fn strictly_increasing(frames: &[Received]) {
 /// `pts_out - (sent - t0)` stays within one video frame; a gap counted twice breaks it.
 fn on_wall_clock(frames: &[Received], t0_us: i64) {
     for f in frames {
-        let wall = f.sent_us() - t0_us;
+        let wall = f.wall_us() - t0_us;
         let drift = f.pts() - wall;
         assert!(
             drift.abs() <= FRAME_US,
@@ -458,46 +467,88 @@ async fn a_second_attach_is_busy_and_the_first_keeps_working() {
     );
 }
 
+// ADR 0004: refuse what `Resolution` or `Fps` reject and anything but H.264.
 #[tokio::test(start_paused = true)]
-async fn a_codec_fps_or_size_mismatch_is_incompatible() {
+async fn invalid_producer_video_is_incompatible() {
     let rig = Rig::started(IdleMode::Documented).await;
     let cases = [
         ProducerInfo {
             codec: VideoCodec::H265,
             ..info()
         },
-        ProducerInfo { fps: 60, ..info() },
+        ProducerInfo { fps: 25, ..info() },
+        ProducerInfo { fps: 0, ..info() },
         ProducerInfo {
-            width: 1920,
-            height: 1080,
+            width: 1921,
+            ..info()
+        },
+        ProducerInfo {
+            width: 1280,
+            height: 1082,
+            ..info()
+        },
+        ProducerInfo {
+            width: 641,
+            height: 360,
             ..info()
         },
     ];
     for case in cases {
-        assert!(matches!(
-            rig.handle.attach(case),
-            Err(AttachError::Incompatible(_))
-        ));
+        assert!(
+            matches!(
+                rig.handle.attach(case.clone()),
+                Err(AttachError::Incompatible(_))
+            ),
+            "{case:?}"
+        );
     }
-    assert!(rig.handle.attach(info()).is_ok());
+    assert_eq!(*rig.handle.producer().borrow(), None);
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_early_producer_is_checked_on_fps_then_closed_by_start_on_a_size_mismatch() {
-    let mut rig = Rig::new(IdleMode::Documented);
-    let fps = ProducerInfo { fps: 60, ..info() };
-    assert!(matches!(
-        rig.handle.attach(fps),
-        Err(AttachError::Incompatible(_))
-    ));
+async fn a_reattach_with_another_valid_size_and_fps_is_accepted_and_published() {
+    let rig = Rig::started(IdleMode::Documented).await;
+    let mut producer = rig.handle.producer();
+    let first = rig.handle.attach(info()).unwrap();
+    assert_eq!(*producer.borrow_and_update(), Some(info()));
+    drop(first);
+    let canvas = ProducerInfo {
+        codec: VideoCodec::H264,
+        fps: 60,
+        width: 1920,
+        height: 1080,
+    };
+    let second = rig.handle.attach(canvas.clone()).unwrap();
+    assert!(producer.has_changed().unwrap());
+    assert_eq!(*producer.borrow_and_update(), Some(canvas));
+    drop(second);
     let small = ProducerInfo {
+        fps: 15,
         width: 640,
         height: 360,
         ..info()
     };
-    let early = rig.handle.attach(small).unwrap();
-    rig.start().await;
-    assert_eq!(early.send(audio(0)), Err(SendError::Closed));
+    let _third = rig.handle.attach(small.clone()).unwrap();
+    assert_eq!(*producer.borrow(), Some(small));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_early_producer_ruled_out_at_start_is_closed_as_incompatible() {
+    let mut rig = Rig::new(IdleMode::Documented);
+    let early = rig.handle.attach(info()).unwrap();
+    let h265 = CaptureConfig {
+        codec: VideoCodec::H265,
+        ..CaptureConfig::default()
+    };
+    let _rx = rig.source.start(h265).await.unwrap();
+    assert!(matches!(
+        early.send(audio(0)),
+        Err(SendError::Closed(CloseReason::Incompatible(_)))
+    ));
+    assert!(matches!(
+        rig.handle.attach(info()),
+        Err(AttachError::Incompatible(_))
+    ));
 }
 
 #[tokio::test(start_paused = true)]
@@ -714,7 +765,10 @@ async fn a_producer_stalled_past_grace_is_closed_and_the_receiver_closes() {
     sleep(GRACE).await;
     settle().await;
     assert_eq!(rig.closed(), Some(last + us(GRACE)));
-    assert_eq!(p.attachment.send(audio(0)), Err(SendError::Closed));
+    assert_eq!(
+        p.attachment.send(audio(0)),
+        Err(SendError::Closed(CloseReason::GraceExpired))
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -781,9 +835,198 @@ async fn a_full_queue_stays_bounded_and_counts_every_loss_exactly() {
     source.stop().await.unwrap();
 }
 
+fn delivered(rx: &mut FrameReceiver) -> u64 {
+    std::iter::from_fn(|| rx.try_recv().ok()).count() as u64
+}
+
+fn lost(stats: AttachmentStats) -> u64 {
+    stats.skipped + stats.dropped_video + stats.dropped_audio
+}
+
+fn burst(a: &Attachment, from: i64, n: i64) -> u64 {
+    for i in from..from + n {
+        a.send(video(i * FRAME_US, i % 50 == 0)).unwrap();
+        a.send(audio(i * FRAME_US)).unwrap();
+    }
+    2 * n as u64
+}
+
+#[tokio::test(start_paused = true)]
+async fn frames_cleared_by_stop_and_restart_are_counted() {
+    let mut source = ExternalSource::new(options(IdleMode::None));
+    let handle = source.handle();
+    let mut rx = source.start(CaptureConfig::default()).await.unwrap();
+    let a = handle.attach(info()).unwrap();
+    let mut sent = burst(&a, 0, 40);
+    let mut got = delivered(&mut rx);
+    source.stop().await.unwrap();
+    got += delivered(&mut rx);
+    assert_eq!(source.queued(), 0);
+    assert_eq!(sent, got + lost(a.stats()), "{:?}", a.stats());
+    let mut rx = source.start(CaptureConfig::default()).await.unwrap();
+    sent += burst(&a, 40, 100);
+    got += delivered(&mut rx);
+    source.stop().await.unwrap();
+    got += delivered(&mut rx);
+    assert_eq!(sent, got + lost(a.stats()), "{:?}", a.stats());
+}
+
+#[tokio::test(start_paused = true)]
+async fn frames_cleared_when_grace_expires_are_counted() {
+    let mut source = ExternalSource::new(options(IdleMode::Continuous));
+    let handle = source.handle();
+    let mut rx = source.start(CaptureConfig::default()).await.unwrap();
+    let a = handle.attach(info()).unwrap();
+    let sent = burst(&a, 0, 100);
+    sleep(GRACE + MS).await;
+    let mut got = 0;
+    while let Some(frame) = rx.recv().await {
+        if !matches!(&frame, MediaFrame::Audio(f) if f.data == OPUS_SILENCE_FRAME) {
+            got += 1;
+        }
+    }
+    assert!(lost(a.stats()) > 0, "{:?}", a.stats());
+    assert_eq!(sent, got + lost(a.stats()), "{:?}", a.stats());
+    assert_eq!(
+        a.send(audio(0)),
+        Err(SendError::Closed(CloseReason::GraceExpired))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn losses_are_charged_to_the_attachment_that_sent_the_frame() {
+    let mut source = ExternalSource::new(options(IdleMode::None));
+    let handle = source.handle();
+    let mut rx = source.start(CaptureConfig::default()).await.unwrap();
+    let first = handle.attach(info()).unwrap();
+    let half = QUEUE_CAPACITY as i64 / 2;
+    let first_sent = burst(&first, 0, half);
+    assert_eq!(source.queued(), QUEUE_CAPACITY - 1);
+    let first_link = first.link.clone();
+    first.close(CloseReason::Ended);
+    let second = handle.attach(info()).unwrap();
+    second.send(video(0, true)).unwrap();
+    for i in 0..10 {
+        second.send(audio(i * AUDIO_US)).unwrap();
+    }
+    let first_stats = first_link.snapshot();
+    assert_eq!(first_stats.dropped_audio, 10, "{first_stats:?}");
+    assert_eq!(first_stats.dropped_video, 0);
+    assert_eq!(second.stats(), AttachmentStats::default());
+    let got = delivered(&mut rx) + source.queued() as u64;
+    assert_eq!(
+        first_sent + 11,
+        got + lost(first_stats) + lost(second.stats())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_offset_uses_the_earlier_first_pts_of_both_tracks() {
+    let rig = Rig::started(IdleMode::None).await;
+    let a = rig.handle.attach(info()).unwrap();
+    a.send(video(0, true)).unwrap();
+    a.send(audio(-21_333)).unwrap();
+    a.send(audio(-1_333)).unwrap();
+    a.send(audio(18_667)).unwrap();
+    settle().await;
+    let pts: Vec<(usize, i64)> = rig
+        .collector
+        .frames()
+        .iter()
+        .map(|f| (f.track(), f.pts()))
+        .collect();
+    assert_eq!(
+        pts,
+        [
+            (VIDEO, 21_333),
+            (AUDIO, 0),
+            (AUDIO, 20_000),
+            (AUDIO, 40_000)
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_single_track_producer_starts_after_the_first_frames_wait() {
+    let rig = Rig::started(IdleMode::None).await;
+    let a = rig.handle.attach(info()).unwrap();
+    a.send(audio(5_000)).unwrap();
+    sleep(FIRST_FRAMES_WAIT - MS).await;
+    assert!(rig.collector.frames().is_empty());
+    sleep(2 * MS).await;
+    let frames = rig.collector.frames();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].pts(), 0);
+    a.send(audio(25_000)).unwrap();
+    settle().await;
+    assert_eq!(rig.collector.frames()[1].pts(), 20_000);
+}
+
+#[tokio::test(start_paused = true)]
+async fn audio_lagging_video_on_reattach_keeps_its_spacing_in_continuous_mode() {
+    let rig = Rig::started(IdleMode::Continuous).await;
+    let mut p = rig.producer(1, 0);
+    p.run(Duration::from_secs(1)).await;
+    drop(p);
+    sleep(Duration::from_millis(500)).await;
+    let mut p = rig.producer(2, 0).with_audio_skew(-80_000);
+    p.run(Duration::from_secs(1)).await;
+    let audio: Vec<i64> = rig
+        .collector
+        .frames()
+        .iter()
+        .filter(|f| f.track() == AUDIO && f.marker().is_some_and(|m| m.attachment == 2))
+        .map(Received::pts)
+        .collect();
+    for w in audio.windows(2) {
+        assert!(
+            w[1] - w[0] >= AUDIO_US - TICK_US[AUDIO],
+            "audio pts bunched: {w:?}"
+        );
+    }
+    av_aligned(&rig.collector.frames());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_constant_av_skew_does_not_accumulate_drift_over_reattaches() {
+    let rig = Rig::started(IdleMode::Continuous).await;
+    for tag in 1..=6 {
+        let mut p = rig.producer(tag, 0).with_audio_skew(-21_333);
+        p.run(Duration::from_secs(1)).await;
+        drop(p);
+        sleep(Duration::from_secs(1)).await;
+    }
+    let frames = rig.collector.frames();
+    strictly_increasing(&frames);
+    av_aligned(&frames);
+    on_wall_clock(&frames, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lagging_audio_track_then_an_unskewed_producer_stays_aligned() {
+    let rig = Rig::started(IdleMode::Continuous).await;
+    let mut p = rig.producer(1, 0).with_audio_skew(-51_655);
+    p.run(Duration::from_millis(201)).await;
+    drop(p);
+    let mut p = rig.producer(2, 0);
+    p.run(Duration::from_millis(500)).await;
+    let frames = rig.collector.frames();
+    strictly_increasing(&frames);
+    av_aligned(&frames);
+}
+
+fn tracks(lost: &[Queued]) -> (usize, usize) {
+    let audio = lost.iter().filter(|q| q.is_audio()).count();
+    (lost.len() - audio, audio)
+}
+
 #[test]
 fn queue_overflow_drops_video_to_the_next_keyframe_and_the_oldest_audio() {
-    let mut queue = VecDeque::new();
+    let link = Arc::new(Link::default());
+    let item = |frame: MediaFrame| Queued {
+        frame,
+        owner: Some(link.clone()),
+    };
     let v = |pts: u64, keyframe: bool| {
         MediaFrame::Video(EncodedVideoFrame {
             codec: VideoCodec::H264,
@@ -798,39 +1041,61 @@ fn queue_overflow_drops_video_to_the_next_keyframe_and_the_oldest_audio() {
             pts_us: pts,
         })
     };
+    let mut queue = VecDeque::new();
     for i in 0..QUEUE_CAPACITY as u64 {
         let frame = if i % 2 == 0 { v(i, i == 0) } else { a(i) };
-        assert_eq!(enqueue(&mut queue, frame).video, 0);
+        assert!(enqueue(&mut queue, item(frame)).is_empty());
     }
-    let lost = enqueue(&mut queue, a(1_000));
-    assert_eq!((lost.video, lost.audio, lost.needs_keyframe), (0, 1, false));
-    assert_eq!(queue.back(), Some(&a(1_000)));
-    assert!(!queue.contains(&a(1)));
-    let videos = queue
-        .iter()
-        .filter(|f| matches!(f, MediaFrame::Video(_)))
-        .count() as u64;
-    let lost = enqueue(&mut queue, v(2_000, false));
-    assert_eq!(
-        (lost.video, lost.audio, lost.needs_keyframe),
-        (videos + 1, 0, true)
-    );
-    assert!(queue.iter().all(|f| matches!(f, MediaFrame::Audio(_))));
-    for i in 0.. {
-        if queue.len() >= QUEUE_CAPACITY {
-            break;
-        }
-        queue.push_back(a(3_000 + i));
+    let lost = enqueue(&mut queue, item(a(1_000)));
+    assert_eq!(tracks(&lost), (0, 1));
+    assert_eq!(lost[0].frame, a(1));
+    assert_eq!(queue.back().map(|q| &q.frame), Some(&a(1_000)));
+    let videos = queue.iter().filter(|q| !q.is_audio()).count();
+    let lost = enqueue(&mut queue, item(v(2_000, false)));
+    assert_eq!(tracks(&lost), (videos + 1, 0));
+    assert!(queue.iter().all(Queued::is_audio));
+    let mut n = 3_000;
+    while queue.len() < QUEUE_CAPACITY {
+        queue.push_back(item(a(n)));
+        n += 1;
     }
-    let lost = enqueue(&mut queue, v(4_000, true));
-    assert_eq!((lost.video, lost.audio), (0, 1));
-    assert_eq!(queue.back(), Some(&v(4_000, true)));
+    let oldest = queue[0].frame.clone();
+    let lost = enqueue(&mut queue, item(v(4_000, true)));
+    assert_eq!(tracks(&lost), (0, 1));
+    assert_eq!(lost[0].frame, oldest);
+    assert_eq!(queue.back().map(|q| &q.frame), Some(&v(4_000, true)));
+    assert_eq!(queue.len(), QUEUE_CAPACITY);
+}
+
+#[test]
+fn an_idle_frame_on_a_full_queue_never_displaces_video() {
+    let link = Arc::new(Link::default());
+    let video = |pts: u64| Queued {
+        frame: MediaFrame::Video(EncodedVideoFrame {
+            codec: VideoCodec::H264,
+            data: vec![],
+            pts_us: pts,
+            keyframe: pts == 0,
+        }),
+        owner: Some(link.clone()),
+    };
+    let silence = || Queued {
+        frame: MediaFrame::Audio(AudioFrame {
+            data: OPUS_SILENCE_FRAME.to_vec(),
+            pts_us: 0,
+        }),
+        owner: None,
+    };
+    let mut queue: VecDeque<Queued> = (0..QUEUE_CAPACITY as u64).map(video).collect();
+    let lost = enqueue(&mut queue, silence());
+    assert_eq!(lost.len(), 1);
+    assert!(lost[0].owner.is_none());
+    assert!(queue.iter().all(|q| !q.is_audio()));
     assert_eq!(queue.len(), QUEUE_CAPACITY);
 }
 
 #[tokio::test(start_paused = true)]
 async fn idle_output_over_one_second_matches_each_mode() {
-    // Discord voice-connections.mdx:502-504 (five frames); RFC 6716 §3.1 config 31 (20 ms each).
     for (idle, expected) in [
         (IdleMode::Documented, 5),
         (IdleMode::Continuous, 50),
@@ -866,7 +1131,11 @@ async fn lists_one_external_target() {
 
 #[derive(Debug, Clone)]
 enum Op {
-    Attach(i64),
+    Attach {
+        start: i64,
+        skew: i64,
+        mid_gop: bool,
+    },
     Detach,
     Produce(u64),
     Wait(u64),
@@ -875,13 +1144,17 @@ enum Op {
 
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        3 => prop_oneof![
-            Just(0i64),
-            Just(1_000_000_000_000i64),
-            Just(-50_000i64),
-            -10_000_000i64..10_000_000,
-        ]
-        .prop_map(Op::Attach),
+        3 => (
+            prop_oneof![
+                Just(0i64),
+                Just(1_000_000_000_000i64),
+                Just(-50_000i64),
+                -10_000_000i64..10_000_000,
+            ],
+            -200_000i64..200_000,
+            any::<bool>(),
+        )
+            .prop_map(|(start, skew, mid_gop)| Op::Attach { start, skew, mid_gop }),
         2 => Just(Op::Detach),
         4 => (20u64..4_000).prop_map(Op::Produce),
         2 => prop_oneof![1u64..3_000, 25_000u64..35_000].prop_map(Op::Wait),
@@ -889,7 +1162,7 @@ fn op() -> impl Strategy<Value = Op> {
     ]
 }
 
-/// The grace rule as specified: media absent since the detach, or since the last frame once stalled.
+/// The grace rule: media absent since the detach, or since the last frame once stalled.
 struct Model {
     started: Instant,
     last_activity: Option<Instant>,
@@ -928,14 +1201,20 @@ async fn run_ops(ops: Vec<Op>) {
     };
     let mut producer: Option<Producer> = None;
     let mut tag = 0u8;
+    let mut restarts: Vec<i64> = Vec::new();
     for op in ops {
         model.update(Instant::now());
         match op {
-            Op::Attach(start) => match rig.handle.attach(info()) {
+            Op::Attach {
+                start,
+                skew,
+                mid_gop,
+            } => match rig.handle.attach(info()) {
                 Ok(attachment) => {
                     assert!(!model.expired && producer.is_none());
                     tag += 1;
-                    producer = Some(Producer::new(attachment, tag, rig.epoch, start));
+                    let p = Producer::new(attachment, tag, rig.epoch, start).with_audio_skew(skew);
+                    producer = Some(if mid_gop { p.starting_mid_gop() } else { p });
                     model.last_activity = Some(Instant::now());
                 }
                 Err(AttachError::Busy) => assert!(!model.expired && producer.is_some()),
@@ -979,6 +1258,7 @@ async fn run_ops(ops: Vec<Op>) {
             Op::Restart => {
                 if !model.expired {
                     rig.restart().await;
+                    restarts.push(rig.now_us());
                 }
             }
         }
@@ -995,15 +1275,36 @@ async fn run_ops(ops: Vec<Op>) {
     let frames = rig.collector.frames();
     strictly_increasing(&frames);
     av_aligned(&frames);
-    if let Some(first) = frames.first() {
-        on_wall_clock(&frames, first.sent_us() - first.pts());
+    let mut shift: Option<(u8, i64)> = None;
+    for f in frames.iter().filter(|f| f.marker().is_some()) {
+        let m = f.marker().unwrap();
+        let d = f.pts() - f.wall_us();
+        match shift {
+            Some((tag, base)) if tag == m.attachment => assert!(
+                (d - base).abs() <= FRAME_US,
+                "attachment {tag}: pts drift {} µs from the wall clock",
+                d - base
+            ),
+            Some((_, base)) => assert!(
+                (d - base).abs() <= 2 * 200_000 + FRAME_US,
+                "reattach shifted the timeline by {} µs",
+                d - base
+            ),
+            None => {}
+        }
+        if shift.is_none_or(|(tag, _)| tag != m.attachment) {
+            shift = Some((m.attachment, d));
+        }
     }
     let mut previous: Option<Marker> = None;
     let mut rearmed = true;
     for f in &frames {
         let Some(m) = f.marker() else { continue };
-        if previous
-            .is_none_or(|p| p.attachment != m.attachment || m.sent_us - p.sent_us >= us(STALL))
+        let restarted =
+            previous.is_some_and(|p| restarts.iter().any(|&r| p.sent_us < r && r <= m.sent_us));
+        if restarted
+            || previous
+                .is_none_or(|p| p.attachment != m.attachment || m.sent_us - p.sent_us >= us(STALL))
         {
             rearmed = true;
         }
