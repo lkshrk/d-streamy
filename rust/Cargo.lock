@@ -1208,6 +1208,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dstreamy-ipc"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "libc",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "dstreamy-media"
 version = "0.1.0"
 dependencies = [
@@ -4907,6 +4922,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]

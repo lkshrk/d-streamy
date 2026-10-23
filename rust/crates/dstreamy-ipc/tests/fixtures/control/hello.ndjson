@@ -1,0 +1,2 @@
+{"id":"1","cmd":"hello","role":"control","protocol":2}
+{"id":"1","cmd":"hello","role":"producer","protocol":2,"video":{"codec":"h264","width":1280,"height":720,"fps":30},"audio":{"codec":"opus","sample_rate":48000,"channels":2,"frame_ms":20},"client":{"name":"obs-dstreamy","version":"0.1.0","obs_version":"32.2.2"}}

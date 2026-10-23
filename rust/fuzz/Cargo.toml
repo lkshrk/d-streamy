@@ -1,0 +1,30 @@
+[package]
+name = "dstreamy-ipc-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+dstreamy-ipc = { path = "../crates/dstreamy-ipc" }
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[[bin]]
+name = "control_line"
+path = "fuzz_targets/control_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "producer_frame"
+path = "fuzz_targets/producer_frame.rs"
+test = false
+doc = false
+bench = false
