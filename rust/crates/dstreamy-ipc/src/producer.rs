@@ -111,8 +111,13 @@ impl Decoder for ProducerCodec {
         if len < HEADER_LEN {
             return Err(ProducerError::TooShort(len));
         }
-        if let Some(&kind) = src.get(LEN_PREFIX) {
-            Kind::try_from(kind)?;
+        if let Some(&kind) = src.get(LEN_PREFIX)
+            && Kind::try_from(kind)? == Kind::EndOfStream
+            && len != HEADER_LEN
+        {
+            return Err(ProducerError::EndOfStreamPayload(
+                (len - HEADER_LEN) as usize,
+            ));
         }
         let total = LEN_PREFIX + len as usize;
         if src.len() < total {
@@ -266,6 +271,17 @@ mod tests {
         assert!(matches!(
             ProducerCodec.decode(&mut buf),
             Err(ProducerError::EndOfStreamPayload(1))
+        ));
+    }
+
+    #[test]
+    fn end_of_stream_payload_is_refused_from_the_header_alone() {
+        let mut buf = BytesMut::new();
+        buf.put_u32(MAX_FRAME_LEN);
+        buf.put_u8(3);
+        assert!(matches!(
+            ProducerCodec.decode(&mut buf),
+            Err(ProducerError::EndOfStreamPayload(n)) if n == (MAX_FRAME_LEN - HEADER_LEN) as usize
         ));
     }
 
