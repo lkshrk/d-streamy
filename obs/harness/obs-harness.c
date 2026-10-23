@@ -50,6 +50,7 @@ struct harness_args {
 	const char *profile;
 	const char *preset;
 	const char *note;
+	const char *x264opts;
 	int seconds;
 	int fps;
 	int width;
@@ -219,8 +220,9 @@ struct trace_recorder {
 	obs_output_t *output;
 	FILE *packets;
 	char *dir;
+	pthread_mutex_t stop_mutex;
 	pthread_t stop_thread;
-	bool stop_thread_active;
+	bool stop_thread_joinable;
 	bool video_extra_written;
 	bool audio_extra_written;
 	long video_limit;
@@ -274,16 +276,38 @@ static void *trace_create(obs_data_t *settings, obs_output_t *output)
 	rec->output = output;
 	rec->dir = bstrdup(obs_data_get_string(settings, "path"));
 	rec->video_limit = (long)obs_data_get_int(settings, "video_packets");
+	pthread_mutex_init(&rec->stop_mutex, NULL);
 	return rec;
+}
+
+static void join_stop_thread(struct trace_recorder *rec)
+{
+	pthread_mutex_lock(&rec->stop_mutex);
+	if (rec->stop_thread_joinable) {
+		pthread_join(rec->stop_thread, NULL);
+		rec->stop_thread_joinable = false;
+	}
+	pthread_mutex_unlock(&rec->stop_mutex);
+}
+
+static bool close_packets(struct trace_recorder *rec)
+{
+	if (!rec->packets)
+		return true;
+	bool ok = fflush(rec->packets) == 0 && !ferror(rec->packets);
+	ok = fclose(rec->packets) == 0 && ok;
+	rec->packets = NULL;
+	if (!ok)
+		rec->write_failed = true;
+	return ok;
 }
 
 static void trace_destroy(void *data)
 {
 	struct trace_recorder *rec = data;
-	if (rec->stop_thread_active)
-		pthread_join(rec->stop_thread, NULL);
-	if (rec->packets)
-		fclose(rec->packets);
+	join_stop_thread(rec);
+	close_packets(rec);
+	pthread_mutex_destroy(&rec->stop_mutex);
 	bfree(rec->dir);
 	bfree(rec);
 }
@@ -306,16 +330,16 @@ static bool trace_start(void *data)
 		return false;
 	if (!obs_output_initialize_encoders(rec->output, 0))
 		return false;
-	if (rec->stop_thread_active)
-		pthread_join(rec->stop_thread, NULL);
+	join_stop_thread(rec);
 	return obs_output_begin_data_capture(rec->output, 0);
 }
 
 static void *trace_stop_thread(void *data)
 {
 	struct trace_recorder *rec = data;
+	if (!close_packets(rec))
+		harness_error("flushing packets.bin failed");
 	obs_output_end_data_capture(rec->output);
-	rec->stop_thread_active = false;
 	return NULL;
 }
 
@@ -324,7 +348,10 @@ static void trace_stop(void *data, uint64_t ts)
 	UNUSED_PARAMETER(ts);
 	struct trace_recorder *rec = data;
 	rec->full = true;
-	rec->stop_thread_active = pthread_create(&rec->stop_thread, NULL, trace_stop_thread, data) == 0;
+	pthread_mutex_lock(&rec->stop_mutex);
+	if (!rec->stop_thread_joinable)
+		rec->stop_thread_joinable = pthread_create(&rec->stop_thread, NULL, trace_stop_thread, data) == 0;
+	pthread_mutex_unlock(&rec->stop_mutex);
 }
 
 static void write_extra_data(struct trace_recorder *rec, obs_encoder_t *encoder, const char *name)
@@ -342,7 +369,9 @@ static void trace_packet(void *data, struct encoder_packet *pkt)
 	struct trace_recorder *rec = data;
 	if (!pkt) {
 		harness_error("encoder error (NULL packet)");
+		rec->full = true;
 		obs_output_signal_stop(rec->output, OBS_OUTPUT_ENCODE_ERROR);
+		os_event_signal(full_event);
 		return;
 	}
 	if (rec->full)
@@ -395,15 +424,19 @@ static struct obs_output_info trace_output_info = {
 	.encoded_audio_codecs = "opus;aac",
 };
 
+static volatile long long stop_code;
+
 static void on_output_stop(void *param, calldata_t *cd)
 {
 	UNUSED_PARAMETER(param);
 	long long code = calldata_int(cd, "code");
 	if (code != OBS_OUTPUT_SUCCESS) {
+		stop_code = code;
 		const char *err = calldata_string(cd, "last_error");
 		harness_error("output stopped with code %lld: %s", code, err ? err : "(none)");
 	}
 	os_event_signal(stopped_event);
+	os_event_signal(full_event);
 }
 
 static void usage(void)
@@ -412,7 +445,7 @@ static void usage(void)
 		"usage: obs-harness [--trace-dir DIR] [--seconds N] [--fps N] [--width N] [--height N]\n"
 		"  [--video-encoder ID] [--audio-encoder ID] [--output ID] [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
-		"  [--modules a,b,c] [--plugin-bin DIR --plugin-data DIR] [--note TEXT] [--verbose]\n");
+		"  [--modules a,b,c] [--plugin-bin DIR --plugin-data DIR] [--note TEXT] [--x264opts OPTS] [--verbose]\n");
 }
 
 static bool parse_int(const char *flag, const char *v, int min, int *out)
@@ -485,6 +518,8 @@ static int parse_args(int argc, char **argv)
 			args.preset = v;
 		else if (strcmp(a, "--note") == 0)
 			args.note = v;
+		else if (strcmp(a, "--x264opts") == 0)
+			args.x264opts = v;
 		else if (strcmp(a, "--seconds") == 0)
 			ok = parse_int(a, v, 1, &args.seconds);
 		else if (strcmp(a, "--fps") == 0)
@@ -515,6 +550,19 @@ static int parse_args(int argc, char **argv)
 	}
 	return -1;
 }
+
+struct frame_counts {
+	uint32_t lagged;
+	uint32_t skipped;
+};
+
+static struct frame_counts frame_counts(void)
+{
+	struct frame_counts c = {obs_get_lagged_frames(), video_output_get_skipped_frames(obs_get_video())};
+	return c;
+}
+
+static struct frame_counts frame_delta;
 
 static void describe_os(struct dstr *out)
 {
@@ -551,6 +599,10 @@ static bool write_provenance(obs_encoder_t *venc, obs_encoder_t *aenc, const str
 	fprintf(f, "Recorded by `obs/harness/obs-harness.c` with its trace recorder output.\n\n");
 	fprintf(f, "| Field | Value |\n|---|---|\n");
 	fprintf(f, "| libobs | %s |\n", obs_get_version_string());
+	const char *commit = getenv("OBS_COMMIT");
+	const char *run_id = getenv("GITHUB_RUN_ID");
+	fprintf(f, "| OBS commit | %s |\n", commit && *commit ? commit : "unknown");
+	fprintf(f, "| CI run | %s |\n", run_id && *run_id ? run_id : "local");
 	fprintf(f, "| OS | %s |\n", os.array);
 	fprintf(f, "| Date (UTC) | %s |\n", date);
 	fprintf(f, "| Graphics module | `%s` |\n", args.graphics);
@@ -560,6 +612,7 @@ static bool write_provenance(obs_encoder_t *venc, obs_encoder_t *aenc, const str
 	fprintf(f, "| Audio encoder | `%s` (codec `%s`), frame size %zu |\n", obs_encoder_get_id(aenc),
 		obs_encoder_get_codec(aenc), obs_encoder_get_frame_size(aenc));
 	fprintf(f, "| Packets | %ld video, %ld audio |\n", rec->video_packets, rec->audio_packets);
+	fprintf(f, "| Frames lagged / skipped while recording | %u / %u |\n", frame_delta.lagged, frame_delta.skipped);
 	if (args.note)
 		fprintf(f, "| Note | %s |\n", args.note);
 	fprintf(f, "\nCommand line:\n\n```\n");
@@ -606,6 +659,12 @@ static bool write_trace_json(obs_encoder_t *venc, obs_encoder_t *aenc, const str
 	obs_data_set_int(d, "audio_packets", rec->audio_packets);
 	obs_data_set_bool(d, "bf_set", args.bf_set);
 	obs_data_set_bool(d, "keyint_set", args.keyint_set);
+	obs_data_set_int(d, "lagged_frames", frame_delta.lagged);
+	obs_data_set_int(d, "skipped_frames", frame_delta.skipped);
+	const char *commit = getenv("OBS_COMMIT");
+	const char *run_id = getenv("GITHUB_RUN_ID");
+	obs_data_set_string(d, "obs_commit", commit && *commit ? commit : "unknown");
+	obs_data_set_string(d, "ci_run", run_id && *run_id ? run_id : "local");
 	obs_data_t *vs = obs_encoder_get_settings(venc);
 	obs_data_set_obj(d, "video_settings", vs);
 	obs_data_release(vs);
@@ -631,6 +690,8 @@ static obs_data_t *video_settings(void)
 		obs_data_set_string(vs, "profile", args.profile);
 	if (args.preset)
 		obs_data_set_string(vs, "preset", args.preset);
+	if (args.x264opts)
+		obs_data_set_string(vs, "x264opts", args.x264opts);
 	return vs;
 }
 
@@ -785,20 +846,36 @@ int main(int argc, char **argv)
 		     verr ? verr : "-", aerr ? aerr : "-");
 	}
 	started = true;
+	struct frame_counts at_start = frame_counts();
 
 	unsigned long budget_ms = (unsigned long)args.seconds * 1000 + 30000;
 	if (os_event_timedwait(full_event, budget_ms) != 0)
 		FAIL("no %d s of video within %lu ms", args.seconds, budget_ms);
 
+	struct frame_counts at_end = frame_counts();
+	frame_delta.lagged = at_end.lagged - at_start.lagged;
+	frame_delta.skipped = at_end.skipped - at_start.skipped;
+
 	obs_output_stop(output);
 	if (os_event_timedwait(stopped_event, 10000) != 0)
 		FAIL("output did not stop within 10 s");
+	for (int i = 0; obs_output_active(output); i++) {
+		if (i == 1000)
+			FAIL("output still active 10 s after its stop signal");
+		os_sleep_ms(10);
+	}
 	started = false;
 
 	struct trace_recorder *rec = obs_obj_get_data(output);
-	printf("HARNESS packets video=%ld audio=%ld\n", rec->video_packets, rec->audio_packets);
-	if (rec->write_failed)
+	join_stop_thread(rec);
+	printf("HARNESS packets video=%ld audio=%ld lagged=%u skipped=%u\n", rec->video_packets, rec->audio_packets,
+	       frame_delta.lagged, frame_delta.skipped);
+	if (stop_code != OBS_OUTPUT_SUCCESS)
+		FAIL("output stopped with code %lld", stop_code);
+	if (rec->write_failed || !close_packets(rec))
 		FAIL("writing the trace failed");
+	if (rec->video_packets < rec->video_limit)
+		FAIL("only %ld of %ld video packets", rec->video_packets, rec->video_limit);
 	if (!rec->audio_packets)
 		FAIL("no audio packets");
 	if (!write_provenance(venc, aenc, rec) || !write_trace_json(venc, aenc, rec))
