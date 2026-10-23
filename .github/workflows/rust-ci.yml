@@ -70,7 +70,10 @@ jobs:
         run: |
           set -euo pipefail
           out=$(cargo tree --locked --target all -e features,normal -i dstreamy-ipc --workspace)
-          ! grep -F 'feature "test-support"' <<<"$out"
+          if grep -F 'feature "test-support"' <<<"$out"; then
+            echo "dstreamy-ipc test-support is enabled through a normal dependency" >&2
+            exit 1
+          fi
       - name: Cross-user IPC tests
         run: cargo test -p dstreamy-ipc --locked --test cross_user -- --ignored --skip nobody_helper
         timeout-minutes: 5
