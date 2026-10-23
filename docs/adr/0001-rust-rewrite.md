@@ -14,7 +14,7 @@ D-Streamy is a SwiftUI menu bar app (ScreenCaptureKit + VideoToolbox) feeding a 
   - macOS: `screencapturekit` + VideoToolbox.
   - Linux: `ashpd` (ScreenCast portal) + PipeWire + GStreamer (VA-API/NVENC/x264).
 - Discord transport: vendor `discord-stream-rs` (a Rust port of `discord-video-stream`, with DAVE via `davey` and WebRTC via `webrtc-rs`), with the FFmpeg feature off and pre-encoded Annex B frames fed in. We write our own user-token main gateway client on `tokio-tungstenite`, since the library leaves the gateway to the caller.
-- Verification runs against a local mock Discord server (gateway, voice WS, WebRTC peer, DAVE peer). The real Discord, real capture permission and GPU encoders are checked once by hand, from `.scratch/rust-rewrite/MANUAL-CHECKLIST.md`.
+- Verification runs against a local mock Discord server (gateway, voice WS, WebRTC peer, DAVE peer). The real Discord, real capture permission and GPU encoders are checked once by hand.
 
 ## Consequences
 

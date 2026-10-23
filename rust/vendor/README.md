@@ -34,5 +34,4 @@ able to use the SSRC Discord assigns in voice READY. See ADR 0002.
 
 ## Reference
 
-The protocol reference is `@dank074/discord-video-stream` 6.0.0; the comparison is in
-`.scratch/rust-rewrite/notes/protocol-audit.md`.
+The protocol reference is `@dank074/discord-video-stream` 6.0.0.

@@ -162,3 +162,4 @@ capture/.build/
 
 # Docs (local only)
 docs/
+.scratch/
