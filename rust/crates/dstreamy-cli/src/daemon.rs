@@ -246,8 +246,14 @@ struct Daemon {
     last_stats: Mutex<Option<StreamStats>>,
     running: Mutex<Option<Running>>,
     portal: Mutex<Option<PortalBook>>,
-    /// Stored or released only after checking the session state while holding it.
-    session_lock: Mutex<Option<SessionLock>>,
+    session_lock: Mutex<Hold>,
+}
+
+/// While `starting`, a `Stopped` state belongs to the previous run and must not release the lock.
+#[derive(Default)]
+struct Hold {
+    lock: Option<SessionLock>,
+    starting: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -295,7 +301,7 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
         last_stats: Mutex::new(None),
         running: Mutex::new(None),
         portal: Mutex::new(None),
-        session_lock: Mutex::new(None),
+        session_lock: Mutex::new(Hold::default()),
     });
     let mut signals = Signals::new();
     let mut tasks = JoinSet::new();
@@ -470,12 +476,13 @@ impl Daemon {
     }
 
     fn release_if_stopped(&self) {
-        let mut held = lock(&self.session_lock);
-        if self
-            .current()
-            .is_none_or(|c| stream::has_stopped(&c.session))
+        let mut hold = lock(&self.session_lock);
+        if !hold.starting
+            && self
+                .current()
+                .is_none_or(|c| stream::has_stopped(&c.session))
         {
-            held.take();
+            hold.lock = None;
         }
     }
 
@@ -541,25 +548,29 @@ impl Daemon {
         let restore_token = capture::restore_token(&config);
         let picked = capture::source_for(&p.target, restore_token.clone())?;
         let capture = stream::capture_config(&p.target, &settings, p.crop);
-        let held = lock(&self.session_lock).take();
-        let session_lock = match held {
-            Some(held) => held,
-            None => SessionLock::acquire(&self.ctx.paths).map_err(CliError::from)?,
-        };
-        stream::start(
+        {
+            let mut hold = lock(&self.session_lock);
+            if hold.lock.is_none() {
+                hold.lock = Some(SessionLock::acquire(&self.ctx.paths).map_err(CliError::from)?);
+            }
+            hold.starting = true;
+        }
+        let started = stream::start(
             &conn.session,
             p.guild_id,
             p.channel_id,
             picked.source,
             capture,
         )
-        .await?;
+        .await;
         {
-            let mut held = lock(&self.session_lock);
-            if !stream::has_stopped(&conn.session) {
-                *held = Some(session_lock);
+            let mut hold = lock(&self.session_lock);
+            hold.starting = false;
+            if started.is_err() || stream::has_stopped(&conn.session) {
+                hold.lock = None;
             }
         }
+        started?;
         *lock(&self.last_stats) = None;
         *lock(&self.portal) = Some(PortalBook::new(restore_token, picked.portal_token));
         *lock(&self.running) = Some(Running {
@@ -601,6 +612,7 @@ impl Daemon {
             return Err(not_running());
         }
         *lock(&self.running) = None;
+        self.release_if_stopped();
         let stats = lock(&self.last_stats).take().unwrap_or_default();
         serde_json::to_value(stats).map_err(|e| Failure::new("internal", e.to_string()))
     }
@@ -631,7 +643,7 @@ impl Daemon {
             }
         }
         *lock(&self.running) = None;
-        lock(&self.session_lock).take();
+        *lock(&self.session_lock) = Hold::default();
         self.remember_portal_token();
     }
 }

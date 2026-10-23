@@ -1,12 +1,15 @@
-use std::process::ExitCode;
-use std::time::Duration;
+use std::io::{BufRead, BufReader, Read};
+use std::path::Path;
+use std::process::{ExitCode, Stdio};
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
 
 use dstreamy_cli::Ctx;
 use dstreamy_cli::tui::model::Key;
 use dstreamy_cli::tui::{Input, Options, drive};
 use dstreamy_core::{Codec, Config, ConfigPaths, Fps, Resolution, StreamConfig};
 use dstreamy_mock_discord::opcodes::gateway as gw;
-use dstreamy_mock_discord::{MOCK_TOKEN, MockDiscord};
+use dstreamy_mock_discord::{MOCK_GUILD_ID, MOCK_TOKEN, MOCK_VOICE_CHANNEL_ID, MockDiscord};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
@@ -56,6 +59,70 @@ impl Harness {
 
     fn config(&self) -> Config {
         Config::load(&self.ctx.paths.config_file).unwrap()
+    }
+
+    /// Runs `dstreamy stream` on the same config dir until it streams (`Ok`) or exits (`Err` with stderr).
+    async fn external_stream(&self) -> Result<(), String> {
+        let dir = self.ctx.paths.config_file.parent().unwrap().to_owned();
+        let url = self.ctx.gateway_url.clone();
+        tokio::task::spawn_blocking(move || external_stream(&dir, &url))
+            .await
+            .unwrap()
+    }
+}
+
+fn external_stream(dir: &Path, gateway_url: &str) -> Result<(), String> {
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("dstreamy"))
+        .env_remove("DSTREAMY_TOKEN")
+        .env_remove("DSTREAMY_CONFIG_DIR")
+        .arg("--config-dir")
+        .arg(dir)
+        .args([
+            "--gateway-url",
+            gateway_url,
+            "stream",
+            "--guild",
+            MOCK_GUILD_ID,
+        ])
+        .args([
+            "--channel",
+            MOCK_VOICE_CHANNEL_ID,
+            "--target",
+            "test-pattern",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, lines) = std_mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + T;
+    loop {
+        if let Ok(line) = lines.recv_timeout(Duration::from_millis(50))
+            && line == "state: streaming"
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(());
+        }
+        if child.try_wait().unwrap().is_some() {
+            let mut stderr = String::new();
+            let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+            return Err(stderr);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the external stream neither streamed nor exited");
+        }
     }
 }
 
@@ -229,4 +296,37 @@ fn the_binary_refuses_to_start_without_a_terminal() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("interactive terminal"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_tui_session_holds_the_lock_until_it_stops() {
+    let h = Harness::new().await;
+    let hr = &h;
+    let code = run_tui(&h, |mut s| async move {
+        s.until("Mock Guild").await;
+        s.press(&[Key::Enter]);
+        s.until("General").await;
+        s.press(&[Key::Enter]);
+        s.until("Test pattern").await;
+        s.press(&[Key::Enter]);
+        s.until("Stream settings").await;
+        s.press(&[Key::Enter]);
+        s.until("streaming  ·").await;
+
+        let refused = hr.external_stream().await.unwrap_err();
+        assert!(
+            refused.contains(&format!(
+                "another dstreamy session is live (pid {})",
+                std::process::id()
+            )),
+            "{refused}"
+        );
+
+        s.press(&[Key::Char('s')]);
+        s.until("stream stopped").await;
+        hr.external_stream().await.unwrap();
+        s.press(&[Key::Char('q')]);
+    })
+    .await;
+    assert_eq!(code, ExitCode::SUCCESS);
 }

@@ -65,6 +65,19 @@ impl Harness {
         s.until("streaming state", |l| l == "state: streaming");
         s
     }
+
+    fn stream_is_refused_by(&self, pid: u32) {
+        let (status, stderr) = self.spawn(&stream_args()).wait();
+        assert!(!status.success(), "{status}: {stderr}");
+        assert!(
+            stderr.contains(&format!("another dstreamy session is live (pid {pid})")),
+            "{stderr}"
+        );
+    }
+
+    fn daemon(&self) -> Proc {
+        self.spawn(&["daemon", "--skip-platform"])
+    }
 }
 
 fn stream_args() -> Vec<&'static str> {
@@ -141,6 +154,10 @@ impl Proc {
         serde_json::from_str(&line).unwrap()
     }
 
+    fn alive(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+    }
+
     fn wait(mut self) -> (std::process::ExitStatus, String) {
         drop(self.stdin.take());
         let deadline = Instant::now() + T;
@@ -163,6 +180,13 @@ impl Proc {
     }
 }
 
+impl Drop for Proc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn start_request() -> Value {
     json!({
         "id": "start",
@@ -180,16 +204,7 @@ fn start_request() -> Value {
 fn a_second_stream_is_refused_until_the_first_is_killed() {
     let h = Harness::new();
     let first = h.stream();
-    let pid = first.child.id();
-
-    let output = h.cmd().args(stream_args()).output().unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains(&format!("another dstreamy session is live (pid {pid})")),
-        "{stderr}"
-    );
-
+    h.stream_is_refused_by(first.child.id());
     first.kill();
     h.stream().kill();
 }
@@ -200,7 +215,7 @@ fn daemon_start_is_already_running_while_a_stream_is_live() {
     let s = h.stream();
     let pid = s.child.id();
 
-    let mut d = h.spawn(&["daemon", "--skip-platform"]);
+    let mut d = h.daemon();
     let reply = d.request(&start_request());
     assert_eq!(reply["type"], "error", "{reply}");
     assert_eq!(reply["code"], "already_running", "{reply}");
@@ -216,12 +231,11 @@ fn daemon_start_is_already_running_while_a_stream_is_live() {
 #[test]
 fn a_daemon_session_that_ends_by_itself_releases_the_lock() {
     let h = Harness::new();
-    let mut d = h.spawn(&["daemon", "--skip-platform"]);
+    let mut d = h.daemon();
+    let pid = d.child.id();
     assert_eq!(d.request(&start_request())["type"], "result");
     d.daemon_state("streaming");
-
-    let refused = h.cmd().args(stream_args()).output().unwrap();
-    assert!(!refused.status.success());
+    h.stream_is_refused_by(pid);
 
     assert!(
         h.mock
@@ -234,6 +248,34 @@ fn a_daemon_session_that_ends_by_itself_releases_the_lock() {
     );
 
     h.stream().kill();
+
+    assert_eq!(d.request(&start_request())["type"], "result");
+    d.daemon_state("streaming");
+    h.stream_is_refused_by(pid);
     let (status, stderr) = d.wait();
     assert!(status.success(), "{status}: {stderr}");
+}
+
+#[test]
+fn a_daemon_stop_releases_the_lock_before_its_reply() {
+    let h = Harness::new();
+    let mut d = h.daemon();
+    assert_eq!(d.request(&start_request())["type"], "result");
+    d.daemon_state("streaming");
+    let reply = d.request(&json!({ "id": "stop", "cmd": "stop" }));
+    assert_eq!(reply["type"], "result", "{reply}");
+
+    h.stream().kill();
+    assert!(d.alive(), "the daemon exited after stop");
+    let (status, stderr) = d.wait();
+    assert!(status.success(), "{status}: {stderr}");
+}
+
+#[test]
+fn read_only_commands_run_while_a_stream_holds_the_lock() {
+    let h = Harness::new();
+    let s = h.stream();
+    let (status, stderr) = h.spawn(&["channels", MOCK_GUILD_ID]).wait();
+    assert!(status.success(), "{status}: {stderr}");
+    s.kill();
 }
