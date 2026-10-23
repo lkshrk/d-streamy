@@ -21,6 +21,13 @@ fn passwd_home() -> PathBuf {
     PathBuf::from(dir.to_str().unwrap())
 }
 
+/// `path` with its longest existing prefix canonicalized, the form the endpoint resolver returns.
+fn resolved(path: &std::path::Path) -> PathBuf {
+    let existing = path.ancestors().find(|p| p.exists()).unwrap();
+    let rest = path.strip_prefix(existing).unwrap();
+    std::fs::canonicalize(existing).unwrap().join(rest)
+}
+
 fn default_path() -> PathBuf {
     Endpoint::default_for_user().unwrap().as_path().to_owned()
 }
@@ -28,7 +35,7 @@ fn default_path() -> PathBuf {
 // The only test in this binary, so mutating the environment races with nothing.
 #[test]
 fn default_endpoint_uses_a_trusted_runtime_dir_or_the_passwd_home() {
-    let fallback = passwd_home().join(HOME_FALLBACK);
+    let fallback = resolved(&passwd_home().join(HOME_FALLBACK));
     // SAFETY: no other thread exists that reads the environment.
     unsafe { std::env::set_var("HOME", "/home/not-the-user") };
 
@@ -43,7 +50,10 @@ fn default_endpoint_uses_a_trusted_runtime_dir_or_the_passwd_home() {
     .unwrap();
     // SAFETY: as above.
     unsafe { std::env::set_var(VAR, runtime.path()) };
-    assert_eq!(default_path(), runtime.path().join("dstreamy/serve.sock"));
+    assert_eq!(
+        default_path(),
+        resolved(&runtime.path().join("dstreamy/serve.sock"))
+    );
 
     let missing = runtime.path().join("not-created");
     // SAFETY: as above.

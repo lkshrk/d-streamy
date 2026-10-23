@@ -407,6 +407,13 @@ mod tests {
         .unwrap()
     }
 
+    /// `path` with its longest existing prefix canonicalized, the form `check_base` returns.
+    fn resolved(path: &Path) -> PathBuf {
+        let existing = path.ancestors().find(|p| p.exists()).unwrap();
+        let rest = path.strip_prefix(existing).unwrap();
+        fs::canonicalize(existing).unwrap().join(rest)
+    }
+
     fn trusted_tempdir() -> tempfile::TempDir {
         let home = passwd_home(own_principal()).unwrap();
         let dir = tempfile::Builder::new()
@@ -503,7 +510,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             path,
-            home.path().join(HOME_FALLBACK).join("dstreamy/serve.sock")
+            resolved(&home.path().join(HOME_FALLBACK).join("dstreamy/serve.sock"))
         );
     }
 
@@ -720,7 +727,7 @@ mod tests {
             Path::is_dir,
         )
         .unwrap();
-        assert_eq!(path, real.join(DIR_NAME).join(SOCKET_NAME));
+        assert_eq!(path, resolved(&real.join(DIR_NAME).join(SOCKET_NAME)));
         let home = trusted_tempdir();
         let state = home.path().join(HOME_FALLBACK);
         fs::create_dir_all(state.parent().unwrap()).unwrap();
@@ -732,7 +739,7 @@ mod tests {
             Path::is_dir,
         )
         .unwrap();
-        assert_eq!(path, real.join(DIR_NAME).join(SOCKET_NAME));
+        assert_eq!(path, resolved(&real.join(DIR_NAME).join(SOCKET_NAME)));
     }
 
     /// `D/e{n}` points at `D/e{n-1}` repeated `fan` times and `e0` at `D`: 1 + fan·cost(n-1) links per level.
@@ -771,31 +778,20 @@ mod tests {
     fn missing_runtime_dir_falls_back_to_the_home_base() {
         let parent = trusted_tempdir();
         let missing = parent.path().join("1000");
+        let home = trusted_tempdir();
+        let expected = resolved(&home.path().join(HOME_FALLBACK).join("dstreamy/serve.sock"));
         let uid = own_principal();
-        let path = resolve_location(
-            Some(missing.as_os_str()),
-            Some(Path::new("/home/u")),
-            |b| check_base(b, uid),
-            Path::is_dir,
-        )
-        .unwrap();
-        assert_eq!(
-            path,
-            Path::new("/home/u")
-                .join(HOME_FALLBACK)
-                .join("dstreamy/serve.sock")
-        );
+        let resolve = || {
+            resolve_location(
+                Some(missing.as_os_str()),
+                Some(home.path()),
+                |b| check_base(b, uid),
+                Path::is_dir,
+            )
+            .unwrap()
+        };
+        assert_eq!(resolve(), expected);
         fs::write(&missing, b"").unwrap();
-        let path = resolve_location(
-            Some(missing.as_os_str()),
-            Some(Path::new("/home/u")),
-            |b| check_base(b, uid),
-            Path::is_dir,
-        )
-        .unwrap();
-        assert!(
-            path.starts_with("/home/u"),
-            "a file was used as the runtime dir"
-        );
+        assert_eq!(resolve(), expected, "a file was used as the runtime dir");
     }
 }
