@@ -10,7 +10,7 @@ pub mod stream_config;
 pub mod target;
 
 pub use codec::{Codec, UnknownCodec};
-pub use config::{Config, ConfigError, ConfigPaths, TOKEN_ENV};
+pub use config::{Config, ConfigError, ConfigPaths, IdleSetting, ServeConfig, TOKEN_ENV};
 pub use crop::CropRect;
 pub use health::{HealthLevel, HealthSample, StreamHealth};
 pub use logging::{QuietOnError, RotatingFileWriter};

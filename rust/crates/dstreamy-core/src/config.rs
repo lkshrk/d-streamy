@@ -51,6 +51,42 @@ pub struct Config {
     pub target: Option<CaptureTarget>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crop: Option<CropRect>,
+    #[serde(skip_serializing_if = "ServeConfig::is_default")]
+    pub serve: ServeConfig,
+}
+
+/// `[serve]`: how `dstreamy serve` treats an external producer (ADR 0004).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServeConfig {
+    pub grace_secs: u64,
+    pub idle: IdleSetting,
+    pub stall_ms: u64,
+}
+
+impl ServeConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            grace_secs: 30,
+            idle: IdleSetting::Documented,
+            stall_ms: 2000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleSetting {
+    #[default]
+    Documented,
+    None,
+    Continuous,
 }
 
 impl Config {
@@ -203,6 +239,11 @@ mod tests {
                 restore_token: Some("tok-123".into()),
             }),
             crop: Some(CropRect::new(10, 20, 800, 600)),
+            serve: ServeConfig {
+                grace_secs: 10,
+                idle: IdleSetting::None,
+                stall_ms: 1500,
+            },
         };
         config.save(&paths.config_file).unwrap();
         assert_eq!(Config::load(&paths.config_file).unwrap(), config);
@@ -223,6 +264,35 @@ mod tests {
         assert_eq!(config.stream.fps, Fps::Fps15);
         assert_eq!(config.stream.bitrate_kbps, 6_000);
         assert_eq!(config.target, None);
+        assert_eq!(config.serve, ServeConfig::default());
+    }
+
+    #[test]
+    fn serve_table_parses_and_rejects_unknown_values() {
+        let (_dir, paths) = paths();
+        create_parent(&paths.config_file).unwrap();
+        fs::write(
+            &paths.config_file,
+            "[serve]\ngrace_secs = 5\nidle = \"continuous\"\nstall_ms = 750\n",
+        )
+        .unwrap();
+        let serve = Config::load(&paths.config_file).unwrap().serve;
+        assert_eq!(
+            serve,
+            ServeConfig {
+                grace_secs: 5,
+                idle: IdleSetting::Continuous,
+                stall_ms: 750,
+            }
+        );
+        for text in [
+            "[serve]\nidle = \"sometimes\"\n",
+            "[serve]\nstall_ms = -1\n",
+            "[serve]\nbogus = 1\n",
+        ] {
+            fs::write(&paths.config_file, text).unwrap();
+            assert!(Config::load(&paths.config_file).is_err(), "{text}");
+        }
     }
 
     #[test]

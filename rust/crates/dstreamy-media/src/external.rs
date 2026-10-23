@@ -47,6 +47,16 @@ pub struct ExternalOptions {
     pub idle: IdleMode,
 }
 
+impl ExternalOptions {
+    /// Fails when `stall` is shorter than `FIRST_FRAMES_WAIT`, so a stall never falls while first frames are held.
+    pub fn validate(&self) -> Result<(), OptionsError> {
+        if self.stall < FIRST_FRAMES_WAIT {
+            return Err(OptionsError::StallTooShort(self.stall));
+        }
+        Ok(())
+    }
+}
+
 impl Default for ExternalOptions {
     fn default() -> Self {
         Self {
@@ -658,11 +668,9 @@ pub struct ExternalSource {
 }
 
 impl ExternalSource {
-    /// Fails when `stall` is shorter than `FIRST_FRAMES_WAIT`, so a stall never falls while first frames are held.
+    /// Fails as [`ExternalOptions::validate`] does.
     pub fn new(options: ExternalOptions) -> Result<Self, OptionsError> {
-        if options.stall < FIRST_FRAMES_WAIT {
-            return Err(OptionsError::StallTooShort(options.stall));
-        }
+        options.validate()?;
         let (status_tx, status) = watch::channel(SourceState::Detached);
         let (producer_tx, producer) = watch::channel(None);
         let inner = Arc::new(Inner {
