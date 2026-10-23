@@ -1,0 +1,24 @@
+{"id":"1","cmd":"hello","role":"control","protocol":2}
+{"id":"2","cmd":"status"}
+{"id":"3","cmd":"logged_in"}
+{"id":"4","cmd":"guilds"}
+{"id":"5","cmd":"set_token","token":"mock-user-token"}
+{"id":"6","cmd":"channels","guild_id":"200000000000000001"}
+{"id":"7","cmd":"targets"}
+{"id":"8","cmd":"subscribe"}
+{"id":"9","cmd":"start","guild_id":"200000000000000001","channel_id":"300000000000000001","target":"test-pattern","codec":"h264","fps":15,"resolution":"320x180","bitrate_kbps":1000,"gain":0.5}
+{"id":"10","cmd":"status"}
+{"id":"11","cmd":"update","fps":30,"resolution":"640x360","bitrate_kbps":1500}
+{"id":"12","cmd":"start","guild_id":"200000000000000001","channel_id":"300000000000000001","target":"test-pattern"}
+{"id":"13","cmd":"stop"}
+{"id":"14","cmd":"start","guild_id":"200000000000000001","channel_id":"300000000000000001","target":"external","codec":"h265"}
+{"id":"15","cmd":"start","guild_id":"200000000000000001","channel_id":"300000000000000001","target":"external","fps":15,"resolution":"320x180","bitrate_kbps":1000}
+{"id":"16","cmd":"status"}
+{"id":"17","cmd":"update","fps":30}
+{"id":"18","cmd":"stop"}
+{"id":"19","cmd":"stop"}
+not json
+{"id":"21","cmd":"bogus"}
+{"cmd":"status"}
+{"id":"23","cmd":"hello","role":"control","protocol":2}
+{"id":"24","cmd":"shutdown"}

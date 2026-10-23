@@ -1,0 +1,8 @@
+{"code":"unsupported_protocol","id":"1","message":"protocol 3 is not supported; this service speaks 2","type":"error"}
+{"code":"malformed","id":"2","message":"malformed line: missing string field \"role\"","type":"error"}
+{"code":"malformed","id":"3","message":"malformed line: unknown role \"viewer\"","type":"error"}
+{"code":"malformed","id":"4","message":"malformed line: missing integer field \"protocol\"","type":"error"}
+{"code":"malformed","id":"5","message":"malformed line: the first line must be hello","type":"error"}
+{"code":"malformed","id":null,"message":"malformed line: line is not JSON: expected ident at line 1 column 2","type":"error"}
+{"code":"malformed","id":null,"message":"malformed line: missing string field \"id\"","type":"error"}
+{"code":"invalid_params","id":"8","message":"role \"producer\" is not available in this version","type":"error"}

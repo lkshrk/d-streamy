@@ -6,13 +6,15 @@ pub mod discord;
 pub mod engine;
 pub mod lock;
 pub mod output;
+pub mod serve;
 pub mod signals;
 pub mod stream;
 pub mod tui;
 
 use dstreamy_core::{ConfigError, ConfigPaths, InvalidStreamConfig, TOKEN_ENV};
 use dstreamy_discord::GatewayError;
-use dstreamy_media::MediaError;
+use dstreamy_ipc::IpcError;
+use dstreamy_media::{MediaError, OptionsError};
 use lock::LockError;
 
 #[derive(Clone)]
@@ -49,6 +51,10 @@ pub enum CliError {
     AlreadyStreaming,
     #[error(transparent)]
     Lock(#[from] LockError),
+    #[error("config [serve]: {0}")]
+    ServeConfig(#[from] OptionsError),
+    #[error(transparent)]
+    Ipc(#[from] IpcError),
     #[error("{0}")]
     Session(String),
     #[error("stream stopped: {0}")]

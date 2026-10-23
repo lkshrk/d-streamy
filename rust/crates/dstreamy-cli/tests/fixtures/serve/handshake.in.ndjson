@@ -1,0 +1,8 @@
+{"id":"1","cmd":"hello","role":"control","protocol":3}
+{"id":"2","cmd":"hello","protocol":2}
+{"id":"3","cmd":"hello","role":"viewer","protocol":2}
+{"id":"4","cmd":"hello","role":"control"}
+{"id":"5","cmd":"status","role":"control","protocol":2}
+not json
+{"cmd":"hello","role":"control","protocol":2}
+{"id":"8","cmd":"hello","role":"producer","protocol":2}

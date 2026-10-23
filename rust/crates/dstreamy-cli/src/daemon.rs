@@ -17,7 +17,7 @@ use crate::output::Out;
 use crate::signals::Signals;
 use crate::{CliError, Ctx};
 
-const COMMANDS: [&str; 10] = [
+pub(crate) const COMMANDS: [&str; 10] = [
     "hello",
     "set_token",
     "logged_in",
@@ -52,15 +52,19 @@ enum Request {
     Engine(Command),
 }
 
-fn parse(line: &[u8]) -> Result<(String, Request), (Option<String>, Failure)> {
-    let malformed = |id: Option<String>, what: &str| {
-        (
-            id,
-            Failure::new("malformed", format!("malformed line: {what}")),
-        )
-    };
-    let value: Value = serde_json::from_slice(line).map_err(|e| malformed(None, &e.to_string()))?;
-    let Value::Object(fields) = &value else {
+pub(crate) fn malformed(id: Option<String>, what: &str) -> (Option<String>, Failure) {
+    (
+        id,
+        Failure::new("malformed", format!("malformed line: {what}")),
+    )
+}
+
+/// The request's `id` and `cmd`, checked against `known` as protocol 1 checks them.
+pub(crate) fn id_and_cmd(
+    value: &Value,
+    known: &[&str],
+) -> Result<(String, String), (Option<String>, Failure)> {
+    let Value::Object(fields) = value else {
         return Err(malformed(None, "expected a JSON object"));
     };
     let Some(id) = fields.get("id").and_then(Value::as_str).map(str::to_owned) else {
@@ -69,17 +73,31 @@ fn parse(line: &[u8]) -> Result<(String, Request), (Option<String>, Failure)> {
     let Some(cmd) = fields.get("cmd").and_then(Value::as_str) else {
         return Err(malformed(Some(id), "missing string field \"cmd\""));
     };
-    if !COMMANDS.contains(&cmd) {
+    if !known.contains(&cmd) {
         let failure = Failure::new("unknown_cmd", format!("unknown command {cmd:?}"));
         return Err((Some(id), failure));
     }
+    Ok((id, cmd.to_owned()))
+}
+
+pub(crate) fn engine_command(
+    id: String,
+    value: Value,
+) -> Result<(String, Command), (Option<String>, Failure)> {
+    match serde_json::from_value(value) {
+        Ok(command) => Ok((id, command)),
+        Err(e) => Err((Some(id), invalid_params(e))),
+    }
+}
+
+fn parse(line: &[u8]) -> Result<(String, Request), (Option<String>, Failure)> {
+    let value: Value = serde_json::from_slice(line).map_err(|e| malformed(None, &e.to_string()))?;
+    let (id, cmd) = id_and_cmd(&value, &COMMANDS)?;
     if cmd == "shutdown" {
         return Ok((id, Request::Shutdown));
     }
-    match serde_json::from_value(value) {
-        Ok(command) => Ok((id, Request::Engine(command))),
-        Err(e) => Err((Some(id), invalid_params(e))),
-    }
+    let (id, command) = engine_command(id, value)?;
+    Ok((id, Request::Engine(command)))
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -125,6 +143,7 @@ fn reply_line(id: Option<&str>, result: Result<Value, Failure>) -> Option<String
 fn event_line(event: &EngineEvent) -> Option<String> {
     match event {
         EngineEvent::Session(event) => line(&Message::Event { event }),
+        EngineEvent::Source(_) => None,
     }
 }
 

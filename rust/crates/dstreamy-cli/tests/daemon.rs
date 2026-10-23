@@ -508,3 +508,37 @@ fn states(messages: &[Value]) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
+
+#[test]
+fn start_with_target_external_fails_as_in_protocol_1() {
+    let h = Harness::new().logged_in();
+    let mut d = h.spawn(false);
+    let start = json!({
+        "id": "x",
+        "cmd": "start",
+        "guild_id": MOCK_GUILD_ID,
+        "channel_id": MOCK_VOICE_CHANNEL_ID,
+        "target": "external",
+        "resolution": "320x180",
+        "fps": 15,
+        "bitrate_kbps": 1000,
+    });
+    let reply = d.request(&start.to_string());
+    assert_eq!(reply["type"], "result", "{reply}");
+    let stopped = d.until("stopped state", |m| {
+        m["event"]["event"] == "state" && m["event"]["state"]["state"] == "stopped"
+    });
+    assert_eq!(
+        stopped["event"]["state"]["reason"]["reason"], "source_failed",
+        "{stopped}"
+    );
+    assert!(
+        d.seen
+            .iter()
+            .all(|m| m["event"]["state"]["state"] != "streaming"),
+        "the daemon streamed an external target"
+    );
+    d.close_stdin();
+    let done = d.finish();
+    assert!(done.status.success(), "{}: {}", done.status, done.stderr);
+}

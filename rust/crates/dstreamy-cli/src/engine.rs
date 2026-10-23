@@ -1,21 +1,24 @@
-//! The command engine behind `dstreamy daemon`: one Discord connection, at most one stream.
+//! The command engine behind `dstreamy daemon` and `dstreamy serve`: one Discord connection, at most one stream.
 
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use dstreamy_core::{CropRect, Fps, Resolution, StreamConfig};
+use dstreamy_core::{Codec, CropRect, Fps, IdleSetting, Resolution, ServeConfig, StreamConfig};
 use dstreamy_discord::{
     DiscordClient, GatewayError, Session, SessionError, SessionEvent, SessionState, StreamStats,
 };
-use dstreamy_media::CaptureConfig;
-use serde::Deserialize;
+use dstreamy_media::{
+    CaptureConfig, CaptureSource, EXTERNAL_TARGET_ID, ExternalHandle, ExternalOptions,
+    ExternalSource, IdleMode, InterruptReason, OptionsError, SourceState,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::capture::{self, PortalBook, TargetRow};
+use crate::capture::{self, PortalBook, PortalToken, TargetRow};
 use crate::discord::{self, Persistence};
 use crate::lock::{LockError, SessionLock};
 use crate::stream::{self, parse_codec};
@@ -31,6 +34,8 @@ pub struct Options {
     pub include_platform: bool,
     /// Capacity of the `events()` broadcast; lossless subscribers are unbounded.
     pub event_capacity: usize,
+    /// Accepts `start` with target `external`; protocol 1 never does.
+    pub allow_external: bool,
 }
 
 impl Default for Options {
@@ -38,13 +43,78 @@ impl Default for Options {
         Self {
             include_platform: true,
             event_capacity: 256,
+            allow_external: false,
         }
     }
 }
 
+// Session events dominate, as in `SessionEvent`; boxing them would add an allocation per event.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     Session(SessionEvent),
+    Source(SourceState),
+}
+
+/// The `[serve]` settings as options for an external source; `stall_ms` below the first-frames wait is refused.
+pub fn external_options(serve: &ServeConfig) -> Result<ExternalOptions, OptionsError> {
+    let options = ExternalOptions {
+        grace: Duration::from_secs(serve.grace_secs),
+        stall: Duration::from_millis(serve.stall_ms),
+        idle: match serve.idle {
+            IdleSetting::Documented => IdleMode::Documented,
+            IdleSetting::None => IdleMode::None,
+            IdleSetting::Continuous => IdleMode::Continuous,
+        },
+    };
+    options.validate()?;
+    Ok(options)
+}
+
+/// An external source's state on the wire: `state`, plus `attachment` or `reason` and `for_ms`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceView {
+    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub for_ms: Option<u64>,
+}
+
+impl From<&SourceState> for SourceView {
+    fn from(state: &SourceState) -> Self {
+        let view = |state| Self {
+            state,
+            attachment: None,
+            reason: None,
+            for_ms: None,
+        };
+        match state {
+            SourceState::Detached => view("detached"),
+            SourceState::Producing { attachment } => Self {
+                attachment: Some(*attachment),
+                ..view("producing")
+            },
+            SourceState::Interrupted { since, reason } => Self {
+                reason: Some(match reason {
+                    InterruptReason::Detached => "detached",
+                    InterruptReason::Stalled => "stalled",
+                }),
+                for_ms: Some(u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                ..view("interrupted")
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Status {
+    pub session: Option<SessionState>,
+    pub source: Option<SourceView>,
+    pub stats: Option<StreamStats>,
+    pub started_by: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -65,7 +135,7 @@ impl Failure {
 impl From<CliError> for Failure {
     fn from(e: CliError) -> Self {
         let code = match &e {
-            CliError::Config(_) => "config",
+            CliError::Config(_) | CliError::ServeConfig(_) => "config",
             CliError::InvalidStreamConfig(_) | CliError::EmptyToken => "invalid_params",
             CliError::NotLoggedIn => {
                 return Self::new("not_logged_in", "not logged in; send set_token first");
@@ -99,6 +169,7 @@ impl From<CliError> for Failure {
             | CliError::Stopped(_)
             | CliError::NoTerminal
             | CliError::Terminal(_)
+            | CliError::Ipc(_)
             | CliError::Lock(LockError::Io { .. }) => "internal",
         };
         Self::new(code, e.to_string())
@@ -167,6 +238,7 @@ struct Running {
     target: String,
     stream: StreamConfig,
     crop: Option<CropRect>,
+    external: bool,
 }
 
 impl Running {
@@ -182,6 +254,7 @@ impl Running {
             target: self.target.clone(),
             stream,
             crop: p.crop.or(self.crop),
+            external: self.external,
         };
         let capture = stream::capture_config(&next.target, &next.stream, next.crop);
         Ok((next, capture))
@@ -200,6 +273,8 @@ pub struct Engine {
     updating: tokio::sync::Mutex<()>,
     last_stats: Mutex<Option<StreamStats>>,
     running: Mutex<Option<Running>>,
+    started_by: Mutex<Option<u64>>,
+    external: Mutex<Option<External>>,
     portal: Mutex<Option<PortalBook>>,
     session_lock: Mutex<Hold>,
     #[cfg(test)]
@@ -227,6 +302,17 @@ impl Hold {
     }
 }
 
+struct External {
+    handle: ExternalHandle,
+    watcher: JoinHandle<()>,
+}
+
+impl Drop for External {
+    fn drop(&mut self) {
+        self.watcher.abort();
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -244,6 +330,8 @@ impl Engine {
             updating: tokio::sync::Mutex::new(()),
             last_stats: Mutex::new(None),
             running: Mutex::new(None),
+            started_by: Mutex::new(None),
+            external: Mutex::new(None),
             portal: Mutex::new(None),
             session_lock: Mutex::new(Hold::default()),
             #[cfg(test)]
@@ -270,6 +358,11 @@ impl Engine {
     }
 
     pub async fn handle(&self, command: Command) -> Result<Value, Failure> {
+        self.handle_as(command, None).await
+    }
+
+    /// As [`Engine::handle`]; a successful `start` records `caller` as `started_by`.
+    pub async fn handle_as(&self, command: Command, caller: Option<u64>) -> Result<Value, Failure> {
         match command {
             Command::Hello => Ok(json!({
                 "protocol": PROTOCOL,
@@ -310,10 +403,51 @@ impl Engine {
                 let rows: Vec<TargetRow> = targets.into_iter().map(Into::into).collect();
                 serde_json::to_value(rows).map_err(|e| Failure::new("internal", e.to_string()))
             }
-            Command::Start(params) => self.start(params).await,
+            Command::Start(params) => self.start(params, caller).await,
             Command::Update(params) => self.update(params).await,
             Command::Stop => self.stop().await,
         }
+    }
+
+    pub fn status(&self) -> Status {
+        let session = self.current().map(|c| c.session.state().borrow().clone());
+        let source = lock(&self.external)
+            .as_ref()
+            .map(|e| SourceView::from(&*e.handle.state().borrow()));
+        Status {
+            started_by: session.as_ref().and(*lock(&self.started_by)),
+            session,
+            source,
+            stats: lock(&self.last_stats).clone(),
+        }
+    }
+
+    /// Announces a producer's video (op 12) for the live session.
+    pub async fn apply_producer_video(
+        &self,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> Result<(), Failure> {
+        let conn = self
+            .current()
+            .filter(|c| c.live())
+            .ok_or_else(not_running)?;
+        conn.session
+            .update_video(width, height, fps)
+            .await
+            .map_err(session_failure)
+    }
+
+    /// Sends `event` to every subscriber as if the session had emitted it.
+    #[doc(hidden)]
+    pub fn inject_for_tests(&self, event: SessionEvent) {
+        self.publish(EngineEvent::Session(event));
+    }
+
+    fn publish(&self, event: EngineEvent) {
+        lock(&self.lossless).retain(|tx| tx.send(event.clone()).is_ok());
+        let _ = self.events.send(event);
     }
 
     fn current(&self) -> Option<Arc<Conn>> {
@@ -361,9 +495,7 @@ impl Engine {
                         }
                         _ => {}
                     }
-                    let event = EngineEvent::Session(event);
-                    lock(&self.lossless).retain(|tx| tx.send(event.clone()).is_ok());
-                    let _ = self.events.send(event);
+                    self.publish(EngineEvent::Session(event));
                 }
                 Err(RecvError::Lagged(n)) => {
                     tracing::warn!(skipped = n, "session events lagged");
@@ -409,14 +541,23 @@ impl Engine {
         Ok(Value::Null)
     }
 
-    async fn start(&self, p: StartParams) -> Result<Value, Failure> {
+    async fn start(&self, p: StartParams, caller: Option<u64>) -> Result<Value, Failure> {
         let config =
             dstreamy_core::Config::load(&self.ctx.paths.config_file).map_err(CliError::from)?;
+        let external = self.opts.allow_external && p.target == EXTERNAL_TARGET_ID;
         let codec = match &p.codec {
             Some(codec) => parse_codec(codec)
                 .map_err(|e| invalid_params(format!("invalid codec {codec:?}: {e}")))?,
+            None if external => Codec::H264,
             None => config.stream.codec,
         };
+        if external && codec != Codec::H264 {
+            return Err(invalid_params("an external session always streams h264"));
+        }
+        let external_options = external
+            .then(|| external_options(&config.serve))
+            .transpose()
+            .map_err(CliError::from)?;
         let settings = StreamConfig {
             resolution: p.resolution.unwrap_or(config.stream.resolution),
             fps: p.fps.unwrap_or(config.stream.fps),
@@ -442,7 +583,18 @@ impl Engine {
             .into());
         }
         let restore_token = capture::restore_token(&config);
-        let picked = capture::source_for(&p.target, restore_token.clone())?;
+        let (source, portal_token, handle): (Box<dyn CaptureSource>, _, _) = match external_options
+        {
+            Some(options) => {
+                let source = ExternalSource::new(options).map_err(CliError::from)?;
+                let handle = source.handle();
+                (Box::new(source), PortalToken::default(), Some(handle))
+            }
+            None => {
+                let picked = capture::source_for(&p.target, restore_token.clone())?;
+                (picked.source, picked.portal_token, None)
+            }
+        };
         let capture = stream::capture_config(&p.target, &settings, p.crop);
         {
             let mut hold = lock(&self.session_lock);
@@ -453,14 +605,7 @@ impl Engine {
         }
         #[cfg(test)]
         drop(self.start_gate.lock().await);
-        let started = stream::start(
-            &conn.session,
-            p.guild_id,
-            p.channel_id,
-            picked.source,
-            capture,
-        )
-        .await;
+        let started = stream::start(&conn.session, p.guild_id, p.channel_id, source, capture).await;
         {
             let mut hold = lock(&self.session_lock);
             hold.starting = false;
@@ -468,13 +613,35 @@ impl Engine {
         }
         started?;
         *lock(&self.last_stats) = None;
-        *lock(&self.portal) = Some(PortalBook::new(restore_token, picked.portal_token));
+        *lock(&self.portal) = Some(PortalBook::new(restore_token, portal_token));
+        *lock(&self.started_by) = caller;
+        *lock(&self.external) = handle.map(|handle| self.watch_source(handle));
         *lock(&self.running) = Some(Running {
             target: p.target,
             stream: settings,
             crop: p.crop,
+            external,
         });
         Ok(Value::Null)
+    }
+
+    fn watch_source(&self, handle: ExternalHandle) -> External {
+        let engine = self.me.clone();
+        let mut states = handle.state();
+        let watcher = tokio::spawn(async move {
+            loop {
+                let state = *states.borrow_and_update();
+                let Some(engine) = engine.upgrade() else {
+                    return;
+                };
+                engine.publish(EngineEvent::Source(state));
+                drop(engine);
+                if states.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+        External { handle, watcher }
     }
 
     async fn update(&self, p: UpdateParams) -> Result<Value, Failure> {
@@ -486,10 +653,16 @@ impl Engine {
             .filter(|c| c.live())
             .ok_or_else(not_running)?;
         let _updating = self.updating.lock().await;
-        let (next, capture) = lock(&self.running)
-            .as_ref()
-            .ok_or_else(not_running)?
-            .updated(&p)?;
+        let (next, capture) = {
+            let running = lock(&self.running);
+            let running = running.as_ref().ok_or_else(not_running)?;
+            if running.external {
+                return Err(invalid_params(
+                    "the producer owns the encoder settings of an external session",
+                ));
+            }
+            running.updated(&p)?
+        };
         conn.session
             .reconfigure(capture)
             .await
@@ -515,6 +688,7 @@ impl Engine {
             return Err(not_running());
         }
         *lock(&self.running) = None;
+        *lock(&self.external) = None;
         self.release_if_stopped();
         let stats = lock(&self.last_stats).take().unwrap_or_default();
         serde_json::to_value(stats).map_err(|e| Failure::new("internal", e.to_string()))
@@ -550,6 +724,8 @@ impl Engine {
             }
         }
         *lock(&self.running) = None;
+        *lock(&self.started_by) = None;
+        *lock(&self.external) = None;
         *lock(&self.session_lock) = Hold::default();
         self.remember_portal_token();
     }
@@ -574,6 +750,7 @@ mod tests {
             target: "display:1".into(),
             stream: StreamConfig::default(),
             crop: None,
+            external: false,
         };
         let crop = CropRect::new(10, 20, 640, 360);
         let update = |line: &str| match serde_json::from_str(line) {
@@ -667,7 +844,7 @@ mod tests {
             ) {
                 let gate = self.engine.start_gate.lock().await;
                 let engine = self.engine.clone();
-                let task = tokio::spawn(async move { engine.start(params()).await });
+                let task = tokio::spawn(async move { engine.start(params(), None).await });
                 timeout(T, async {
                     while !lock(&self.engine.session_lock).starting {
                         assert!(!task.is_finished(), "the start ended early");
@@ -728,7 +905,7 @@ mod tests {
         #[tokio::test(flavor = "current_thread")]
         async fn a_stop_that_finds_the_session_ended_still_releases_the_lock() {
             let f = Fixture::new().await;
-            f.engine.start(params()).await.unwrap();
+            f.engine.start(params(), None).await.unwrap();
             f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
             let conn = f.engine.current().unwrap();
             conn.forwarder.abort();
@@ -760,7 +937,7 @@ mod tests {
         #[tokio::test(flavor = "current_thread")]
         async fn a_lagged_forwarder_releases_the_lock_of_a_stopped_session() {
             let f = Fixture::new().await;
-            f.engine.start(params()).await.unwrap();
+            f.engine.start(params(), None).await.unwrap();
             f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
             f.engine.current().unwrap().forwarder.abort();
             assert!(
@@ -798,7 +975,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn the_previous_runs_stop_does_not_release_a_starting_runs_lock() {
             let f = Fixture::new().await;
-            f.engine.start(params()).await.unwrap();
+            f.engine.start(params(), None).await.unwrap();
             f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
             assert!(
                 f.mock
@@ -834,7 +1011,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn guilds_and_update_do_not_wait_for_a_stop_or_each_other() {
             let f = Fixture::new().await;
-            f.engine.start(params()).await.unwrap();
+            f.engine.start(params(), None).await.unwrap();
             f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
 
             let updating = f.engine.updating.lock().await;
@@ -895,10 +1072,40 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn producer_video_is_announced_with_op_12() {
+            use dstreamy_mock_discord::VoiceKind;
+            use dstreamy_mock_discord::opcodes::voice::OP_VIDEO;
+
+            let f = Fixture::new().await;
+            let idle = f.engine.apply_producer_video(160, 90, 15).await;
+            assert_eq!(idle.unwrap_err().code, "not_running");
+            f.engine.start(params(), None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            f.engine.apply_producer_video(160, 90, 15).await.unwrap();
+            let announced = f
+                .mock
+                .wait_for(T, |r| {
+                    r.ops
+                        .iter()
+                        .filter(|o| o.is(Some(VoiceKind::Stream), OP_VIDEO))
+                        .filter_map(|o| o.json())
+                        .any(|d| {
+                            d["streams"][0]["max_resolution"]["width"] == 160
+                                && d["streams"][0]["max_resolution"]["height"] == 90
+                                && d["streams"][0]["max_framerate"] == 15
+                        })
+                        .then_some(())
+                })
+                .await;
+            assert!(announced.is_some(), "no op 12 with the producer's video");
+            f.engine.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn every_receiver_gets_every_event() {
             let f = Fixture::new().await;
             let receivers = [f.engine.events(), f.engine.events()];
-            f.engine.start(params()).await.unwrap();
+            f.engine.start(params(), None).await.unwrap();
             f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
             f.engine.handle(Command::Stop).await.unwrap();
             f.engine.shutdown().await;
@@ -956,6 +1163,29 @@ mod tests {
         ));
         drop(engine);
         assert!(lossless.recv().await.is_none(), "closes with the engine");
+    }
+
+    #[test]
+    fn serve_options_come_from_the_config_and_a_short_stall_is_refused() {
+        let options = external_options(&ServeConfig::default()).unwrap();
+        assert_eq!(options, ExternalOptions::default());
+        let serve = ServeConfig {
+            grace_secs: 5,
+            idle: IdleSetting::Continuous,
+            stall_ms: 500,
+        };
+        let options = external_options(&serve).unwrap();
+        assert_eq!(options.grace, Duration::from_secs(5));
+        assert_eq!(options.stall, dstreamy_media::FIRST_FRAMES_WAIT);
+        assert_eq!(options.idle, IdleMode::Continuous);
+        let short = ServeConfig {
+            stall_ms: 499,
+            ..serve
+        };
+        assert_eq!(
+            external_options(&short),
+            Err(OptionsError::StallTooShort(Duration::from_millis(499)))
+        );
     }
 
     #[test]

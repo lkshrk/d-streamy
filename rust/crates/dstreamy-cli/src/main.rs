@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use clap::{ArgAction, Parser, Subcommand};
 use dstreamy_cli::discord::{self, Persistence};
 use dstreamy_cli::output::{Out, table};
-use dstreamy_cli::{CliError, Ctx, capture, daemon, stream, tui};
+use dstreamy_cli::{CliError, Ctx, capture, daemon, serve, stream, tui};
 use dstreamy_core::{ConfigPaths, RotatingFileWriter};
 use dstreamy_discord::{DEFAULT_GATEWAY_URL, VoiceChannelKind};
 use serde::Serialize;
@@ -77,6 +77,21 @@ enum Command {
         #[arg(long, hide = true)]
         skip_platform: bool,
     },
+    /// Run as a service: control clients and media producers connect over a local socket
+    ///
+    /// Runs until a client sends `shutdown`, or SIGINT or SIGTERM arrives. Logs go to
+    /// dstreamy.log in the config directory, and to stderr with -v.
+    Serve {
+        /// Socket path; defaults to a private per-user directory
+        #[arg(long, value_name = "PATH")]
+        endpoint: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        skip_platform: bool,
+        #[arg(long, hide = true, default_value_t = 256, value_parser = clap::value_parser!(u64).range(1..=65_536))]
+        event_capacity: u64,
+        #[arg(long, hide = true)]
+        test_hooks: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -103,7 +118,9 @@ fn main() -> ExitCode {
     };
     let (log_file, to_stderr) = match cli.command {
         Command::Tui { .. } => (Some(tui::log_file(&ctx)), false),
-        Command::Daemon { .. } => (Some(tui::log_file(&ctx)), cli.verbose > 0),
+        Command::Daemon { .. } | Command::Serve { .. } => {
+            (Some(tui::log_file(&ctx)), cli.verbose > 0)
+        }
         _ => (None, true),
     };
     init_logging(&out, cli.verbose, log_file, to_stderr);
@@ -201,6 +218,20 @@ async fn run(
                 ..daemon::Options::default()
             };
             daemon::run(ctx, out, opts).await
+        }
+        Command::Serve {
+            endpoint,
+            skip_platform,
+            event_capacity,
+            test_hooks,
+        } => {
+            let opts = serve::Options {
+                endpoint,
+                include_platform: !skip_platform,
+                event_capacity: usize::try_from(event_capacity).unwrap_or(usize::MAX),
+                test_hooks,
+            };
+            serve::run(ctx, out, opts).await
         }
         Command::Tui { skip_platform } => {
             let opts = tui::Options {
