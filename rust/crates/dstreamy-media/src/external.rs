@@ -27,6 +27,9 @@ const SILENCE_SPACING: Duration = Duration::from_micros(OPUS_FRAME_DURATION_US);
 const TICK_US: [i64; 2] = [12, 21];
 /// A producer that sends only one track still starts within this.
 pub const FIRST_FRAMES_WAIT: Duration = Duration::from_millis(500);
+/// Bounds that keep every deadline representable as an `Instant`.
+pub const MAX_GRACE: Duration = Duration::from_secs(3600);
+pub const MAX_STALL: Duration = Duration::from_secs(600);
 const VIDEO: usize = 0;
 const AUDIO: usize = 1;
 const CHANNEL_CAPACITY: usize = 1;
@@ -48,10 +51,16 @@ pub struct ExternalOptions {
 }
 
 impl ExternalOptions {
-    /// Fails when `stall` is shorter than `FIRST_FRAMES_WAIT`, so a stall never falls while first frames are held.
+    /// Fails when `stall` is shorter than `FIRST_FRAMES_WAIT`, so a stall never falls while first frames are held, or above its bound.
     pub fn validate(&self) -> Result<(), OptionsError> {
         if self.stall < FIRST_FRAMES_WAIT {
             return Err(OptionsError::StallTooShort(self.stall));
+        }
+        if self.stall > MAX_STALL {
+            return Err(OptionsError::StallTooLong(self.stall));
+        }
+        if self.grace > MAX_GRACE {
+            return Err(OptionsError::GraceTooLong(self.grace));
         }
         Ok(())
     }
@@ -125,6 +134,10 @@ impl From<MediaFrame> for ProducerFrame {
 pub enum OptionsError {
     #[error("stall {0:?} is shorter than the {FIRST_FRAMES_WAIT:?} first-frames wait")]
     StallTooShort(Duration),
+    #[error("stall {0:?} is longer than {MAX_STALL:?}")]
+    StallTooLong(Duration),
+    #[error("grace {0:?} is longer than {MAX_GRACE:?}")]
+    GraceTooLong(Duration),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

@@ -1142,6 +1142,32 @@ fn a_stall_shorter_than_the_first_frames_wait_is_rejected() {
     assert!(ExternalSource::new(exact).is_ok());
 }
 
+#[test]
+fn grace_and_stall_have_upper_bounds() {
+    let at_bounds = ExternalOptions {
+        grace: MAX_GRACE,
+        stall: MAX_STALL,
+        ..options(IdleMode::None)
+    };
+    assert!(ExternalSource::new(at_bounds.clone()).is_ok());
+    let grace = ExternalOptions {
+        grace: Duration::from_secs(u64::MAX),
+        ..at_bounds.clone()
+    };
+    assert_eq!(
+        ExternalSource::new(grace).err(),
+        Some(OptionsError::GraceTooLong(Duration::from_secs(u64::MAX)))
+    );
+    let stall = ExternalOptions {
+        stall: MAX_STALL + MS,
+        ..at_bounds
+    };
+    assert_eq!(
+        ExternalSource::new(stall).err(),
+        Some(OptionsError::StallTooLong(MAX_STALL + MS))
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn held_frames_are_dropped_and_counted_on_a_stall() {
     let rig = Rig::started(IdleMode::None).await;
