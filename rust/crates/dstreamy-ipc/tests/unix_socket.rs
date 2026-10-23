@@ -60,9 +60,8 @@ async fn bind_connect_round_trip() {
     assert_eq!(got_hello, hello);
     assert_eq!(got_frame, frame);
     assert_eq!(rejected, 0);
-    // SAFETY: geteuid has no preconditions.
-    assert_eq!(peer.uid, unsafe { libc::geteuid() });
-    assert_eq!(peer.pid, Some(std::process::id() as i32));
+    assert!(peer.is_current_user());
+    assert_eq!(peer.pid(), Some(std::process::id()));
 }
 
 #[tokio::test]
@@ -201,4 +200,77 @@ async fn over_long_socket_path_is_refused() {
     assert!(matches!(err, IpcError::PathTooLong(_)), "{err}");
     let err = connect(&endpoint).await.err().unwrap();
     assert!(matches!(err, IpcError::PathTooLong(_)), "{err}");
+}
+
+#[tokio::test]
+async fn concurrent_binds_leave_exactly_one_live_listener() {
+    for _ in 0..20 {
+        let tmp = tempfile::tempdir().unwrap();
+        let endpoint = endpoint_in(tmp.path());
+        drop(Listener::bind(&endpoint).await.unwrap());
+        let (a, b) = tokio::join!(
+            tokio::spawn({
+                let e = endpoint.clone();
+                async move { Listener::bind(&e).await }
+            }),
+            tokio::spawn({
+                let e = endpoint.clone();
+                async move { Listener::bind(&e).await }
+            }),
+        );
+        let results = [a.unwrap(), b.unwrap()];
+        let live: Vec<&Listener> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(
+            live.len(),
+            1,
+            "{:?}",
+            results.iter().map(|r| r.as_ref().err()).collect::<Vec<_>>()
+        );
+        for err in results.iter().filter_map(|r| r.as_ref().err()) {
+            assert!(matches!(err, IpcError::AlreadyRunning(_)), "{err}");
+        }
+        let (accepted, connected) = tokio::join!(live[0].accept(), connect(&endpoint));
+        accepted.unwrap();
+        connected.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn client_refuses_a_directory_that_is_not_private() {
+    let tmp = tempfile::tempdir().unwrap();
+    let endpoint = endpoint_in(tmp.path());
+    let listener = Listener::bind(&endpoint).await.unwrap();
+    let dir = endpoint.as_path().parent().unwrap();
+    for bad in [0o755, 0o777, 0o711] {
+        fs::set_permissions(dir, Permissions::from_mode(bad)).unwrap();
+        let err = connect(&endpoint).await.err().unwrap();
+        assert!(
+            matches!(err, IpcError::InsecureDirectory { .. }),
+            "{bad:o}: {err}"
+        );
+    }
+    fs::set_permissions(dir, Permissions::from_mode(0o700)).unwrap();
+    let (accepted, connected) = tokio::join!(listener.accept(), connect(&endpoint));
+    accepted.unwrap();
+    connected.unwrap();
+}
+
+#[tokio::test]
+async fn client_refuses_a_symlinked_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = endpoint_in(&tmp.path().join("real"));
+    let _listener = Listener::bind(&real).await.unwrap();
+    let link_root = tmp.path().join("link");
+    fs::create_dir(&link_root).unwrap();
+    std::os::unix::fs::symlink(real.as_path().parent().unwrap(), link_root.join("dstreamy"))
+        .unwrap();
+    let err = connect(&endpoint_in(&link_root)).await.err().unwrap();
+    assert!(matches!(err, IpcError::InsecureDirectory { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn client_reports_a_missing_directory_as_not_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let err = connect(&endpoint_in(tmp.path())).await.err().unwrap();
+    assert!(matches!(err, IpcError::NotRunning(_)), "{err}");
 }

@@ -11,10 +11,14 @@ thiserror.workspace = true
 tokio = { version = "1", features = ["net"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 
+[features]
+test-support = []
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
+dstreamy-ipc = { path = ".", features = ["test-support"] }
 futures-util = { version = "0.3", features = ["sink"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile.workspace = true

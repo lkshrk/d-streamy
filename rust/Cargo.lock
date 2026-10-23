@@ -1211,6 +1211,7 @@ dependencies = [
 name = "dstreamy-ipc"
 version = "0.1.0"
 dependencies = [
+ "dstreamy-ipc",
  "futures-util",
  "libc",
  "proptest",

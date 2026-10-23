@@ -10,6 +10,9 @@ mod unix;
 #[cfg(unix)]
 use unix as sys;
 
+#[cfg(not(unix))]
+compile_error!("dstreamy-ipc has no transport for this platform yet (named pipes: issue 15)");
+
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,7 +26,6 @@ pub use auth::authorize;
 pub use control::{ControlCodec, Malformed};
 pub use error::IpcError;
 pub use producer::{Frame, Kind, ProducerCodec, ProducerError};
-pub use sys::Peer;
 
 /// Where the service listens: a socket path on Unix.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,8 +40,8 @@ impl Endpoint {
         }
     }
 
-    pub fn default_for_user() -> Self {
-        Self::new(sys::default_location())
+    pub fn default_for_user() -> Result<Self, IpcError> {
+        sys::default_location().map(Self::new)
     }
 
     pub fn as_path(&self) -> &Path {
@@ -50,6 +52,31 @@ impl Endpoint {
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.location.display().fmt(f)
+    }
+}
+
+/// The connecting process as the kernel reported it at connect time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Peer {
+    principal: sys::Principal,
+    pid: Option<u32>,
+}
+
+impl Peer {
+    pub(crate) fn new(principal: sys::Principal, pid: Option<u32>) -> Self {
+        Self { principal, pid }
+    }
+
+    pub(crate) fn principal(&self) -> sys::Principal {
+        self.principal
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    pub fn is_current_user(&self) -> bool {
+        authorize(&sys::own_principal(), &self.principal)
     }
 }
 
@@ -65,8 +92,8 @@ impl Listener {
         Self::bind_with(endpoint, sys::Access::Private).await
     }
 
-    /// Skips the private-directory check and opens the endpoint to every user, so tests can
-    /// prove that [`authorize`] alone refuses other users.
+    /// Opens the endpoint to every user so tests can prove [`authorize`] alone refuses others.
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub async fn bind_permissive_for_tests(endpoint: &Endpoint) -> Result<Self, IpcError> {
         Self::bind_with(endpoint, sys::Access::EveryoneForTests).await
@@ -81,8 +108,7 @@ impl Listener {
         })
     }
 
-    /// Waits for a connection from the current user; others are dropped before any read.
-    /// Cancel safe.
+    /// Waits for a connection from the current user, dropping others before any read; cancel safe.
     pub async fn accept(&self) -> io::Result<(Stream, Peer)> {
         loop {
             let (stream, peer) = self.inner.accept().await?;
