@@ -1262,6 +1262,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dstreamy-test-producer"
+version = "0.1.0"
+dependencies = [
+ "openh264",
+ "thiserror 2.0.21",
+ "unsafe-libopus",
+]
+
+[[package]]
 name = "dtls"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

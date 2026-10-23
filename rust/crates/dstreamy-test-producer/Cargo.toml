@@ -1,0 +1,17 @@
+[package]
+name = "dstreamy-test-producer"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+openh264 = "0.9"
+thiserror = "2"
+unsafe-libopus = "0.2"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "obs-trace-check"
+path = "src/obs_trace_check.rs"
