@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 
 use crate::capture::{self, PortalBook};
 use crate::discord::{self, Persistence};
+use crate::lock::SessionLock;
 use crate::signals::Signals;
 use crate::stream::{self, FORCED_EXIT};
 use crate::{CliError, Ctx};
@@ -133,6 +134,7 @@ struct Live {
     session: Session,
     events: broadcast::Receiver<SessionEvent>,
     portal: Option<PortalBook>,
+    lock: Option<SessionLock>,
 }
 
 /// `on_draw` sees every frame; with `signals`, a second interrupt during shutdown exits at once.
@@ -191,7 +193,7 @@ where
                                 let _ = tx.send(Msg::Guilds(discord::guilds(&client).await));
                             }
                         }));
-                        live = Some(Live { client, session, events, portal: None });
+                        live = Some(Live { client, session, events, portal: None, lock: None });
                         Msg::Connected { user }
                     }
                     Ok(Err(e)) => Msg::ConnectFailed(e.to_string()),
@@ -202,6 +204,7 @@ where
                 Ok(event) => {
                     if matches!(event, SessionEvent::State { .. }) {
                         remember_token(ctx, &mut live, &mut app);
+                        release_if_stopped(&mut live);
                     }
                     Msg::Session(event)
                 }
@@ -210,6 +213,7 @@ where
                     let Some(l) = &live else { continue };
                     let state = l.session.state().borrow().clone();
                     remember_token(ctx, &mut live, &mut app);
+                    release_if_stopped(&mut live);
                     Msg::Session(SessionEvent::State { state })
                 }
                 Err(RecvError::Closed) => unreachable!("the session holds the event sender"),
@@ -284,6 +288,7 @@ where
         client,
         session,
         portal,
+        lock: _lock,
         ..
     }) = live.take()
     {
@@ -343,6 +348,14 @@ async fn next_signal(signals: &mut Option<Signals>) {
     }
 }
 
+fn release_if_stopped(live: &mut Option<Live>) {
+    if let Some(l) = live
+        && stream::has_stopped(&l.session)
+    {
+        l.lock = None;
+    }
+}
+
 fn remember_token(ctx: &Ctx, live: &mut Option<Live>, app: &mut App) {
     let Some(book) = live.as_mut().and_then(|l| l.portal.as_mut()) else {
         return;
@@ -363,6 +376,10 @@ async fn start(
 ) -> Result<(), String> {
     let Some(l) = live else {
         return Err("not connected to Discord".to_owned());
+    };
+    let lock = match l.lock.take() {
+        Some(lock) => lock,
+        None => SessionLock::acquire(&ctx.paths).map_err(|e| e.to_string())?,
     };
     let mut config = Config::load(&ctx.paths.config_file).map_err(|e| e.to_string())?;
     let restore_token = capture::restore_token(&config);
@@ -385,7 +402,11 @@ async fn start(
         capture,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    if !stream::has_stopped(&l.session) {
+        l.lock = Some(lock);
+    }
+    Ok(())
 }
 
 /// A saved portal restore token is kept while the portal target stays selected.

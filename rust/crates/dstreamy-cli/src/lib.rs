@@ -3,6 +3,7 @@
 pub mod capture;
 pub mod daemon;
 pub mod discord;
+pub mod lock;
 pub mod output;
 pub mod signals;
 pub mod stream;
@@ -11,6 +12,7 @@ pub mod tui;
 use dstreamy_core::{ConfigError, ConfigPaths, InvalidStreamConfig, TOKEN_ENV};
 use dstreamy_discord::GatewayError;
 use dstreamy_media::MediaError;
+use lock::LockError;
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -44,6 +46,8 @@ pub enum CliError {
     Media(#[from] MediaError),
     #[error("a stream is already running")]
     AlreadyStreaming,
+    #[error(transparent)]
+    Lock(#[from] LockError),
     #[error("{0}")]
     Session(String),
     #[error("stream stopped: {0}")]

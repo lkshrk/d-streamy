@@ -20,6 +20,7 @@ use tokio::time::timeout;
 
 use crate::capture::{self, PortalBook, TargetRow};
 use crate::discord::{self, Persistence};
+use crate::lock::{LockError, SessionLock};
 use crate::output::Out;
 use crate::signals::Signals;
 use crate::stream::{self, parse_codec};
@@ -108,12 +109,15 @@ impl From<CliError> for Failure {
                 );
             }
             CliError::Media(_) => "capture",
-            CliError::AlreadyStreaming => "already_running",
+            CliError::AlreadyStreaming | CliError::Lock(LockError::Held { .. }) => {
+                "already_running"
+            }
             CliError::ReadToken(_)
             | CliError::Session(_)
             | CliError::Stopped(_)
             | CliError::NoTerminal
-            | CliError::Terminal(_) => "internal",
+            | CliError::Terminal(_)
+            | CliError::Lock(LockError::Io { .. }) => "internal",
         };
         Self::new(code, e.to_string())
     }
@@ -242,6 +246,8 @@ struct Daemon {
     last_stats: Mutex<Option<StreamStats>>,
     running: Mutex<Option<Running>>,
     portal: Mutex<Option<PortalBook>>,
+    /// Stored or released only after checking the session state while holding it.
+    session_lock: Mutex<Option<SessionLock>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -289,6 +295,7 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
         last_stats: Mutex::new(None),
         running: Mutex::new(None),
         portal: Mutex::new(None),
+        session_lock: Mutex::new(None),
     });
     let mut signals = Signals::new();
     let mut tasks = JoinSet::new();
@@ -448,7 +455,10 @@ impl Daemon {
                 Ok(event) => {
                     match &event {
                         SessionEvent::Health(h) => *lock(&self.last_stats) = Some(h.stats.clone()),
-                        SessionEvent::State { .. } => self.remember_portal_token(),
+                        SessionEvent::State { .. } => {
+                            self.remember_portal_token();
+                            self.release_if_stopped();
+                        }
                         _ => {}
                     }
                     self.write(&Message::Event { event: &event });
@@ -456,6 +466,16 @@ impl Daemon {
                 Err(RecvError::Lagged(n)) => tracing::warn!(skipped = n, "session events lagged"),
                 Err(RecvError::Closed) => break,
             }
+        }
+    }
+
+    fn release_if_stopped(&self) {
+        let mut held = lock(&self.session_lock);
+        if self
+            .current()
+            .is_none_or(|c| stream::has_stopped(&c.session))
+        {
+            held.take();
         }
     }
 
@@ -521,6 +541,11 @@ impl Daemon {
         let restore_token = capture::restore_token(&config);
         let picked = capture::source_for(&p.target, restore_token.clone())?;
         let capture = stream::capture_config(&p.target, &settings, p.crop);
+        let held = lock(&self.session_lock).take();
+        let session_lock = match held {
+            Some(held) => held,
+            None => SessionLock::acquire(&self.ctx.paths).map_err(CliError::from)?,
+        };
         stream::start(
             &conn.session,
             p.guild_id,
@@ -529,6 +554,12 @@ impl Daemon {
             capture,
         )
         .await?;
+        {
+            let mut held = lock(&self.session_lock);
+            if !stream::has_stopped(&conn.session) {
+                *held = Some(session_lock);
+            }
+        }
         *lock(&self.last_stats) = None;
         *lock(&self.portal) = Some(PortalBook::new(restore_token, picked.portal_token));
         *lock(&self.running) = Some(Running {
@@ -600,6 +631,7 @@ impl Daemon {
             }
         }
         *lock(&self.running) = None;
+        lock(&self.session_lock).take();
         self.remember_portal_token();
     }
 }

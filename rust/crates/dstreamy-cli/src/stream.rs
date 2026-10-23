@@ -13,6 +13,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 
 use crate::discord::{self, Persistence};
+use crate::lock::SessionLock;
 use crate::output::Out;
 use crate::signals::Signals;
 use crate::{CliError, Ctx, capture};
@@ -138,6 +139,7 @@ pub async fn run_with(
         out.warn(warning);
     }
     let capture = args.capture_config(&stream, args.crop.or(config.crop));
+    let _lock = SessionLock::acquire(&ctx.paths)?;
     let restore_token = capture::restore_token(&config);
     let capture::Picked {
         source,
@@ -220,6 +222,7 @@ pub async fn run_with(
     }
 }
 
+/// Returns once the run has left the previous state, so a `Stopped` seen afterwards is this run's.
 pub async fn start(
     session: &Session,
     guild: String,
@@ -228,13 +231,21 @@ pub async fn start(
     capture: CaptureConfig,
 ) -> Result<(), CliError> {
     let options = SessionOptions::new(StreamOptions::new(capture));
+    let mut state = session.state();
+    state.borrow_and_update();
     session
         .start(Some(guild), channel, source, options)
         .await
         .map_err(|e| match e.error {
             SessionError::AlreadyRunning => CliError::AlreadyStreaming,
             error => CliError::Session(error.to_string()),
-        })
+        })?;
+    let _ = state.changed().await;
+    Ok(())
+}
+
+pub fn has_stopped(session: &Session) -> bool {
+    matches!(*session.state().borrow(), SessionState::Stopped { .. })
 }
 
 pub async fn teardown(session: Session, client: Arc<DiscordClient>) {
