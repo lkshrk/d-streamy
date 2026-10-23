@@ -33,11 +33,15 @@ dstreamy-capture-linux = { path = "../dstreamy-capture-linux" }
 
 [dev-dependencies]
 assert_cmd = "2"
+dstreamy-cli = { path = ".", features = ["test-hooks"] }
 dstreamy-mock-discord = { path = "../dstreamy-mock-discord" }
 insta = "1"
 serde_json = "1"
 tempfile.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[features]
+test-hooks = []
 
 [lints]
 workspace = true

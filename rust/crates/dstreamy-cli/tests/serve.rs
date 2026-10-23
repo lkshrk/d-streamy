@@ -68,26 +68,19 @@ impl Harness {
     }
 
     fn spawn_serve(&self, extra: &[&str]) -> Service {
-        let mut child = self
-            .cmd()
-            .args(["serve", "--skip-platform", "--test-hooks", "--endpoint"])
-            .arg(self.endpoint())
-            .args(extra)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stderr = child.stderr.take().unwrap();
-        let stderr = std::thread::spawn(move || {
-            let mut text = String::new();
-            let _ = stderr.read_to_string(&mut text);
-            text
-        });
-        Service {
-            child,
-            stderr: Some(stderr),
-        }
+        Service::spawn(
+            self.cmd()
+                .args([
+                    "-v",
+                    "serve",
+                    "--skip-platform",
+                    "--test-hooks",
+                    "--endpoint",
+                ])
+                .arg(self.endpoint())
+                .args(extra)
+                .stdout(Stdio::null()),
+        )
     }
 
     fn serve(&self, extra: &[&str]) -> Service {
@@ -109,6 +102,23 @@ impl Harness {
         let hello = c.request(&hello("control", 2));
         assert_eq!(hello["type"], "result", "{hello}");
         (c, hello)
+    }
+
+    /// Waits until the service holds exactly `n` connections, counting the one that asks.
+    fn wait_for_connections(&self, n: u64) {
+        let (mut probe, _) = self.control();
+        let deadline = Instant::now() + T;
+        loop {
+            let live = probe.request(&json!({"id": "n", "cmd": "test_connections"}));
+            if live["data"]["live"] == n + 1 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "connections never reached {n}: {live}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn voice_left(&self) -> bool {
@@ -146,6 +156,24 @@ struct Service {
 }
 
 impl Service {
+    fn spawn(cmd: &mut std::process::Command) -> Self {
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        });
+        Self {
+            child,
+            stderr: Some(stderr),
+        }
+    }
+
     fn finish(mut self) -> (ExitStatus, String) {
         let deadline = Instant::now() + T;
         let status = loop {
@@ -183,6 +211,12 @@ struct Client {
     seen: Vec<Value>,
     taken: Vec<bool>,
     closed: bool,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 impl Client {
@@ -277,6 +311,18 @@ impl Client {
         self.seen.clone()
     }
 
+    /// Whatever arrives within `window`, without waiting for anything in particular.
+    fn settle(&mut self, window: Duration) {
+        let deadline = Instant::now() + window;
+        while let Ok(Some(line)) = self
+            .lines
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            self.seen.push(serde_json::from_str(&line).unwrap());
+            self.taken.push(false);
+        }
+    }
+
     fn is_closed_within(&mut self, limit: Duration) -> bool {
         let deadline = Instant::now() + limit;
         while !self.closed {
@@ -337,9 +383,16 @@ fn hello_negotiates_the_protocol_and_rejects_bad_roles() {
     assert_eq!(data["platform"], std::env::consts::OS);
     assert!(data["connection"].is_u64(), "{reply}");
     assert_eq!(
-        data["session"],
+        data["status"],
         json!({"session": null, "source": null, "stats": null, "started_by": null})
     );
+    assert!(data.get("session").is_none(), "{reply}");
+
+    let mut v1 = h.client();
+    let reply = v1.request(&hello("control", 1));
+    assert_eq!(reply["data"]["protocol"], 2, "{reply}");
+    let status = v1.request(&json!({"id": "st", "cmd": "status"}));
+    assert_eq!(status["type"], "result", "{status}");
 
     let mut c = h.client();
     let reply = c.request(&hello("control", 3));
@@ -384,13 +437,17 @@ fn two_controls_share_one_session_and_a_disconnect_keeps_it() {
     assert_eq!(started["type"], "result", "{started}");
     b.state("streaming");
     b.until("health event", |m| m["event"]["event"] == "health");
+    a.settle(Duration::from_millis(1500));
     assert!(
         a.seen.iter().all(|m| m["type"] != "event"),
-        "A got events without subscribing"
+        "A got events without subscribing: {:?}",
+        a.seen
     );
+    b.settle(Duration::from_millis(200));
     assert!(b.seen.iter().all(|m| m["id"] != "start"), "B got A's reply");
 
     drop(a);
+    h.wait_for_connections(1);
     let before = stream_video(&h.mock.recorded());
     assert!(h.stream_video(before + 15), "the stream stopped with A");
     b.until("health after A left", |m| m["event"]["event"] == "health");
@@ -557,7 +614,11 @@ fn update_on_an_external_session_is_invalid_params() {
         json!({"state": "detached"}),
         "{status}"
     );
-    a.until("source event", |m| m["event"]["event"] == "source");
+    let source = a.until("source event", |m| m["event"]["event"] == "source");
+    assert_eq!(
+        source,
+        json!({"type": "event", "event": {"event": "source", "state": "detached"}})
+    );
 
     let update = json!({"id": "u", "cmd": "update", "fps": 30});
     let reply = a.request(&update);
@@ -592,6 +653,24 @@ fn a_stall_shorter_than_the_first_frames_wait_is_refused() {
     shutdown_and_exit(&h, s);
 }
 
+fn stream_args() -> Vec<&'static str> {
+    vec![
+        "stream",
+        "--guild",
+        MOCK_GUILD_ID,
+        "--channel",
+        MOCK_VOICE_CHANNEL_ID,
+        "--target",
+        "test-pattern",
+        "--res",
+        "320x180",
+        "--fps",
+        "15",
+        "--bitrate",
+        "1000",
+    ]
+}
+
 #[test]
 fn serve_holds_the_session_lock_against_stream_and_the_reverse() {
     let h = Harness::new().logged_in();
@@ -601,21 +680,9 @@ fn serve_holds_the_session_lock_against_stream_and_the_reverse() {
     a.request(&json!({"id": "sub", "cmd": "subscribe"}));
     assert_eq!(a.request(&start("test-pattern"))["type"], "result");
     a.state("streaming");
-    let out = h
-        .cmd()
-        .args([
-            "stream",
-            "--guild",
-            MOCK_GUILD_ID,
-            "--channel",
-            MOCK_VOICE_CHANNEL_ID,
-            "--target",
-            "test-pattern",
-        ])
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let refused = Service::spawn(h.cmd().args(stream_args()).stdout(Stdio::null()));
+    let (status, stderr) = refused.finish();
+    assert!(!status.success(), "{status}");
     assert!(
         stderr.contains(&format!("another dstreamy session is live (pid {pid})")),
         "{stderr}"
@@ -625,33 +692,19 @@ fn serve_holds_the_session_lock_against_stream_and_the_reverse() {
         "result"
     );
 
-    let mut stream = h
-        .cmd()
-        .args([
-            "stream",
-            "--guild",
-            MOCK_GUILD_ID,
-            "--channel",
-            MOCK_VOICE_CHANNEL_ID,
-            "--target",
-            "test-pattern",
-            "--res",
-            "320x180",
-            "--fps",
-            "15",
-            "--bitrate",
-            "1000",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut lines = BufReader::new(stream.stdout.take().unwrap()).lines();
-    assert!(
-        lines
-            .by_ref()
+    let mut stream = Service::spawn(h.cmd().args(stream_args()).stdout(Stdio::piped()));
+    let (tx, streaming) = mpsc::channel();
+    let stdout = stream.child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let seen = BufReader::new(stdout)
+            .lines()
             .map_while(Result::ok)
-            .any(|l| l == "state: streaming"),
+            .any(|l| l == "state: streaming");
+        let _ = tx.send(seen);
+    });
+    assert_eq!(
+        streaming.recv_timeout(T),
+        Ok(true),
         "the stream never streamed"
     );
     let reply = a.request(&json!({"id": "again", "cmd": "start",
@@ -659,11 +712,217 @@ fn serve_holds_the_session_lock_against_stream_and_the_reverse() {
     assert_eq!(reply["code"], "already_running", "{reply}");
     assert_eq!(
         reply["message"],
-        format!("another dstreamy session is live (pid {})", stream.id())
+        format!(
+            "another dstreamy session is live (pid {})",
+            stream.child.id()
+        )
     );
-    let _ = stream.kill();
-    let _ = stream.wait();
+    drop(stream);
     shutdown_and_exit(&h, s);
+}
+
+#[test]
+fn a_client_that_floods_requests_without_reading_is_bounded() {
+    let h = Harness::new();
+    let s = h.serve(&[]);
+    let mut flood = UnixStream::connect(h.endpoint()).unwrap();
+    writeln!(flood, "{}", hello("control", 2)).unwrap();
+    flood
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let line = format!("{}\n", json!({"id": "s", "cmd": "status"}));
+    let mut written = 0usize;
+    let blocked = loop {
+        match flood.write_all(line.as_bytes()) {
+            Ok(()) => written += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break true,
+            Err(e) => panic!("{e}"),
+        }
+        if written > 2_000_000 {
+            break false;
+        }
+    };
+    assert!(
+        blocked,
+        "the service kept reading {written} requests nobody read the replies of"
+    );
+    let rss = rss_kib(s.child.id());
+    assert!(rss < 200 * 1024, "service RSS {rss} KiB");
+
+    let (mut other, _) = h.control();
+    let reply = other.request(&json!({"id": "l", "cmd": "logged_in"}));
+    assert_eq!(reply["type"], "result", "{reply}");
+    drop(flood);
+    shutdown_and_exit(&h, s);
+}
+
+fn rss_kib(pid: u32) -> u64 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+#[test]
+fn a_connection_that_never_says_hello_is_closed() {
+    let h = Harness::new();
+    let s = h.serve(&[]);
+    let mut silent = h.client();
+    let opened = Instant::now();
+    assert!(
+        silent.is_closed_within(T),
+        "the silent connection stayed open"
+    );
+    let waited = opened.elapsed();
+    assert!(waited >= Duration::from_secs(9), "closed after {waited:?}");
+    assert!(silent.seen.is_empty(), "{:?}", silent.seen);
+    shutdown_and_exit(&h, s);
+}
+
+#[test]
+fn connections_over_the_cap_are_refused_with_busy() {
+    let h = Harness::new();
+    let s = h.serve(&[]);
+    let mut held: Vec<Client> = (0..64).map(|_| h.client()).collect();
+    for c in &mut held[..63] {
+        assert_eq!(c.request(&hello("control", 2))["type"], "result");
+    }
+    let mut extra = h.client();
+    let reply = extra.reply(None);
+    assert_eq!(reply["code"], "busy", "{reply}");
+    assert!(extra.is_closed_within(T));
+    let last = held.last_mut().unwrap();
+    assert_eq!(last.request(&hello("control", 2))["type"], "result");
+    held.truncate(1);
+    h.wait_for_connections(1);
+    shutdown_and_exit(&h, s);
+}
+
+#[test]
+fn status_forgets_who_started_a_session_once_it_stops() {
+    let h = Harness::new().logged_in();
+    let s = h.serve(&[]);
+    let (mut a, hello_a) = h.control();
+    a.request(&json!({"id": "sub", "cmd": "subscribe"}));
+    assert_eq!(a.request(&start("external"))["type"], "result");
+    a.state("streaming");
+    let status = a.request(&json!({"id": "st1", "cmd": "status"}));
+    assert_eq!(status["data"]["started_by"], hello_a["data"]["connection"]);
+    assert!(
+        h.mock
+            .voice_state_from_other_session(MOCK_GUILD_ID, Some(MOCK_VOICE_CHANNEL_ID))
+    );
+    a.state("stopped");
+    let status = a.request(&json!({"id": "st2", "cmd": "status"}));
+    assert_eq!(status["data"]["started_by"], Value::Null, "{status}");
+    assert_eq!(status["data"]["source"], Value::Null, "{status}");
+
+    assert_eq!(a.request(&start("test-pattern"))["type"], "result");
+    a.state("streaming");
+    assert_eq!(
+        a.request(&json!({"id": "stop", "cmd": "stop"}))["type"],
+        "result"
+    );
+    let status = a.request(&json!({"id": "st3", "cmd": "status"}));
+    assert_eq!(status["data"]["started_by"], Value::Null, "{status}");
+    shutdown_and_exit(&h, s);
+}
+
+#[test]
+fn shutdown_waits_for_commands_still_holding_the_connection() {
+    let h = Harness::new().logged_in();
+    let s = h.serve(&[]);
+    let (mut a, _) = h.control();
+    a.request(&json!({"id": "sub", "cmd": "subscribe"}));
+    assert_eq!(a.request(&start("test-pattern"))["type"], "result");
+    a.state("streaming");
+    a.send(&json!({"id": "hold", "cmd": "test_hold", "ms": 1500}));
+    a.until("hold event", |m| m["event"]["message"] == "test hold true");
+    let (mut b, _) = h.control();
+    assert_eq!(
+        b.request(&json!({"id": "bye", "cmd": "shutdown"}))["type"],
+        "result"
+    );
+    let (status, stderr) = s.finish();
+    assert!(status.success(), "{status}: {stderr}");
+    assert!(
+        !stderr.contains("still in use"),
+        "shutdown ran while a command held the connection: {stderr}"
+    );
+    assert!(h.voice_left());
+}
+
+#[test]
+fn shutdown_waits_for_commands_of_clients_that_already_left() {
+    let h = Harness::new().logged_in();
+    let s = h.serve(&[]);
+    let (mut a, _) = h.control();
+    a.request(&json!({"id": "sub", "cmd": "subscribe"}));
+    assert_eq!(a.request(&start("test-pattern"))["type"], "result");
+    a.state("streaming");
+    a.send(&json!({"id": "hold", "cmd": "test_hold", "ms": 1500}));
+    a.until("hold event", |m| m["event"]["message"] == "test hold true");
+    drop(a);
+    h.wait_for_connections(0);
+    let (mut b, _) = h.control();
+    assert_eq!(
+        b.request(&json!({"id": "bye", "cmd": "shutdown"}))["type"],
+        "result"
+    );
+    let (status, stderr) = s.finish();
+    assert!(status.success(), "{status}: {stderr}");
+    assert!(
+        !stderr.contains("still in use"),
+        "shutdown ran while a departed client's command held the connection: {stderr}"
+    );
+    assert!(h.voice_left());
+}
+
+#[test]
+fn a_second_shutdown_during_shutdown_also_succeeds() {
+    let h = Harness::new().logged_in();
+    let s = h.serve(&[]);
+    let (mut a, _) = h.control();
+    let (mut b, _) = h.control();
+    a.request(&json!({"id": "sub", "cmd": "subscribe"}));
+    assert_eq!(a.request(&start("test-pattern"))["type"], "result");
+    a.state("streaming");
+    a.send(&json!({"id": "bye-a", "cmd": "shutdown"}));
+    a.state("stopped");
+    let reply = b.request(&json!({"id": "bye-b", "cmd": "shutdown"}));
+    assert_eq!(reply["type"], "result", "{reply}");
+    assert_eq!(a.reply(Some("bye-a"))["type"], "result");
+    let (status, stderr) = s.finish();
+    assert!(status.success(), "{status}: {stderr}");
+}
+
+#[test]
+fn the_endpoint_stays_bound_until_the_session_is_torn_down_and_is_removed_after() {
+    let h = Harness::new().logged_in();
+    let s = h.serve(&[]);
+    let (mut a, _) = h.control();
+    a.request(&json!({"id": "sub", "cmd": "subscribe"}));
+    assert_eq!(a.request(&start("test-pattern"))["type"], "result");
+    a.state("streaming");
+    a.send(&json!({"id": "bye", "cmd": "shutdown"}));
+    let lock_free =
+        || dstreamy_cli::lock::SessionLock::acquire(&ConfigPaths::in_dir(h.dir.path())).is_ok();
+    let deadline = Instant::now() + T;
+    while h.endpoint().exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the socket file was never removed"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        lock_free(),
+        "the endpoint was given up while the session still held the lock"
+    );
+    let (status, stderr) = s.finish();
+    assert!(status.success(), "{status}: {stderr}");
+    assert!(h.voice_left());
 }
 
 /// One scenario per fixture pair, as the daemon fixtures: replies in request order, then kept events.
@@ -687,9 +946,9 @@ mod golden {
     fn zero(value: &mut Value) {
         let Value::Object(fields) = value else { return };
         for (key, v) in fields.iter_mut() {
-            if key.ends_with("_level") {
+            if key.ends_with("_level") && v.is_string() {
                 *v = json!("good");
-            } else if key.ends_with("_series") {
+            } else if key.ends_with("_series") && v.is_array() {
                 *v = json!([]);
             } else if key == "last_error" {
                 *v = Value::Null;
@@ -740,7 +999,7 @@ mod golden {
                     data["version"] = json!("<version>");
                     data["platform"] = json!("<platform>");
                     data["connection"] = json!("<connection>");
-                    status(&mut data["session"]);
+                    status(&mut data["status"]);
                 } else if data.get("started_by").is_some() {
                     status(data);
                 } else if data.get("video_frames_sent").is_some() {

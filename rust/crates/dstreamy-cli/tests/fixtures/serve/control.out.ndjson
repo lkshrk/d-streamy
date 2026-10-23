@@ -1,4 +1,4 @@
-{"data":{"connection":"<connection>","platform":"<platform>","protocol":2,"session":{"session":null,"source":null,"started_by":null,"stats":null},"version":"<version>"},"id":"1","type":"result"}
+{"data":{"connection":"<connection>","platform":"<platform>","protocol":2,"status":{"session":null,"source":null,"started_by":null,"stats":null},"version":"<version>"},"id":"1","type":"result"}
 {"data":{"session":null,"source":null,"started_by":null,"stats":null},"id":"2","type":"result"}
 {"data":{"logged_in":false},"id":"3","type":"result"}
 {"code":"not_logged_in","id":"4","message":"not logged in; send set_token first","type":"error"}
@@ -20,7 +20,7 @@
 {"code":"malformed","id":null,"message":"malformed line: line is not JSON: expected ident at line 1 column 2","type":"error"}
 {"code":"unknown_cmd","id":"21","message":"unknown command \"bogus\"","type":"error"}
 {"code":"malformed","id":null,"message":"malformed line: missing string field \"id\"","type":"error"}
-{"data":{"connection":"<connection>","platform":"<platform>","protocol":2,"session":{"session":{"reason":{"reason":"requested"},"state":"stopped"},"source":null,"started_by":"<connection>","stats":null},"version":"<version>"},"id":"23","type":"result"}
+{"data":{"connection":"<connection>","platform":"<platform>","protocol":2,"status":{"session":{"reason":{"reason":"requested"},"state":"stopped"},"source":null,"started_by":null,"stats":null},"version":"<version>"},"id":"23","type":"result"}
 {"data":null,"id":"24","type":"result"}
 {"event":{"event":"state","state":{"state":"connecting"}},"type":"event"}
 {"event":{"event":"state","state":{"state":"streaming"}},"type":"event"}

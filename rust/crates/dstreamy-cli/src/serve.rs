@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use dstreamy_core::Config;
+#[cfg(any(test, feature = "test-hooks"))]
 use dstreamy_discord::SessionEvent;
 use dstreamy_ipc::{ControlCodec, Endpoint, Listener, Stream};
 use futures_util::{SinkExt, StreamExt};
@@ -14,7 +15,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::codec::{Encoder, FramedRead, FramedWrite};
@@ -31,13 +32,18 @@ pub const PROTOCOL: u64 = 2;
 const LAG_FLUSH: Duration = Duration::from_secs(10);
 const CLOSE_FLUSH: Duration = Duration::from_secs(2);
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+pub const MAX_CONNECTIONS: usize = 64;
+/// Queued messages plus running commands per connection; reading pauses at this.
+pub const MAX_IN_FLIGHT: usize = 64;
+pub const DEFAULT_EVENT_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct Options {
     pub endpoint: Option<PathBuf>,
     pub include_platform: bool,
     pub event_capacity: usize,
-    /// Enables the hidden `test_events` command.
+    /// Enables the hidden test commands; only honoured with the `test-hooks` feature.
     pub test_hooks: bool,
 }
 
@@ -47,6 +53,8 @@ enum Phase {
     Stopping,
     Closed,
 }
+
+type TaskSet = JoinSet<()>;
 
 pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliError> {
     let config = Config::load(&ctx.paths.config_file)?;
@@ -67,44 +75,80 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
     );
     let (phase_tx, phase) = watch::channel(Phase::Running);
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
+    let (orphans_tx, mut orphans_rx) = mpsc::unbounded_channel::<TaskSet>();
+    let (drained_tx, mut drained_rx) = mpsc::channel::<()>(1);
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let mut orphans: Vec<TaskSet> = Vec::new();
     let mut signals = Signals::new();
     let mut connections = JoinSet::new();
     let mut next_id = 0u64;
     let caller = loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
-                    next_id += 1;
-                    let conn = Connection {
-                        id: next_id,
-                        engine: engine.clone(),
-                        phase: phase.clone(),
-                        shutdown: shutdown_tx.clone(),
-                        capacity: opts.event_capacity,
-                        test_hooks: opts.test_hooks,
-                    };
-                    connections.spawn(conn.run(stream));
-                }
+                Ok((stream, _)) => match slots.clone().try_acquire_owned() {
+                    Ok(slot) => {
+                        next_id += 1;
+                        let conn = Connection {
+                            id: next_id,
+                            engine: engine.clone(),
+                            phase: phase.clone(),
+                            shutdown: shutdown_tx.clone(),
+                            orphans: orphans_tx.clone(),
+                            drained: Some(drained_tx.clone()),
+                            capacity: opts.event_capacity,
+                            test_hooks: opts.test_hooks,
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            slots: slots.clone(),
+                            _slot: slot,
+                        };
+                        connections.spawn(conn.run(stream));
+                    }
+                    Err(_) => {
+                        connections.spawn(refuse(stream));
+                    }
+                },
                 Err(e) => {
                     tracing::warn!("accepting a connection: {e}");
                     tokio::time::sleep(ACCEPT_RETRY).await;
                 }
             },
+            Some(set) = orphans_rx.recv() => {
+                orphans.push(set);
+                orphans.retain_mut(|set| {
+                    while set.try_join_next().is_some() {}
+                    !set.is_empty()
+                });
+            }
             Some(done) = shutdown_rx.recv() => break Some(done),
             () = signals.recv() => break None,
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     };
-    drop(listener);
     phase_tx.send_replace(Phase::Stopping);
+    drop(drained_tx);
+    let stopped = async {
+        while drained_rx.recv().await.is_some() {}
+        while let Ok(set) = orphans_rx.try_recv() {
+            orphans.push(set);
+        }
+        for set in &mut orphans {
+            set.abort_all();
+            while set.join_next().await.is_some() {}
+        }
+        engine.shutdown().await;
+    };
     let forced = tokio::select! {
         biased;
         () = signals.recv() => true,
-        () = engine.shutdown() => false,
+        () = stopped => false,
     };
     if forced {
         return Ok(ExitCode::from(FORCED_EXIT));
     }
+    if let Err(e) = std::fs::remove_file(endpoint.as_path()) {
+        tracing::warn!("removing {endpoint}: {e}");
+    }
+    drop(listener);
     if let Some(done) = caller {
         let _ = done.send(());
     }
@@ -116,6 +160,17 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
         tracing::debug!("connections still open at exit");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Answers a connection over the cap with `busy` and closes it.
+async fn refuse(stream: Stream) {
+    let mut writer = FramedWrite::new(stream, ControlCodec::new());
+    let busy = Message::Error {
+        id: None,
+        code: "busy",
+        message: format!("too many connections (at most {MAX_CONNECTIONS})"),
+    };
+    let _ = timeout(CLOSE_FLUSH, writer.send(&busy)).await;
 }
 
 #[derive(Serialize)]
@@ -170,7 +225,7 @@ fn hello_data(engine: &Engine, connection: u64) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
         "connection": connection,
-        "session": engine.status(),
+        "status": engine.status(),
     })
 }
 
@@ -221,8 +276,15 @@ struct Connection {
     engine: Arc<Engine>,
     phase: watch::Receiver<Phase>,
     shutdown: mpsc::UnboundedSender<oneshot::Sender<()>>,
+    /// Commands still running when the client left; the service aborts and awaits them before its engine shuts down.
+    orphans: mpsc::UnboundedSender<TaskSet>,
+    /// Dropped once this connection's commands are finished or aborted and awaited.
+    drained: Option<mpsc::Sender<()>>,
     capacity: usize,
     test_hooks: bool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    slots: Arc<Semaphore>,
+    _slot: OwnedSemaphorePermit,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -257,10 +319,10 @@ impl Connection {
         let mut reader = FramedRead::new(read, ControlCodec::new());
         let mut writer = FramedWrite::new(write, ControlCodec::new());
         let first = tokio::select! {
-            first = reader.next() => first,
+            first = timeout(HELLO_TIMEOUT, reader.next()) => first,
             _ = self.phase.wait_for(|p| *p != Phase::Running) => return,
         };
-        let Some(Ok(first)) = first else { return };
+        let Ok(Some(Ok(first))) = first else { return };
         let hello = first
             .map_err(|e| malformed(None, &e.to_string()))
             .and_then(|value| handshake(&value));
@@ -292,6 +354,7 @@ impl Connection {
         let mut reading = true;
         let mut stopping = *self.phase.borrow() != Phase::Running;
         let mut shutdown: Option<(String, oneshot::Receiver<()>)> = None;
+        let mut late_shutdowns: Vec<String> = Vec::new();
         let end = loop {
             if writer.write_buffer().is_empty()
                 && let Some(message) = pending.pop_front()
@@ -305,6 +368,7 @@ impl Connection {
             if !reading
                 && tasks.is_empty()
                 && shutdown.is_none()
+                && late_shutdowns.is_empty()
                 && pending.is_empty()
                 && !unflushed
             {
@@ -320,10 +384,15 @@ impl Connection {
                     if !stopping {
                         stopping = true;
                         tasks.abort_all();
+                        while tasks.join_next().await.is_some() {}
+                        while let Ok((id, result)) = replies.try_recv() {
+                            pending.push_back(Message::reply(Some(id), result));
+                        }
                         for (_, id) in lock(&unanswered).drain() {
                             let failure = Failure::new("internal", "service shutting down");
                             pending.push_back(Message::reply(Some(id), Err(failure)));
                         }
+                        self.drained = None;
                     }
                 }
                 flushed = SinkExt::<&Message>::flush(&mut writer), if unflushed => {
@@ -351,7 +420,7 @@ impl Connection {
                         pending.push_back(Message::reply(Some(id), Ok(Value::Null)));
                     }
                 }
-                line = reader.next(), if reading => match line {
+                line = reader.next(), if reading && pending.len() + tasks.len() < MAX_IN_FLIGHT => match line {
                     None | Some(Err(_)) => reading = false,
                     Some(Ok(Err(e))) => {
                         let (id, failure) = malformed(None, &e.to_string());
@@ -361,6 +430,7 @@ impl Connection {
                         let request = Request::parse(value, self.test_hooks);
                         match request {
                             Err((id, failure)) => pending.push_back(Message::reply(id, Err(failure))),
+                            Ok((id, Request::Shutdown)) if stopping => late_shutdowns.push(id),
                             Ok((id, _)) if stopping => {
                                 let failure = Failure::new("internal", "service shutting down");
                                 pending.push_back(Message::reply(Some(id), Err(failure)));
@@ -384,7 +454,13 @@ impl Connection {
                                     pending.push_back(Message::reply(Some(earlier), Ok(Value::Null)));
                                 }
                             }
-                            Ok((id, Request::TestEvents(spec))) => {
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            Ok((id, Request::Test(hooks::Hook::TestConnections))) => {
+                                let live = MAX_CONNECTIONS - self.slots.available_permits();
+                                pending.push_back(Message::reply(Some(id), Ok(json!({ "live": live }))));
+                            }
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            Ok((id, Request::Test(hook))) => {
                                 let key = next_key;
                                 next_key += 1;
                                 lock(&unanswered).insert(key, id);
@@ -392,7 +468,7 @@ impl Connection {
                                 let replies = replies_tx.clone();
                                 let unanswered = unanswered.clone();
                                 tasks.spawn(async move {
-                                    spec.emit(&engine).await;
+                                    hook.run(&engine).await;
                                     if let Some(id) = lock(&unanswered).remove(&key) {
                                         let _ = replies.send((id, Ok(Value::Null)));
                                     }
@@ -419,9 +495,13 @@ impl Connection {
             }
         };
         match end {
-            End::Eof | End::Gone => tasks.detach_all(),
+            End::Eof | End::Gone => {
+                let _ = self.orphans.send(tasks);
+                self.drained = None;
+            }
             End::Lagged => {
-                tasks.detach_all();
+                let _ = self.orphans.send(tasks);
+                self.drained = None;
                 let failure = Failure::new("lagged", "events were not read in time; disconnecting");
                 queue(&mut writer, Message::reply(None, Err(failure)));
                 flush_within(&mut writer, LAG_FLUSH).await;
@@ -441,6 +521,9 @@ impl Connection {
                     pending.push_back(Message::reply(Some(id), Err(failure)));
                 }
                 if let Some((id, _)) = shutdown.take() {
+                    pending.push_back(Message::reply(Some(id), Ok(Value::Null)));
+                }
+                for id in late_shutdowns {
                     pending.push_back(Message::reply(Some(id), Ok(Value::Null)));
                 }
                 for message in pending {
@@ -475,7 +558,8 @@ enum Request {
     Status,
     Subscribe,
     Shutdown,
-    TestEvents(TestEvents),
+    #[cfg(any(test, feature = "test-hooks"))]
+    Test(hooks::Hook),
     Engine(engine::Command),
 }
 
@@ -483,18 +567,22 @@ impl Request {
     fn parse(value: Value, test_hooks: bool) -> Result<(String, Self), (Option<String>, Failure)> {
         let mut known: Vec<&str> = COMMANDS.to_vec();
         known.extend(["status", "subscribe"]);
+        #[cfg(any(test, feature = "test-hooks"))]
         if test_hooks {
-            known.push("test_events");
+            known.extend(hooks::COMMANDS);
         }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = test_hooks;
         let (id, cmd) = id_and_cmd(&value, &known)?;
         let request = match cmd.as_str() {
             "hello" => Self::Hello,
             "status" => Self::Status,
             "subscribe" => Self::Subscribe,
             "shutdown" => Self::Shutdown,
-            "test_events" => match serde_json::from_value(value) {
-                Ok(spec) => Self::TestEvents(spec),
-                Err(e) => return Err((Some(id), engine::invalid_params(e))),
+            #[cfg(any(test, feature = "test-hooks"))]
+            cmd if hooks::COMMANDS.contains(&cmd) => match hooks::Hook::parse(value) {
+                Ok(hook) => Self::Test(hook),
+                Err(failure) => return Err((Some(id), failure)),
             },
             _ => {
                 let (id, command) = engine_command(id, value)?;
@@ -505,25 +593,78 @@ impl Request {
     }
 }
 
-/// `count` non-fatal error events of about `bytes` each, `interval_ms` apart.
-#[derive(serde::Deserialize)]
-struct TestEvents {
-    count: u32,
-    #[serde(default)]
-    bytes: usize,
-    #[serde(default)]
-    interval_ms: u64,
-}
+#[cfg(any(test, feature = "test-hooks"))]
+mod hooks {
+    use super::*;
 
-impl TestEvents {
-    async fn emit(&self, engine: &Engine) {
-        let padding = "x".repeat(self.bytes);
-        for n in 0..self.count {
-            engine.inject_for_tests(SessionEvent::Error {
-                message: format!("test event {n} {padding}"),
-                fatal: false,
-            });
-            tokio::time::sleep(Duration::from_millis(self.interval_ms)).await;
+    pub const COMMANDS: [&str; 3] = ["test_events", "test_hold", "test_connections"];
+    const MAX_COUNT: u32 = 10_000;
+    const MAX_BYTES: usize = 64 * 1024;
+    const MAX_HOLD_MS: u64 = 10_000;
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "cmd", rename_all = "snake_case")]
+    #[allow(clippy::enum_variant_names)]
+    pub enum Hook {
+        /// `count` non-fatal error events of about `bytes` each, `interval_ms` apart.
+        TestEvents {
+            count: u32,
+            #[serde(default)]
+            bytes: usize,
+            #[serde(default)]
+            interval_ms: u64,
+        },
+        /// Holds the Discord connection until aborted, after an event saying so; releasing it takes `ms`.
+        TestHold { ms: u64 },
+        /// Replies `{"live": n}`, the connections holding a slot.
+        TestConnections,
+    }
+
+    impl Hook {
+        pub fn parse(value: Value) -> Result<Self, Failure> {
+            let hook: Self = serde_json::from_value(value).map_err(engine::invalid_params)?;
+            match &hook {
+                Self::TestEvents { count, bytes, .. }
+                    if *count > MAX_COUNT || *bytes > MAX_BYTES =>
+                {
+                    Err(engine::invalid_params(format!(
+                        "at most {MAX_COUNT} events of {MAX_BYTES} bytes"
+                    )))
+                }
+                Self::TestHold { ms } if *ms > MAX_HOLD_MS => {
+                    Err(engine::invalid_params(format!("at most {MAX_HOLD_MS} ms")))
+                }
+                _ => Ok(hook),
+            }
+        }
+
+        pub async fn run(self, engine: &Engine) {
+            match self {
+                Self::TestEvents {
+                    count,
+                    bytes,
+                    interval_ms,
+                } => {
+                    let padding = "x".repeat(bytes);
+                    for n in 0..count {
+                        engine.inject_for_tests(SessionEvent::Error {
+                            message: format!("test event {n} {padding}"),
+                            fatal: false,
+                        });
+                        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                    }
+                }
+                Self::TestHold { ms } => {
+                    let held = engine.hold_connection_for_tests(Duration::from_millis(ms));
+                    engine.inject_for_tests(SessionEvent::Error {
+                        message: format!("test hold {}", held.is_some()),
+                        fatal: false,
+                    });
+                    std::future::pending::<()>().await;
+                    drop(held);
+                }
+                Self::TestConnections => {}
+            }
         }
     }
 }
@@ -603,8 +744,31 @@ mod tests {
         ));
         assert!(matches!(
             Request::parse(line, true),
-            Ok((_, Request::TestEvents(_)))
+            Ok((_, Request::Test(_)))
         ));
+    }
+
+    #[test]
+    fn test_hooks_are_bounded() {
+        for line in [
+            json!({"id": "t", "cmd": "test_events", "count": 1, "bytes": usize::MAX}),
+            json!({"id": "t", "cmd": "test_events", "count": u32::MAX}),
+            json!({"id": "t", "cmd": "test_hold", "ms": u64::MAX}),
+        ] {
+            assert!(
+                matches!(
+                    Request::parse(line.clone(), true),
+                    Err((
+                        Some(_),
+                        Failure {
+                            code: "invalid_params",
+                            ..
+                        }
+                    ))
+                ),
+                "{line}"
+            );
+        }
     }
 
     #[test]

@@ -85,10 +85,13 @@ enum Command {
         /// Socket path; defaults to a private per-user directory
         #[arg(long, value_name = "PATH")]
         endpoint: Option<PathBuf>,
+        #[cfg(feature = "test-hooks")]
         #[arg(long, hide = true)]
         skip_platform: bool,
+        #[cfg(feature = "test-hooks")]
         #[arg(long, hide = true, default_value_t = 256, value_parser = clap::value_parser!(u64).range(1..=65_536))]
         event_capacity: u64,
+        #[cfg(feature = "test-hooks")]
         #[arg(long, hide = true)]
         test_hooks: bool,
     },
@@ -219,6 +222,7 @@ async fn run(
             };
             daemon::run(ctx, out, opts).await
         }
+        #[cfg(feature = "test-hooks")]
         Command::Serve {
             endpoint,
             skip_platform,
@@ -230,6 +234,16 @@ async fn run(
                 include_platform: !skip_platform,
                 event_capacity: usize::try_from(event_capacity).unwrap_or(usize::MAX),
                 test_hooks,
+            };
+            serve::run(ctx, out, opts).await
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        Command::Serve { endpoint } => {
+            let opts = serve::Options {
+                endpoint,
+                include_platform: true,
+                event_capacity: serve::DEFAULT_EVENT_CAPACITY,
+                test_hooks: false,
             };
             serve::run(ctx, out, opts).await
         }
