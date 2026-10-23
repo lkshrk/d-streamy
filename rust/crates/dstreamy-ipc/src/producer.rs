@@ -1,5 +1,4 @@
-//! Binary media frames from a producer: `u32 BE len | u8 kind | i64 BE pts_us | u8 flags | payload`
-//! (ADR 0004). `len` counts everything after itself.
+//! Producer frames per ADR 0004: `u32 BE len | u8 kind | i64 BE pts_us | u8 flags | payload`.
 
 use std::io;
 
@@ -11,6 +10,8 @@ pub const HEADER_LEN: u32 = 1 + 8 + 1;
 pub const FLAG_KEYFRAME: u8 = 1;
 
 const LEN_PREFIX: usize = 4;
+/// Most a header may make the decoder reserve before the payload bytes arrive.
+pub const MAX_RESERVE: usize = 64 << 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -68,8 +69,6 @@ pub enum ProducerError {
     UnknownKind(u8),
     #[error("reserved flag bits set: {0:#04x}")]
     ReservedFlags(u8),
-    #[error("keyframe flag on a non-video frame")]
-    KeyframeNotVideo,
     #[error("end-of-stream frame carries {0} payload bytes")]
     EndOfStreamPayload(usize),
     #[error("stream ended inside a frame")]
@@ -90,9 +89,6 @@ impl ProducerCodec {
 fn check(kind: Kind, flags: u8, payload_len: usize) -> Result<(), ProducerError> {
     if flags & !FLAG_KEYFRAME != 0 {
         return Err(ProducerError::ReservedFlags(flags & !FLAG_KEYFRAME));
-    }
-    if flags & FLAG_KEYFRAME != 0 && kind != Kind::Video {
-        return Err(ProducerError::KeyframeNotVideo);
     }
     if kind == Kind::EndOfStream && payload_len != 0 {
         return Err(ProducerError::EndOfStreamPayload(payload_len));
@@ -120,7 +116,7 @@ impl Decoder for ProducerCodec {
         }
         let total = LEN_PREFIX + len as usize;
         if src.len() < total {
-            src.reserve(total - src.len());
+            src.reserve((total - src.len()).min(MAX_RESERVE));
             return Ok(None);
         }
         src.advance(LEN_PREFIX);
@@ -133,7 +129,7 @@ impl Decoder for ProducerCodec {
         Ok(Some(Frame {
             kind,
             pts_us,
-            keyframe: flags & FLAG_KEYFRAME != 0,
+            keyframe: kind == Kind::Video && flags & FLAG_KEYFRAME != 0,
             payload,
         }))
     }
@@ -163,7 +159,11 @@ impl Encoder<&Frame> for ProducerCodec {
         if len > MAX_FRAME_LEN.into() {
             return Err(ProducerError::Oversized(len));
         }
-        let flags = if frame.keyframe { FLAG_KEYFRAME } else { 0 };
+        let flags = if frame.keyframe && frame.kind == Kind::Video {
+            FLAG_KEYFRAME
+        } else {
+            0
+        };
         check(frame.kind, flags, frame.payload.len())?;
         dst.reserve(frame.encoded_len());
         dst.put_u32(len as u32);
@@ -234,14 +234,29 @@ mod tests {
         ));
     }
 
+    // OBS ffmpeg_opus marks every packet a keyframe (obs-ffmpeg-audio-encoders.c:394 @ 32.2.2).
     #[test]
-    fn keyframe_flag_is_video_only() {
-        let mut buf = header(HEADER_LEN + 3, 2, 0, FLAG_KEYFRAME);
+    fn keyframe_flag_is_ignored_on_non_video() {
+        let mut buf = header(HEADER_LEN + 3, 2, 960, FLAG_KEYFRAME);
         buf.put_slice(&[0xF8, 0xFF, 0xFE]);
-        assert!(matches!(
-            ProducerCodec.decode(&mut buf),
-            Err(ProducerError::KeyframeNotVideo)
-        ));
+        let frame = ProducerCodec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(frame.kind, Kind::Opus);
+        assert!(!frame.keyframe);
+        let mut buf = header(HEADER_LEN, 3, 0, FLAG_KEYFRAME);
+        assert!(!ProducerCodec.decode(&mut buf).unwrap().unwrap().keyframe);
+    }
+
+    #[test]
+    fn a_header_alone_reserves_at_most_the_cap() {
+        let mut buf = BytesMut::new();
+        buf.put_u32(MAX_FRAME_LEN);
+        buf.put_u8(1);
+        assert!(ProducerCodec.decode(&mut buf).unwrap().is_none());
+        assert!(
+            buf.capacity() <= LEN_PREFIX + 1 + MAX_RESERVE,
+            "{}",
+            buf.capacity()
+        );
     }
 
     #[test]

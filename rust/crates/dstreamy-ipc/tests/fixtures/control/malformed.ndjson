@@ -1,5 +1,9 @@
 not json
 ÿş{}
 {"id":
+
 [1,2]
+
+   
+{"id":"crlf","cmd":"status"}
 {"id":"after","cmd":"status"}

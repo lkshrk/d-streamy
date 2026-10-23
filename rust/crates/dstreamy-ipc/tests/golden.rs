@@ -1,4 +1,4 @@
-//! Golden fixtures shared with the C plugin. `DSTREAMY_BLESS=1` rewrites the producer fixtures.
+//! Golden fixtures shared with the C plugin; `DSTREAMY_BLESS=1` rewrites the generated ones.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -69,26 +69,29 @@ fn producer_reverse_channel_events() {
 #[test]
 fn malformed_lines_do_not_stop_decoding() {
     let lines = control("malformed.ndjson");
-    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert_eq!(lines.len(), 6, "{lines:?}");
     assert!(matches!(lines[0], Err(Malformed::NotJson(_))));
     assert_eq!(lines[1], Err(Malformed::NotUtf8));
     assert!(matches!(lines[2], Err(Malformed::NotJson(_))));
     assert_eq!(lines[3], Ok(json!([1, 2])));
-    assert_eq!(lines[4], Ok(json!({"id": "after", "cmd": "status"})));
+    assert_eq!(lines[4], Ok(json!({"id": "crlf", "cmd": "status"})));
+    assert_eq!(lines[5], Ok(json!({"id": "after", "cmd": "status"})));
+}
+
+fn encode_lines(values: &[Value]) -> Vec<u8> {
+    let mut buf = BytesMut::new();
+    for value in values {
+        ControlCodec::new().encode(value, &mut buf).unwrap();
+    }
+    buf.to_vec()
 }
 
 #[test]
-fn every_control_fixture_round_trips_through_the_encoder() {
-    for entry in fs::read_dir(fixtures().join("control")).unwrap() {
-        let path = entry.unwrap().path();
-        for value in decode_lines(&fs::read(&path).unwrap())
-            .into_iter()
-            .flatten()
-        {
-            let mut buf = BytesMut::new();
-            ControlCodec::new().encode(&value, &mut buf).unwrap();
-            assert_eq!(decode_lines(&buf), [Ok(value)], "{}", path.display());
-        }
+fn canonical_control_fixtures_match_the_encoder() {
+    for name in ["hello.ndjson", "producer_events.ndjson"] {
+        let path = fixtures().join("control").join(name);
+        let values: Vec<Value> = control(name).into_iter().map(Result::unwrap).collect();
+        write_or_check(&path, &encode_lines(&values));
     }
 }
 
@@ -133,6 +136,15 @@ fn valid_streams() -> Vec<(&'static str, Vec<Frame>)> {
                 },
                 Frame::end_of_stream(33_333),
             ],
+        ),
+        (
+            "opus_keyframe_flag_ignored",
+            vec![Frame {
+                kind: Kind::Opus,
+                pts_us: 20_000,
+                keyframe: false,
+                payload: payload(&silence),
+            }],
         ),
         (
             "pts_extremes",
@@ -212,6 +224,9 @@ fn pretty(value: &Value) -> Vec<u8> {
 fn producer_fixtures_match_the_encoder() {
     let dir = fixtures().join("producer");
     for (name, frames) in valid_streams() {
+        if name == "opus_keyframe_flag_ignored" {
+            continue;
+        }
         let mut bin = BytesMut::new();
         for frame in &frames {
             ProducerCodec.encode(frame, &mut bin).unwrap();
@@ -222,6 +237,21 @@ fn producer_fixtures_match_the_encoder() {
             &pretty(&describe(&frames)),
         );
     }
+}
+
+#[test]
+fn opus_keyframe_flag_fixture_is_hand_built() {
+    let bin = fs::read(fixtures().join("producer/opus_keyframe_flag_ignored.bin")).unwrap();
+    assert_eq!(bin[13], 1, "the fixture no longer sets flag bit 0 on audio");
+    let (_, frames) = valid_streams()
+        .into_iter()
+        .find(|(n, _)| *n == "opus_keyframe_flag_ignored")
+        .unwrap();
+    let json = fs::read(fixtures().join("producer/opus_keyframe_flag_ignored.json")).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&json).unwrap(),
+        describe(&frames)
+    );
 }
 
 #[test]
@@ -275,7 +305,6 @@ fn error_name(err: &ProducerError) -> &'static str {
         ProducerError::TooShort(_) => "too_short",
         ProducerError::UnknownKind(_) => "unknown_kind",
         ProducerError::ReservedFlags(_) => "reserved_flags",
-        ProducerError::KeyframeNotVideo => "keyframe_not_video",
         ProducerError::EndOfStreamPayload(_) => "end_of_stream_payload",
         ProducerError::Truncated => "truncated",
         ProducerError::Io(_) => "io",
