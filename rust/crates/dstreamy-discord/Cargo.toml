@@ -24,6 +24,8 @@ webpki-roots = "0.26"
 
 [dev-dependencies]
 async-trait = "0.1"
+openh264 = "0.9"
+unsafe-libopus = "0.2"
 dstreamy-mock-discord = { path = "../dstreamy-mock-discord" }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 

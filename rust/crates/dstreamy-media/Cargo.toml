@@ -9,11 +9,13 @@ async-trait = "0.1"
 dstreamy-core = { path = "../dstreamy-core" }
 openh264 = "0.9"
 thiserror = "2"
-tokio = { version = "1", features = ["sync", "rt"] }
+tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
+tracing = "0.1"
 unsafe-libopus = "0.2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
+proptest = "1"
+tokio = { version = "1", features = ["sync", "rt", "macros", "rt-multi-thread", "time", "test-util"] }
 
 [lints]
 workspace = true
