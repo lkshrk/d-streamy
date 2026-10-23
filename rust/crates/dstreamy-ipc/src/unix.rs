@@ -516,16 +516,28 @@ mod tests {
         assert!(matches!(err, IpcError::UnverifiedServer { .. }), "{err}");
     }
 
-    #[test]
-    fn symlink_planted_in_tmp_is_not_trusted_even_when_it_points_home() {
+    fn link_home_from(dir: &Path) -> (PathBuf, Result<(), String>) {
         let home = passwd_home(own_principal()).unwrap();
-        let link = std::env::temp_dir().join(format!("dstreamy-link-{}", std::process::id()));
+        let link = dir.join(format!("dstreamy-link-{}", std::process::id()));
         let _ = fs::remove_file(&link);
         std::os::unix::fs::symlink(&home, &link).unwrap();
-        let err = check_base(&link, own_principal());
+        let result = check_base(&link, own_principal());
         fs::remove_file(&link).unwrap();
-        let err = err.unwrap_err();
+        (link, result)
+    }
+
+    #[test]
+    fn symlink_planted_in_shared_tmp_is_not_trusted_even_when_it_points_home() {
+        let (link, result) = link_home_from(Path::new("/tmp"));
+        let err = result.expect_err(&format!("{} was trusted", link.display()));
         assert!(err.contains("writable by other users"), "{err}");
+    }
+
+    #[test]
+    fn symlink_in_a_private_dir_pointing_home_is_trusted() {
+        let private = trusted_tempdir();
+        let (link, result) = link_home_from(private.path());
+        result.unwrap_or_else(|e| panic!("{}: {e}", link.display()));
     }
 
     #[test]
