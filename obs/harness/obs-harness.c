@@ -221,6 +221,7 @@ struct trace_recorder {
 	FILE *packets;
 	char *dir;
 	pthread_mutex_t stop_mutex;
+	pthread_mutex_t write_mutex;
 	pthread_t stop_thread;
 	bool stop_thread_joinable;
 	bool video_extra_written;
@@ -277,6 +278,7 @@ static void *trace_create(obs_data_t *settings, obs_output_t *output)
 	rec->dir = bstrdup(obs_data_get_string(settings, "path"));
 	rec->video_limit = (long)obs_data_get_int(settings, "video_packets");
 	pthread_mutex_init(&rec->stop_mutex, NULL);
+	pthread_mutex_init(&rec->write_mutex, NULL);
 	return rec;
 }
 
@@ -292,14 +294,18 @@ static void join_stop_thread(struct trace_recorder *rec)
 
 static bool close_packets(struct trace_recorder *rec)
 {
-	if (!rec->packets)
-		return true;
-	bool ok = fflush(rec->packets) == 0 && !ferror(rec->packets);
-	ok = fclose(rec->packets) == 0 && ok;
-	rec->packets = NULL;
+	pthread_mutex_lock(&rec->write_mutex);
+	rec->full = true;
+	bool ok = true;
+	if (rec->packets) {
+		ok = fflush(rec->packets) == 0 && !ferror(rec->packets);
+		ok = fclose(rec->packets) == 0 && ok;
+		rec->packets = NULL;
+	}
 	if (!ok)
 		rec->write_failed = true;
-	return ok;
+	pthread_mutex_unlock(&rec->write_mutex);
+	return ok && !rec->write_failed;
 }
 
 static void trace_destroy(void *data)
@@ -308,6 +314,7 @@ static void trace_destroy(void *data)
 	join_stop_thread(rec);
 	close_packets(rec);
 	pthread_mutex_destroy(&rec->stop_mutex);
+	pthread_mutex_destroy(&rec->write_mutex);
 	bfree(rec->dir);
 	bfree(rec);
 }
@@ -374,8 +381,11 @@ static void trace_packet(void *data, struct encoder_packet *pkt)
 		os_event_signal(full_event);
 		return;
 	}
-	if (rec->full)
+	pthread_mutex_lock(&rec->write_mutex);
+	if (rec->full || !rec->packets) {
+		pthread_mutex_unlock(&rec->write_mutex);
 		return;
+	}
 
 	bool video = pkt->type == OBS_ENCODER_VIDEO;
 	if (video && !rec->video_extra_written) {
@@ -403,12 +413,11 @@ static void trace_packet(void *data, struct encoder_packet *pkt)
 
 	if (!video) {
 		os_atomic_inc_long(&rec->audio_packets);
-		return;
-	}
-	if (os_atomic_inc_long(&rec->video_packets) >= rec->video_limit) {
+	} else if (os_atomic_inc_long(&rec->video_packets) >= rec->video_limit) {
 		rec->full = true;
 		os_event_signal(full_event);
 	}
+	pthread_mutex_unlock(&rec->write_mutex);
 }
 
 static struct obs_output_info trace_output_info = {
@@ -430,8 +439,9 @@ static void on_output_stop(void *param, calldata_t *cd)
 {
 	UNUSED_PARAMETER(param);
 	long long code = calldata_int(cd, "code");
-	if (code != OBS_OUTPUT_SUCCESS) {
+	if (code != OBS_OUTPUT_SUCCESS && stop_code == OBS_OUTPUT_SUCCESS)
 		stop_code = code;
+	if (code != OBS_OUTPUT_SUCCESS) {
 		const char *err = calldata_string(cd, "last_error");
 		harness_error("output stopped with code %lld: %s", code, err ? err : "(none)");
 	}
