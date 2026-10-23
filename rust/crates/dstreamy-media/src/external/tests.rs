@@ -258,7 +258,7 @@ struct Rig {
 
 impl Rig {
     fn new(idle: IdleMode) -> Self {
-        let source = ExternalSource::new(options(idle));
+        let source = ExternalSource::new(options(idle)).unwrap();
         let handle = source.handle();
         let epoch = Instant::now();
         Self {
@@ -808,7 +808,7 @@ async fn keyframe_requests_reach_the_attachment_or_are_latched_for_the_next() {
 
 #[tokio::test(start_paused = true)]
 async fn a_full_queue_stays_bounded_and_counts_every_loss_exactly() {
-    let mut source = ExternalSource::new(options(IdleMode::None));
+    let mut source = ExternalSource::new(options(IdleMode::None)).unwrap();
     let handle = source.handle();
     let mut rx = source.start(CaptureConfig::default()).await.unwrap();
     let a = handle.attach(info()).unwrap();
@@ -853,7 +853,7 @@ fn burst(a: &Attachment, from: i64, n: i64) -> u64 {
 
 #[tokio::test(start_paused = true)]
 async fn frames_cleared_by_stop_and_restart_are_counted() {
-    let mut source = ExternalSource::new(options(IdleMode::None));
+    let mut source = ExternalSource::new(options(IdleMode::None)).unwrap();
     let handle = source.handle();
     let mut rx = source.start(CaptureConfig::default()).await.unwrap();
     let a = handle.attach(info()).unwrap();
@@ -873,7 +873,7 @@ async fn frames_cleared_by_stop_and_restart_are_counted() {
 
 #[tokio::test(start_paused = true)]
 async fn frames_cleared_when_grace_expires_are_counted() {
-    let mut source = ExternalSource::new(options(IdleMode::Continuous));
+    let mut source = ExternalSource::new(options(IdleMode::Continuous)).unwrap();
     let handle = source.handle();
     let mut rx = source.start(CaptureConfig::default()).await.unwrap();
     let a = handle.attach(info()).unwrap();
@@ -895,7 +895,7 @@ async fn frames_cleared_when_grace_expires_are_counted() {
 
 #[tokio::test(start_paused = true)]
 async fn losses_are_charged_to_the_attachment_that_sent_the_frame() {
-    let mut source = ExternalSource::new(options(IdleMode::None));
+    let mut source = ExternalSource::new(options(IdleMode::None)).unwrap();
     let handle = source.handle();
     let mut rx = source.start(CaptureConfig::default()).await.unwrap();
     let first = handle.attach(info()).unwrap();
@@ -1045,7 +1045,7 @@ async fn a_track_with_no_history_continues_from_the_other_tracks_clock() {
 
 #[tokio::test(start_paused = true)]
 async fn held_frames_released_through_an_overflow_wait_for_a_keyframe() {
-    let mut source = ExternalSource::new(options(IdleMode::None));
+    let mut source = ExternalSource::new(options(IdleMode::None)).unwrap();
     let handle = source.handle();
     let mut rx = source.start(CaptureConfig::default()).await.unwrap();
     let first = handle.attach(info()).unwrap();
@@ -1123,6 +1123,57 @@ async fn a_changing_producer_skew_pushes_the_timeline_ahead_only_when_it_shrinks
         }
         assert_eq!(ahead, 100_000);
     }
+}
+
+#[test]
+fn a_stall_shorter_than_the_first_frames_wait_is_rejected() {
+    let short = ExternalOptions {
+        stall: FIRST_FRAMES_WAIT - MS,
+        ..options(IdleMode::None)
+    };
+    assert_eq!(
+        ExternalSource::new(short).err(),
+        Some(OptionsError::StallTooShort(FIRST_FRAMES_WAIT - MS))
+    );
+    let exact = ExternalOptions {
+        stall: FIRST_FRAMES_WAIT,
+        ..options(IdleMode::None)
+    };
+    assert!(ExternalSource::new(exact).is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_frames_are_dropped_and_counted_on_a_stall() {
+    let rig = Rig::started(IdleMode::None).await;
+    let a = rig.handle.attach(info()).unwrap();
+    a.send(video(0, true)).unwrap();
+    a.send(video(FRAME_US, false)).unwrap();
+    {
+        let mut state = rig.source.inner.lock();
+        let cur = state.current.as_mut().unwrap();
+        assert_eq!(cur.held.len(), 2);
+        cur.first_at = None;
+    }
+    sleep(STALL + MS).await;
+    assert!(matches!(
+        *rig.handle.state().borrow(),
+        SourceState::Interrupted {
+            reason: InterruptReason::Stalled,
+            ..
+        }
+    ));
+    assert!(
+        rig.source
+            .inner
+            .lock()
+            .current
+            .as_ref()
+            .unwrap()
+            .held
+            .is_empty()
+    );
+    assert_eq!(a.stats().dropped_video, 2);
+    assert!(rig.collector.frames().is_empty());
 }
 
 fn tracks(lost: &[Queued]) -> (usize, usize) {
@@ -1233,7 +1284,7 @@ async fn idle_output_over_one_second_matches_each_mode() {
 
 #[tokio::test(start_paused = true)]
 async fn lists_one_external_target() {
-    let source = ExternalSource::new(options(IdleMode::None));
+    let source = ExternalSource::new(options(IdleMode::None)).unwrap();
     let targets = source.list_targets().await.unwrap();
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].id, EXTERNAL_TARGET_ID);

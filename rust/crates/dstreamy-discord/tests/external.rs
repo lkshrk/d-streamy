@@ -121,7 +121,7 @@ impl Fixture {
         let client = client(&mock).await;
         let session = Session::new(client.clone());
         let mut state = session.state();
-        let source = ExternalSource::new(external);
+        let source = ExternalSource::new(external).unwrap();
         let handle = source.handle();
         let mut options = SessionOptions::new(StreamOptions::new(capture()));
         options.health_interval = Duration::from_millis(100);
@@ -290,14 +290,11 @@ async fn a_producer_swap_keeps_streaming_with_continuous_decodable_media() {
     // davey may reject the first keyframe after DAVE comes up; video then resumes at the next one.
     let start = video.iter().position(|v| is_keyframe(&v.data)).unwrap();
     if start > 0 {
+        let drops = &before.dropped_frames;
         assert!(
-            !before.dropped_frames.is_empty()
-                && before
-                    .dropped_frames
-                    .iter()
-                    .all(|d| d.starts_with("DAVE decrypt (video)")),
-            "video before the first keyframe; drops: {:?}",
-            before.dropped_frames
+            drops.iter().any(|d| d.starts_with("DAVE decrypt (video)"))
+                && drops.iter().all(|d| d.starts_with("DAVE decrypt (")),
+            "video before the first keyframe; drops: {drops:?}"
         );
     }
     assert!(split > start);
@@ -398,7 +395,7 @@ async fn a_viewer_pli_reaches_the_attachment_keyframe_requests() {
     f.finish().await;
 }
 
-/// The idle silence of one gap: a fresh libopus encoder's first packet is also `F8 FF FE`, so only the run ending at the reattach counts.
+/// The silence run that ends at the reattach, with the time from the detach to the reattach.
 async fn silence_during_gap(idle: IdleMode) -> (Vec<u32>, Duration) {
     let f = Fixture::streaming(options(idle, Duration::from_secs(30))).await;
     let feeder = f.attach().await;

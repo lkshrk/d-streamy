@@ -26,7 +26,7 @@ const SILENCE_SPACING: Duration = Duration::from_micros(OPUS_FRAME_DURATION_US);
 /// One RTP tick rounded up, as in the pump's `Timebase`: 90 kHz video, 48 kHz audio.
 const TICK_US: [i64; 2] = [12, 21];
 /// A producer that sends only one track still starts within this.
-const FIRST_FRAMES_WAIT: Duration = Duration::from_millis(500);
+pub const FIRST_FRAMES_WAIT: Duration = Duration::from_millis(500);
 const VIDEO: usize = 0;
 const AUDIO: usize = 1;
 const CHANNEL_CAPACITY: usize = 1;
@@ -109,6 +109,12 @@ impl From<MediaFrame> for ProducerFrame {
             },
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OptionsError {
+    #[error("stall {0:?} is shorter than the {FIRST_FRAMES_WAIT:?} first-frames wait")]
+    StallTooShort(Duration),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -436,6 +442,7 @@ impl State {
             let last = cur.active_at.max(first_start);
             if now >= last + inner.options.stall {
                 cur.stalled = true;
+                cur.drop_held();
                 warn!(attachment = cur.id, "producer stalled");
                 inner.set_status(SourceState::Interrupted {
                     since: last,
@@ -651,7 +658,11 @@ pub struct ExternalSource {
 }
 
 impl ExternalSource {
-    pub fn new(options: ExternalOptions) -> Self {
+    /// Fails when `stall` is shorter than `FIRST_FRAMES_WAIT`, so a stall never falls while first frames are held.
+    pub fn new(options: ExternalOptions) -> Result<Self, OptionsError> {
+        if options.stall < FIRST_FRAMES_WAIT {
+            return Err(OptionsError::StallTooShort(options.stall));
+        }
         let (status_tx, status) = watch::channel(SourceState::Detached);
         let (producer_tx, producer) = watch::channel(None);
         let inner = Arc::new(Inner {
@@ -661,12 +672,12 @@ impl ExternalSource {
             status: status_tx,
             producer: producer_tx,
         });
-        Self {
+        Ok(Self {
             inner,
             status,
             producer,
             task: None,
-        }
+        })
     }
 
     pub fn handle(&self) -> ExternalHandle {

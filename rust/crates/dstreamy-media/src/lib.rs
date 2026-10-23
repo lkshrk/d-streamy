@@ -15,8 +15,9 @@ pub use encoder::{AudioEncoder, I420Frame, VideoEncoder};
 pub use error::MediaError;
 pub use external::{
     AttachError, Attachment, AttachmentStats, CloseReason, DOCUMENTED_SILENCE_FRAMES,
-    EXTERNAL_TARGET_ID, ExternalHandle, ExternalOptions, ExternalSource, IdleMode, InterruptReason,
-    OPUS_SILENCE_FRAME, ProducerFrame, ProducerInfo, SendError, SourceState,
+    EXTERNAL_TARGET_ID, ExternalHandle, ExternalOptions, ExternalSource, FIRST_FRAMES_WAIT,
+    IdleMode, InterruptReason, OPUS_SILENCE_FRAME, OptionsError, ProducerFrame, ProducerInfo,
+    SendError, SourceState,
 };
 pub use frame::{
     AudioFrame, EncodedVideoFrame, MediaFrame, OPUS_CHANNELS, OPUS_FRAME_DURATION_US,
