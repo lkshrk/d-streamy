@@ -3,7 +3,7 @@ use std::fs::{self, DirBuilder, File, OpenOptions, Permissions, TryLockError};
 use std::io::{self, ErrorKind};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use tokio::net::{UnixListener, UnixStream};
 
@@ -57,26 +57,30 @@ pub(crate) fn default_location() -> Result<PathBuf, IpcError> {
 pub(crate) fn resolve_location(
     runtime_dir: Option<&OsStr>,
     home: Option<&Path>,
-    trust: impl Fn(&Path) -> Result<(), String>,
+    trust: impl Fn(&Path) -> Result<PathBuf, String>,
 ) -> Result<PathBuf, IpcError> {
     let in_dir = |dir: &Path| dir.join(DIR_NAME).join(SOCKET_NAME);
     let runtime = runtime_dir
         .map(Path::new)
         .filter(|dir| dir.is_absolute())
-        .filter(|dir| fits_sun_path(&in_dir(dir)))
-        .filter(|dir| trust(dir).is_ok());
-    if let Some(dir) = runtime {
-        return Ok(in_dir(dir));
+        .and_then(|dir| trust(dir).ok())
+        .map(|dir| in_dir(&dir))
+        .filter(|path| fits_sun_path(path));
+    if let Some(path) = runtime {
+        return Ok(path);
     }
     let home = home
         .filter(|home| home.is_absolute())
         .ok_or(IpcError::NoHomeDirectory)?;
     let base = home.join(HOME_FALLBACK);
-    let path = in_dir(&base);
+    let resolved = trust(&base).map_err(|reason| IpcError::InsecureDirectory {
+        path: base.clone(),
+        reason,
+    })?;
+    let path = in_dir(&resolved);
     if !fits_sun_path(&path) {
         return Err(IpcError::PathTooLong(path));
     }
-    trust(&base).map_err(|reason| IpcError::InsecureDirectory { path: base, reason })?;
     Ok(path)
 }
 
@@ -114,12 +118,15 @@ fn passwd_home(uid: u32) -> Option<PathBuf> {
     }
 }
 
-/// Trusted when every existing component, symlink targets included, is ours or root's and writable by no one else.
-pub(crate) fn check_base(base: &Path, uid: u32) -> Result<(), String> {
+/// Checks every existing component (ours or root's, writable by no one else) and returns the resolved path to use.
+pub(crate) fn check_base(base: &Path, uid: u32) -> Result<PathBuf, String> {
+    if base.components().any(|c| c == Component::ParentDir) {
+        return Err(format!("{} contains ..", base.display()));
+    }
     check_components(base, uid, 0)
 }
 
-fn check_components(path: &Path, uid: u32, depth: u32) -> Result<(), String> {
+fn check_components(path: &Path, uid: u32, depth: u32) -> Result<PathBuf, String> {
     if depth > 8 {
         return Err(format!("{}: too many symbolic links", path.display()));
     }
@@ -127,8 +134,9 @@ fn check_components(path: &Path, uid: u32, depth: u32) -> Result<(), String> {
         return Err(format!("{} is not absolute", path.display()));
     }
     let mut current = PathBuf::new();
-    for part in path.components() {
-        if part == std::path::Component::ParentDir {
+    let mut parts = path.components();
+    while let Some(part) = parts.next() {
+        if part == Component::ParentDir {
             if !current.pop() || current.as_os_str().is_empty() {
                 return Err(format!("{} climbs above /", path.display()));
             }
@@ -137,7 +145,18 @@ fn check_components(path: &Path, uid: u32, depth: u32) -> Result<(), String> {
         current.push(part);
         let meta = match fs::symlink_metadata(&current) {
             Ok(meta) => meta,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                for rest in parts {
+                    if rest == Component::ParentDir {
+                        return Err(format!(
+                            "{} has .. after a missing component",
+                            path.display()
+                        ));
+                    }
+                    current.push(rest);
+                }
+                return Ok(current);
+            }
             Err(e) => return Err(format!("{}: {e}", current.display())),
         };
         if meta.uid() != uid && meta.uid() != 0 {
@@ -151,9 +170,10 @@ fn check_components(path: &Path, uid: u32, depth: u32) -> Result<(), String> {
             let target =
                 fs::read_link(&current).map_err(|e| format!("{}: {e}", current.display()))?;
             let target = current.parent().unwrap_or(Path::new("/")).join(target);
-            check_components(&target, uid, depth + 1)?;
-            current =
-                fs::canonicalize(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+            current = check_components(&target, uid, depth + 1)?;
+            if !current.is_dir() {
+                return Err(format!("{} does not lead to a directory", target.display()));
+            }
             continue;
         }
         if !meta.is_dir() {
@@ -163,7 +183,7 @@ fn check_components(path: &Path, uid: u32, depth: u32) -> Result<(), String> {
             return Err(format!("{} is writable by other users", current.display()));
         }
     }
-    Ok(())
+    Ok(current)
 }
 
 fn fits_sun_path(path: &Path) -> bool {
@@ -371,7 +391,10 @@ mod tests {
     }
 
     fn resolve(runtime: Option<&str>) -> PathBuf {
-        resolve_location(runtime.map(OsStr::new), Some(Path::new(HOME)), |_| Ok(())).unwrap()
+        resolve_location(runtime.map(OsStr::new), Some(Path::new(HOME)), |b| {
+            Ok(b.to_owned())
+        })
+        .unwrap()
     }
 
     fn trusted_tempdir() -> tempfile::TempDir {
@@ -420,15 +443,16 @@ mod tests {
     #[test]
     fn over_long_home_is_path_too_long() {
         let home = PathBuf::from(format!("/home/{}", "h".repeat(MAX_PATH_LEN)));
-        let err = resolve_location(None, Some(&home), |_| Ok(())).unwrap_err();
+        let err = resolve_location(None, Some(&home), |b| Ok(b.to_owned())).unwrap_err();
         assert!(matches!(err, IpcError::PathTooLong(p) if p.starts_with(&home)));
     }
 
     #[test]
     fn no_home_and_no_runtime_dir_is_an_error() {
-        let err = resolve_location(None, None, |_| Ok(())).unwrap_err();
+        let err = resolve_location(None, None, |b| Ok(b.to_owned())).unwrap_err();
         assert!(matches!(err, IpcError::NoHomeDirectory), "{err}");
-        let err = resolve_location(None, Some(Path::new("relative")), |_| Ok(())).unwrap_err();
+        let err =
+            resolve_location(None, Some(Path::new("relative")), |b| Ok(b.to_owned())).unwrap_err();
         assert!(matches!(err, IpcError::NoHomeDirectory), "{err}");
     }
 
@@ -476,7 +500,7 @@ mod tests {
             if b == runtime.path() {
                 check_base(b, uid.wrapping_add(1))
             } else {
-                Ok(())
+                Ok(b.to_owned())
             }
         })
         .unwrap();
@@ -583,8 +607,58 @@ mod tests {
         std::os::unix::fs::symlink("shared/../safe", &link).unwrap();
         let err = check_base(&link, own_principal()).unwrap_err();
         assert!(err.contains("writable by other users"), "{err}");
-        let err = check_base(Path::new("/../../tmp/x"), own_principal()).unwrap_err();
+        let up = root.path().join("up");
+        std::os::unix::fs::symlink("/../../tmp/x", &up).unwrap();
+        let err = check_base(&up, own_principal()).unwrap_err();
         assert!(err.contains("climbs above /"), "{err}");
+    }
+
+    #[test]
+    fn dotdot_in_the_base_itself_is_refused() {
+        let home = passwd_home(own_principal()).unwrap();
+        let probe = home.join("no-such-dir-xyz/../../../tmp");
+        let err = check_base(&probe, own_principal()).unwrap_err();
+        assert!(err.contains("contains .."), "{err}");
+        let uid = own_principal();
+        let fallback = trusted_tempdir();
+        let path = resolve_location(Some(probe.as_os_str()), Some(fallback.path()), |b| {
+            check_base(b, uid)
+        })
+        .unwrap();
+        assert!(!path.starts_with("/tmp"), "{}", path.display());
+        assert!(
+            path.components().all(|c| c != Component::ParentDir),
+            "{}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn dotdot_after_a_missing_component_is_refused_inside_a_link() {
+        let root = trusted_tempdir();
+        let writable = root.path().join("writable");
+        DirBuilder::new().mode(0o777).create(&writable).unwrap();
+        fs::set_permissions(&writable, Permissions::from_mode(0o777)).unwrap();
+        let trusted = root.path().join("trusted");
+        fs::create_dir(&trusted).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink("trusted/missing/../../writable", &link).unwrap();
+        let err = check_base(&link, own_principal()).unwrap_err();
+        assert!(err.contains("after a missing component"), "{err}");
+        let err = check_base(&trusted.join("missing/../../writable"), own_principal()).unwrap_err();
+        assert!(err.contains("contains .."), "{err}");
+    }
+
+    #[test]
+    fn missing_private_dir_under_a_trusted_base_resolves_and_binds() {
+        let root = trusted_tempdir();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(root.path(), &link).unwrap();
+        let resolved = check_base(&link.join("not-yet/deeper"), own_principal()).unwrap();
+        assert_eq!(resolved, root.path().join("not-yet/deeper"));
+        let socket = resolved.join(DIR_NAME).join(SOCKET_NAME);
+        prepare_private_dir(socket_dir(&socket)).unwrap();
+        check_private_dir(socket_dir(&socket), own_principal()).unwrap();
     }
 
     #[test]
@@ -597,5 +671,26 @@ mod tests {
         fs::set_permissions(b.path(), Permissions::from_mode(0o777)).unwrap();
         let err = check_base(&link.join("sub"), own_principal()).unwrap_err();
         assert!(err.contains("writable by other users"), "{err}");
+    }
+
+    #[test]
+    fn resolved_runtime_dir_is_what_resolve_location_returns() {
+        let root = trusted_tempdir();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink("real", &link).unwrap();
+        let uid = own_principal();
+        let path = resolve_location(Some(link.as_os_str()), Some(Path::new("/home/u")), |b| {
+            check_base(b, uid)
+        })
+        .unwrap();
+        assert_eq!(path, real.join(DIR_NAME).join(SOCKET_NAME));
+        let home = trusted_tempdir();
+        let state = home.path().join(HOME_FALLBACK);
+        fs::create_dir_all(state.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &state).unwrap();
+        let path = resolve_location(None, Some(home.path()), |b| check_base(b, uid)).unwrap();
+        assert_eq!(path, real.join(DIR_NAME).join(SOCKET_NAME));
     }
 }

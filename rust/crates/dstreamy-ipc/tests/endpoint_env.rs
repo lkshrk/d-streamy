@@ -45,6 +45,11 @@ fn default_endpoint_uses_a_trusted_runtime_dir_or_the_passwd_home() {
         assert_eq!(default_path(), fallback, "{VAR}={untrusted}");
     }
 
+    let escape = passwd_home().join("no-such-dir-xyz/../../../tmp");
+    // SAFETY: as above.
+    unsafe { std::env::set_var(VAR, &escape) };
+    assert_eq!(default_path(), fallback, "{VAR}={}", escape.display());
+
     let long = format!("/var/folders/{}/T/", "q".repeat(100));
     // SAFETY: as above.
     unsafe { std::env::set_var(VAR, &long) };
