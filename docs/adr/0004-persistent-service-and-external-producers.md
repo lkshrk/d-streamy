@@ -100,6 +100,7 @@ Unix-only code already exists behind `cfg(unix)`: the 0600 token and config file
 ## Consequences
 
 - OBS can stream to Discord and to Twitch at the same time, and either can stop independently.
+- The directory trust check reads owner and mode bits only. On macOS, an ACL on a parent directory can grant another user write access without changing the mode; only the owner or root can set it, and `~/Library` carries a standard deny ACL, so refusing every ACL would break the home fallback. This is accepted.
 - Flatpak OBS can't reach the service's socket in its default sandbox, so the first release supports native OBS packages only; Flatpak needs a later decision on a sandbox-visible socket path or a documented override.
 - An OBS crash or restart within the grace period keeps the Discord stream; the viewer sees a short freeze, then picture from the next keyframe.
 - The default own-encoder mode costs a second video encode, and a hardware encoder may hit the driver's session limit. Share mode avoids that but works only while the main stream runs and constrains its encoder; a Twitch encoder error ends both streams.
