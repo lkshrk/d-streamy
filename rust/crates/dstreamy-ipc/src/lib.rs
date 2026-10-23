@@ -10,11 +10,6 @@ mod unix;
 #[cfg(unix)]
 use unix as sys;
 
-#[cfg(all(feature = "test-support", not(debug_assertions)))]
-compile_error!(
-    "the test-support feature opens the endpoint to every user and must not reach a release build"
-);
-
 #[cfg(not(unix))]
 compile_error!("dstreamy-ipc has no transport for this platform yet (named pipes: issue 15)");
 
@@ -39,6 +34,7 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    /// Uses `location` as given: the trusted-base check of [`Endpoint::default_for_user`] is skipped.
     pub fn new(location: impl Into<PathBuf>) -> Self {
         Self {
             location: location.into(),
@@ -94,21 +90,37 @@ pub struct Listener {
 
 impl Listener {
     pub async fn bind(endpoint: &Endpoint) -> Result<Self, IpcError> {
-        Self::bind_with(endpoint, sys::Access::Private).await
+        Self::bind_with(endpoint, sys::Access::Private, sys::own_principal()).await
     }
 
     /// Opens the endpoint to every user so tests can prove [`authorize`] alone refuses others.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub async fn bind_permissive_for_tests(endpoint: &Endpoint) -> Result<Self, IpcError> {
-        Self::bind_with(endpoint, sys::Access::EveryoneForTests).await
+        Self::bind_with(
+            endpoint,
+            sys::Access::EveryoneForTests,
+            sys::own_principal(),
+        )
+        .await
     }
 
-    async fn bind_with(endpoint: &Endpoint, access: sys::Access) -> Result<Self, IpcError> {
+    /// Binds normally but authorizes peers against `own` instead of this process's user.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn bind_as_for_tests(endpoint: &Endpoint, own: u32) -> Result<Self, IpcError> {
+        Self::bind_with(endpoint, sys::Access::Private, own).await
+    }
+
+    async fn bind_with(
+        endpoint: &Endpoint,
+        access: sys::Access,
+        own: sys::Principal,
+    ) -> Result<Self, IpcError> {
         Ok(Self {
             inner: sys::Listener::bind(endpoint.as_path(), access).await?,
             endpoint: endpoint.clone(),
-            own: sys::own_principal(),
+            own,
             rejected: AtomicU64::new(0),
         })
     }
@@ -140,7 +152,16 @@ impl Listener {
 
 pub async fn connect(endpoint: &Endpoint) -> Result<Stream, IpcError> {
     Ok(Stream {
-        inner: sys::connect(endpoint.as_path()).await?,
+        inner: sys::connect(endpoint.as_path(), sys::own_principal()).await?,
+    })
+}
+
+/// Connects normally but expects the server to run as `own` instead of this process's user.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub async fn connect_as_for_tests(endpoint: &Endpoint, own: u32) -> Result<Stream, IpcError> {
+    Ok(Stream {
+        inner: sys::connect(endpoint.as_path(), own).await?,
     })
 }
 

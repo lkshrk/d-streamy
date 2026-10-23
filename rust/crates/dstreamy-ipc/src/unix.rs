@@ -36,7 +36,7 @@ const HOME_FALLBACK: &str = ".local/state";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Access {
     Private,
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     EveryoneForTests,
 }
 
@@ -114,24 +114,50 @@ fn passwd_home(uid: u32) -> Option<PathBuf> {
     }
 }
 
-/// A base directory is trusted when it and every ancestor belong to us or root and no one else can write them.
+/// Trusted when every existing component, symlink targets included, is ours or root's and writable by no one else.
 pub(crate) fn check_base(base: &Path, uid: u32) -> Result<(), String> {
-    let existing = base
-        .ancestors()
-        .find(|dir| dir.exists())
-        .ok_or_else(|| format!("{} has no existing ancestor", base.display()))?;
-    let canonical =
-        fs::canonicalize(existing).map_err(|e| format!("{}: {e}", existing.display()))?;
-    for dir in canonical.ancestors() {
-        let meta = fs::metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        if !meta.is_dir() {
-            return Err(format!("{} is not a directory", dir.display()));
+    check_components(base, uid, 0)
+}
+
+fn check_components(path: &Path, uid: u32, depth: u32) -> Result<(), String> {
+    if depth > 8 {
+        return Err(format!("{}: too many symbolic links", path.display()));
+    }
+    if !path.is_absolute() {
+        return Err(format!("{} is not absolute", path.display()));
+    }
+    let mut current = PathBuf::new();
+    for part in path.components() {
+        if part == std::path::Component::ParentDir {
+            return Err(format!("{} contains ..", path.display()));
         }
+        current.push(part);
+        let meta = match fs::symlink_metadata(&current) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("{}: {e}", current.display())),
+        };
         if meta.uid() != uid && meta.uid() != 0 {
-            return Err(format!("{} is owned by uid {}", dir.display(), meta.uid()));
+            return Err(format!(
+                "{} is owned by uid {}",
+                current.display(),
+                meta.uid()
+            ));
+        }
+        if meta.file_type().is_symlink() {
+            let target =
+                fs::read_link(&current).map_err(|e| format!("{}: {e}", current.display()))?;
+            let target = current.parent().unwrap_or(Path::new("/")).join(target);
+            check_components(&target, uid, depth + 1)?;
+            current =
+                fs::canonicalize(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+            continue;
+        }
+        if !meta.is_dir() {
+            return Err(format!("{} is not a directory", current.display()));
         }
         if meta.mode() & 0o022 != 0 {
-            return Err(format!("{} is writable by other users", dir.display()));
+            return Err(format!("{} is writable by other users", current.display()));
         }
     }
     Ok(())
@@ -147,12 +173,30 @@ fn socket_dir(path: &Path) -> &Path {
         .unwrap_or(Path::new("."))
 }
 
+#[cfg(not(target_vendor = "apple"))]
 fn peer_of(stream: &UnixStream) -> io::Result<Peer> {
     let cred = stream.peer_cred()?;
     Ok(Peer::new(
         cred.uid(),
         cred.pid().and_then(|pid| u32::try_from(pid).ok()),
     ))
+}
+
+/// tokio asks `LOCAL_PEEREPID` first, which is ENOTCONN once the peer closed (XNU `uipc_usrreq.c:852-856`).
+#[cfg(target_vendor = "apple")]
+fn peer_of(stream: &UnixStream) -> io::Result<Peer> {
+    use std::os::fd::AsRawFd;
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: both out-pointers are valid; getpeereid reads the credentials cached at connect.
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let pid = stream
+        .peer_cred()
+        .ok()
+        .and_then(|cred| cred.pid())
+        .and_then(|pid| u32::try_from(pid).ok());
+    Ok(Peer::new(uid, pid))
 }
 
 pub(crate) struct Listener {
@@ -167,7 +211,7 @@ impl Listener {
         let dir = socket_dir(path);
         match access {
             Access::Private => prepare_private_dir(dir)?,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             Access::EveryoneForTests => {
                 fs::create_dir_all(dir)?;
                 fs::set_permissions(dir, Permissions::from_mode(0o711))?;
@@ -182,7 +226,7 @@ impl Listener {
             }
             Err(e) => return Err(e.into()),
         };
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         if access == Access::EveryoneForTests {
             fs::set_permissions(path, Permissions::from_mode(0o777))?;
         }
@@ -276,12 +320,11 @@ async fn remove_stale(path: &Path) -> Result<(), IpcError> {
     }
 }
 
-pub(crate) async fn connect(path: &Path) -> Result<Stream, IpcError> {
+pub(crate) async fn connect(path: &Path, own: Principal) -> Result<Stream, IpcError> {
     if !fits_sun_path(path) {
         return Err(IpcError::PathTooLong(path.to_owned()));
     }
-    let own = own_principal();
-    match check_private_dir(socket_dir(path), own) {
+    match check_private_dir(socket_dir(path), own_principal()) {
         Err(IpcError::Io(e)) if e.kind() == ErrorKind::NotFound => {
             return Err(IpcError::NotRunning(path.to_owned()));
         }
@@ -471,5 +514,29 @@ mod tests {
         let enotconn = io::Error::from_raw_os_error(libc::ENOTCONN);
         let err = verify_server(path, own, Err(enotconn)).unwrap_err();
         assert!(matches!(err, IpcError::UnverifiedServer { .. }), "{err}");
+    }
+
+    #[test]
+    fn symlink_planted_in_tmp_is_not_trusted_even_when_it_points_home() {
+        let home = passwd_home(own_principal()).unwrap();
+        let link = std::env::temp_dir().join(format!("dstreamy-link-{}", std::process::id()));
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        let err = check_base(&link, own_principal());
+        fs::remove_file(&link).unwrap();
+        let err = err.unwrap_err();
+        assert!(err.contains("writable by other users"), "{err}");
+    }
+
+    #[test]
+    fn own_symlink_into_a_trusted_dir_is_followed() {
+        let a = trusted_tempdir();
+        let b = trusted_tempdir();
+        let link = a.path().join("link");
+        std::os::unix::fs::symlink(b.path(), &link).unwrap();
+        check_base(&link, own_principal()).unwrap();
+        fs::set_permissions(b.path(), Permissions::from_mode(0o777)).unwrap();
+        let err = check_base(&link.join("sub"), own_principal()).unwrap_err();
+        assert!(err.contains("writable by other users"), "{err}");
     }
 }
