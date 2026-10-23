@@ -26,6 +26,7 @@
 #define AUDIO_CHUNK 480
 #define FLASH_PERIOD_NS 1000000000ULL
 #define BEEP_NS 20000000ULL
+#define AUDIO_BUFFERING_MS 200
 #define BEEP_HZ 1000.0
 #define TONE_HZ 440.0
 #define BEEP_AMPLITUDE 0.5f
@@ -688,9 +689,15 @@ int main(int argc, char **argv)
 	if (vres != OBS_VIDEO_SUCCESS)
 		FAIL("obs_reset_video(%s) returned %d", args.graphics, vres);
 
-	struct obs_audio_info oai = {.samples_per_sec = SAMPLE_RATE, .speakers = SPEAKERS_STEREO};
-	if (!obs_reset_audio(&oai))
-		FAIL("obs_reset_audio failed");
+	// Fixed headroom: with dynamic buffering a chunk delivered late on a loaded runner is mixed as silence.
+	struct obs_audio_info2 oai = {
+		.samples_per_sec = SAMPLE_RATE,
+		.speakers = SPEAKERS_STEREO,
+		.max_buffering_ms = AUDIO_BUFFERING_MS,
+		.fixed_buffering = true,
+	};
+	if (!obs_reset_audio2(&oai))
+		FAIL("obs_reset_audio2 failed");
 
 	if (args.plugin_bin)
 		obs_add_module_path(args.plugin_bin, args.plugin_data);

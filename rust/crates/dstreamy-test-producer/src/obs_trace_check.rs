@@ -144,6 +144,20 @@ fn check(dir: &Path, fps: i64, seconds: i64) -> Result<(), String> {
     if tone < 0.02 || off.iter().any(|&o| o > tone / 4.0) {
         return Err(format!("no clean 440 Hz tone (amplitude {tone:.4})"));
     }
+    // The first packets carry the encoder's priming, which decodes to a ramp-in.
+    let warmup = (2 * 480).min(pcm.len());
+    let warmup_end_us = start_us + sync::samples_to_us(warmup, SAMPLE_RATE);
+    let dropouts = sync::quiet_spans(&pcm[warmup..], warmup_end_us, &beeps, SAMPLE_RATE)
+        .iter()
+        .flat_map(|span| span.as_chunks::<480>().0)
+        .filter(|w| sync::goertzel_amplitude(&w[..], TONE_HZ, SAMPLE_RATE) < tone / 2.0)
+        .count();
+    println!("audio: {dropouts} 10 ms windows below half the tone level");
+    if dropouts > 0 {
+        return Err(format!(
+            "{dropouts} audio dropouts (10 ms windows) in the tone"
+        ));
+    }
 
     let frame_us = 1_000_000 / fps;
     let span = (
