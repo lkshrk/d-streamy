@@ -7,7 +7,10 @@ on:
       - "obs/**"
       - "rust/crates/dstreamy-test-producer/**"
       - "rust/crates/dstreamy-media/**"
+      - "rust/crates/dstreamy-core/**"
+      - "rust/Cargo.toml"
       - "rust/Cargo.lock"
+      - "rust/rust-toolchain.toml"
       - ".github/workflows/obs-ci.yml"
   pull_request:
     branches: [rust-rewrite]
@@ -15,7 +18,10 @@ on:
       - "obs/**"
       - "rust/crates/dstreamy-test-producer/**"
       - "rust/crates/dstreamy-media/**"
+      - "rust/crates/dstreamy-core/**"
+      - "rust/Cargo.toml"
       - "rust/Cargo.lock"
+      - "rust/rust-toolchain.toml"
       - ".github/workflows/obs-ci.yml"
   workflow_dispatch:
 

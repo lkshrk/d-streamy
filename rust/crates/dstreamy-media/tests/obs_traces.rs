@@ -312,7 +312,7 @@ fn aac_trace_is_not_opus() {
     assert_eq!(aac.len(), 1);
     let asc = &aac[0].audio_extra;
     assert!(!asc.starts_with(b"OpusHead"));
-    // ISO/IEC 14496-3 AudioSpecificConfig: 5-bit object type, 4-bit sampling index, 4-bit channel configuration.
+    // AudioSpecificConfig layout: docs/specs.md pin (FFmpeg libavcodec/mpeg4audio.c:77-101).
     assert!(asc.len() >= 2, "AudioSpecificConfig too short");
     assert_eq!(asc[0] >> 3, 2, "object type is not AAC LC");
     assert_eq!(
@@ -326,6 +326,15 @@ fn aac_trace_is_not_opus() {
         "channel configuration is not stereo"
     );
     assert_eq!(aac[0].meta["audio_frame_size"], 1024);
+    let audio: Vec<&Packet> = aac[0].audio().collect();
+    for (i, p) in audio.iter().enumerate() {
+        assert_eq!(p.timebase, (1, 48_000), "AAC timebase");
+        assert_eq!(
+            p.pts,
+            audio[0].pts + 1024 * i as i64,
+            "AAC pts step at packet {i}"
+        );
+    }
 }
 
 #[test]
