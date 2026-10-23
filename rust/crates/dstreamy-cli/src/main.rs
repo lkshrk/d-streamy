@@ -198,6 +198,7 @@ async fn run(
         Command::Daemon { skip_platform } => {
             let opts = daemon::Options {
                 include_platform: !skip_platform,
+                ..daemon::Options::default()
             };
             daemon::run(ctx, out, opts).await
         }

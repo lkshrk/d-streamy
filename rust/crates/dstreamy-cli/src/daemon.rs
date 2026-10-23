@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use dstreamy_discord::SessionEvent;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -48,7 +47,12 @@ enum Message<'a> {
     },
 }
 
-fn parse(line: &[u8]) -> Result<(String, Command), (Option<String>, Failure)> {
+enum Request {
+    Shutdown,
+    Engine(Command),
+}
+
+fn parse(line: &[u8]) -> Result<(String, Request), (Option<String>, Failure)> {
     let malformed = |id: Option<String>, what: &str| {
         (
             id,
@@ -69,37 +73,12 @@ fn parse(line: &[u8]) -> Result<(String, Command), (Option<String>, Failure)> {
         let failure = Failure::new("unknown_cmd", format!("unknown command {cmd:?}"));
         return Err((Some(id), failure));
     }
+    if cmd == "shutdown" {
+        return Ok((id, Request::Shutdown));
+    }
     match serde_json::from_value(value) {
-        Ok(command) => Ok((id, command)),
+        Ok(command) => Ok((id, Request::Engine(command))),
         Err(e) => Err((Some(id), invalid_params(e))),
-    }
-}
-
-struct Writer {
-    lines: Mutex<Option<std::sync::mpsc::Sender<String>>>,
-}
-
-impl Writer {
-    fn write(&self, message: &Message<'_>) {
-        let line = match serde_json::to_string(message) {
-            Ok(line) => line,
-            Err(e) => {
-                tracing::error!("serializing a protocol message: {e}");
-                return;
-            }
-        };
-        if let Some(writer) = lock(&self.lines).as_ref() {
-            let _ = writer.send(line);
-        }
-    }
-
-    fn reply(&self, id: Option<&str>, result: Result<Value, Failure>) {
-        let message = match (id, result) {
-            (Some(id), Ok(data)) => Message::Result { id, data },
-            (id, Ok(_)) => unreachable!("a result always answers a request with id {id:?}"),
-            (id, Err(Failure { code, message })) => Message::Error { id, code, message },
-        };
-        self.write(&message);
     }
 }
 
@@ -126,6 +105,57 @@ fn read_stdin(lines: mpsc::UnboundedSender<Vec<u8>>) {
     }
 }
 
+type Reply = (Option<String>, Result<Value, Failure>);
+
+fn line(message: &Message<'_>) -> Option<String> {
+    serde_json::to_string(message)
+        .inspect_err(|e| tracing::error!("serializing a protocol message: {e}"))
+        .ok()
+}
+
+fn reply_line(id: Option<&str>, result: Result<Value, Failure>) -> Option<String> {
+    let message = match (id, result) {
+        (Some(id), Ok(data)) => Message::Result { id, data },
+        (id, Ok(_)) => unreachable!("a result always answers a request with id {id:?}"),
+        (id, Err(Failure { code, message })) => Message::Error { id, code, message },
+    };
+    line(&message)
+}
+
+fn event_line(event: &EngineEvent) -> Option<String> {
+    match event {
+        EngineEvent::Session(event) => line(&Message::Event { event }),
+    }
+}
+
+/// Until both channels close; `biased` writes every event already received before the next reply.
+async fn write_out(
+    mut events: mpsc::UnboundedReceiver<EngineEvent>,
+    mut replies: mpsc::UnboundedReceiver<Reply>,
+    out: std::sync::mpsc::Sender<String>,
+) {
+    let send = |line: Option<String>| {
+        if let Some(line) = line {
+            let _ = out.send(line);
+        }
+    };
+    let mut events_open = true;
+    let mut replies_open = true;
+    while events_open || replies_open {
+        tokio::select! {
+            biased;
+            event = events.recv(), if events_open => match event {
+                Some(event) => send(event_line(&event)),
+                None => events_open = false,
+            },
+            reply = replies.recv(), if replies_open => match reply {
+                Some((id, result)) => send(reply_line(id.as_deref(), result)),
+                None => replies_open = false,
+            },
+        }
+    }
+}
+
 pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliError> {
     let (lines_tx, mut lines) = mpsc::unbounded_channel();
     // A detached thread: a blocked stdin read must not hold up the runtime's shutdown.
@@ -137,12 +167,12 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
             writer_out.line(line);
         }
     });
-    let writer = Arc::new(Writer {
-        lines: Mutex::new(Some(writer)),
-    });
     let engine = Engine::new(ctx, opts);
-    let (drain, drained) = tokio::sync::oneshot::channel();
-    let events = tokio::spawn(write_events(engine.events(), writer.clone(), drained));
+    let (replies, replies_rx) = mpsc::unbounded_channel::<Reply>();
+    let output = tokio::spawn(write_out(engine.subscribe_lossless(), replies_rx, writer));
+    let reply = |id: Option<String>, result| {
+        let _ = replies.send((id, result));
+    };
     let pending: Arc<Mutex<HashMap<u64, String>>> = Arc::default();
     let mut signals = Signals::new();
     let mut tasks = JoinSet::new();
@@ -153,22 +183,22 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
             line = lines.recv() => {
                 let Some(line) = line else { break };
                 match parse(&line) {
-                    Err((id, failure)) => writer.reply(id.as_deref(), Err(failure)),
-                    Ok((id, Command::Shutdown)) => {
+                    Err((id, failure)) => reply(id, Err(failure)),
+                    Ok((id, Request::Shutdown)) => {
                         shutdown_id = Some(id);
                         break;
                     }
-                    Ok((id, command)) => {
+                    Ok((id, Request::Engine(command))) => {
                         let key = next_key;
                         next_key += 1;
                         lock(&pending).insert(key, id);
                         let engine = engine.clone();
-                        let writer = writer.clone();
+                        let replies = replies.clone();
                         let pending = pending.clone();
                         tasks.spawn(async move {
                             let result = engine.handle(command).await;
                             if let Some(id) = lock(&pending).remove(&key) {
-                                writer.reply(Some(&id), result);
+                                let _ = replies.send((Some(id), result));
                             }
                         });
                     }
@@ -184,51 +214,20 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
     tasks.shutdown().await;
     let unanswered: Vec<String> = lock(&pending).drain().map(|(_, id)| id).collect();
     for id in unanswered {
-        writer.reply(
-            Some(&id),
+        reply(
+            Some(id),
             Err(Failure::new("internal", "daemon shutting down")),
         );
     }
     engine.shutdown().await;
-    let _ = drain.send(());
-    let _ = events.await;
     if let Some(id) = shutdown_id {
-        writer.reply(Some(&id), Ok(Value::Null));
+        reply(Some(id), Ok(Value::Null));
     }
-    drop(lock(&writer.lines).take());
+    drop(replies);
+    drop(engine);
+    let _ = output.await;
     let _ = tokio::task::spawn_blocking(move || writing.join()).await;
     Ok(ExitCode::SUCCESS)
-}
-
-/// Writes engine events until `drain` fires, then the ones already queued.
-async fn write_events(
-    mut events: tokio::sync::broadcast::Receiver<EngineEvent>,
-    writer: Arc<Writer>,
-    mut drain: tokio::sync::oneshot::Receiver<()>,
-) {
-    let write = |event: EngineEvent| match event {
-        EngineEvent::Session(event) => writer.write(&Message::Event { event: &event }),
-    };
-    loop {
-        tokio::select! {
-            biased;
-            event = events.recv() => match event {
-                Ok(event) => write(event),
-                Err(RecvError::Lagged(n)) => tracing::warn!(skipped = n, "engine events lagged"),
-                Err(RecvError::Closed) => return,
-            },
-            _ = &mut drain => break,
-        }
-    }
-    loop {
-        match events.try_recv() {
-            Ok(event) => write(event),
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
-                tracing::warn!(skipped = n, "engine events lagged");
-            }
-            Err(_) => return,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -279,6 +278,67 @@ mod tests {
     fn extra_fields_are_ignored() {
         let (id, command) = parse(b"{\"id\":\"x\",\"cmd\":\"stop\",\"later\":true}").unwrap();
         assert_eq!(id, "x");
-        assert!(matches!(command, Command::Stop));
+        assert!(matches!(command, Request::Engine(Command::Stop)));
+    }
+
+    fn written(
+        events: Vec<EngineEvent>,
+        replies: Vec<Reply>,
+        late: Vec<EngineEvent>,
+    ) -> Vec<Value> {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = mpsc::unbounded_channel();
+        let (out, lines) = std::sync::mpsc::channel();
+        for event in events {
+            event_tx.send(event).unwrap();
+        }
+        for reply in replies {
+            reply_tx.send(reply).unwrap();
+        }
+        drop(reply_tx);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let writer = tokio::spawn(write_out(event_rx, reply_rx, out));
+            tokio::task::yield_now().await;
+            for event in late {
+                event_tx.send(event).unwrap();
+            }
+            drop(event_tx);
+            writer.await.unwrap();
+        });
+        lines
+            .into_iter()
+            .map(|l| serde_json::from_str(&l).unwrap())
+            .collect()
+    }
+
+    fn resumed() -> EngineEvent {
+        EngineEvent::Session(SessionEvent::Resumed)
+    }
+
+    #[test]
+    fn a_flood_of_events_queued_before_the_writer_runs_is_written_in_full_before_the_reply() {
+        let lines = written(
+            vec![resumed(); 10_000],
+            vec![(Some("1".into()), Ok(Value::Null))],
+            vec![],
+        );
+        assert_eq!(lines.len(), 10_001);
+        assert!(lines[..10_000].iter().all(|l| l["type"] == "event"));
+        assert_eq!(lines[10_000]["id"], "1");
+    }
+
+    #[test]
+    fn events_after_the_last_reply_are_written_until_the_engine_closes_them() {
+        let lines = written(
+            vec![],
+            vec![(Some("1".into()), Ok(Value::Null))],
+            vec![resumed(); 3],
+        );
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0]["id"], "1");
+        assert!(lines[1..].iter().all(|l| l["type"] == "event"));
     }
 }

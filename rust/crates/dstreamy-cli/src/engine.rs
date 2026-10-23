@@ -10,8 +10,8 @@ use dstreamy_discord::{
 use dstreamy_media::CaptureConfig;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -25,11 +25,21 @@ pub const PROTOCOL: u32 = 1;
 /// Discord closes the gateway with 4004 when the token is not valid.
 const AUTH_FAILED: u16 = 4004;
 const FORWARDER_DRAIN: Duration = Duration::from_secs(2);
-const EVENT_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
     pub include_platform: bool,
+    /// Capacity of the `events()` broadcast; lossless subscribers are unbounded.
+    pub event_capacity: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            include_platform: true,
+            event_capacity: 256,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -115,7 +125,6 @@ pub enum Command {
     Start(StartParams),
     Update(UpdateParams),
     Stop,
-    Shutdown,
 }
 
 #[derive(Deserialize)]
@@ -184,6 +193,7 @@ pub struct Engine {
     ctx: Ctx,
     opts: Options,
     events: broadcast::Sender<EngineEvent>,
+    lossless: Mutex<Vec<mpsc::UnboundedSender<EngineEvent>>>,
     conn: Mutex<Option<Arc<Conn>>>,
     /// Held while the connection is created, replaced or torn down, and while a stream starts.
     lifecycle: tokio::sync::Mutex<()>,
@@ -198,6 +208,8 @@ pub struct Engine {
     stop_gate: tokio::sync::Mutex<()>,
     #[cfg(test)]
     stop_entered: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    shutdown_entered: std::sync::atomic::AtomicBool,
 }
 
 /// While `starting`, a `Stopped` state belongs to the previous run and must not release the lock.
@@ -225,7 +237,8 @@ impl Engine {
             me: me.clone(),
             ctx: ctx.clone(),
             opts,
-            events: broadcast::channel(EVENT_CAPACITY).0,
+            events: broadcast::channel(opts.event_capacity).0,
+            lossless: Mutex::new(Vec::new()),
             conn: Mutex::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
             updating: tokio::sync::Mutex::new(()),
@@ -239,11 +252,21 @@ impl Engine {
             stop_gate: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             stop_entered: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            shutdown_entered: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
+    /// May lag and skip events once `event_capacity` is exceeded.
     pub fn events(&self) -> broadcast::Receiver<EngineEvent> {
         self.events.subscribe()
+    }
+
+    /// Every event in order; closes once the engine and its event forwarder are gone.
+    pub fn subscribe_lossless(&self) -> mpsc::UnboundedReceiver<EngineEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        lock(&self.lossless).push(tx);
+        rx
     }
 
     pub async fn handle(&self, command: Command) -> Result<Value, Failure> {
@@ -290,7 +313,6 @@ impl Engine {
             Command::Start(params) => self.start(params).await,
             Command::Update(params) => self.update(params).await,
             Command::Stop => self.stop().await,
-            Command::Shutdown => unreachable!("shutdown is handled by the read loop"),
         }
     }
 
@@ -339,7 +361,9 @@ impl Engine {
                         }
                         _ => {}
                     }
-                    let _ = self.events.send(EngineEvent::Session(event));
+                    let event = EngineEvent::Session(event);
+                    lock(&self.lossless).retain(|tx| tx.send(event.clone()).is_ok());
+                    let _ = self.events.send(event);
                 }
                 Err(RecvError::Lagged(n)) => {
                     tracing::warn!(skipped = n, "session events lagged");
@@ -498,11 +522,14 @@ impl Engine {
 
     /// Stops the stream and disconnects; the session's last events are sent before it returns.
     pub async fn shutdown(&self) {
+        #[cfg(test)]
+        self.shutdown_entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let _lifecycle = self.lifecycle.lock().await;
         self.disconnect_locked().await;
     }
 
-    /// Needs `lifecycle` held; the session's last events are written before it returns.
+    /// Needs `lifecycle` held; the session's last events are sent before it returns.
     async fn disconnect_locked(&self) {
         let Some(conn) = lock(&self.conn).take() else {
             return;
@@ -621,6 +648,7 @@ mod tests {
                 };
                 let opts = Options {
                     include_platform: false,
+                    ..Options::default()
                 };
                 let engine = Engine::new(&ctx, opts);
                 Self { mock, dir, engine }
@@ -847,7 +875,17 @@ mod tests {
             let (start, gate) = f.start_in_flight().await;
             let engine = f.engine.clone();
             let shutdown = tokio::spawn(async move { engine.shutdown().await });
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            timeout(T, async {
+                while !f
+                    .engine
+                    .shutdown_entered
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
             assert!(!shutdown.is_finished(), "shutdown ran past the start");
             drop(gate);
             assert!(timeout(T, start).await.unwrap().unwrap().is_ok());
@@ -885,6 +923,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lossless_subscriber_gets_every_event_the_broadcast_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Ctx {
+            paths: dstreamy_core::ConfigPaths::in_dir(dir.path()),
+            gateway_url: String::new(),
+        };
+        let opts = Options {
+            event_capacity: 4,
+            ..Options::default()
+        };
+        let engine = Engine::new(&ctx, opts);
+        let mut lossless = engine.subscribe_lossless();
+        let mut lossy = engine.events();
+        let (tx, rx) = broadcast::channel(128);
+        for _ in 0..100 {
+            tx.send(SessionEvent::Resumed).unwrap();
+        }
+        drop(tx);
+        engine.clone().forward(rx).await;
+        let mut n = 0;
+        while let Ok(EngineEvent::Session(SessionEvent::Resumed)) = lossless.try_recv() {
+            n += 1;
+        }
+        assert_eq!(n, 100);
+        assert!(matches!(
+            lossy.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(96))
+        ));
+        drop(engine);
+        assert!(lossless.recv().await.is_none(), "closes with the engine");
     }
 
     #[test]
