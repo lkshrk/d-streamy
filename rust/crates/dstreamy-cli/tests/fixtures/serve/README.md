@@ -8,7 +8,7 @@ Protocol: `docs/adr/0004-persistent-service-and-external-producers.md` (IPC), wi
 Scenarios:
 
 - `control`: one control connection, from `hello` to `shutdown`, against the mock Discord server with `--skip-platform`. The test sends one request at a time and waits for its reply; after a `start` it also waits for the `streaming` state and one `health` event, and after a `stop` for the `stopped` state. It ends when the service closes the connection.
-- `handshake`: each line on its own new connection; every one is refused and the connection closed.
+- `handshake`: each line on its own new connection, which the client then half-closes. Every hello but the protocol 1 one is refused and the connection closed; the protocol 1 hello is answered and the connection ends at EOF.
 
 Normalisation, applied to the real output before comparing:
 

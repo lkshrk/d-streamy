@@ -10,7 +10,7 @@ use dstreamy_core::Config;
 #[cfg(any(test, feature = "test-hooks"))]
 use dstreamy_discord::SessionEvent;
 use dstreamy_ipc::{ControlCodec, Endpoint, Listener, Stream};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{ReadHalf, WriteHalf};
@@ -34,6 +34,8 @@ const CLOSE_FLUSH: Duration = Duration::from_secs(2);
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_CONNECTIONS: usize = 64;
+/// Over-cap connections still being told `busy`; beyond this they are dropped unanswered.
+pub const MAX_REFUSING: usize = 64;
 /// Queued messages plus running commands per connection; reading pauses at this.
 pub const MAX_IN_FLIGHT: usize = 64;
 pub const DEFAULT_EVENT_CAPACITY: usize = 256;
@@ -78,6 +80,7 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
     let (orphans_tx, mut orphans_rx) = mpsc::unbounded_channel::<TaskSet>();
     let (drained_tx, mut drained_rx) = mpsc::channel::<()>(1);
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let refusing = Arc::new(Semaphore::new(MAX_REFUSING));
     let mut orphans: Vec<TaskSet> = Vec::new();
     let mut signals = Signals::new();
     let mut connections = JoinSet::new();
@@ -85,8 +88,8 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
     let caller = loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => match slots.clone().try_acquire_owned() {
-                    Ok(slot) => {
+                Ok((stream, _)) => match admit(&slots, &refusing) {
+                    Admit::Serve(slot) => {
                         next_id += 1;
                         let conn = Connection {
                             id: next_id,
@@ -103,9 +106,10 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
                         };
                         connections.spawn(conn.run(stream));
                     }
-                    Err(_) => {
-                        connections.spawn(refuse(stream));
+                    Admit::Refuse(permit) => {
+                        connections.spawn(refuse(stream, permit));
                     }
+                    Admit::Drop => drop(stream),
                 },
                 Err(e) => {
                     tracing::warn!("accepting a connection: {e}");
@@ -162,8 +166,24 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
     Ok(ExitCode::SUCCESS)
 }
 
+enum Admit {
+    Serve(OwnedSemaphorePermit),
+    Refuse(OwnedSemaphorePermit),
+    Drop,
+}
+
+fn admit(slots: &Arc<Semaphore>, refusing: &Arc<Semaphore>) -> Admit {
+    if let Ok(slot) = slots.clone().try_acquire_owned() {
+        return Admit::Serve(slot);
+    }
+    match refusing.clone().try_acquire_owned() {
+        Ok(permit) => Admit::Refuse(permit),
+        Err(_) => Admit::Drop,
+    }
+}
+
 /// Answers a connection over the cap with `busy` and closes it.
-async fn refuse(stream: Stream) {
+async fn refuse(stream: Stream, _permit: OwnedSemaphorePermit) {
     let mut writer = FramedWrite::new(stream, ControlCodec::new());
     let busy = Message::Error {
         id: None,
@@ -242,9 +262,9 @@ fn handshake(value: &Value) -> Result<(String, Role), (Option<String>, Failure)>
     let Some(protocol) = fields.get("protocol").and_then(Value::as_u64) else {
         return Err(malformed(Some(id), "missing integer field \"protocol\""));
     };
-    if protocol > PROTOCOL {
+    if protocol == 0 || protocol > PROTOCOL {
         let message =
-            format!("protocol {protocol} is not supported; this service speaks {PROTOCOL}");
+            format!("protocol {protocol} is not supported; this service speaks 1 to {PROTOCOL}");
         return Err((Some(id), Failure::new("unsupported_protocol", message)));
     }
     match fields.get("role").and_then(Value::as_str) {
@@ -355,6 +375,8 @@ impl Connection {
         let mut stopping = *self.phase.borrow() != Phase::Running;
         let mut shutdown: Option<(String, oneshot::Receiver<()>)> = None;
         let mut late_shutdowns: Vec<String> = Vec::new();
+        #[cfg_attr(not(any(test, feature = "test-hooks")), allow(unused_mut))]
+        let mut muted = false;
         let end = loop {
             if writer.write_buffer().is_empty()
                 && let Some(message) = pending.pop_front()
@@ -420,7 +442,7 @@ impl Connection {
                         pending.push_back(Message::reply(Some(id), Ok(Value::Null)));
                     }
                 }
-                line = reader.next(), if reading && pending.len() + tasks.len() < MAX_IN_FLIGHT => match line {
+                line = reader.next(), if reading && !muted && pending.len() + tasks.len() < MAX_IN_FLIGHT => match line {
                     None | Some(Err(_)) => reading = false,
                     Some(Ok(Err(e))) => {
                         let (id, failure) = malformed(None, &e.to_string());
@@ -453,6 +475,11 @@ impl Connection {
                                 if let Some((earlier, _)) = shutdown.replace((id, rx)) {
                                     pending.push_back(Message::reply(Some(earlier), Ok(Value::Null)));
                                 }
+                            }
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            Ok((id, Request::Test(hooks::Hook::TestMute))) => {
+                                muted = true;
+                                pending.push_back(Message::reply(Some(id), Ok(Value::Null)));
                             }
                             #[cfg(any(test, feature = "test-hooks"))]
                             Ok((id, Request::Test(hooks::Hook::TestConnections))) => {
@@ -526,6 +553,23 @@ impl Connection {
                 for id in late_shutdowns {
                     pending.push_back(Message::reply(Some(id), Ok(Value::Null)));
                 }
+                for _ in 0..MAX_IN_FLIGHT {
+                    let Some(Some(Ok(line))) = reader.next().now_or_never() else {
+                        break;
+                    };
+                    let (id, result) = match line.map_err(|e| malformed(None, &e.to_string())) {
+                        Err((id, failure)) => (id, Err(failure)),
+                        Ok(value) => match Request::parse(value, self.test_hooks) {
+                            Err((id, failure)) => (id, Err(failure)),
+                            Ok((id, Request::Shutdown)) => (Some(id), Ok(Value::Null)),
+                            Ok((id, _)) => (
+                                Some(id),
+                                Err(Failure::new("internal", "service shutting down")),
+                            ),
+                        },
+                    };
+                    pending.push_back(Message::reply(id, result));
+                }
                 for message in pending {
                     queue(&mut writer, message);
                 }
@@ -597,7 +641,7 @@ impl Request {
 mod hooks {
     use super::*;
 
-    pub const COMMANDS: [&str; 3] = ["test_events", "test_hold", "test_connections"];
+    pub const COMMANDS: [&str; 4] = ["test_events", "test_hold", "test_connections", "test_mute"];
     const MAX_COUNT: u32 = 10_000;
     const MAX_BYTES: usize = 64 * 1024;
     const MAX_HOLD_MS: u64 = 10_000;
@@ -618,6 +662,8 @@ mod hooks {
         TestHold { ms: u64 },
         /// Replies `{"live": n}`, the connections holding a slot.
         TestConnections,
+        /// Stops reading this connection's lines until the service closes it.
+        TestMute,
     }
 
     impl Hook {
@@ -663,7 +709,7 @@ mod hooks {
                     std::future::pending::<()>().await;
                     drop(held);
                 }
-                Self::TestConnections => {}
+                Self::TestConnections | Self::TestMute => {}
             }
         }
     }
@@ -719,6 +765,11 @@ mod tests {
             ),
             (r#"[]"#, None, "malformed"),
             (
+                r#"{"id":"1","cmd":"hello","role":"control","protocol":0}"#,
+                Some("1"),
+                "unsupported_protocol",
+            ),
+            (
                 r#"{"id":"1","cmd":"hello","role":"producer","protocol":2}"#,
                 Some("1"),
                 "invalid_params",
@@ -746,6 +797,29 @@ mod tests {
             Request::parse(line, true),
             Ok((_, Request::Test(_)))
         ));
+    }
+
+    #[test]
+    fn connections_past_both_caps_are_dropped() {
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let refusing = Arc::new(Semaphore::new(MAX_REFUSING));
+        let served: Vec<_> = (0..MAX_CONNECTIONS)
+            .map(|_| match admit(&slots, &refusing) {
+                Admit::Serve(p) => p,
+                _ => panic!("refused below the cap"),
+            })
+            .collect();
+        let refused: Vec<_> = (0..MAX_REFUSING)
+            .map(|_| match admit(&slots, &refusing) {
+                Admit::Refuse(p) => p,
+                _ => panic!("not refused with busy"),
+            })
+            .collect();
+        assert!(matches!(admit(&slots, &refusing), Admit::Drop));
+        drop(refused);
+        assert!(matches!(admit(&slots, &refusing), Admit::Refuse(_)));
+        drop(served);
+        assert!(matches!(admit(&slots, &refusing), Admit::Serve(_)));
     }
 
     #[test]

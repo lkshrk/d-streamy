@@ -889,10 +889,33 @@ fn a_second_shutdown_during_shutdown_also_succeeds() {
     assert_eq!(a.request(&start("test-pattern"))["type"], "result");
     a.state("streaming");
     a.send(&json!({"id": "bye-a", "cmd": "shutdown"}));
-    a.state("stopped");
-    let reply = b.request(&json!({"id": "bye-b", "cmd": "shutdown"}));
-    assert_eq!(reply["type"], "result", "{reply}");
+    b.send(&json!({"id": "bye-b", "cmd": "shutdown"}));
+    assert_eq!(b.reply(Some("bye-b"))["type"], "result");
     assert_eq!(a.reply(Some("bye-a"))["type"], "result");
+    let (status, stderr) = s.finish();
+    assert!(status.success(), "{status}: {stderr}");
+}
+
+#[test]
+fn lines_still_unread_when_the_service_closes_are_answered() {
+    let h = Harness::new();
+    let s = h.serve(&[]);
+    let (mut a, _) = h.control();
+    let (mut b, _) = h.control();
+    assert_eq!(
+        b.request(&json!({"id": "mute", "cmd": "test_mute"}))["type"],
+        "result"
+    );
+    b.send(&json!({"id": "st", "cmd": "status"}));
+    b.send(&json!({"id": "bye-b", "cmd": "shutdown"}));
+    assert_eq!(
+        a.request(&json!({"id": "bye-a", "cmd": "shutdown"}))["type"],
+        "result"
+    );
+    let status = b.reply(Some("st"));
+    assert_eq!(status["code"], "internal", "{status}");
+    assert_eq!(b.reply(Some("bye-b"))["type"], "result");
+    assert!(b.is_closed_within(T));
     let (status, stderr) = s.finish();
     assert!(status.success(), "{status}: {stderr}");
 }
@@ -1067,13 +1090,14 @@ mod golden {
     }
 
     #[test]
-    fn handshake_errors_match_the_fixture() {
+    fn handshakes_match_the_fixture() {
         let h = Harness::new();
         let s = h.serve(&[]);
         let mut all = Vec::new();
         for line in requests("handshake") {
             let mut c = h.client();
             c.send_raw(format!("{line}\n").as_bytes());
+            c.stream.shutdown(std::net::Shutdown::Write).unwrap();
             all.extend(c.drain());
         }
         check("handshake", &all);

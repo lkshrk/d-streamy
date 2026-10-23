@@ -6,3 +6,5 @@
 not json
 {"cmd":"hello","role":"control","protocol":2}
 {"id":"8","cmd":"hello","role":"producer","protocol":2}
+{"id":"9","cmd":"hello","role":"control","protocol":0}
+{"id":"10","cmd":"hello","role":"control","protocol":1}
