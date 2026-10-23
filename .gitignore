@@ -160,6 +160,8 @@ node_modules/
 # Swift
 capture/.build/
 
-# Docs (local only)
-docs/
+# Docs (local only, except ADRs and the spec register)
+docs/*
+!docs/adr/
+!docs/specs.md
 .scratch/
