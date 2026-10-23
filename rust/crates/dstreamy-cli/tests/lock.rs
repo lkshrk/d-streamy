@@ -3,6 +3,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use dstreamy_cli::lock::SessionLock;
 use dstreamy_core::ConfigPaths;
 use dstreamy_mock_discord::{MOCK_GUILD_ID, MOCK_TOKEN, MOCK_VOICE_CHANNEL_ID, MockDiscord};
 use serde_json::{Value, json};
@@ -57,6 +58,7 @@ impl Harness {
             lines,
             stderr,
             seen: Vec::new(),
+            taken: Vec::new(),
         }
     }
 
@@ -77,6 +79,10 @@ impl Harness {
 
     fn daemon(&self) -> Proc {
         self.spawn(&["daemon", "--skip-platform"])
+    }
+
+    fn lock_is_free(&self) -> bool {
+        SessionLock::acquire(&ConfigPaths::in_dir(self.dir.path())).is_ok()
     }
 }
 
@@ -116,10 +122,16 @@ struct Proc {
     lines: mpsc::Receiver<String>,
     stderr: mpsc::Receiver<String>,
     seen: Vec<String>,
+    taken: Vec<bool>,
 }
 
 impl Proc {
+    /// The first line matching `f` that no earlier call returned, waiting for it if needed.
     fn until(&mut self, what: &str, mut f: impl FnMut(&str) -> bool) -> String {
+        if let Some(i) = (0..self.seen.len()).find(|&i| !self.taken[i] && f(&self.seen[i])) {
+            self.taken[i] = true;
+            return self.seen[i].clone();
+        }
         let deadline = Instant::now() + T;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -128,22 +140,31 @@ impl Proc {
                 panic!("no {what}; seen {:?}; stderr {stderr:?}", self.seen);
             };
             self.seen.push(line.clone());
-            if f(&line) {
+            let matched = f(&line);
+            self.taken.push(matched);
+            if matched {
                 return line;
             }
         }
     }
 
-    fn request(&mut self, request: &Value) -> Value {
+    fn send(&mut self, request: &Value) {
         let stdin = self.stdin.as_mut().expect("stdin is open");
         writeln!(stdin, "{request}").unwrap();
         stdin.flush().unwrap();
-        let id = request["id"].clone();
+    }
+
+    fn reply(&mut self, id: &str) -> Value {
         let line = self.until(&format!("reply to {id}"), |l| {
             let v: Value = serde_json::from_str(l).unwrap();
             v["type"] != "event" && v["id"] == id
         });
         serde_json::from_str(&line).unwrap()
+    }
+
+    fn request(&mut self, request: &Value) -> Value {
+        self.send(request);
+        self.reply(request["id"].as_str().unwrap())
     }
 
     fn daemon_state(&mut self, state: &str) -> Value {
@@ -264,6 +285,7 @@ fn a_daemon_stop_releases_the_lock_before_its_reply() {
     d.daemon_state("streaming");
     let reply = d.request(&json!({ "id": "stop", "cmd": "stop" }));
     assert_eq!(reply["type"], "result", "{reply}");
+    assert!(h.lock_is_free(), "the lock outlived the stop reply");
 
     h.stream().kill();
     assert!(d.alive(), "the daemon exited after stop");
@@ -278,4 +300,35 @@ fn read_only_commands_run_while_a_stream_holds_the_lock() {
     let (status, stderr) = h.spawn(&["channels", MOCK_GUILD_ID]).wait();
     assert!(status.success(), "{status}: {stderr}");
     s.kill();
+}
+
+#[test]
+fn a_start_right_after_a_takeover_keeps_its_lock() {
+    let h = Harness::new();
+    let mut d = h.daemon();
+    assert_eq!(d.request(&start_request())["type"], "result");
+    d.daemon_state("streaming");
+    assert!(
+        h.mock
+            .voice_state_from_other_session(MOCK_GUILD_ID, Some(MOCK_VOICE_CHANNEL_ID))
+    );
+    let deadline = Instant::now() + T;
+    for n in 0.. {
+        let mut restart = start_request();
+        restart["id"] = json!(format!("restart-{n}"));
+        let reply = d.request(&restart);
+        if reply["type"] == "result" {
+            break;
+        }
+        assert_eq!(reply["code"], "already_running", "{reply}");
+        assert!(
+            Instant::now() < deadline,
+            "the taken-over session never stopped"
+        );
+    }
+    d.daemon_state("streaming");
+    assert!(
+        !h.lock_is_free(),
+        "the earlier stop released the new run's lock"
+    );
 }

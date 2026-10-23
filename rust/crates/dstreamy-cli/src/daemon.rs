@@ -247,6 +247,8 @@ struct Daemon {
     running: Mutex<Option<Running>>,
     portal: Mutex<Option<PortalBook>>,
     session_lock: Mutex<Hold>,
+    #[cfg(test)]
+    start_gate: tokio::sync::Mutex<()>,
 }
 
 /// While `starting`, a `Stopped` state belongs to the previous run and must not release the lock.
@@ -254,6 +256,14 @@ struct Daemon {
 struct Hold {
     lock: Option<SessionLock>,
     starting: bool,
+}
+
+impl Hold {
+    fn release_if(&mut self, stopped: bool) {
+        if stopped && !self.starting {
+            self.lock = None;
+        }
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -290,19 +300,7 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
             writer_out.line(line);
         }
     });
-    let daemon = Arc::new(Daemon {
-        ctx: ctx.clone(),
-        opts,
-        writer: Mutex::new(Some(writer)),
-        conn: Mutex::new(None),
-        lifecycle: tokio::sync::Mutex::new(()),
-        updating: tokio::sync::Mutex::new(()),
-        pending: Mutex::new(HashMap::new()),
-        last_stats: Mutex::new(None),
-        running: Mutex::new(None),
-        portal: Mutex::new(None),
-        session_lock: Mutex::new(Hold::default()),
-    });
+    let daemon = Daemon::new(ctx, opts, Some(writer));
     let mut signals = Signals::new();
     let mut tasks = JoinSet::new();
     let mut next_key = 0u64;
@@ -356,6 +354,24 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
 }
 
 impl Daemon {
+    fn new(ctx: &Ctx, opts: Options, writer: Option<std::sync::mpsc::Sender<String>>) -> Arc<Self> {
+        Arc::new(Self {
+            ctx: ctx.clone(),
+            opts,
+            writer: Mutex::new(writer),
+            conn: Mutex::new(None),
+            lifecycle: tokio::sync::Mutex::new(()),
+            updating: tokio::sync::Mutex::new(()),
+            pending: Mutex::new(HashMap::new()),
+            last_stats: Mutex::new(None),
+            running: Mutex::new(None),
+            portal: Mutex::new(None),
+            session_lock: Mutex::new(Hold::default()),
+            #[cfg(test)]
+            start_gate: tokio::sync::Mutex::new(()),
+        })
+    }
+
     fn write(&self, message: &Message<'_>) {
         let line = match serde_json::to_string(message) {
             Ok(line) => line,
@@ -469,7 +485,10 @@ impl Daemon {
                     }
                     self.write(&Message::Event { event: &event });
                 }
-                Err(RecvError::Lagged(n)) => tracing::warn!(skipped = n, "session events lagged"),
+                Err(RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "session events lagged");
+                    self.release_if_stopped();
+                }
                 Err(RecvError::Closed) => break,
             }
         }
@@ -477,13 +496,10 @@ impl Daemon {
 
     fn release_if_stopped(&self) {
         let mut hold = lock(&self.session_lock);
-        if !hold.starting
-            && self
-                .current()
-                .is_none_or(|c| stream::has_stopped(&c.session))
-        {
-            hold.lock = None;
-        }
+        let stopped = self
+            .current()
+            .is_none_or(|c| stream::has_stopped(&c.session));
+        hold.release_if(stopped);
     }
 
     fn remember_portal_token(&self) {
@@ -555,6 +571,8 @@ impl Daemon {
             }
             hold.starting = true;
         }
+        #[cfg(test)]
+        drop(self.start_gate.lock().await);
         let started = stream::start(
             &conn.session,
             p.guild_id,
@@ -563,21 +581,23 @@ impl Daemon {
             capture,
         )
         .await;
-        {
+        let stopped = {
             let mut hold = lock(&self.session_lock);
             hold.starting = false;
-            if started.is_err() || stream::has_stopped(&conn.session) {
-                hold.lock = None;
-            }
-        }
+            let stopped = stream::has_stopped(&conn.session);
+            hold.release_if(started.is_err() || stopped);
+            stopped
+        };
         started?;
         *lock(&self.last_stats) = None;
         *lock(&self.portal) = Some(PortalBook::new(restore_token, picked.portal_token));
-        *lock(&self.running) = Some(Running {
-            target: p.target,
-            stream: settings,
-            crop: p.crop,
-        });
+        if !stopped {
+            *lock(&self.running) = Some(Running {
+                target: p.target,
+                stream: settings,
+                crop: p.crop,
+            });
+        }
         Ok(Value::Null)
     }
 
@@ -603,6 +623,7 @@ impl Daemon {
     }
 
     async fn stop(self: &Arc<Self>) -> Result<Value, Failure> {
+        let _lifecycle = self.lifecycle.lock().await;
         let conn = self
             .current()
             .filter(|c| c.live())
@@ -737,6 +758,162 @@ mod tests {
         let (id, command) = parse(b"{\"id\":\"x\",\"cmd\":\"stop\",\"later\":true}").unwrap();
         assert_eq!(id, "x");
         assert!(matches!(command, Command::Stop));
+    }
+
+    #[test]
+    fn a_stopped_state_keeps_the_lock_while_a_start_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = dstreamy_core::ConfigPaths::in_dir(dir.path());
+        let mut hold = Hold {
+            lock: Some(SessionLock::acquire(&paths).unwrap()),
+            starting: true,
+        };
+        hold.release_if(true);
+        assert!(hold.lock.is_some());
+        hold.starting = false;
+        hold.release_if(false);
+        assert!(hold.lock.is_some());
+        hold.release_if(true);
+        assert!(hold.lock.is_none());
+    }
+
+    mod session_lock {
+        use std::time::Duration;
+
+        use dstreamy_core::ConfigPaths;
+        use dstreamy_mock_discord::{
+            MOCK_GUILD_ID, MOCK_TOKEN, MOCK_VOICE_CHANNEL_ID, MockDiscord,
+        };
+        use tempfile::TempDir;
+        use tokio::time::timeout;
+
+        use super::*;
+
+        const T: Duration = Duration::from_secs(20);
+
+        struct Fixture {
+            mock: MockDiscord,
+            dir: TempDir,
+            daemon: Arc<Daemon>,
+        }
+
+        impl Fixture {
+            async fn new() -> Self {
+                let mock = MockDiscord::start().await.unwrap();
+                let dir = tempfile::tempdir().unwrap();
+                let paths = ConfigPaths::in_dir(dir.path());
+                paths.save_token(MOCK_TOKEN).unwrap();
+                let ctx = Ctx {
+                    paths,
+                    gateway_url: mock.gateway_url(),
+                };
+                let opts = Options {
+                    include_platform: false,
+                };
+                let daemon = Daemon::new(&ctx, opts, None);
+                Self { mock, dir, daemon }
+            }
+
+            fn lock_is_free(&self) -> bool {
+                SessionLock::acquire(&ConfigPaths::in_dir(self.dir.path())).is_ok()
+            }
+
+            /// Spawns a start and returns once it is parked on `start_gate` with `starting` set.
+            async fn start_in_flight(
+                &self,
+            ) -> (
+                JoinHandle<Result<Value, Failure>>,
+                tokio::sync::MutexGuard<'_, ()>,
+            ) {
+                let gate = self.daemon.start_gate.lock().await;
+                let daemon = self.daemon.clone();
+                let task = tokio::spawn(async move { daemon.start(params()).await });
+                timeout(T, async {
+                    while !lock(&self.daemon.session_lock).starting {
+                        assert!(!task.is_finished(), "the start ended early");
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the start never reached the session");
+                (task, gate)
+            }
+
+            async fn wait_state(&self, f: impl Fn(&SessionState) -> bool) {
+                let mut state = self.daemon.current().unwrap().session.state();
+                timeout(T, state.wait_for(|s| f(s))).await.unwrap().unwrap();
+            }
+        }
+
+        fn params() -> StartParams {
+            StartParams {
+                guild_id: MOCK_GUILD_ID.into(),
+                channel_id: MOCK_VOICE_CHANNEL_ID.into(),
+                target: "test-pattern".into(),
+                crop: None,
+                codec: None,
+                fps: Some(Fps::Fps15),
+                resolution: Some(Resolution::new(320, 180).unwrap()),
+                bitrate_kbps: Some(1000),
+                gain: None,
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_stop_sent_during_a_start_waits_for_it_and_releases_before_replying() {
+            let f = Fixture::new().await;
+            let (start, gate) = f.start_in_flight().await;
+            let daemon = f.daemon.clone();
+            let stop = tokio::spawn(async move { daemon.stop().await });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(gate);
+            let stopped = timeout(T, stop).await.unwrap().unwrap();
+            assert!(stopped.is_ok(), "{stopped:?}");
+            assert!(f.lock_is_free(), "the lock outlived the stop reply");
+            assert!(start.await.unwrap().is_ok());
+            assert!(lock(&f.daemon.running).is_none());
+            f.daemon.disconnect().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_aborted_start_keeps_the_lock_until_teardown() {
+            let f = Fixture::new().await;
+            let (start, _gate) = f.start_in_flight().await;
+            start.abort();
+            assert!(start.await.unwrap_err().is_cancelled());
+            assert!(
+                !f.lock_is_free(),
+                "the lock was dropped with the aborted start"
+            );
+            f.daemon.disconnect().await;
+            assert!(f.lock_is_free());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_previous_runs_stop_does_not_release_a_starting_runs_lock() {
+            let f = Fixture::new().await;
+            f.daemon.start(params()).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            assert!(
+                f.mock
+                    .voice_state_from_other_session(MOCK_GUILD_ID, Some(MOCK_VOICE_CHANNEL_ID))
+            );
+            f.wait_state(|s| matches!(s, SessionState::Stopped { .. }))
+                .await;
+            f.daemon.release_if_stopped();
+            assert!(f.lock_is_free());
+
+            let (start, gate) = f.start_in_flight().await;
+            f.daemon.release_if_stopped();
+            assert!(
+                !f.lock_is_free(),
+                "a stale Stopped released the new run's lock"
+            );
+            drop(gate);
+            assert!(start.await.unwrap().is_ok());
+            assert!(!f.lock_is_free());
+            f.daemon.disconnect().await;
+        }
     }
 
     #[test]
