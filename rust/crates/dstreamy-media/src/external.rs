@@ -280,12 +280,18 @@ impl Timeline {
             .map(|(pts, at)| pts.saturating_add(micros(now.saturating_duration_since(at))))
     }
 
+    /// As `carried`, falling back to the other track's clock for a track that never had a frame.
+    fn clock(&self, track: usize, now: Instant) -> Option<i64> {
+        self.carried(track, now)
+            .or_else(|| self.carried(1 - track, now))
+    }
+
     /// One offset for both tracks: the smallest that keeps each track at or after its own carried-forward clock.
     fn offset_for(&self, first_in: [Option<i64>; 2], now: Instant) -> i64 {
         let earliest = first_in.iter().flatten().min().copied().unwrap_or(0);
         [VIDEO, AUDIO]
             .into_iter()
-            .filter_map(|t| Some(self.carried(t, now)?.saturating_sub(first_in[t]?)))
+            .filter_map(|t| Some(self.clock(t, now)?.saturating_sub(first_in[t]?)))
             .max()
             .unwrap_or_else(|| -earliest)
     }
@@ -468,10 +474,7 @@ impl State {
                     self.idle = None;
                 }
             }
-            let pts = [AUDIO, VIDEO]
-                .into_iter()
-                .find_map(|t| self.timeline.carried(t, at))
-                .unwrap_or(0);
+            let pts = self.timeline.clock(AUDIO, at).unwrap_or(0);
             let pts_us = self.timeline.stamp(AUDIO, pts);
             let silence = MediaFrame::Audio(AudioFrame {
                 data: OPUS_SILENCE_FRAME.to_vec(),
@@ -530,6 +533,14 @@ impl State {
         let Some(offset) = cur.offset else {
             return;
         };
+        if let ProducerFrame::Video { keyframe, .. } = &frame {
+            if *keyframe {
+                cur.gate = Gate::Open;
+            } else if cur.gate != Gate::Open {
+                cur.link.drop_frame(VIDEO);
+                return;
+            }
+        }
         let pts = frame.pts_us().saturating_add(offset);
         let (codec, link) = (cur.info.codec, cur.link.clone());
         let media = self.stamp(frame, pts, at, codec);

@@ -1015,6 +1015,116 @@ async fn a_lagging_audio_track_then_an_unskewed_producer_stays_aligned() {
     av_aligned(&frames);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_track_with_no_history_continues_from_the_other_tracks_clock() {
+    let rig = Rig::started(IdleMode::None).await;
+    let a = rig.handle.attach(info()).unwrap();
+    for i in 0..30 {
+        a.send(video(i * FRAME_US, i == 0)).unwrap();
+        sleep(Duration::from_micros(FRAME_US as u64)).await;
+    }
+    drop(a);
+    sleep(Duration::from_millis(200)).await;
+    let last_video = rig.collector.frames().last().unwrap().pts();
+    let b = rig.handle.attach(info()).unwrap();
+    b.send(audio(0)).unwrap();
+    sleep(FIRST_FRAMES_WAIT + MS).await;
+    let first_audio = rig
+        .collector
+        .frames()
+        .into_iter()
+        .find(|f| f.track() == AUDIO)
+        .unwrap();
+    let expected = last_video + us(Duration::from_millis(200)) + FRAME_US;
+    assert!(
+        (first_audio.pts() - expected).abs() <= FRAME_US,
+        "audio starts at {} µs, video was at {last_video} µs",
+        first_audio.pts()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_frames_released_through_an_overflow_wait_for_a_keyframe() {
+    let mut source = ExternalSource::new(options(IdleMode::None));
+    let handle = source.handle();
+    let mut rx = source.start(CaptureConfig::default()).await.unwrap();
+    let first = handle.attach(info()).unwrap();
+    for i in 0..QUEUE_CAPACITY as i64 - 1 {
+        first.send(audio(i * AUDIO_US)).unwrap();
+        first.send(video(i * FRAME_US, i == 0)).unwrap();
+        if source.queued() >= QUEUE_CAPACITY - 1 {
+            break;
+        }
+    }
+    let queued_before = source.queued();
+    assert_eq!(queued_before, QUEUE_CAPACITY - 1);
+    first.close(CloseReason::Ended);
+    let second = handle.attach(info()).unwrap();
+    second.send(video(0, true)).unwrap();
+    second.send(video(FRAME_US, false)).unwrap();
+    second.send(video(2 * FRAME_US, false)).unwrap();
+    second.send(audio(0)).unwrap();
+    let frames: Vec<MediaFrame> = std::iter::from_fn(|| rx.try_recv().ok())
+        .chain(std::iter::from_fn(|| {
+            source.inner.lock().queue.pop_front().map(|q| q.frame)
+        }))
+        .collect();
+    let mut gate_open = false;
+    for f in frames.iter().filter_map(|f| match f {
+        MediaFrame::Video(v) if v.data == [0] => Some(v),
+        _ => None,
+    }) {
+        if f.keyframe {
+            gate_open = true;
+        }
+        assert!(
+            gate_open,
+            "P-frame at {} µs queued without a keyframe",
+            f.pts_us
+        );
+    }
+    let stats = second.stats();
+    assert_eq!(stats.dropped_video, 3, "{stats:?}");
+}
+
+/// ADR 0004: a smaller skew than the previous producer's pushes both tracks ahead once, by the difference.
+#[tokio::test(start_paused = true)]
+async fn a_changing_producer_skew_pushes_the_timeline_ahead_only_when_it_shrinks() {
+    let skews = [0, 100_000, 0, 50_000];
+    for idle in IDLE_MODES {
+        let rig = Rig::started(idle).await;
+        for (i, skew) in skews.into_iter().enumerate() {
+            let mut p = rig.producer(i as u8 + 1, 0).with_audio_skew(skew);
+            p.run(Duration::from_secs(2)).await;
+            drop(p);
+            sleep(Duration::from_secs(1)).await;
+        }
+        let frames = rig.collector.frames();
+        strictly_increasing(&frames);
+        av_aligned(&frames);
+        let mut ahead = 0;
+        let mut previous: Option<i64> = None;
+        for (i, skew) in skews.into_iter().enumerate() {
+            let tag = i as u8 + 1;
+            if let Some(prev) = previous {
+                ahead += (prev - skew).max(0);
+            }
+            previous = Some(skew);
+            for f in frames
+                .iter()
+                .filter(|f| f.marker().is_some_and(|m| m.attachment == tag))
+            {
+                let drift = f.pts() - f.wall_us();
+                assert!(
+                    (drift - ahead).abs() <= FRAME_US,
+                    "{idle:?} attachment {tag}: drift {drift} µs, expected {ahead} µs ahead"
+                );
+            }
+        }
+        assert_eq!(ahead, 100_000);
+    }
+}
+
 fn tracks(lost: &[Queued]) -> (usize, usize) {
     let audio = lost.iter().filter(|q| q.is_audio()).count();
     (lost.len() - audio, audio)
