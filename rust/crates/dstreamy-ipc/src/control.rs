@@ -56,6 +56,10 @@ fn is_blank(line: &[u8]) -> bool {
     line.iter().all(|b| matches!(b, b' ' | b'\t' | b'\r'))
 }
 
+fn content_len(line: &[u8]) -> usize {
+    line.strip_suffix(b"\r").unwrap_or(line).len()
+}
+
 fn parse(line: &[u8]) -> Result<Value, Malformed> {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     let text = std::str::from_utf8(line).map_err(|_| Malformed::NotUtf8)?;
@@ -68,7 +72,7 @@ impl Decoder for ControlCodec {
 
     fn decode(&mut self, src: &mut BytesMut) -> io::Result<Option<Self::Item>> {
         loop {
-            let limit = src.len().min(self.max_line + 1);
+            let limit = src.len().min(self.max_line + 2);
             let newline = src[self.scanned.min(limit)..limit]
                 .iter()
                 .position(|&b| b == b'\n')
@@ -92,9 +96,12 @@ impl Decoder for ControlCodec {
                     if is_blank(&line[..end]) {
                         continue;
                     }
+                    if content_len(&line[..end]) > self.max_line {
+                        return Ok(Some(Err(Malformed::Oversized)));
+                    }
                     return Ok(Some(parse(&line[..end])));
                 }
-                (false, None) if src.len() > self.max_line => {
+                (false, None) if content_len(src) > self.max_line => {
                     self.discarding = true;
                     self.scanned = 0;
                     return Ok(Some(Err(Malformed::Oversized)));
@@ -168,6 +175,41 @@ mod tests {
         let items = drain(&mut ControlCodec::new(), &mut buf);
         assert_eq!(items.len(), 1);
         assert!(items[0].is_ok());
+    }
+
+    #[test]
+    fn crlf_line_at_the_cap_is_accepted() {
+        for terminator in [&b"\r\n"[..], b"\n"] {
+            let mut line = Vec::from(&b"\""[..]);
+            line.resize(MAX_LINE - 1, b'a');
+            line.push(b'"');
+            line.extend_from_slice(terminator);
+            let mut whole = BytesMut::from(&line[..]);
+            assert!(matches!(
+                drain(&mut ControlCodec::new(), &mut whole)[..],
+                [Ok(_)]
+            ));
+            let mut codec = ControlCodec::new();
+            let mut split = BytesMut::from(&line[..line.len() - 1]);
+            assert!(drain(&mut codec, &mut split).is_empty());
+            split.extend_from_slice(&line[line.len() - 1..]);
+            assert!(matches!(drain(&mut codec, &mut split)[..], [Ok(_)]));
+        }
+    }
+
+    #[test]
+    fn cap_counts_content_without_the_terminator() {
+        let decode = |bytes: &[u8]| {
+            drain(
+                &mut ControlCodec::with_max_line(4),
+                &mut BytesMut::from(bytes),
+            )
+        };
+        assert!(matches!(decode(b"[12]\r\n")[..], [Ok(_)]));
+        assert!(matches!(decode(b"[12]\n")[..], [Ok(_)]));
+        assert_eq!(decode(b"[123]\n"), [Err(Malformed::Oversized)]);
+        assert_eq!(decode(b"[123]\r\n"), [Err(Malformed::Oversized)]);
+        assert_eq!(decode(b"[12]\r\r\n"), [Err(Malformed::Oversized)]);
     }
 
     #[test]
