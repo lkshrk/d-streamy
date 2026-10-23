@@ -66,11 +66,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - name: Shipped crates never enable dstreamy-ipc test-support
+        shell: bash
         run: |
-          if cargo tree --locked -e features,normal -i dstreamy-ipc --workspace 2>/dev/null | grep -F 'test-support'; then
-            echo "dstreamy-ipc test-support reaches a normal dependency edge" >&2
-            exit 1
-          fi
+          set -euo pipefail
+          out=$(cargo tree --locked --target all -e features,normal -i dstreamy-ipc --workspace)
+          ! grep -F 'feature "test-support"' <<<"$out"
       - name: Cross-user IPC tests
         run: cargo test -p dstreamy-ipc --locked --test cross_user -- --ignored --skip nobody_helper
         timeout-minutes: 5
