@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dstreamy_discord::{
-    DiscordClient, GatewayOptions, Session, SessionEvent, SessionOptions, SessionState, StopReason,
-    StreamOptions, StreamStats,
+    Backoff, DiscordClient, GatewayOptions, Session, SessionEvent, SessionOptions, SessionState,
+    StopReason, StreamOptions, StreamStats,
 };
 use dstreamy_media::{
     Attachment, CaptureConfig, CaptureSource, ExternalHandle, ExternalOptions, ExternalSource,
@@ -47,6 +47,7 @@ async fn client(mock: &MockDiscord) -> Arc<DiscordClient> {
     let mut opts = GatewayOptions::new(SecretString::from(MOCK_TOKEN)).with_url(mock.gateway_url());
     opts.reconnect_delay_min = Duration::from_millis(10);
     opts.reconnect_delay_max = Duration::from_millis(50);
+    opts.invalid_session_delay = Duration::from_millis(50);
     let client = timeout(T, DiscordClient::connect(opts))
         .await
         .unwrap()
@@ -94,11 +95,14 @@ impl Feeder {
         }
     }
 
-    async fn detach(mut self) {
+    /// Returns when the attachment was told to go, which is no later than when the source saw it drop.
+    async fn detach(mut self) -> tokio::time::Instant {
+        let at = tokio::time::Instant::now();
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
         timeout(T, &mut self.task).await.unwrap().unwrap();
+        at
     }
 }
 
@@ -121,6 +125,11 @@ impl Fixture {
         let handle = source.handle();
         let mut options = SessionOptions::new(StreamOptions::new(capture()));
         options.health_interval = Duration::from_millis(100);
+        options.backoff = Backoff {
+            base: Duration::from_millis(20),
+            max: Duration::from_millis(200),
+            max_attempts: 5,
+        };
         session
             .start(
                 Some(MOCK_GUILD_ID.into()),
@@ -184,7 +193,6 @@ fn options(idle: IdleMode, grace: Duration) -> ExternalOptions {
         grace,
         stall: Duration::from_secs(2),
         idle,
-        fps: FPS,
     }
 }
 
@@ -273,7 +281,13 @@ async fn a_producer_swap_keeps_streaming_with_continuous_decodable_media() {
     increasing(&audio.iter().map(|a| a.rtp_timestamp).collect::<Vec<_>>());
 
     let split = after_gap(&video);
-    assert!(is_keyframe(&video[0].data));
+    // davey may reject the first keyframe after DAVE comes up; video then resumes at the next one.
+    let start = video.iter().position(|v| is_keyframe(&v.data)).unwrap();
+    assert!(
+        start == 0 || !recorded.dropped_frames.is_empty(),
+        "video before the first keyframe without a DAVE loss"
+    );
+    assert!(split > start);
     assert!(
         is_keyframe(&video[split].data),
         "first video after the gap is not a keyframe"
@@ -288,7 +302,7 @@ async fn a_producer_swap_keeps_streaming_with_continuous_decodable_media() {
     );
 
     let mut decoder = Decoder::new().unwrap();
-    for (i, au) in video.iter().enumerate() {
+    for (i, au) in video.iter().enumerate().skip(start) {
         decoder
             .decode(&au.data)
             .unwrap_or_else(|e| panic!("video {i} failed to decode: {e}"));
@@ -315,8 +329,7 @@ async fn without_a_reattach_the_session_stops_with_capture_ended_after_grace() {
     let mut f = Fixture::streaming(options(IdleMode::Documented, grace)).await;
     let feeder = f.attach().await;
     f.frames_after(20, 30).await;
-    feeder.detach().await;
-    let detached = tokio::time::Instant::now();
+    let detached = feeder.detach().await;
     wait_state(&mut f.state, |s| {
         *s == SessionState::Stopped {
             reason: StopReason::CaptureEnded,
@@ -357,38 +370,45 @@ async fn a_viewer_pli_reaches_the_attachment_keyframe_requests() {
     let mut requests = attachment.keyframe_requests();
     let feeder = Feeder::spawn(attachment).await;
     f.frames_after(20, 30).await;
-    health_where(&mut events, |s| s.dave_keyframe_requests == 1).await;
-    requests.borrow_and_update();
+    let before = health_where(&mut events, |s| s.dave_keyframe_requests == 1).await;
+    sleep(Duration::from_millis(600)).await;
+    let before_pli = *requests.borrow_and_update();
     assert!(f.mock.send_pli(VoiceKind::Stream).await);
     timeout(T, requests.changed()).await.unwrap().unwrap();
     let stats = health_where(&mut events, |s| s.viewer_keyframe_requests == 1).await;
-    assert_eq!(stats.dave_keyframe_requests, 1, "{stats:?}");
+    assert_eq!(*requests.borrow(), before_pli + 1);
+    assert_eq!(
+        stats.dave_keyframe_requests, before.dave_keyframe_requests,
+        "{stats:?}"
+    );
     feeder.detach().await;
     f.finish().await;
 }
 
-/// Idle silence sent in a gap; a fresh libopus encoder's first packet is also `F8 FF FE`, so only the run ending at the reattach counts.
-async fn silence_during_gap(idle: IdleMode) -> usize {
+/// The idle silence of one gap: a fresh libopus encoder's first packet is also `F8 FF FE`, so only the run ending at the reattach counts.
+async fn silence_during_gap(idle: IdleMode) -> (Vec<u32>, Duration) {
     let f = Fixture::streaming(options(idle, Duration::from_secs(30))).await;
     let feeder = f.attach().await;
     f.frames_after(20, 30).await;
-    feeder.detach().await;
+    let detached = feeder.detach().await;
     sleep(GAP).await;
     let gap = f.mock.recorded();
     let feeder = f.attach().await;
+    let reattached = detached.elapsed();
     f.frames_after(gap.video.len() + 10, gap.audio.len() + 20)
         .await;
     feeder.detach().await;
     let in_gap = stream_audio(&gap);
-    let silence: Vec<&RecordedAudioFrame> = in_gap
+    let mut silence: Vec<u32> = in_gap
         .iter()
         .rev()
         .take_while(|a| a.data == OPUS_SILENCE_FRAME)
-        .copied()
+        .map(|a| a.rtp_timestamp)
         .collect();
+    silence.reverse();
     for pair in silence.windows(2) {
         assert_eq!(
-            pair[0].rtp_timestamp.wrapping_sub(pair[1].rtp_timestamp),
+            pair[1].wrapping_sub(pair[0]),
             960,
             "silence frames 20 ms apart (RFC 6716 config 31)"
         );
@@ -398,26 +418,28 @@ async fn silence_during_gap(idle: IdleMode) -> usize {
     increasing(&audio.iter().map(|a| a.rtp_timestamp).collect::<Vec<_>>());
     assert_eq!(*f.state.borrow(), SessionState::Streaming);
     f.finish().await;
-    silence.len()
+    (silence, reattached)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn documented_idle_sends_exactly_five_silence_frames_in_a_gap() {
-    // Discord voice-connections.mdx:502-504.
-    assert_eq!(silence_during_gap(IdleMode::Documented).await, 5);
+    assert_eq!(silence_during_gap(IdleMode::Documented).await.0.len(), 5);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn no_idle_sends_no_silence_in_a_gap() {
-    assert_eq!(silence_during_gap(IdleMode::None).await, 0);
+    assert!(silence_during_gap(IdleMode::None).await.0.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn continuous_idle_sends_silence_every_20ms_through_a_gap() {
-    let n = silence_during_gap(IdleMode::Continuous).await;
-    let expected = (GAP.as_millis() / 20) as usize;
+    let (silence, reattached) = silence_during_gap(IdleMode::Continuous).await;
+    let (first, last) = (silence[0], *silence.last().unwrap());
+    let covered = last.wrapping_sub(first) / 960 + 1;
+    let at_least = (GAP.as_millis() / 20) as u32 - 1;
+    let at_most = (reattached.as_millis() / 20) as u32 + 1;
     assert!(
-        n.abs_diff(expected) <= 3,
-        "{n} silence frames, expected about {expected}"
+        (at_least..=at_most).contains(&covered),
+        "silence covers {covered} frames; gap held {at_least}..={at_most}"
     );
 }
