@@ -440,9 +440,23 @@ impl Engine {
     }
 
     /// Sends `event` to every subscriber as if the session had emitted it.
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn inject_for_tests(&self, event: SessionEvent) {
         self.publish(EngineEvent::Session(event));
+    }
+
+    /// A share of the Discord connection, as a command in flight holds one; dropping it takes `release`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn hold_connection_for_tests(&self, release: Duration) -> Option<impl Send + use<>> {
+        struct Held(#[allow(dead_code)] Arc<Conn>, Duration);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                std::thread::sleep(self.1);
+            }
+        }
+        self.current().map(|conn| Held(conn, release))
     }
 
     fn publish(&self, event: EngineEvent) {
@@ -512,6 +526,10 @@ impl Engine {
             .current()
             .is_none_or(|c| stream::has_stopped(&c.session));
         hold.release_if(stopped);
+        if stopped && !hold.starting {
+            *lock(&self.started_by) = None;
+            *lock(&self.external) = None;
+        }
     }
 
     fn remember_portal_token(&self) {
@@ -616,6 +634,7 @@ impl Engine {
         *lock(&self.portal) = Some(PortalBook::new(restore_token, portal_token));
         *lock(&self.started_by) = caller;
         *lock(&self.external) = handle.map(|handle| self.watch_source(handle));
+        self.release_if_stopped();
         *lock(&self.running) = Some(Running {
             target: p.target,
             stream: settings,
@@ -688,6 +707,7 @@ impl Engine {
             return Err(not_running());
         }
         *lock(&self.running) = None;
+        *lock(&self.started_by) = None;
         *lock(&self.external) = None;
         self.release_if_stopped();
         let stats = lock(&self.last_stats).take().unwrap_or_default();
@@ -720,6 +740,9 @@ impl Engine {
                 }
             }
             Err(shared) => {
+                tracing::warn!(
+                    "the Discord connection is still in use; stopping without closing it"
+                );
                 let _ = shared.session.stop().await;
             }
         }
@@ -1185,6 +1208,14 @@ mod tests {
         assert_eq!(
             external_options(&short),
             Err(OptionsError::StallTooShort(Duration::from_millis(499)))
+        );
+        let huge = ServeConfig {
+            grace_secs: u64::MAX,
+            ..serve
+        };
+        assert_eq!(
+            external_options(&huge),
+            Err(OptionsError::GraceTooLong(Duration::from_secs(u64::MAX)))
         );
     }
 
