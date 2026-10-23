@@ -29,6 +29,17 @@ fn mkdir(path: &Path, mode: u32) {
     fs::set_permissions(path, Permissions::from_mode(mode)).unwrap();
 }
 
+fn nobody_uid() -> u32 {
+    let out = Command::new("id").args(["-u", "nobody"]).output().unwrap();
+    let uid: i64 = String::from_utf8(out.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // macOS prints nobody as -2, the two's-complement spelling of uid 4294967294.
+    uid as u32
+}
+
 fn result_in(line: &str) -> Option<String> {
     line.find(MARKER)
         .map(|i| line[i + MARKER.len()..].trim().to_owned())
@@ -143,16 +154,19 @@ async fn client_refuses_a_server_run_by_another_user() {
     fs::rename(&planted, endpoint.as_path()).unwrap();
 
     let err = connect(&endpoint).await.err().unwrap();
+    let nobody = nobody_uid();
     assert!(
-        matches!(err, IpcError::ImpostorServer { uid, .. } if uid != 0),
-        "{err}"
+        matches!(err, IpcError::ImpostorServer { uid, .. } if uid == nobody),
+        "expected ImpostorServer with uid {nobody}: {err}"
     );
+    let accepted = lines
+        .by_ref()
+        .map_while(Result::ok)
+        .find_map(|l| result_in(&l));
+    assert_eq!(accepted.as_deref(), Some("accepted"));
+    fs::write(open.join("release"), b"").unwrap();
     let rest: Vec<String> = lines.map_while(Result::ok).collect();
     assert!(child.wait().unwrap().success(), "{rest:?}");
-    assert_eq!(
-        rest.iter().find_map(|l| result_in(l)).as_deref(),
-        Some("accepted")
-    );
 }
 
 #[test]
@@ -196,8 +210,13 @@ fn nobody_helper() {
                 std::process::exit(3);
             });
             report("listening");
-            let _ = listener.accept().unwrap();
+            let (held, _) = listener.accept().unwrap();
             report("accepted");
+            let release = Path::new(&path).with_file_name("release");
+            while !release.exists() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            drop(held);
         }
         other => panic!("unknown helper mode {other}"),
     }
