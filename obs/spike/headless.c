@@ -421,6 +421,9 @@ cleanup:
 		obs_set_output_source(0, NULL);
 		obs_scene_release(scene);
 		obs_source_release(color);
+		// Deferred destroys enqueue more destroys; drain like frontend/widgets/OBSBasic_SceneCollections.cpp:1626.
+		while (obs_wait_for_destroy_queue())
+			;
 		printf("SPIKE calling obs_shutdown\n");
 		obs_shutdown();
 	}
