@@ -249,6 +249,10 @@ struct Daemon {
     session_lock: Mutex<Hold>,
     #[cfg(test)]
     start_gate: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    stop_gate: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    stop_entered: std::sync::atomic::AtomicBool,
 }
 
 /// While `starting`, a `Stopped` state belongs to the previous run and must not release the lock.
@@ -369,6 +373,10 @@ impl Daemon {
             session_lock: Mutex::new(Hold::default()),
             #[cfg(test)]
             start_gate: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            stop_gate: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            stop_entered: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -581,23 +589,19 @@ impl Daemon {
             capture,
         )
         .await;
-        let stopped = {
+        {
             let mut hold = lock(&self.session_lock);
             hold.starting = false;
-            let stopped = stream::has_stopped(&conn.session);
-            hold.release_if(started.is_err() || stopped);
-            stopped
-        };
+            hold.release_if(started.is_err() || stream::has_stopped(&conn.session));
+        }
         started?;
         *lock(&self.last_stats) = None;
         *lock(&self.portal) = Some(PortalBook::new(restore_token, picked.portal_token));
-        if !stopped {
-            *lock(&self.running) = Some(Running {
-                target: p.target,
-                stream: settings,
-                crop: p.crop,
-            });
-        }
+        *lock(&self.running) = Some(Running {
+            target: p.target,
+            stream: settings,
+            crop: p.crop,
+        });
         Ok(Value::Null)
     }
 
@@ -623,12 +627,18 @@ impl Daemon {
     }
 
     async fn stop(self: &Arc<Self>) -> Result<Value, Failure> {
+        #[cfg(test)]
+        self.stop_entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let _lifecycle = self.lifecycle.lock().await;
         let conn = self
             .current()
             .filter(|c| c.live())
             .ok_or_else(not_running)?;
+        #[cfg(test)]
+        drop(self.stop_gate.lock().await);
         let stopped = conn.session.stop().await.map_err(session_failure)?;
+        self.release_if_stopped();
         if stopped.is_none() {
             return Err(not_running());
         }
@@ -865,13 +875,79 @@ mod tests {
             let (start, gate) = f.start_in_flight().await;
             let daemon = f.daemon.clone();
             let stop = tokio::spawn(async move { daemon.stop().await });
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            timeout(T, async {
+                while !f
+                    .daemon
+                    .stop_entered
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!stop.is_finished(), "stop ran past the in-flight start");
             drop(gate);
             let stopped = timeout(T, stop).await.unwrap().unwrap();
             assert!(stopped.is_ok(), "{stopped:?}");
             assert!(f.lock_is_free(), "the lock outlived the stop reply");
             assert!(start.await.unwrap().is_ok());
-            assert!(lock(&f.daemon.running).is_none());
+            f.daemon.disconnect().await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_stop_that_finds_the_session_ended_still_releases_the_lock() {
+            let f = Fixture::new().await;
+            f.daemon.start(params()).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            let conn = f.daemon.current().unwrap();
+            conn.forwarder.abort();
+            let gate = f.daemon.stop_gate.lock().await;
+            let daemon = f.daemon.clone();
+            let stop = tokio::spawn(async move { daemon.stop().await });
+            timeout(T, async {
+                while f.daemon.lifecycle.try_lock().is_ok() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("stop never took lifecycle");
+            assert!(
+                f.mock
+                    .voice_state_from_other_session(MOCK_GUILD_ID, Some(MOCK_VOICE_CHANNEL_ID))
+            );
+            f.wait_state(|s| matches!(s, SessionState::Stopped { .. }))
+                .await;
+            let _ = conn.session.stop().await;
+            drop(conn);
+            drop(gate);
+            let stopped = timeout(T, stop).await.unwrap().unwrap();
+            assert_eq!(stopped.unwrap_err().code, "not_running");
+            assert!(f.lock_is_free(), "not_running kept the lock");
+            f.daemon.disconnect().await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_lagged_forwarder_releases_the_lock_of_a_stopped_session() {
+            let f = Fixture::new().await;
+            f.daemon.start(params()).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            f.daemon.current().unwrap().forwarder.abort();
+            assert!(
+                f.mock
+                    .voice_state_from_other_session(MOCK_GUILD_ID, Some(MOCK_VOICE_CHANNEL_ID))
+            );
+            f.wait_state(|s| matches!(s, SessionState::Stopped { .. }))
+                .await;
+            assert!(!f.lock_is_free());
+
+            let (tx, rx) = broadcast::channel(1);
+            for _ in 0..3 {
+                tx.send(SessionEvent::Resumed).unwrap();
+            }
+            drop(tx);
+            timeout(T, f.daemon.clone().forward(rx)).await.unwrap();
+            assert!(f.lock_is_free(), "a lagged forwarder kept the lock");
             f.daemon.disconnect().await;
         }
 
