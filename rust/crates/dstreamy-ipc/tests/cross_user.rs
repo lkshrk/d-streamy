@@ -11,6 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener as StdListener, UnixStream as StdStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use dstreamy_ipc::{Endpoint, IpcError, Listener, connect};
@@ -29,6 +30,33 @@ fn require_disposable_host() {
 fn mkdir(path: &Path, mode: u32) {
     fs::create_dir(path).unwrap();
     fs::set_permissions(path, Permissions::from_mode(mode)).unwrap();
+}
+
+/// Kills the helper (and the sudo wrapping it) if the test fails or times out, so its pipe closes.
+struct KillOnDrop {
+    child: Option<Child>,
+    helper_pid: Arc<OnceLock<String>>,
+}
+
+impl KillOnDrop {
+    fn wait(mut self) -> std::process::ExitStatus {
+        self.child.take().unwrap().wait().unwrap()
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if let Some(pid) = self.helper_pid.get() {
+            let _ = Command::new("sudo")
+                .args(["-n", "-u", "nobody", "kill", "-9", pid])
+                .status();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 fn nobody_uid() -> u32 {
@@ -148,12 +176,31 @@ async fn client_refuses_a_server_run_by_another_user() {
         mkdir(&open, 0o777);
         let planted = open.join("serve.sock");
         let mut child = sandbox.spawn_as_nobody("serve", &planted);
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        let ready = lines
-            .by_ref()
-            .map_while(Result::ok)
-            .find_map(|l| result_in(&l));
-        assert_eq!(ready.as_deref(), Some("listening"));
+        let stdout = child.stdout.take().unwrap();
+        let helper_pid = Arc::new(OnceLock::new());
+        let child = KillOnDrop {
+            child: Some(child),
+            helper_pid: helper_pid.clone(),
+        };
+        let (tx, mut results) = tokio::sync::mpsc::unbounded_channel();
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut lines = Vec::new();
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(result) = result_in(&line) {
+                    match result.strip_prefix("pid ") {
+                        Some(pid) => {
+                            let _ = helper_pid.set(pid.to_owned());
+                        }
+                        None => {
+                            let _ = tx.send(result);
+                        }
+                    }
+                }
+                lines.push(line);
+            }
+            lines
+        });
+        assert_eq!(results.recv().await.as_deref(), Some("listening"));
 
         let endpoint = sandbox.endpoint();
         mkdir(endpoint.as_path().parent().unwrap(), 0o700);
@@ -165,14 +212,13 @@ async fn client_refuses_a_server_run_by_another_user() {
             matches!(err, IpcError::ImpostorServer { uid, .. } if uid == nobody),
             "expected ImpostorServer with uid {nobody}: {err}"
         );
-        let accepted = lines
-            .by_ref()
-            .map_while(Result::ok)
-            .find_map(|l| result_in(&l));
-        assert_eq!(accepted.as_deref(), Some("accepted"));
+        assert_eq!(results.recv().await.as_deref(), Some("accepted"));
         fs::write(open.join("release"), b"").unwrap();
-        let rest: Vec<String> = lines.map_while(Result::ok).collect();
-        assert!(child.wait().unwrap().success(), "{rest:?}");
+        let status = tokio::task::spawn_blocking(move || child.wait())
+            .await
+            .unwrap();
+        let lines = reader.await.unwrap();
+        assert!(status.success(), "{lines:?}");
     })
     .await;
 }
@@ -211,6 +257,7 @@ fn nobody_helper() {
             }
         }),
         "serve" => {
+            report(&format!("pid {}", std::process::id()));
             let listener = StdListener::bind(&path).unwrap();
             fs::set_permissions(&path, Permissions::from_mode(0o777)).unwrap();
             std::thread::spawn(|| {

@@ -22,7 +22,7 @@ dstreamy-ipc = { path = ".", features = ["test-support"] }
 futures-util = { version = "0.3", features = ["sink"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile.workspace = true
-tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true
