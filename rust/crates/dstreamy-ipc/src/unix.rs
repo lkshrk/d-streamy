@@ -129,7 +129,10 @@ fn check_components(path: &Path, uid: u32, depth: u32) -> Result<(), String> {
     let mut current = PathBuf::new();
     for part in path.components() {
         if part == std::path::Component::ParentDir {
-            return Err(format!("{} contains ..", path.display()));
+            if !current.pop() || current.as_os_str().is_empty() {
+                return Err(format!("{} climbs above /", path.display()));
+            }
+            continue;
         }
         current.push(part);
         let meta = match fs::symlink_metadata(&current) {
@@ -516,28 +519,72 @@ mod tests {
         assert!(matches!(err, IpcError::UnverifiedServer { .. }), "{err}");
     }
 
-    fn link_home_from(dir: &Path) -> (PathBuf, Result<(), String>) {
-        let home = passwd_home(own_principal()).unwrap();
-        let link = dir.join(format!("dstreamy-link-{}", std::process::id()));
-        let _ = fs::remove_file(&link);
-        std::os::unix::fs::symlink(&home, &link).unwrap();
-        let result = check_base(&link, own_principal());
-        fs::remove_file(&link).unwrap();
-        (link, result)
+    fn world_writable_tempdir() -> tempfile::TempDir {
+        let dir = trusted_tempdir();
+        fs::set_permissions(dir.path(), Permissions::from_mode(0o777)).unwrap();
+        dir
     }
 
     #[test]
-    fn symlink_planted_in_shared_tmp_is_not_trusted_even_when_it_points_home() {
-        let (link, result) = link_home_from(Path::new("/tmp"));
-        let err = result.expect_err(&format!("{} was trusted", link.display()));
+    fn symlink_from_a_private_dir_into_a_writable_dir_is_refused() {
+        let private = trusted_tempdir();
+        let writable = world_writable_tempdir();
+        let trusted = trusted_tempdir();
+        let link = private.path().join("state");
+        std::os::unix::fs::symlink(writable.path(), &link).unwrap();
+        let err = check_base(&link, own_principal()).unwrap_err();
+        assert!(err.contains("writable by other users"), "{err}");
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(trusted.path(), &link).unwrap();
+        check_base(&link, own_principal()).unwrap();
+    }
+
+    #[test]
+    fn relative_dotdot_link_to_a_trusted_dir_is_accepted() {
+        let root = trusted_tempdir();
+        let dotfiles = root.path().join("dotfiles/state");
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(&dotfiles)
+            .unwrap();
+        let local = root.path().join("home/.local");
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(&local)
+            .unwrap();
+        std::os::unix::fs::symlink("../../dotfiles/state", local.join("state")).unwrap();
+        check_base(&local.join("state"), own_principal()).unwrap();
+    }
+
+    #[test]
+    fn relative_link_resolving_into_a_writable_dir_is_refused() {
+        let root = trusted_tempdir();
+        let shared = root.path().join("shared");
+        DirBuilder::new().mode(0o777).create(&shared).unwrap();
+        fs::set_permissions(&shared, Permissions::from_mode(0o777)).unwrap();
+        fs::create_dir(shared.join("state")).unwrap();
+        let local = root.path().join("home");
+        DirBuilder::new().mode(0o755).create(&local).unwrap();
+        std::os::unix::fs::symlink("../shared/state", local.join("state")).unwrap();
+        let err = check_base(&local.join("state"), own_principal()).unwrap_err();
         assert!(err.contains("writable by other users"), "{err}");
     }
 
     #[test]
-    fn symlink_in_a_private_dir_pointing_home_is_trusted() {
-        let private = trusted_tempdir();
-        let (link, result) = link_home_from(private.path());
-        result.unwrap_or_else(|e| panic!("{}: {e}", link.display()));
+    fn dotdot_chain_through_a_writable_dir_is_refused() {
+        let root = trusted_tempdir();
+        let shared = root.path().join("shared");
+        DirBuilder::new().mode(0o777).create(&shared).unwrap();
+        fs::set_permissions(&shared, Permissions::from_mode(0o777)).unwrap();
+        fs::create_dir(root.path().join("safe")).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink("shared/../safe", &link).unwrap();
+        let err = check_base(&link, own_principal()).unwrap_err();
+        assert!(err.contains("writable by other users"), "{err}");
+        let err = check_base(Path::new("/../../tmp/x"), own_principal()).unwrap_err();
+        assert!(err.contains("climbs above /"), "{err}");
     }
 
     #[test]
