@@ -713,7 +713,10 @@ int main(int argc, char **argv)
 
 	obs_register_source(&audio_source_info);
 	obs_register_output(&trace_output_info);
-	marker_base_ns = os_gettime_ns() + FLASH_PERIOD_NS;
+	uint64_t interval_ns = obs_get_frame_interval_ns();
+	// Mid-frame, so the beep - flash offset is about half a frame instead of anywhere in [0, 1) frames.
+	marker_base_ns = obs_get_video_frame_time() + util_mul_div64(FLASH_PERIOD_NS, 1, interval_ns) * interval_ns +
+			 interval_ns / 2;
 
 	obs_data_t *cs = obs_data_create();
 	obs_data_set_int(cs, "color", DARK_COLOR);

@@ -1,5 +1,7 @@
 add_executable(obs-harness obs-harness.c)
 target_link_libraries(obs-harness PRIVATE OBS::libobs)
+# libobs headers need POSIX and GNU declarations; the template turns C extensions off on macOS and Windows.
+set_target_properties(obs-harness PROPERTIES C_EXTENSIONS ON)
 
 if(OS_LINUX OR OS_FREEBSD OR OS_OPENBSD)
   target_link_libraries(obs-harness PRIVATE m)
