@@ -1,7 +1,6 @@
 #![no_main]
 
 use dstreamy_ipc::ControlCodec;
-use dstreamy_ipc::control::MAX_LINE;
 use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
 use tokio_util::bytes::BytesMut;
@@ -17,12 +16,14 @@ fn has_float(value: &Value) -> bool {
     }
 }
 
+const MAX_LINE: usize = 64;
+
 fuzz_target!(|data: &[u8]| {
     let (split, data) = match data.split_first() {
         Some((&split, rest)) => (usize::from(split).max(1), rest),
         None => return,
     };
-    let mut codec = ControlCodec::new();
+    let mut codec = ControlCodec::with_max_line(MAX_LINE);
     let mut buf = BytesMut::new();
     let mut items = Vec::new();
     for chunk in data.chunks(split) {
