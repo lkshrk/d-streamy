@@ -346,3 +346,47 @@ fn opus_toc_durations_follow_rfc_6716() {
     assert_eq!(opus_duration_quarter_ms(&[0xe3, 0x04]), Some(40));
     assert_eq!(opus_duration_quarter_ms(&[]), None);
 }
+
+fn pts_us(p: &Packet) -> i64 {
+    p.pts * 1_000_000 * i64::from(p.timebase.0) / i64::from(p.timebase.1)
+}
+
+/// Feeds a trace's packets through `Ingest` as the plugin will send them; the first refusal, if any.
+fn ingest(trace: &Trace) -> Result<(), String> {
+    let mut ingest = dstreamy_media::Ingest::default();
+    for (i, p) in trace.packets.iter().enumerate() {
+        let checked = if p.video {
+            let has_sps =
+                annexb::nal_units(&p.data).any(|n| annexb::h264_nal_type(n) == Some(H264_NAL_SPS));
+            let mut au = Vec::new();
+            if p.keyframe && !has_sps {
+                au.extend_from_slice(&trace.video_extra);
+            }
+            au.extend_from_slice(&p.data);
+            ingest.video(&au, pts_us(p), p.keyframe)
+        } else {
+            ingest.audio(&p.data, pts_us(p))
+        };
+        checked.map_err(|e| format!("{} packet {i}: {e}", trace.name))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn every_opus_trace_passes_ingest_unless_it_uses_b_frames() {
+    let mut seen = 0;
+    for trace in load_all() {
+        if trace.meta["audio_codec"] != "opus" {
+            continue;
+        }
+        seen += 1;
+        let result = ingest(&trace);
+        if trace.name.contains("-bf2-") || trace.name.contains("-bfunset-") {
+            let e = result.expect_err(&trace.name);
+            assert!(e.contains("B-frames are enabled"), "{e}");
+        } else {
+            result.unwrap();
+        }
+    }
+    assert_eq!(seen, 8, "Opus traces");
+}

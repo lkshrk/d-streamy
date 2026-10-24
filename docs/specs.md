@@ -107,7 +107,9 @@ Every external behaviour `dstreamy serve`, the IPC layer and the OBS plugin depe
 
 | Behaviour | Source | Used by |
 |---|---|---|
-| TOC byte `config(5) s(1) c(2)`; `s` is per packet; codes 0–3; configs 28–31 are CELT FB 2.5/5/10/20 ms | RFC 6716 §3.1, Table 2 | ingest validation |
+| TOC byte `config(5) s(1) c(2)`; `s` is per packet; codes 0–3 (1 frame, 2 equal, 2 sized, M frames). Table 2 frame sizes: configs 0–11 SILK NB/MB/WB 10/20/40/60 ms, 12–15 Hybrid SWB/FB 10/20 ms, 16–31 CELT NB/WB/SWB/FB 2.5/5/10/20 ms | RFC 6716 §3.1, Table 2 | ingest validation |
+| Frame lengths: one byte 0–251, else `b0 + 4·b1` (at most 1275); code 3 adds a frame count byte `v p M`, optional padding lengths (255 = 254 plus another byte) and, for VBR, M−1 lengths | RFC 6716 §3.2.1, §3.2.5 | ingest validation |
+| A receiver refuses packets that break R1 (at least one byte), R2 (no frame over 1275 bytes), R3 (code 1 payload even), R4 (code 2 length fits), R5 (code 3 has 1 to 120 ms of frames), R6 (code 3 CBR: padding fits and the rest divides by M), R7 (code 3 VBR: headers, M−1 frames and padding fit) | RFC 6716 §3.4 | ingest validation |
 | `F8 FF FE` is config 31 (CELT FB 20 ms), mono, code 0 | RFC 6716 §3.1, §3.2.2 | idle frames, 20 ms spacing |
 | Mono frames are valid in a stereo stream | RFC 6716 §2.1.2, RFC 7587 §3.4 | idle frames |
 | RTP clock 48 kHz; one Opus packet per RTP payload; 20 ms = 960 ticks | RFC 7587 §4.1, §4.2 | timeline |
