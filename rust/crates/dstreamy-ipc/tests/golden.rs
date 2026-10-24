@@ -56,12 +56,53 @@ fn producer_reverse_channel_events() {
         .into_iter()
         .map(Result::unwrap)
         .collect();
+    assert_eq!(lines[0], json!({"attached": 1}));
+    assert_eq!(lines[1], json!({"type": "keyframe_request"}));
     assert_eq!(
-        lines,
+        lines[2],
+        json!({"type": "source", "state": "producing", "attachment": 1})
+    );
+    assert_eq!(lines[3], json!({"type": "source", "state": "detached"}));
+    let reasons: Vec<&str> = lines[4..]
+        .iter()
+        .map(|l| {
+            assert_eq!(l["type"], "detached", "{l}");
+            assert!(l["message"].is_string(), "{l}");
+            l["reason"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        ["stopped", "shutdown", "incompatible", "oversized"]
+    );
+}
+
+#[test]
+fn producer_hello_replies() {
+    let lines: Vec<Value> = control("producer_hello_replies.ndjson")
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(lines[0], json!({"attached": 1}));
+    let codes: Vec<&str> = lines[1..]
+        .iter()
+        .map(|l| {
+            assert_eq!(
+                (&l["type"], &l["id"]),
+                (&json!("error"), &json!("1")),
+                "{l}"
+            );
+            l["code"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        codes,
         [
-            json!({"attached": 1}),
-            json!({"type": "keyframe_request"}),
-            json!({"type": "detached", "reason": "incompatible"}),
+            "no_session",
+            "busy",
+            "incompatible",
+            "unsupported_protocol",
+            "malformed"
         ]
     );
 }
@@ -88,7 +129,11 @@ fn encode_lines(values: &[Value]) -> Vec<u8> {
 
 #[test]
 fn canonical_control_fixtures_match_the_encoder() {
-    for name in ["hello.ndjson", "producer_events.ndjson"] {
+    for name in [
+        "hello.ndjson",
+        "producer_events.ndjson",
+        "producer_hello_replies.ndjson",
+    ] {
         let path = fixtures().join("control").join(name);
         let values: Vec<Value> = control(name).into_iter().map(Result::unwrap).collect();
         write_or_check(&path, &encode_lines(&values));
@@ -164,6 +209,87 @@ fn valid_streams() -> Vec<(&'static str, Vec<Frame>)> {
             ],
         ),
     ]
+}
+
+/// Streams the codec accepts but ingest validation refuses, with the clause and the expected message.
+fn ingest_streams() -> Vec<(&'static str, &'static str, &'static str, Vec<Frame>)> {
+    let sps_pps_idr: &[u8] = &[
+        0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x1F, 0, 0, 0, 1, 0x68, 0xCE, 0x3C, 0x80, 0, 0, 0, 1, 0x65,
+        0x88, 0x84, 0x00,
+    ];
+    let p_slice: &[u8] = &[0, 0, 0, 1, 0x41, 0x9A, 0x02];
+    let video = |pts_us: i64, keyframe: bool, data: &[u8]| Frame {
+        kind: Kind::Video,
+        pts_us,
+        keyframe,
+        payload: payload(data),
+    };
+    vec![
+        (
+            "ingest_no_start_code",
+            "H.264 §B.1.1",
+            "not Annex B",
+            vec![
+                video(0, true, sps_pps_idr),
+                video(33_333, false, &p_slice[4..]),
+            ],
+        ),
+        (
+            "ingest_idr_without_flag",
+            "H.264 Table 7-1",
+            "IDR slice in a frame not flagged as a keyframe",
+            vec![
+                video(0, true, sps_pps_idr),
+                video(33_333, false, sps_pps_idr),
+            ],
+        ),
+        (
+            "ingest_keyframe_without_sps",
+            "H.264 §7.4.1.2",
+            "no SPS",
+            vec![video(0, true, &sps_pps_idr[8..])],
+        ),
+        (
+            "ingest_pts_ne_dts",
+            "docs/specs.md OBS bf=0 pts = dts",
+            "B-frames are enabled",
+            vec![
+                video(0, true, sps_pps_idr),
+                video(66_666, false, p_slice),
+                video(33_333, false, p_slice),
+            ],
+        ),
+        (
+            "ingest_opus_40ms",
+            "RFC 6716 §3.1",
+            "not 20 ms",
+            vec![
+                video(0, true, sps_pps_idr),
+                Frame {
+                    kind: Kind::Opus,
+                    pts_us: 0,
+                    keyframe: false,
+                    payload: payload(&[0xF9, 0xFF, 0xFE]),
+                },
+            ],
+        ),
+    ]
+}
+
+#[test]
+fn ingest_fixtures_match_the_encoder() {
+    let dir = fixtures().join("producer");
+    for (name, clause, message, frames) in ingest_streams() {
+        let mut bin = BytesMut::new();
+        for frame in &frames {
+            ProducerCodec.encode(frame, &mut bin).unwrap();
+        }
+        write_or_check(&dir.join(format!("{name}.bin")), &bin);
+        let mut spec = describe(&frames);
+        spec["detached"] =
+            json!({"reason": "incompatible", "clause": clause, "message_contains": message});
+        write_or_check(&dir.join(format!("{name}.json")), &pretty(&spec));
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

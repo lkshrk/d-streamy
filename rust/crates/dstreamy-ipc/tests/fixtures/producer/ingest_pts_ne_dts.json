@@ -1,0 +1,30 @@
+{
+  "detached": {
+    "clause": "docs/specs.md OBS bf=0 pts = dts",
+    "message_contains": "B-frames are enabled",
+    "reason": "incompatible"
+  },
+  "frames": [
+    {
+      "keyframe": true,
+      "kind": "video",
+      "kind_byte": 1,
+      "payload_hex": "000000016742c01f0000000168ce3c800000000165888400",
+      "pts_us": 0
+    },
+    {
+      "keyframe": false,
+      "kind": "video",
+      "kind_byte": 1,
+      "payload_hex": "00000001419a02",
+      "pts_us": 66666
+    },
+    {
+      "keyframe": false,
+      "kind": "video",
+      "kind_byte": 1,
+      "payload_hex": "00000001419a02",
+      "pts_us": 33333
+    }
+  ]
+}

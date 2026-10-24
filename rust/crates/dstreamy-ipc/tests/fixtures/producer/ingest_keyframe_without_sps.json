@@ -1,0 +1,16 @@
+{
+  "detached": {
+    "clause": "H.264 §7.4.1.2",
+    "message_contains": "no SPS",
+    "reason": "incompatible"
+  },
+  "frames": [
+    {
+      "keyframe": true,
+      "kind": "video",
+      "kind_byte": 1,
+      "payload_hex": "0000000168ce3c800000000165888400",
+      "pts_us": 0
+    }
+  ]
+}

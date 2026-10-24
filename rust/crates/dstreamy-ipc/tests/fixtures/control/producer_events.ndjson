@@ -1,3 +1,8 @@
 {"attached":1}
 {"type":"keyframe_request"}
-{"reason":"incompatible","type":"detached"}
+{"attachment":1,"state":"producing","type":"source"}
+{"state":"detached","type":"source"}
+{"message":"no media within the grace period","reason":"stopped","type":"detached"}
+{"message":"the service is shutting down","reason":"shutdown","type":"detached"}
+{"message":"B-frames are enabled: video pts 0 µs does not follow 33333 µs","reason":"incompatible","type":"detached"}
+{"message":"frame length 8388609 exceeds the 8388608-byte limit","reason":"oversized","type":"detached"}

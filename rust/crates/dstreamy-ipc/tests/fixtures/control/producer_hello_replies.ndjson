@@ -1,0 +1,6 @@
+{"attached":1}
+{"code":"no_session","id":"1","message":"no session with target external is live; start one first","type":"error"}
+{"code":"busy","id":"1","message":"another producer is attached","type":"error"}
+{"code":"incompatible","id":"1","message":"video.fps 25: must be 15, 30 or 60","type":"error"}
+{"code":"unsupported_protocol","id":"1","message":"protocol 3 is not supported; this service speaks 1 to 2","type":"error"}
+{"code":"malformed","id":"1","message":"malformed line: missing object field \"video\"","type":"error"}
