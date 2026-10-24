@@ -208,19 +208,46 @@ pub struct AttachmentStats {
 }
 
 #[derive(Default)]
-struct Link {
+struct Counters {
     skipped: AtomicU64,
     dropped: [AtomicU64; 2],
+}
+
+impl Counters {
+    fn snapshot(&self) -> AttachmentStats {
+        AttachmentStats {
+            skipped: self.skipped.load(Ordering::Relaxed),
+            dropped_video: self.dropped[VIDEO].load(Ordering::Relaxed),
+            dropped_audio: self.dropped[AUDIO].load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Link {
+    own: Counters,
+    total: Arc<Counters>,
     closed: Mutex<Option<CloseReason>>,
 }
 
 impl Link {
+    fn new(total: Arc<Counters>) -> Self {
+        Self {
+            total,
+            ..Self::default()
+        }
+    }
+
     fn skip(&self) {
-        self.skipped.fetch_add(1, Ordering::Relaxed);
+        for c in [&self.own, &*self.total] {
+            c.skipped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn drop_frame(&self, track: usize) {
-        self.dropped[track].fetch_add(1, Ordering::Relaxed);
+        for c in [&self.own, &*self.total] {
+            c.dropped[track].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn close(&self, reason: CloseReason) {
@@ -236,12 +263,16 @@ impl Link {
     }
 
     fn snapshot(&self) -> AttachmentStats {
-        AttachmentStats {
-            skipped: self.skipped.load(Ordering::Relaxed),
-            dropped_video: self.dropped[VIDEO].load(Ordering::Relaxed),
-            dropped_audio: self.dropped[AUDIO].load(Ordering::Relaxed),
-        }
+        self.own.snapshot()
     }
+}
+
+/// Every attachment's losses so far, and the source queue's length now and at its highest.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SourceStats {
+    pub lost: AttachmentStats,
+    pub queued: usize,
+    pub max_queued: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,6 +444,7 @@ struct State {
     detached_at: Option<Instant>,
     idle: Option<Idle>,
     queue: VecDeque<Queued>,
+    max_queued: usize,
     timeline: Timeline,
     logged_ignored: bool,
 }
@@ -519,6 +551,7 @@ impl State {
     fn push(&mut self, frame: MediaFrame, owner: Option<Arc<Link>>) {
         let queued_keyframe = matches!(&frame, MediaFrame::Video(v) if v.keyframe);
         let lost = enqueue(&mut self.queue, Queued { frame, owner });
+        self.max_queued = self.max_queued.max(self.queue.len());
         let mut current_lost_video = false;
         for item in &lost {
             item.charge();
@@ -638,11 +671,26 @@ struct Inner {
     wake: Notify,
     status: watch::Sender<SourceState>,
     producer: watch::Sender<Option<ProducerInfo>>,
+    totals: Arc<Counters>,
 }
 
 impl Inner {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Closes the attachment as `SourceGone` and refuses any later one.
+    fn end(&self) {
+        let mut state = self.lock();
+        state.gone = true;
+        if let Some(mut cur) = state.current.take() {
+            cur.drop_held();
+            cur.link.close(CloseReason::SourceGone);
+        }
+        state.idle = None;
+        state.clear_queue();
+        self.set_status(SourceState::Detached);
+        self.wake.notify_one();
     }
 
     fn set_status(&self, status: SourceState) {
@@ -692,6 +740,7 @@ impl ExternalSource {
             wake: Notify::new(),
             status: status_tx,
             producer: producer_tx,
+            totals: Arc::default(),
         });
         Ok(Self {
             inner,
@@ -720,15 +769,7 @@ impl Drop for ExternalSource {
         if let Some(task) = self.task.take() {
             task.abort();
         }
-        let mut state = self.inner.lock();
-        state.gone = true;
-        if let Some(mut cur) = state.current.take() {
-            cur.drop_held();
-            cur.link.close(CloseReason::SourceGone);
-        }
-        state.idle = None;
-        state.clear_queue();
-        self.inner.set_status(SourceState::Detached);
+        self.inner.end();
     }
 }
 
@@ -875,7 +916,7 @@ impl ExternalHandle {
         let (keyframes, requests) = watch::channel(0);
         let latched = std::mem::take(&mut state.latched_keyframe);
         keyframes.send_modify(|n| *n += 1 + u64::from(latched));
-        let link = Arc::new(Link::default());
+        let link = Arc::new(Link::new(inner.totals.clone()));
         state.current = Some(Current {
             id,
             info: info.clone(),
@@ -911,6 +952,24 @@ impl ExternalHandle {
     /// The latest attached producer's declared video, for announcing it to Discord.
     pub fn producer(&self) -> watch::Receiver<Option<ProducerInfo>> {
         self.producer.clone()
+    }
+
+    /// Ends the source for its session, which stopped but may still hold it.
+    pub fn end(&self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.end();
+        }
+    }
+
+    /// `None` once the source is gone.
+    pub fn stats(&self) -> Option<SourceStats> {
+        let inner = self.inner.upgrade()?;
+        let state = inner.lock();
+        Some(SourceStats {
+            lost: inner.totals.snapshot(),
+            queued: state.queue.len(),
+            max_queued: state.max_queued,
+        })
     }
 }
 
@@ -988,6 +1047,11 @@ impl Attachment {
 
     pub fn stats(&self) -> AttachmentStats {
         self.link.snapshot()
+    }
+
+    /// Why the source closed this attachment, once it has.
+    pub fn close_reason(&self) -> Option<CloseReason> {
+        self.link.closed()
     }
 
     pub fn close(mut self, reason: CloseReason) {

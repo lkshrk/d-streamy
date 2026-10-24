@@ -6,6 +6,7 @@ mod error;
 mod external;
 mod frame;
 mod h264;
+mod ingest;
 mod opus;
 mod source;
 mod target;
@@ -17,13 +18,14 @@ pub use external::{
     AttachError, Attachment, AttachmentStats, CloseReason, DOCUMENTED_SILENCE_FRAMES,
     EXTERNAL_TARGET_ID, ExternalHandle, ExternalOptions, ExternalSource, FIRST_FRAMES_WAIT,
     IdleMode, InterruptReason, MAX_GRACE, MAX_STALL, OPUS_SILENCE_FRAME, OptionsError,
-    ProducerFrame, ProducerInfo, SendError, SourceState,
+    ProducerFrame, ProducerInfo, SendError, SourceState, SourceStats,
 };
 pub use frame::{
     AudioFrame, EncodedVideoFrame, MediaFrame, OPUS_CHANNELS, OPUS_FRAME_DURATION_US,
     OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE, VideoCodec,
 };
 pub use h264::OpenH264Encoder;
+pub use ingest::{Ingest, IngestError};
 pub use opus::OpusEncoder;
 pub use source::{CaptureConfig, CaptureSource, CropRect, FRAME_CHANNEL_CAPACITY, FrameReceiver};
 pub use target::{CaptureTarget, TargetKind};
