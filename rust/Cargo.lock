@@ -1273,6 +1273,7 @@ dependencies = [
 name = "dstreamy-test-producer"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "clap",
  "dstreamy-ipc",
  "dstreamy-media",
