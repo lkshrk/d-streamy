@@ -611,7 +611,8 @@ fn update_on_an_external_session_is_invalid_params() {
     let status = a.request(&json!({"id": "st", "cmd": "status"}));
     assert_eq!(
         status["data"]["source"],
-        json!({"state": "detached"}),
+        json!({"state": "detached", "stats": {"skipped": 0, "dropped_video": 0,
+            "dropped_audio": 0, "queued": 0, "max_queued": 0}}),
         "{status}"
     );
     let source = a.until("source event", |m| m["event"]["event"] == "source");
@@ -995,6 +996,9 @@ mod golden {
         }
         if value["source"].get("for_ms").is_some() {
             value["source"]["for_ms"] = json!(0);
+        }
+        if value["source"]["stats"].is_object() {
+            zero(&mut value["source"]["stats"]);
         }
     }
 

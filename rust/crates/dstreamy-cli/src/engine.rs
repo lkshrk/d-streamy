@@ -9,12 +9,13 @@ use dstreamy_discord::{
 };
 use dstreamy_media::{
     CaptureConfig, CaptureSource, EXTERNAL_TARGET_ID, ExternalHandle, ExternalOptions,
-    ExternalSource, IdleMode, InterruptReason, OptionsError, SourceState,
+    ExternalSource, IdleMode, InterruptReason, OptionsError, ProducerInfo, SourceState,
+    SourceStats,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -81,6 +82,30 @@ pub struct SourceView {
     pub reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub for_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<SourceCounters>,
+}
+
+/// What every producer lost so far, and the source queue now and at its deepest.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceCounters {
+    pub skipped: u64,
+    pub dropped_video: u64,
+    pub dropped_audio: u64,
+    pub queued: usize,
+    pub max_queued: usize,
+}
+
+impl From<SourceStats> for SourceCounters {
+    fn from(s: SourceStats) -> Self {
+        Self {
+            skipped: s.lost.skipped,
+            dropped_video: s.lost.dropped_video,
+            dropped_audio: s.lost.dropped_audio,
+            queued: s.queued,
+            max_queued: s.max_queued,
+        }
+    }
 }
 
 impl From<&SourceState> for SourceView {
@@ -90,6 +115,7 @@ impl From<&SourceState> for SourceView {
             attachment: None,
             reason: None,
             for_ms: None,
+            stats: None,
         };
         match state {
             SourceState::Detached => view("detached"),
@@ -305,11 +331,15 @@ impl Hold {
 struct External {
     handle: ExternalHandle,
     watcher: JoinHandle<()>,
+    announcer: JoinHandle<()>,
 }
 
 impl Drop for External {
     fn drop(&mut self) {
         self.watcher.abort();
+        self.announcer.abort();
+        // A stopped session keeps its source for a restart; no producer may feed it meanwhile.
+        self.handle.end();
     }
 }
 
@@ -411,15 +441,21 @@ impl Engine {
 
     pub fn status(&self) -> Status {
         let session = self.current().map(|c| c.session.state().borrow().clone());
-        let source = lock(&self.external)
-            .as_ref()
-            .map(|e| SourceView::from(&*e.handle.state().borrow()));
+        let source = lock(&self.external).as_ref().map(|e| SourceView {
+            stats: e.handle.stats().map(SourceCounters::from),
+            ..SourceView::from(&*e.handle.state().borrow())
+        });
         Status {
             started_by: session.as_ref().and(*lock(&self.started_by)),
             session,
             source,
             stats: lock(&self.last_stats).clone(),
         }
+    }
+
+    /// The live external session's source, for attaching producers.
+    pub fn external(&self) -> Option<ExternalHandle> {
+        lock(&self.external).as_ref().map(|e| e.handle.clone())
     }
 
     /// Announces a producer's video (op 12) for the live session.
@@ -633,7 +669,12 @@ impl Engine {
         *lock(&self.last_stats) = None;
         *lock(&self.portal) = Some(PortalBook::new(restore_token, portal_token));
         *lock(&self.started_by) = caller;
-        *lock(&self.external) = handle.map(|handle| self.watch_source(handle));
+        let announced = (
+            settings.resolution.width(),
+            settings.resolution.height(),
+            settings.fps.get(),
+        );
+        *lock(&self.external) = handle.map(|handle| self.watch_source(handle, announced));
         self.release_if_stopped();
         *lock(&self.running) = Some(Running {
             target: p.target,
@@ -644,7 +685,8 @@ impl Engine {
         Ok(Value::Null)
     }
 
-    fn watch_source(&self, handle: ExternalHandle) -> External {
+    fn watch_source(&self, handle: ExternalHandle, announced: (u32, u32, u32)) -> External {
+        let announcer = tokio::spawn(announce(self.me.clone(), handle.producer(), announced));
         let engine = self.me.clone();
         let mut states = handle.state();
         let watcher = tokio::spawn(async move {
@@ -660,7 +702,11 @@ impl Engine {
                 }
             }
         });
-        External { handle, watcher }
+        External {
+            handle,
+            watcher,
+            announcer,
+        }
     }
 
     async fn update(&self, p: UpdateParams) -> Result<Value, Failure> {
@@ -751,6 +797,33 @@ impl Engine {
         *lock(&self.external) = None;
         *lock(&self.session_lock) = Hold::default();
         self.remember_portal_token();
+    }
+}
+
+/// Sends op 12 whenever an attached producer's size or fps differs from what the session last announced.
+async fn announce(
+    engine: Weak<Engine>,
+    mut producers: watch::Receiver<Option<ProducerInfo>>,
+    mut announced: (u32, u32, u32),
+) {
+    loop {
+        let declared = producers
+            .borrow_and_update()
+            .as_ref()
+            .map(|p| (p.width, p.height, p.fps));
+        if let Some(declared) = declared.filter(|d| *d != announced) {
+            let Some(engine) = engine.upgrade() else {
+                return;
+            };
+            let (width, height, fps) = declared;
+            match engine.apply_producer_video(width, height, fps).await {
+                Ok(()) => announced = declared,
+                Err(e) => tracing::warn!("announcing the producer's video: {}", e.message),
+            }
+        }
+        if producers.changed().await.is_err() {
+            return;
+        }
     }
 }
 

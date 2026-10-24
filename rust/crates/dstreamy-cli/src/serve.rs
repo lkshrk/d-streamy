@@ -9,7 +9,8 @@ use std::time::Duration;
 use dstreamy_core::Config;
 #[cfg(any(test, feature = "test-hooks"))]
 use dstreamy_discord::SessionEvent;
-use dstreamy_ipc::{ControlCodec, Endpoint, Listener, Stream};
+use dstreamy_ipc::{ControlCodec, Endpoint, Listener, ProducerCodec, Stream};
+use dstreamy_media::ProducerInfo;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -26,6 +27,8 @@ use crate::output::Out;
 use crate::signals::Signals;
 use crate::stream::FORCED_EXIT;
 use crate::{CliError, Ctx};
+
+mod producer;
 
 pub const PROTOCOL: u64 = 2;
 /// How long a lagged subscriber gets to read its `lagged` error before the connection closes.
@@ -237,6 +240,7 @@ impl Message {
 
 enum Role {
     Control,
+    Producer(ProducerInfo),
 }
 
 fn hello_data(engine: &Engine, connection: u64) -> Value {
@@ -269,13 +273,10 @@ fn handshake(value: &Value) -> Result<(String, Role), (Option<String>, Failure)>
     }
     match fields.get("role").and_then(Value::as_str) {
         Some("control") => Ok((id, Role::Control)),
-        Some("producer") => Err((
-            Some(id),
-            Failure::new(
-                "invalid_params",
-                "role \"producer\" is not available in this version",
-            ),
-        )),
+        Some("producer") => match producer::hello(fields) {
+            Ok(info) => Ok((id, Role::Producer(info))),
+            Err(failure) => Err((Some(id), failure)),
+        },
         Some(role) => Err(malformed(Some(id), &format!("unknown role {role:?}"))),
         None => Err(malformed(Some(id), "missing string field \"role\"")),
     }
@@ -352,14 +353,56 @@ impl Connection {
                     &mut writer,
                     Message::reply(Some(id), Ok(hello_data(&self.engine, self.id))),
                 );
+                self.control(reader, writer).await;
             }
+            Ok((id, Role::Producer(info))) => self.producer(id, info, reader, writer).await,
             Err((id, failure)) => {
                 queue(&mut writer, Message::reply(id, Err(failure)));
                 flush_within(&mut writer, CLOSE_FLUSH).await;
-                return;
             }
         }
-        self.control(reader, writer).await;
+    }
+
+    async fn producer(
+        mut self,
+        id: String,
+        info: ProducerInfo,
+        reader: Reader,
+        mut writer: Writer,
+    ) {
+        self.drained = None;
+        let attached = self
+            .engine
+            .external()
+            .ok_or(dstreamy_media::AttachError::NoSession)
+            .and_then(|handle| Ok((handle.attach(info)?, handle.state())));
+        let (attachment, states) = match attached {
+            Ok(attached) => attached,
+            Err(e) => {
+                queue(
+                    &mut writer,
+                    Message::reply(Some(id), Err(producer::attach_failure(e))),
+                );
+                flush_within(&mut writer, CLOSE_FLUSH).await;
+                return;
+            }
+        };
+        if let Err(e) = ControlCodec::new().encode(
+            &json!({ "attached": attachment.id() }),
+            writer.write_buffer_mut(),
+        ) {
+            tracing::error!("encoding the attached reply: {e}");
+        }
+        let reader = reader.map_decoder(|_| ProducerCodec::new());
+        producer::run(
+            attachment,
+            states,
+            reader,
+            writer,
+            self.phase.clone(),
+            CLOSE_FLUSH,
+        )
+        .await;
     }
 
     async fn control(&mut self, mut reader: Reader, mut writer: Writer) {
@@ -772,7 +815,12 @@ mod tests {
             (
                 r#"{"id":"1","cmd":"hello","role":"producer","protocol":2}"#,
                 Some("1"),
-                "invalid_params",
+                "malformed",
+            ),
+            (
+                r#"{"id":"1","cmd":"hello","role":"producer","protocol":3}"#,
+                Some("1"),
+                "unsupported_protocol",
             ),
         ] {
             let (got_id, got_code) = rejected(line);
