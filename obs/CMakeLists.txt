@@ -40,3 +40,4 @@ set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_nam
 
 enable_testing()
 add_subdirectory(harness)
+add_subdirectory(tests)
