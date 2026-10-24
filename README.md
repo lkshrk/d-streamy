@@ -110,4 +110,4 @@ Use at your own risk. This project uses a self-bot (user token automation) which
 
 ## License
 
-MIT, see [LICENSE](LICENSE). The OBS plugin in `obs/` links libobs and is licensed under GPL-2.0, see [obs/LICENSE](obs/LICENSE). Vendored crates under `rust/vendor/` keep their own licenses.
+GPL-3.0-or-later, see [LICENSE](LICENSE). This covers the OBS plugin in `obs/` too, which links libobs (GPL-2.0-or-later). Vendored crates under `rust/vendor/` keep their own licenses.
