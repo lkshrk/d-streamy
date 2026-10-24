@@ -4,11 +4,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgGroup, Parser, ValueEnum};
 use dstreamy_ipc::{ControlCodec, Endpoint, Frame, Kind, ProducerCodec};
 use dstreamy_media::{
     CaptureConfig, CaptureSource, FrameReceiver, MediaFrame, TestPatternSource, VideoCodec, annexb,
 };
+use dstreamy_test_producer::trace::{Converted, Replay, Trace};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
@@ -32,14 +33,18 @@ enum Corrupt {
 #[derive(Debug, Parser)]
 #[command(
     name = "mock-producer",
-    about = "Feeds `dstreamy serve` a test pattern as a producer"
+    about = "Feeds `dstreamy serve` a test pattern or a recorded OBS trace as a producer",
+    group(ArgGroup::new("media").required(true).args(["pattern", "replay"]))
 )]
 struct Args {
     #[arg(long)]
     endpoint: Option<PathBuf>,
     /// Encodes `TestPatternSource` live.
-    #[arg(long, required = true)]
+    #[arg(long)]
     pattern: bool,
+    /// Replays an `obs-harness` trace at real-time pace through `obs/src/packet.c`; its size and codecs replace the flags.
+    #[arg(long, value_name = "TRACE_DIR")]
+    replay: Option<PathBuf>,
     #[arg(long, default_value_t = 320)]
     width: u32,
     #[arg(long, default_value_t = 180)]
@@ -87,13 +92,27 @@ enum Outcome {
     Detached(Value),
 }
 
-fn hello(args: &Args) -> Value {
-    json!({
+fn hello(args: &Args, trace: Option<&Trace>) -> Result<Value, String> {
+    let (video, audio) = match trace {
+        Some(t) => (
+            json!({"codec": "h264", "width": t.width()?, "height": t.height()?, "fps": t.fps()?}),
+            json!({
+                "codec": t.audio_codec(), "sample_rate": t.sample_rate()?, "channels": 2,
+                "frame_ms": t.audio_frame_size()? * 1000 / t.sample_rate()?.max(1),
+            }),
+        ),
+        None => (
+            json!({"codec": "h264", "width": args.width, "height": args.height, "fps": args.fps}),
+            json!({"codec": "opus", "sample_rate": 48000, "channels": 2, "frame_ms": 20}),
+        ),
+    };
+    let obs_version = trace.and_then(|t| t.meta["libobs"].as_str().map(str::to_owned));
+    Ok(json!({
         "id": "1", "cmd": "hello", "role": "producer", "protocol": 2,
-        "video": {"codec": "h264", "width": args.width, "height": args.height, "fps": args.fps},
-        "audio": {"codec": "opus", "sample_rate": 48000, "channels": 2, "frame_ms": 20},
-        "client": {"name": "mock-producer", "version": env!("CARGO_PKG_VERSION"), "obs_version": null},
-    })
+        "video": video,
+        "audio": audio,
+        "client": {"name": "mock-producer", "version": env!("CARGO_PKG_VERSION"), "obs_version": obs_version},
+    }))
 }
 
 /// Prints a line that tests read from stdout.
@@ -118,9 +137,15 @@ fn media(frame: MediaFrame) -> Frame {
     self::frame(kind, i64::try_from(pts).unwrap_or(i64::MAX), keyframe, data)
 }
 
-/// Where frames come from: the live pattern, or for `--burst` one encoded loop replayed with rising pts.
+/// Where frames come from: the live pattern, an OBS trace, or for `--burst` one encoded loop replayed with rising pts.
 enum Media {
     Live(TestPatternSource, FrameReceiver),
+    Replay {
+        replay: Replay,
+        origin: Instant,
+        first_dts_us: Option<i64>,
+        pending: Option<(Instant, Frame)>,
+    },
     Burst {
         clip: Vec<Frame>,
         span_us: i64,
@@ -170,9 +195,41 @@ impl Media {
         }
     }
 
-    async fn next(&mut self) -> Option<Frame> {
+    /// `None` when the media ends; an error when `packet.c` refuses a trace packet.
+    async fn next(&mut self) -> Option<Result<Frame, String>> {
         match self {
-            Self::Live(_, frames) => frames.recv().await.map(media),
+            Self::Live(_, frames) => frames.recv().await.map(|f| Ok(media(f))),
+            Self::Replay {
+                replay,
+                origin,
+                first_dts_us,
+                pending,
+            } => {
+                // `select!` may drop this future while it sleeps, so the converted packet waits in `pending`.
+                if pending.is_none() {
+                    let replayed = match replay.next()? {
+                        Ok(r) => r,
+                        Err(e) => return Some(Err(e.to_string())),
+                    };
+                    let first = *first_dts_us.get_or_insert(replayed.dts_usec);
+                    let due = *origin
+                        + Duration::from_micros(
+                            u64::try_from(replayed.dts_usec - first).unwrap_or(0),
+                        );
+                    let frame = match replayed.frame {
+                        Converted::Video {
+                            data,
+                            pts_us,
+                            keyframe,
+                        } => frame(Kind::Video, pts_us, keyframe, data),
+                        Converted::Audio { data, pts_us } => frame(Kind::Opus, pts_us, false, data),
+                    };
+                    *pending = Some((due, frame));
+                }
+                let due = pending.as_ref().map(|(due, _)| *due)?;
+                sleep_until(due).await;
+                pending.take().map(|(_, frame)| Ok(frame))
+            }
             Self::Burst {
                 clip,
                 span_us,
@@ -190,7 +247,7 @@ impl Media {
                     *next = 0;
                     *lap += 1;
                 }
-                Some(frame)
+                Some(Ok(frame))
             }
         }
     }
@@ -208,7 +265,7 @@ impl Media {
                 while frames.try_recv().is_ok() {}
                 pattern.request_keyframe();
             }
-            Self::Burst { .. } => {}
+            Self::Replay { .. } | Self::Burst { .. } => {}
         }
     }
 
@@ -275,7 +332,7 @@ fn corrupted(kind: Corrupt, last_video_pts: i64, keyframe: &[u8]) -> Result<Byte
     Ok(buf)
 }
 
-async fn connect(endpoint: &Endpoint, args: &Args) -> Result<Option<(Lines, Sink)>, String> {
+async fn connect(endpoint: &Endpoint, hello: &Value) -> Result<Option<(Lines, Sink)>, String> {
     let stream = dstreamy_ipc::connect(endpoint)
         .await
         .map_err(|e| format!("connecting to {endpoint}: {e}"))?;
@@ -283,7 +340,7 @@ async fn connect(endpoint: &Endpoint, args: &Args) -> Result<Option<(Lines, Sink
     let mut lines = FramedRead::new(read, ControlCodec::new());
     let mut hello_writer = FramedWrite::new(write, ControlCodec::new());
     hello_writer
-        .send(hello(args))
+        .send(hello.clone())
         .await
         .map_err(|e| format!("sending hello: {e}"))?;
     let reply = match lines.next().await {
@@ -301,19 +358,30 @@ async fn connect(endpoint: &Endpoint, args: &Args) -> Result<Option<(Lines, Sink
 /// Sends test-pattern media until the duration, a fault, or the service ends the attachment.
 async fn attach(
     args: &Args,
+    trace: Option<&Trace>,
     mut lines: Lines,
     mut sink: Sink,
     deadline: Option<Instant>,
 ) -> Result<Outcome, String> {
-    let config = CaptureConfig {
-        width: args.width,
-        height: args.height,
-        fps: args.fps,
-        bitrate_bps: args.bitrate_kbps * 1000,
-        codec: VideoCodec::H264,
-        ..CaptureConfig::default()
+    let mut source = match trace {
+        Some(t) => Media::Replay {
+            replay: t.clone().replay(),
+            origin: Instant::now(),
+            first_dts_us: None,
+            pending: None,
+        },
+        None => {
+            let config = CaptureConfig {
+                width: args.width,
+                height: args.height,
+                fps: args.fps,
+                bitrate_bps: args.bitrate_kbps * 1000,
+                codec: VideoCodec::H264,
+                ..CaptureConfig::default()
+            };
+            Media::new(config, args.burst).await?
+        }
     };
-    let mut source = Media::new(config, args.burst).await?;
     let started = Instant::now();
     let at = |ms: Option<u64>| ms.map(|ms| started + Duration::from_millis(ms));
     let disconnect_at = at(args.disconnect_after);
@@ -372,8 +440,18 @@ async fn attach(
                 }
             }
             next = source.next() => {
-                let Some(frame) = next else {
-                    return Err("the test pattern ended".into());
+                let frame = match next {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(e)) => {
+                        report(json!({"refused": e}));
+                        source.stop().await;
+                        return Err(format!("conversion refused a trace packet: {e}"));
+                    }
+                    None if trace.is_some() => {
+                        let _ = sink.send(Frame::end_of_stream(last_video_pts)).await;
+                        break Outcome::Finished;
+                    }
+                    None => return Err("the test pattern ended".into()),
                 };
                 let frame = match args.pad_keyframes {
                     Some(size) if frame.keyframe => padded(frame, size),
@@ -432,12 +510,14 @@ async fn run(args: Args) -> Result<(), String> {
     let deadline = args
         .duration
         .map(|ms| Instant::now() + Duration::from_millis(ms));
+    let trace = args.replay.as_deref().map(Trace::load).transpose()?;
+    let hello = hello(&args, trace.as_ref())?;
     let mut left = args.reconnect;
     loop {
-        let Some((lines, sink)) = connect(&endpoint, &args).await? else {
+        let Some((lines, sink)) = connect(&endpoint, &hello).await? else {
             return Err("the service refused the producer".into());
         };
-        let outcome = attach(&args, lines, sink, deadline).await?;
+        let outcome = attach(&args, trace.as_ref(), lines, sink, deadline).await?;
         report(json!({"outcome": format!("{outcome:?}")}));
         match outcome {
             Outcome::Disconnected if left > 0 => {

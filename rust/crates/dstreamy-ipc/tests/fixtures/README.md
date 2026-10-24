@@ -27,3 +27,7 @@ Each `<name>.bin` is a byte stream of producer frames (`u32 BE length | u8 kind 
 | `opus_keyframe_flag_ignored` | An Opus frame with flag bit 0 set, which decodes with `keyframe: false`. Hand-built. |
 | `err_*` | One frame-level error each. |
 | `ingest_*` | One ingest rule each: no start code, IDR without the keyframe flag, keyframe without SPS, pts ≠ dts (B-frames), a 40 ms Opus packet. Generated. |
+
+## OBS traces
+
+The recorded OBS packets under `obs/tests/traces/` are not producer frames. `obs/src/packet.c` converts them into producer frames, and both `obs/tests/packet_test.c` (ctest) and `mock-producer --replay` (`rust/crates/dstreamy-cli/tests/trace_replay.rs`) run them through it.
