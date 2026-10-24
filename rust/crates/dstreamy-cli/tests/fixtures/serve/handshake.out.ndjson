@@ -5,6 +5,6 @@
 {"code":"malformed","id":"5","message":"malformed line: the first line must be hello","type":"error"}
 {"code":"malformed","id":null,"message":"malformed line: line is not JSON: expected ident at line 1 column 2","type":"error"}
 {"code":"malformed","id":null,"message":"malformed line: missing string field \"id\"","type":"error"}
-{"code":"malformed","id":"8","message":"malformed line: missing object field \"video\"","type":"error"}
+{"code":"invalid_params","id":"8","message":"missing object field \"video\"","type":"error"}
 {"code":"unsupported_protocol","id":"9","message":"protocol 0 is not supported; this service speaks 1 to 2","type":"error"}
 {"data":{"connection":"<connection>","platform":"<platform>","protocol":2,"status":{"session":null,"source":null,"started_by":null,"stats":null},"version":"<version>"},"id":"10","type":"result"}

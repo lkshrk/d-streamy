@@ -94,6 +94,7 @@ pub struct SourceCounters {
     pub dropped_audio: u64,
     pub queued: usize,
     pub max_queued: usize,
+    pub overflow_keyframe_requests: u64,
 }
 
 impl From<SourceStats> for SourceCounters {
@@ -104,6 +105,7 @@ impl From<SourceStats> for SourceCounters {
             dropped_audio: s.lost.dropped_audio,
             queued: s.queued,
             max_queued: s.max_queued,
+            overflow_keyframe_requests: s.overflow_keyframe_requests,
         }
     }
 }
@@ -328,8 +330,12 @@ impl Hold {
     }
 }
 
+/// Width, height and fps as op 12 announces them.
+pub type VideoSize = (u32, u32, u32);
+
 struct External {
     handle: ExternalHandle,
+    announced: watch::Receiver<VideoSize>,
     watcher: JoinHandle<()>,
     announcer: JoinHandle<()>,
 }
@@ -454,8 +460,12 @@ impl Engine {
     }
 
     /// The live external session's source, for attaching producers.
-    pub fn external(&self) -> Option<ExternalHandle> {
-        lock(&self.external).as_ref().map(|e| e.handle.clone())
+    /// `None` unless the session is live, so a producer never attaches to the source of a stopped run.
+    pub fn external(&self) -> Option<(ExternalHandle, watch::Receiver<VideoSize>)> {
+        self.current().filter(|c| c.live())?;
+        lock(&self.external)
+            .as_ref()
+            .map(|e| (e.handle.clone(), e.announced.clone()))
     }
 
     /// Announces a producer's video (op 12) for the live session.
@@ -685,8 +695,9 @@ impl Engine {
         Ok(Value::Null)
     }
 
-    fn watch_source(&self, handle: ExternalHandle, announced: (u32, u32, u32)) -> External {
-        let announcer = tokio::spawn(announce(self.me.clone(), handle.producer(), announced));
+    fn watch_source(&self, handle: ExternalHandle, announced: VideoSize) -> External {
+        let (announced_tx, announced_rx) = watch::channel(announced);
+        let announcer = tokio::spawn(announce(self.me.clone(), handle.producer(), announced_tx));
         let engine = self.me.clone();
         let mut states = handle.state();
         let watcher = tokio::spawn(async move {
@@ -704,6 +715,7 @@ impl Engine {
         });
         External {
             handle,
+            announced: announced_rx,
             watcher,
             announcer,
         }
@@ -800,24 +812,37 @@ impl Engine {
     }
 }
 
+/// At most one op 12 per this interval; producers attaching faster get the latest size once it passes.
+pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Sends op 12 whenever an attached producer's size or fps differs from what the session last announced.
 async fn announce(
     engine: Weak<Engine>,
     mut producers: watch::Receiver<Option<ProducerInfo>>,
-    mut announced: (u32, u32, u32),
+    announced: watch::Sender<VideoSize>,
 ) {
+    let mut last_sent: Option<tokio::time::Instant> = None;
     loop {
         let declared = producers
             .borrow_and_update()
             .as_ref()
             .map(|p| (p.width, p.height, p.fps));
-        if let Some(declared) = declared.filter(|d| *d != announced) {
+        if let Some(declared) = declared.filter(|d| *d != *announced.borrow()) {
+            if let Some(at) = last_sent {
+                tokio::time::sleep_until(at + ANNOUNCE_INTERVAL).await;
+                if producers.has_changed().unwrap_or(false) {
+                    continue;
+                }
+            }
             let Some(engine) = engine.upgrade() else {
                 return;
             };
             let (width, height, fps) = declared;
+            last_sent = Some(tokio::time::Instant::now());
             match engine.apply_producer_video(width, height, fps).await {
-                Ok(()) => announced = declared,
+                Ok(()) => {
+                    announced.send_replace(declared);
+                }
                 Err(e) => tracing::warn!("announcing the producer's video: {}", e.message),
             }
         }
@@ -921,6 +946,7 @@ mod tests {
                 };
                 let opts = Options {
                     include_platform: false,
+                    allow_external: true,
                     ..Options::default()
                 };
                 let engine = Engine::new(&ctx, opts);
@@ -938,9 +964,19 @@ mod tests {
                 JoinHandle<Result<Value, Failure>>,
                 tokio::sync::MutexGuard<'_, ()>,
             ) {
+                self.start_in_flight_with(params()).await
+            }
+
+            async fn start_in_flight_with(
+                &self,
+                p: StartParams,
+            ) -> (
+                JoinHandle<Result<Value, Failure>>,
+                tokio::sync::MutexGuard<'_, ()>,
+            ) {
                 let gate = self.engine.start_gate.lock().await;
                 let engine = self.engine.clone();
-                let task = tokio::spawn(async move { engine.start(params(), None).await });
+                let task = tokio::spawn(async move { engine.start(p, None).await });
                 timeout(T, async {
                     while !lock(&self.engine.session_lock).starting {
                         assert!(!task.is_finished(), "the start ended early");
@@ -1165,6 +1201,34 @@ mod tests {
             timeout(T, shutdown).await.unwrap().unwrap();
             assert!(f.engine.current().is_none());
             assert!(f.lock_is_free());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_stopped_external_session_is_not_offered_while_a_new_start_runs() {
+            let external = || StartParams {
+                target: EXTERNAL_TARGET_ID.into(),
+                ..params()
+            };
+            let f = Fixture::new().await;
+            f.engine.start(external(), None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            assert!(f.engine.external().is_some());
+            // Without the forwarder nothing reacts to the stop, as when its events lag behind a new start.
+            f.engine.current().unwrap().forwarder.abort();
+            assert!(
+                f.mock
+                    .voice_state_from_other_session(MOCK_GUILD_ID, Some(MOCK_VOICE_CHANNEL_ID))
+            );
+            f.wait_state(|s| matches!(s, SessionState::Stopped { .. }))
+                .await;
+            let (start, gate) = f.start_in_flight_with(external()).await;
+            assert!(
+                f.engine.external().is_none(),
+                "a producer could attach to the stopped run's source"
+            );
+            drop(gate);
+            assert!(start.await.unwrap().is_ok());
+            f.engine.shutdown().await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

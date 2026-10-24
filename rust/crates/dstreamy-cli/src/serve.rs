@@ -36,6 +36,8 @@ const LAG_FLUSH: Duration = Duration::from_secs(10);
 const CLOSE_FLUSH: Duration = Duration::from_secs(2);
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `attached` waits for op 12 with the producer's video, which is rate limited to one a second.
+const ANNOUNCE_WAIT: Duration = Duration::from_secs(5);
 pub const MAX_CONNECTIONS: usize = 64;
 /// Over-cap connections still being told `busy`; beyond this they are dropped unanswered.
 pub const MAX_REFUSING: usize = 64;
@@ -371,12 +373,13 @@ impl Connection {
         mut writer: Writer,
     ) {
         self.drained = None;
+        let declared = (info.width, info.height, info.fps);
         let attached = self
             .engine
             .external()
             .ok_or(dstreamy_media::AttachError::NoSession)
-            .and_then(|handle| Ok((handle.attach(info)?, handle.state())));
-        let (attachment, states) = match attached {
+            .and_then(|(handle, announced)| Ok((handle.attach(info)?, handle.state(), announced)));
+        let (attachment, states, mut announced) = match attached {
             Ok(attached) => attached,
             Err(e) => {
                 queue(
@@ -387,6 +390,12 @@ impl Connection {
                 return;
             }
         };
+        let op12 = timeout(ANNOUNCE_WAIT, announced.wait_for(|a| *a == declared))
+            .await
+            .is_ok_and(|r| r.is_ok());
+        if !op12 {
+            tracing::warn!(?declared, "the producer's video was not announced in time");
+        }
         if let Err(e) = ControlCodec::new().encode(
             &json!({ "attached": attachment.id() }),
             writer.write_buffer_mut(),
@@ -815,7 +824,7 @@ mod tests {
             (
                 r#"{"id":"1","cmd":"hello","role":"producer","protocol":2}"#,
                 Some("1"),
-                "malformed",
+                "invalid_params",
             ),
             (
                 r#"{"id":"1","cmd":"hello","role":"producer","protocol":3}"#,

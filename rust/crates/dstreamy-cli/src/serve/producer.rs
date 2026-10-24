@@ -23,8 +23,8 @@ const OPUS_SAMPLE_RATE: u64 = 48_000;
 const OPUS_CHANNELS: u64 = 2;
 const OPUS_FRAME_MS: u64 = 20;
 
-fn malformed(what: &str) -> Failure {
-    Failure::new("malformed", format!("malformed line: {what}"))
+fn invalid(what: &str) -> Failure {
+    crate::engine::invalid_params(what)
 }
 
 fn incompatible(message: String) -> Failure {
@@ -38,7 +38,7 @@ fn object<'a>(
     fields
         .get(key)
         .and_then(Value::as_object)
-        .ok_or_else(|| malformed(&format!("missing object field \"{key}\"")))
+        .ok_or_else(|| invalid(&format!("missing object field \"{key}\"")))
 }
 
 fn text<'a>(fields: &'a Map<String, Value>, path: &str) -> Result<&'a str, Failure> {
@@ -46,7 +46,7 @@ fn text<'a>(fields: &'a Map<String, Value>, path: &str) -> Result<&'a str, Failu
     fields
         .get(key)
         .and_then(Value::as_str)
-        .ok_or_else(|| malformed(&format!("missing string field \"{path}\"")))
+        .ok_or_else(|| invalid(&format!("missing string field \"{path}\"")))
 }
 
 fn number(fields: &Map<String, Value>, path: &str) -> Result<u64, Failure> {
@@ -54,7 +54,7 @@ fn number(fields: &Map<String, Value>, path: &str) -> Result<u64, Failure> {
     fields
         .get(key)
         .and_then(Value::as_u64)
-        .ok_or_else(|| malformed(&format!("missing integer field \"{path}\"")))
+        .ok_or_else(|| invalid(&format!("missing integer field \"{path}\"")))
 }
 
 fn expect(path: &str, got: u64, want: u64) -> Result<(), Failure> {
@@ -183,7 +183,9 @@ fn admit(ingest: &mut Ingest, frame: Frame) -> Result<Option<ProducerFrame>, Str
             }))
         }
         Kind::Opus => {
-            ingest.audio(&frame.payload).map_err(|e| e.to_string())?;
+            ingest
+                .audio(&frame.payload, frame.pts_us)
+                .map_err(|e| e.to_string())?;
             Ok(Some(ProducerFrame::Audio {
                 data: frame.payload.into(),
                 pts_us: frame.pts_us,
@@ -295,6 +297,7 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncWriteExt, DuplexStream};
     use tokio_util::bytes::{BufMut, Bytes, BytesMut};
+    use tokio_util::codec::Decoder;
 
     use super::*;
 
@@ -372,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hello_missing_a_field_is_malformed() {
+    fn a_hello_missing_a_field_is_invalid_params() {
         for (path, value) in [
             (&["video"][..], Value::Null),
             (&["audio"], json!("opus")),
@@ -382,7 +385,11 @@ mod tests {
             (&["video", "codec"], json!(264)),
         ] {
             let f = checked(producer_hello(), path, value.clone()).unwrap_err();
-            assert_eq!(f.code, "malformed", "{path:?} = {value}: {}", f.message);
+            assert_eq!(
+                f.code, "invalid_params",
+                "{path:?} = {value}: {}",
+                f.message
+            );
         }
     }
 
@@ -431,29 +438,38 @@ mod tests {
 
     #[test]
     fn hello_replies_match_the_shared_fixture() {
-        let replies = fixture("producer_hello_replies.ndjson");
-        assert_eq!(replies[0], json!({"attached": 1}));
-        let codes: Vec<&str> = replies[1..]
-            .iter()
-            .map(|r| r["code"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            codes,
-            [
-                "no_session",
-                "busy",
-                "incompatible",
-                "unsupported_protocol",
-                "malformed"
-            ]
-        );
-        for (e, code) in [
-            (AttachError::NoSession, "no_session"),
-            (AttachError::Busy, "busy"),
-            (AttachError::Incompatible("x".into()), "incompatible"),
-        ] {
-            assert_eq!(attach_failure(e).code, code);
+        for case in fixture("producer_hello_replies.ndjson") {
+            let name = case["case"].as_str().unwrap();
+            let reply = &case["reply"];
+            let failure = match name {
+                "attached" => {
+                    assert!(hello(case["request"].as_object().unwrap()).is_ok());
+                    continue;
+                }
+                "no_session" => attach_failure(AttachError::NoSession),
+                "busy" => attach_failure(AttachError::Busy),
+                "unsupported_protocol" => match super::super::handshake(&case["request"]) {
+                    Err((_, f)) => f,
+                    Ok(_) => panic!("{name} was accepted"),
+                },
+                _ => hello(case["request"].as_object().unwrap()).unwrap_err(),
+            };
+            assert_eq!(reply["code"], failure.code, "{name}");
+            assert_eq!(reply["message"], failure.message, "{name}");
         }
+    }
+
+    #[test]
+    fn an_aac_hello_is_refused_before_any_packet() {
+        let mut line = producer_hello();
+        line["audio"]["codec"] = json!("aac");
+        let f = hello(line.as_object().unwrap()).unwrap_err();
+        assert_eq!(f.code, "incompatible");
+        assert!(
+            f.message.contains("audio encoder must be Opus"),
+            "{}",
+            f.message
+        );
     }
 
     struct Rig {
@@ -576,6 +592,68 @@ mod tests {
             .find(|e| e["type"] == "detached")
             .expect("no detached event");
         (detached, state)
+    }
+
+    /// Every `producer/ingest_*` fixture: its name, its bytes and the `detached` it expects.
+    fn ingest_fixtures() -> Vec<(String, Vec<u8>, Value)> {
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../dstreamy-ipc/tests/fixtures/producer");
+        let mut out: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.extension().is_some_and(|e| e == "bin")
+                    && p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("ingest_")
+            })
+            .map(|p| {
+                let spec: Value =
+                    serde_json::from_slice(&std::fs::read(p.with_extension("json")).unwrap())
+                        .unwrap();
+                let name = p.file_stem().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read(&p).unwrap(), spec["detached"].clone())
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    #[test]
+    fn every_ingest_fixture_is_refused_with_its_message() {
+        let fixtures = ingest_fixtures();
+        assert_eq!(fixtures.len(), 5);
+        for (name, bytes, detached) in fixtures {
+            assert_eq!(detached["reason"], "incompatible", "{name}");
+            let mut buf = BytesMut::from(&bytes[..]);
+            let mut ingest = Ingest::default();
+            let mut refused = None;
+            while let Some(frame) = ProducerCodec::new().decode_eof(&mut buf).unwrap() {
+                if let Err(message) = admit(&mut ingest, frame) {
+                    refused = Some(message);
+                    break;
+                }
+            }
+            let message = refused.unwrap_or_else(|| panic!("{name} was accepted"));
+            let want = detached["message_contains"].as_str().unwrap();
+            assert!(message.contains(want), "{name}: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ingest_fixture_sent_to_serve_detaches_with_its_message() {
+        let (name, bytes, want) = ingest_fixtures()
+            .into_iter()
+            .find(|(n, ..)| n == "ingest_pts_ne_dts")
+            .unwrap();
+        let (detached, _) = detached_after(&[BytesMut::from(&bytes[..])]).await;
+        assert_eq!(detached["reason"], want["reason"], "{name}");
+        let contains = want["message_contains"].as_str().unwrap();
+        assert!(
+            detached["message"].as_str().unwrap().contains(contains),
+            "{detached}"
+        );
     }
 
     fn keyframe() -> BytesMut {
