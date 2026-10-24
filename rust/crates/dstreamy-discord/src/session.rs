@@ -874,15 +874,16 @@ impl Run {
     }
 
     fn update_video(&mut self, attrs: VideoAttributes) -> Result<(), SessionError> {
-        if let Some((conn, _)) = &self.stream {
-            conn.set_video_attributes(Some(attrs))
-                .map_err(StreamError::from)?;
-        }
         if let Some(pump) = &self.pump {
             pump.set_fps(attrs.fps);
         }
-        self.attrs = attrs;
-        Ok(())
+        let stream = self.stream.as_ref().map(|(conn, _)| conn);
+        remember_then_announce(&mut self.attrs, attrs, |attrs| match stream {
+            Some(conn) => conn
+                .set_video_attributes(Some(attrs))
+                .map_err(|e| StreamError::from(e).into()),
+            None => Ok(()),
+        })
     }
 
     fn sample(&mut self) -> Option<HealthSnapshot> {
@@ -962,9 +963,36 @@ async fn next_event(conn: &mut Option<(MediaConnection, Events)>) -> Option<Voic
     }
 }
 
+/// Keeps `attrs` even when `announce` fails, so the next connection announces the new size.
+fn remember_then_announce(
+    current: &mut VideoAttributes,
+    attrs: VideoAttributes,
+    announce: impl FnOnce(VideoAttributes) -> Result<(), SessionError>,
+) -> Result<(), SessionError> {
+    *current = attrs;
+    announce(attrs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_attributes_refused_by_a_closing_connection_are_kept_for_the_reconnect() {
+        let mut current = VideoAttributes {
+            width: 320,
+            height: 180,
+            fps: 30,
+        };
+        let next = VideoAttributes {
+            width: 160,
+            height: 90,
+            fps: 15,
+        };
+        let refused = remember_then_announce(&mut current, next, |_| Err(SessionError::Gone));
+        assert!(refused.is_err());
+        assert_eq!(current, next);
+    }
 
     #[test]
     fn backoff_doubles_with_jitter_up_to_the_cap() {
