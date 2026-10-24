@@ -60,11 +60,23 @@ fn options() -> SessionOptions {
     options
 }
 
-#[derive(Default)]
 struct Counters {
     starts: AtomicUsize,
     configs: Mutex<Vec<CaptureConfig>>,
     keyframe_requests: AtomicUsize,
+    /// `Behaviour::GateRestart` holds every start after the first until a permit is added.
+    restart_gate: tokio::sync::Semaphore,
+}
+
+impl Default for Counters {
+    fn default() -> Self {
+        Self {
+            starts: AtomicUsize::default(),
+            configs: Mutex::default(),
+            keyframe_requests: AtomicUsize::default(),
+            restart_gate: tokio::sync::Semaphore::new(0),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -73,6 +85,7 @@ enum Behaviour {
     FailStart,
     HangStart,
     FailRestart,
+    GateRestart,
     EndAfter(usize),
 }
 
@@ -114,6 +127,10 @@ impl CaptureSource for Counted {
             Behaviour::HangStart => std::future::pending().await,
             Behaviour::FailRestart if self.counters.starts.load(Ordering::SeqCst) > 1 => {
                 return Err(MediaError::AlreadyRunning);
+            }
+            Behaviour::GateRestart if self.counters.starts.load(Ordering::SeqCst) > 1 => {
+                self.counters.restart_gate.acquire().await.unwrap().forget();
+                self.inner.start(config).await?
             }
             _ => self.inner.start(config).await?,
         };
@@ -164,12 +181,16 @@ impl Fixture {
     }
 
     async fn streaming_with(options: SessionOptions) -> Self {
+        Self::streaming_source(options, Behaviour::Normal).await
+    }
+
+    async fn streaming_source(options: SessionOptions, behaviour: Behaviour) -> Self {
         let mock = MockDiscord::start().await.unwrap();
         let client = client(&mock).await;
         let session = Session::new(client.clone());
         let events = session.subscribe();
         let mut state = session.state();
-        let (source, counters) = Counted::boxed();
+        let (source, counters) = Counted::with(behaviour);
         session
             .start(
                 Some(MOCK_GUILD_ID.into()),
@@ -1103,4 +1124,53 @@ async fn reconfigure_needs_a_running_session() {
     let err = session.reconfigure(smaller_capture()).await.unwrap_err();
     assert!(matches!(err, SessionError::NotRunning), "{err}");
     close(client, session, mock).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_video_on_a_closing_connection_is_kept_and_announced_on_the_reconnect() {
+    let f = Fixture::streaming_source(options(), Behaviour::GateRestart).await;
+    let session = &f.session;
+    let reconfigure = session.reconfigure(smaller_capture());
+    let parked = async {
+        while f.counters.starts.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    };
+    let (reconfigured, ()) = tokio::join!(reconfigure, async {
+        timeout(T, parked).await.expect("the restart never began");
+        // The actor is held in the restart, so it cannot see the stream connection close.
+        assert!(
+            f.mock
+                .drop_voice(VoiceKind::Stream, Some(vo::CLOSE_SESSION_NO_LONGER_VALID))
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let update = session.update_video(240, 136, 30);
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            f.counters.restart_gate.add_permits(1);
+        };
+        let (updated, ()) = tokio::join!(update, release);
+        assert!(updated.is_ok(), "{updated:?}");
+    });
+    reconfigured.unwrap();
+    let last_width = |r: &dstreamy_mock_discord::Recorded| {
+        r.ops
+            .iter()
+            .rev()
+            .filter(|o| o.is(Some(VoiceKind::Stream), vo::OP_VIDEO))
+            .find_map(|o| o.json()?["streams"][0]["max_resolution"]["width"].as_u64())
+    };
+    f.mock
+        .wait_for(T, |r| (last_width(r) == Some(240)).then_some(()))
+        .await
+        .unwrap_or_else(|| panic!("last op 12 width {:?}", last_width(&f.mock.recorded())));
+    // Going back to the earlier size after the refused one still reaches Discord.
+    let mut state = f.session.state();
+    wait_state(&mut state, |s| *s == SessionState::Streaming).await;
+    f.session.update_video(160, 90, 15).await.unwrap();
+    f.mock
+        .wait_for(T, |r| (last_width(r) == Some(160)).then_some(()))
+        .await
+        .unwrap_or_else(|| panic!("last op 12 width {:?}", last_width(&f.mock.recorded())));
+    f.finish().await;
 }
