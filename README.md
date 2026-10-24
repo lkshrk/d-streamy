@@ -107,3 +107,7 @@ dstreamy stream --guild <GUILD> --channel <CHANNEL> --target display:1
 ## Disclaimer
 
 Use at your own risk. This project uses a self-bot (user token automation) which violates Discord's Terms of Service. Your account may be suspended or banned. The authors take no responsibility for any consequences.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The OBS plugin in `obs/` links libobs and is licensed under GPL-2.0, see [obs/LICENSE](obs/LICENSE). Vendored crates under `rust/vendor/` keep their own licenses.
