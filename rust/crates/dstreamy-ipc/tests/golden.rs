@@ -83,28 +83,36 @@ fn producer_hello_replies() {
         .into_iter()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(lines[0], json!({"attached": 1}));
-    let codes: Vec<&str> = lines[1..]
-        .iter()
-        .map(|l| {
-            assert_eq!(
-                (&l["type"], &l["id"]),
-                (&json!("error"), &json!("1")),
-                "{l}"
-            );
-            l["code"].as_str().unwrap()
-        })
-        .collect();
+    let cases: Vec<&str> = lines.iter().map(|l| l["case"].as_str().unwrap()).collect();
     assert_eq!(
-        codes,
+        cases,
         [
+            "attached",
             "no_session",
             "busy",
-            "incompatible",
+            "incompatible_fps",
+            "incompatible_audio_codec",
             "unsupported_protocol",
-            "malformed"
+            "invalid_params",
         ]
     );
+    for l in &lines {
+        assert!(l["precondition"].is_string(), "{l}");
+        assert_eq!(l["request"]["role"], "producer", "{l}");
+        let reply = &l["reply"];
+        match reply.get("attached") {
+            Some(id) => assert_eq!(id, 1),
+            None => {
+                assert_eq!(
+                    (&reply["type"], &reply["id"]),
+                    (&json!("error"), &json!("1")),
+                    "{l}"
+                );
+                let code = reply["code"].as_str().unwrap();
+                assert!(l["case"].as_str().unwrap().starts_with(code), "{l}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -245,7 +253,7 @@ fn ingest_streams() -> Vec<(&'static str, &'static str, &'static str, Vec<Frame>
         ),
         (
             "ingest_keyframe_without_sps",
-            "H.264 §7.4.1.2",
+            "ADR 0004 ingest: a keyframe carries SPS and PPS (docs/specs.md OBS packets)",
             "no SPS",
             vec![video(0, true, &sps_pps_idr[8..])],
         ),

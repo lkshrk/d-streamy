@@ -1,6 +1,6 @@
 {
   "detached": {
-    "clause": "H.264 §7.4.1.2",
+    "clause": "ADR 0004 ingest: a keyframe carries SPS and PPS (docs/specs.md OBS packets)",
     "message_contains": "no SPS",
     "reason": "incompatible"
   },

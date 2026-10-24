@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use dstreamy_core::ConfigPaths;
-use dstreamy_media::OPUS_SILENCE_FRAME;
+use dstreamy_media::{OPUS_SILENCE_FRAME, QUEUE_MAX_BYTES};
 use dstreamy_mock_discord::opcodes::voice::OP_VIDEO;
 use dstreamy_mock_discord::{
     MOCK_GUILD_ID, MOCK_TOKEN, MOCK_VOICE_CHANNEL_ID, MockDiscord, Recorded, RecordedAudioFrame,
@@ -23,10 +23,28 @@ use tokio::runtime::Runtime;
 const T: Duration = Duration::from_secs(20);
 const FPS: u32 = 30;
 
-/// Built once per test binary: `cargo test` builds only this package's binaries.
+/// Built once per test binary, next to `dstreamy` with the same profile and target: `cargo test` builds only this package's binaries.
 fn mock_producer() -> &'static Path {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
+        let dstreamy = assert_cmd::cargo::cargo_bin("dstreamy");
+        let profile_dir = dstreamy.parent().expect("dstreamy has a directory");
+        let profile = match profile_dir.file_name().and_then(|n| n.to_str()) {
+            Some("debug") => "dev",
+            Some(name) => name,
+            None => panic!("no profile directory in {}", dstreamy.display()),
+        };
+        let mut target_dir = profile_dir
+            .parent()
+            .expect("a target directory")
+            .to_path_buf();
+        let mut args: Vec<std::ffi::OsString> = Vec::new();
+        // Cargo tags the target directory root; one level more is a `--target` triple.
+        if !target_dir.join("CACHEDIR.TAG").exists() {
+            let triple = target_dir.file_name().unwrap().to_owned();
+            target_dir = target_dir.parent().unwrap().to_path_buf();
+            args.extend(["--target".into(), triple]);
+        }
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let status = Command::new(cargo)
             .args([
@@ -35,13 +53,19 @@ fn mock_producer() -> &'static Path {
                 "--locked",
                 "-p",
                 "dstreamy-test-producer",
+            ])
+            .args([
                 "--bin",
                 "mock-producer",
+                "--profile",
+                profile,
+                "--target-dir",
             ])
+            .arg(&target_dir)
+            .args(args)
             .status()
             .expect("running cargo build for mock-producer");
         assert!(status.success(), "building mock-producer failed");
-        let dstreamy = assert_cmd::cargo::cargo_bin("dstreamy");
         let bin = dstreamy.with_file_name(format!("mock-producer{}", std::env::consts::EXE_SUFFIX));
         assert!(bin.exists(), "{} missing", bin.display());
         bin
@@ -453,54 +477,92 @@ fn hello_errors_no_session_busy_incompatible_and_unsupported_protocol() {
     assert!(!status.success(), "{stderr}");
 }
 
+fn video_ops(r: &Recorded) -> Vec<(u64, u64, u64)> {
+    r.ops
+        .iter()
+        .filter(|o| o.is(Some(VoiceKind::Stream), OP_VIDEO))
+        .filter_map(|o| o.json())
+        .map(|d| {
+            let s = &d["streams"][0];
+            (
+                s["max_resolution"]["width"].as_u64().unwrap_or(0),
+                s["max_resolution"]["height"].as_u64().unwrap_or(0),
+                s["max_framerate"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect()
+}
+
+fn size_args(w: u64, hgt: u64, fps: u64) -> Vec<String> {
+    [
+        "--width",
+        &w.to_string(),
+        "--height",
+        &hgt.to_string(),
+        "--fps",
+        &fps.to_string(),
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
 #[test]
-fn op_12_follows_each_producers_declared_video() {
+fn op_12_follows_each_producer_and_comes_before_its_media() {
     let h = Harness::new("");
     let _s = h.serve();
     let _c = h.external_session();
-    let video_ops = |r: &Recorded| -> Vec<(u64, u64, u64)> {
-        r.ops
-            .iter()
-            .filter(|o| o.is(Some(VoiceKind::Stream), OP_VIDEO))
-            .filter_map(|o| o.json())
-            .map(|d| {
-                let s = &d["streams"][0];
-                (
-                    s["max_resolution"]["width"].as_u64().unwrap_or(0),
-                    s["max_resolution"]["height"].as_u64().unwrap_or(0),
-                    s["max_framerate"].as_u64().unwrap_or(0),
-                )
-            })
-            .collect()
-    };
-    let announced_after = |seen: usize, want: (u64, u64, u64)| {
-        h.wait(&format!("op 12 {want:?} after op {seen}"), |r| {
-            let ops = video_ops(r);
-            ops[seen.min(ops.len())..]
-                .iter()
-                .position(|&op| op == want)
-                .map(|i| seen + i + 1)
-        })
-    };
-    let seen = h.wait("the session's own op 12", |r| {
+    let mut seen = h.wait("the session's own op 12", |r| {
         let ops = video_ops(r);
         ops.contains(&(320, 180, u64::from(FPS)))
             .then_some(ops.len())
     });
-    let mut seen = seen;
-    for (w, hgt, fps) in [(640, 360, 15), (160, 90, 30), (640, 360, 15)] {
-        let mut p = h.producer(&[
-            "--width",
-            &w.to_string(),
-            "--height",
-            &hgt.to_string(),
-            "--fps",
-            &fps.to_string(),
-        ]);
+    for want in [(640, 360, 15), (160, 90, 30), (640, 360, 15)] {
+        let args = size_args(want.0, want.1, want.2);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut p = h.producer(&args);
         p.attached();
-        seen = announced_after(seen, (w, hgt, fps));
+        // The producer sends media only after `attached`, so op 12 recorded by now preceded its media.
+        let ops = video_ops(&h.mock.recorded());
+        let at = ops[seen.min(ops.len())..]
+            .iter()
+            .position(|&op| op == want)
+            .unwrap_or_else(|| panic!("op 12 {want:?} not sent before attached: {ops:?}"));
+        seen += at + 1;
         p.kill();
     }
+}
+
+#[test]
+fn producers_cycling_sizes_get_at_most_one_op_12_a_second_and_the_last_size_wins() {
+    let h = Harness::new("");
+    let _s = h.serve();
+    let _c = h.external_session();
+    let before = h.wait("the session's own op 12", |r| {
+        let ops = video_ops(r);
+        ops.contains(&(320, 180, u64::from(FPS)))
+            .then_some(ops.len())
+    });
+    let started = Instant::now();
+    let sizes = [(640, 360, 15), (160, 90, 30)];
+    for i in 0..10 {
+        let (w, hgt, fps) = sizes[i % 2];
+        let args = size_args(w, hgt, fps);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut p = h.producer(&args);
+        p.attached();
+        p.kill();
+    }
+    let elapsed = started.elapsed();
+    let last = sizes[9 % 2];
+    h.wait("the last size announced", |r| {
+        (video_ops(r).last() == Some(&last)).then_some(())
+    });
+    let sent = video_ops(&h.mock.recorded()).len() - before;
+    let allowed = (started.elapsed().as_secs_f64() / 1.0).ceil() as usize + 1;
+    assert!(
+        sent <= allowed,
+        "{sent} op 12 in {elapsed:?} of producer churn; at most {allowed} allowed"
+    );
 }
 
 #[test]
@@ -671,6 +733,9 @@ fn a_session_that_stops_on_its_own_detaches_its_producer_stopped() {
     c.until("stopped", |m| m["event"]["state"]["state"] == "stopped");
     let detached = p.wait_line("detached", |v| v["event"]["type"] == "detached");
     assert_eq!(detached["event"]["reason"], "stopped", "{detached}");
+    let again = h.producer(&[]);
+    let reply = again.wait_line("hello reply", |v| v.get("hello").is_some());
+    assert_eq!(reply["hello"]["code"], "no_session", "{reply}");
 }
 
 #[test]
@@ -683,9 +748,15 @@ fn a_stalled_producer_shows_interrupted_stalled_then_producing() {
     c.source("producing", |e| e["state"] == "producing");
     p.wait_line("stall", |v| v["fault"] == "stall");
     let stalled_at = Instant::now();
-    c.source("stalled", |e| {
+    let stalled = c.source("stalled", |e| {
         e["state"] == "interrupted" && e["reason"] == "stalled"
     });
+    // The event's `for_ms` is the time from the last frame to the stall.
+    let for_ms = stalled["event"]["for_ms"].as_u64().unwrap();
+    assert!(
+        (400..1_500).contains(&for_ms),
+        "stalled {for_ms} ms after the last frame, expected about stall_ms = 500"
+    );
     let status = c.status();
     assert_eq!(status["source"]["state"], "interrupted", "{status}");
     assert_eq!(status["source"]["reason"], "stalled", "{status}");
@@ -812,7 +883,7 @@ fn peak_rss_kib(pid: u32) -> u64 {
         .expect("VmHWM in /proc/<pid>/status")
 }
 
-/// Peak physical footprint of `pid`, in KiB; untested locally.
+/// Peak physical footprint of `pid`, in KiB.
 #[cfg(target_os = "macos")]
 fn peak_rss_kib(pid: u32) -> u64 {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
@@ -835,6 +906,8 @@ struct Overload {
     session: Value,
     source: Value,
     depths: Vec<u64>,
+    keyframe_requests: usize,
+    sent_bytes: u64,
 }
 
 impl Overload {
@@ -850,6 +923,10 @@ impl Overload {
 
 /// Runs a producer for `secs` and samples the source queue depth every 50 ms.
 fn overload_run(burst: Option<u32>, secs: u64) -> Overload {
+    overload_run_with(burst, secs, &[])
+}
+
+fn overload_run_with(burst: Option<u32>, secs: u64, extra: &[&str]) -> Overload {
     let h = Harness::new("");
     let s = h.serve();
     let mut c = h.external_session();
@@ -857,7 +934,8 @@ fn overload_run(burst: Option<u32>, secs: u64) -> Overload {
     if let Some(factor) = burst {
         args.extend(["--burst".to_owned(), factor.to_string()]);
     }
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut args: Vec<&str> = args.iter().map(String::as_str).collect();
+    args.extend(extra);
     let p = h.producer(&args);
     p.attached();
     let mut depths = Vec::new();
@@ -866,19 +944,36 @@ fn overload_run(burst: Option<u32>, secs: u64) -> Overload {
         depths.push(c.status()["source"]["stats"]["queued"].as_u64().unwrap());
         std::thread::sleep(Duration::from_millis(50));
     }
+    let keyframe_requests = p
+        .lines()
+        .iter()
+        .filter(|v| v["event"]["type"] == "keyframe_request")
+        .count();
+    let lines = p.lines.clone();
     let (status, stderr) = p.finish();
     assert!(status.success(), "{stderr}");
+    let sent_bytes = lines
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|v| v["sent_bytes"].as_u64())
+        .expect("mock-producer reports the bytes it sent");
     let status = c.status();
     c.drain();
     let run = Overload {
+        keyframe_requests,
+        sent_bytes,
         peak_rss_kib: peak_rss_kib(s.pid()),
         session: status["stats"].clone(),
         source: status["source"]["stats"].clone(),
         depths,
     };
     eprintln!(
-        "burst {burst:?}: serve peak RSS {} KiB, session {}, source {}",
-        run.peak_rss_kib, run.session, run.source
+        "burst {burst:?}: sent {} KiB, serve peak RSS {} KiB, session {}, source {}",
+        run.sent_bytes / 1024,
+        run.peak_rss_kib,
+        run.session,
+        run.source
     );
     run
 }
@@ -897,7 +992,7 @@ fn assert_within_capacity(run: &Overload) {
     );
 }
 
-const RSS_MARGIN_KIB: u64 = 64 * 1024;
+const RSS_MARGIN_KIB: u64 = 8 * 1024;
 
 #[test]
 fn a_burst_10_producer_keeps_serve_memory_within_a_margin_of_a_real_time_baseline() {
@@ -936,6 +1031,43 @@ fn a_producer_faster_than_serve_can_send_is_dropped_not_buffered() {
     assert!(
         flood.peak_rss_kib <= baseline.peak_rss_kib + RSS_MARGIN_KIB,
         "serve peak RSS {} KiB is more than {RSS_MARGIN_KIB} KiB over the {} KiB baseline",
+        flood.peak_rss_kib,
+        baseline.peak_rss_kib
+    );
+}
+
+#[test]
+fn a_flood_of_8_mib_keyframes_keeps_serve_memory_bounded() {
+    let baseline = overload_run(None, 5);
+    let pad = (8 << 20) - 64;
+    let flood = overload_run_with(Some(50), 12, &["--pad-keyframes", &pad.to_string()]);
+    assert_within_capacity(&flood);
+    let source_lost = flood.source["dropped_video"].as_u64().unwrap();
+    assert!(
+        source_lost > 0,
+        "the source queue never overflowed: {}",
+        flood.source
+    );
+    let requested = flood.source["overflow_keyframe_requests"].as_u64().unwrap();
+    assert!(
+        requested > 0,
+        "no keyframe request after overflow: {}",
+        flood.source
+    );
+    assert!(
+        flood.keyframe_requests > 0,
+        "the producer saw no keyframe request"
+    );
+    // Queues and in-flight copies measured up to ~260 MiB with glibc arenas; keeping what was sent would exceed it.
+    let bound_kib = (QUEUE_MAX_BYTES as u64 + 40 * (8 << 20)) / 1024;
+    assert!(
+        flood.sent_bytes / 1024 > bound_kib + bound_kib / 2,
+        "the flood sent only {} KiB, too little to tell buffering from the bound",
+        flood.sent_bytes / 1024
+    );
+    assert!(
+        flood.peak_rss_kib <= baseline.peak_rss_kib + bound_kib,
+        "serve peak RSS {} KiB is more than {bound_kib} KiB over the {} KiB baseline",
         flood.peak_rss_kib,
         baseline.peak_rss_kib
     );

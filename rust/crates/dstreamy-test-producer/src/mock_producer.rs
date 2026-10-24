@@ -51,6 +51,9 @@ struct Args {
     /// Sends `factor` times faster than real time.
     #[arg(long, value_name = "FACTOR")]
     burst: Option<u32>,
+    /// Pads every keyframe with filler data to this many bytes.
+    #[arg(long, value_name = "BYTES")]
+    pad_keyframes: Option<usize>,
     /// Stops after this long; runs until killed otherwise.
     #[arg(long, value_name = "MS")]
     duration: Option<u64>,
@@ -213,6 +216,20 @@ impl Media {
     }
 }
 
+/// Appends a filler data NAL unit (H.264 Table 7-1, type 12) so the frame is `size` bytes.
+fn padded(mut frame: Frame, size: usize) -> Frame {
+    let mut data = frame.payload.to_vec();
+    let fill = size.saturating_sub(data.len() + annexb::START_CODE.len() + 2);
+    if fill > 0 {
+        data.extend_from_slice(&annexb::START_CODE);
+        data.push(12);
+        data.resize(data.len() + fill, 0xFF);
+        data.push(0x80);
+    }
+    frame.payload = Bytes::from(data);
+    frame
+}
+
 /// A frame the service must refuse for `kind`, built from the last frames sent.
 fn corrupted(kind: Corrupt, last_video_pts: i64, keyframe: &[u8]) -> Result<BytesMut, String> {
     let mut buf = BytesMut::new();
@@ -301,6 +318,7 @@ async fn attach(
     let mut corrupt_at = args.corrupt.and(at(Some(args.corrupt_after)));
     let mut last_video_pts = 0i64;
     let mut last_keyframe: Option<Vec<u8>> = None;
+    let mut sent_bytes = 0u64;
     let outcome = loop {
         let wake = [deadline, disconnect_at, stall_at, corrupt_at]
             .into_iter()
@@ -346,7 +364,7 @@ async fn attach(
                     report(json!({"fault": "corrupt", "kind": format!("{kind:?}")}));
                     let io = sink.get_mut();
                     if io.write_all(&bytes).await.is_err() || io.flush().await.is_err() {
-                        break Outcome::Disconnected;
+                        break pending_detached(&mut lines).await;
                     }
                 }
             }
@@ -354,20 +372,42 @@ async fn attach(
                 let Some(frame) = next else {
                     return Err("the test pattern ended".into());
                 };
+                let frame = match args.pad_keyframes {
+                    Some(size) if frame.keyframe => padded(frame, size),
+                    _ => frame,
+                };
                 if frame.kind == Kind::Video {
                     last_video_pts = frame.pts_us;
                     if frame.keyframe {
                         last_keyframe = Some(frame.payload.to_vec());
                     }
                 }
+                sent_bytes += frame.payload.len() as u64;
                 if sink.send(frame).await.is_err() {
-                    break Outcome::Disconnected;
+                    break pending_detached(&mut lines).await;
                 }
             }
         }
     };
+    report(json!({"sent_bytes": sent_bytes}));
     source.stop().await;
     Ok(outcome)
+}
+
+/// After a failed write the service may already have sent `detached` before closing; read it if so.
+async fn pending_detached(lines: &mut Lines) -> Outcome {
+    let drain = async {
+        while let Some(Ok(Ok(event))) = lines.next().await {
+            report(json!({"event": event}));
+            if event["type"] == "detached" {
+                return Outcome::Detached(event);
+            }
+        }
+        Outcome::Disconnected
+    };
+    tokio::time::timeout(Duration::from_secs(1), drain)
+        .await
+        .unwrap_or(Outcome::Disconnected)
 }
 
 async fn sleep_until_opt(at: Option<Instant>) {
