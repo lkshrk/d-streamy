@@ -309,6 +309,8 @@ struct Current {
     held: Vec<Held>,
     active_at: Instant,
     stalled: bool,
+    /// False until the producer may send; the stall timer only runs while true.
+    timing: bool,
 }
 
 impl Current {
@@ -488,7 +490,7 @@ impl State {
         let first_start = self.first_start?;
         let cur = self.current.as_ref();
         let stall = cur
-            .filter(|c| !c.stalled)
+            .filter(|c| c.timing && !c.stalled)
             .map(|c| c.active_at.max(first_start) + options.stall);
         let held = cur
             .filter(|c| c.offset.is_none())
@@ -516,6 +518,7 @@ impl State {
             self.release_held();
         }
         if let Some(cur) = self.current.as_mut()
+            && cur.timing
             && !cur.stalled
         {
             let last = cur.active_at.max(first_start);
@@ -927,6 +930,13 @@ pub struct ExternalHandle {
 
 impl ExternalHandle {
     pub fn attach(&self, info: ProducerInfo) -> Result<Attachment, AttachError> {
+        let attachment = self.attach_paused(info)?;
+        attachment.start_stall_timer();
+        Ok(attachment)
+    }
+
+    /// As [`ExternalHandle::attach`], with the stall timer stopped until [`Attachment::start_stall_timer`].
+    pub fn attach_paused(&self, info: ProducerInfo) -> Result<Attachment, AttachError> {
         let inner = self.inner.upgrade().ok_or(AttachError::NoSession)?;
         let mut state = inner.lock();
         if !state.advance(&inner, Instant::now()) {
@@ -954,6 +964,7 @@ impl ExternalHandle {
             held: Vec::new(),
             active_at: Instant::now(),
             stalled: false,
+            timing: false,
         });
         state.idle = None;
         drop(state);
@@ -1064,6 +1075,24 @@ impl Attachment {
         drop(guard);
         inner.wake.notify_one();
         Ok(())
+    }
+
+    /// Starts the stall timer, from now; the producer may send from here on.
+    pub fn start_stall_timer(&self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let mut state = inner.lock();
+        if let Some(cur) = state
+            .current
+            .as_mut()
+            .filter(|c| c.id == self.id && !c.timing)
+        {
+            cur.timing = true;
+            cur.active_at = Instant::now();
+        }
+        drop(state);
+        inner.wake.notify_one();
     }
 
     /// Bumped on every keyframe the session asks for, and once on attach.

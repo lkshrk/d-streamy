@@ -747,6 +747,33 @@ async fn stop_and_start_keep_the_attachment_and_continue_pts() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_paused_attachment_stalls_only_after_its_stall_timer_starts() {
+    let rig = Rig::started(IdleMode::None).await;
+    let state = rig.handle.state();
+    let a = rig.handle.attach_paused(info()).unwrap();
+    sleep(STALL * 3).await;
+    settle().await;
+    assert_eq!(*state.borrow(), SourceState::Producing { attachment: 1 });
+    a.start_stall_timer();
+    sleep(STALL - MS).await;
+    settle().await;
+    assert_eq!(*state.borrow(), SourceState::Producing { attachment: 1 });
+    sleep(MS).await;
+    settle().await;
+    assert!(
+        matches!(
+            *state.borrow(),
+            SourceState::Interrupted {
+                reason: InterruptReason::Stalled,
+                ..
+            }
+        ),
+        "{:?}",
+        *state.borrow()
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_silent_producer_is_stalled_then_producing_again_from_a_keyframe() {
     let rig = Rig::started(IdleMode::Documented).await;
     let mut state = rig.handle.state();

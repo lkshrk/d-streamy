@@ -533,6 +533,30 @@ fn op_12_follows_each_producer_and_comes_before_its_media() {
 }
 
 #[test]
+fn waiting_for_a_rate_limited_op_12_does_not_count_as_a_stall() {
+    let h = Harness::new("[serve]\nstall_ms = 500\n");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    for want in [(640, 360, 15), (160, 90, 30)] {
+        let args = size_args(want.0, want.1, want.2);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut p = h.producer(&args);
+        let id = p.attached();
+        c.source("producing", |e| e["attachment"] == id);
+        std::thread::sleep(Duration::from_millis(300));
+        p.kill();
+        c.source("detached", |e| e["reason"] == "detached");
+    }
+    c.drain();
+    let stalls: Vec<&Value> = c
+        .seen
+        .iter()
+        .filter(|m| m["event"]["event"] == "source" && m["event"]["reason"] == "stalled")
+        .collect();
+    assert!(stalls.is_empty(), "{stalls:?}");
+}
+
+#[test]
 fn producers_cycling_sizes_get_at_most_one_op_12_a_second_and_the_last_size_wins() {
     let h = Harness::new("");
     let _s = h.serve();

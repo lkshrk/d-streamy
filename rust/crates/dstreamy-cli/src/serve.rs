@@ -378,7 +378,9 @@ impl Connection {
             .engine
             .external()
             .ok_or(dstreamy_media::AttachError::NoSession)
-            .and_then(|(handle, announced)| Ok((handle.attach(info)?, handle.state(), announced)));
+            .and_then(|(handle, announced)| {
+                Ok((handle.attach_paused(info)?, handle.state(), announced))
+            });
         let (attachment, states, mut announced) = match attached {
             Ok(attached) => attached,
             Err(e) => {
@@ -396,6 +398,7 @@ impl Connection {
         if !op12 {
             tracing::warn!(?declared, "the producer's video was not announced in time");
         }
+        attachment.start_stall_timer();
         if let Err(e) = ControlCodec::new().encode(
             &json!({ "attached": attachment.id() }),
             writer.write_buffer_mut(),
