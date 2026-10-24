@@ -1155,8 +1155,11 @@ dependencies = [
  "dstreamy-ipc",
  "dstreamy-media",
  "dstreamy-mock-discord",
+ "dstreamy-test-producer",
  "futures-util",
  "insta",
+ "libc",
+ "openh264",
  "ratatui",
  "rpassword",
  "secrecy",
@@ -1270,9 +1273,15 @@ dependencies = [
 name = "dstreamy-test-producer"
 version = "0.1.0"
 dependencies = [
+ "clap",
+ "dstreamy-ipc",
+ "dstreamy-media",
+ "futures-util",
  "openh264",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
  "unsafe-libopus",
 ]
 

@@ -1,0 +1,426 @@
+//! `mock-producer`: a test producer for `dstreamy serve` (ADR 0004 producer role). Not shipped.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::Duration;
+
+use clap::{Parser, ValueEnum};
+use dstreamy_ipc::{ControlCodec, Endpoint, Frame, Kind, ProducerCodec};
+use dstreamy_media::{
+    CaptureConfig, CaptureSource, FrameReceiver, MediaFrame, TestPatternSource, VideoCodec, annexb,
+};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::time::{Instant, sleep, sleep_until};
+use tokio_util::bytes::{BufMut, Bytes, BytesMut};
+use tokio_util::codec::{FramedRead, FramedWrite};
+
+const RECONNECT_DELAY: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Corrupt {
+    NoStartCode,
+    IdrWithoutFlag,
+    KeyframeWithoutSps,
+    PtsNeDts,
+    #[value(name = "opus-40ms")]
+    Opus40ms,
+    Oversized,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "mock-producer",
+    about = "Feeds `dstreamy serve` a test pattern as a producer"
+)]
+struct Args {
+    #[arg(long)]
+    endpoint: Option<PathBuf>,
+    /// Encodes `TestPatternSource` live.
+    #[arg(long, required = true)]
+    pattern: bool,
+    #[arg(long, default_value_t = 320)]
+    width: u32,
+    #[arg(long, default_value_t = 180)]
+    height: u32,
+    #[arg(long, default_value_t = 30)]
+    fps: u32,
+    #[arg(long, default_value_t = 400)]
+    bitrate_kbps: u32,
+    /// Sends `factor` times faster than real time.
+    #[arg(long, value_name = "FACTOR")]
+    burst: Option<u32>,
+    /// Stops after this long; runs until killed otherwise.
+    #[arg(long, value_name = "MS")]
+    duration: Option<u64>,
+    #[arg(long, value_name = "MS")]
+    disconnect_after: Option<u64>,
+    /// Stops sending, but stays connected, for `stall_for` ms.
+    #[arg(long, value_name = "MS")]
+    stall_after: Option<u64>,
+    #[arg(long, value_name = "MS", default_value_t = 3_000)]
+    stall_for: u64,
+    #[arg(long, value_enum)]
+    corrupt: Option<Corrupt>,
+    /// Sends `--corrupt` this long after attaching.
+    #[arg(long, value_name = "MS", default_value_t = 500)]
+    corrupt_after: u64,
+    /// Connects again after each disconnect, `--reconnect` times at most.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    reconnect: u32,
+}
+
+type Lines = FramedRead<ReadHalf<dstreamy_ipc::Stream>, ControlCodec>;
+type Sink = FramedWrite<WriteHalf<dstreamy_ipc::Stream>, ProducerCodec>;
+
+#[derive(Debug)]
+enum Outcome {
+    Finished,
+    Disconnected,
+    Detached(Value),
+}
+
+fn hello(args: &Args) -> Value {
+    json!({
+        "id": "1", "cmd": "hello", "role": "producer", "protocol": 2,
+        "video": {"codec": "h264", "width": args.width, "height": args.height, "fps": args.fps},
+        "audio": {"codec": "opus", "sample_rate": 48000, "channels": 2, "frame_ms": 20},
+        "client": {"name": "mock-producer", "version": env!("CARGO_PKG_VERSION"), "obs_version": null},
+    })
+}
+
+/// Prints a line that tests read from stdout.
+fn report(value: Value) {
+    println!("{value}");
+}
+
+fn frame(kind: Kind, pts_us: i64, keyframe: bool, payload: Vec<u8>) -> Frame {
+    Frame {
+        kind,
+        pts_us,
+        keyframe,
+        payload: Bytes::from(payload),
+    }
+}
+
+fn media(frame: MediaFrame) -> Frame {
+    let (kind, pts, keyframe, data) = match frame {
+        MediaFrame::Video(v) => (Kind::Video, v.pts_us, v.keyframe, v.data),
+        MediaFrame::Audio(a) => (Kind::Opus, a.pts_us, false, a.data),
+    };
+    self::frame(kind, i64::try_from(pts).unwrap_or(i64::MAX), keyframe, data)
+}
+
+/// Where frames come from: the live pattern, or for `--burst` one encoded loop replayed with rising pts.
+enum Media {
+    Live(TestPatternSource, FrameReceiver),
+    Burst {
+        clip: Vec<Frame>,
+        span_us: i64,
+        next: usize,
+        lap: i64,
+        factor: u32,
+        origin: Instant,
+    },
+}
+
+/// One keyframe interval of pattern media, encoded once; the encoder is too slow to burst live.
+async fn clip(config: CaptureConfig) -> Result<(Vec<Frame>, i64), String> {
+    let span_us = i64::from(config.keyframe_interval_frames()) * 1_000_000 / i64::from(config.fps);
+    let mut pattern = TestPatternSource::unpaced();
+    let mut frames = pattern.start(config).await.map_err(|e| e.to_string())?;
+    let mut clip = Vec::new();
+    while let Some(frame) = frames.recv().await {
+        let frame = media(frame);
+        if frame.pts_us >= span_us {
+            break;
+        }
+        clip.push(frame);
+    }
+    let _ = pattern.stop().await;
+    Ok((clip, span_us))
+}
+
+impl Media {
+    async fn new(config: CaptureConfig, burst: Option<u32>) -> Result<Self, String> {
+        match burst {
+            Some(factor) => {
+                let (clip, span_us) = clip(config).await?;
+                Ok(Self::Burst {
+                    clip,
+                    span_us,
+                    next: 0,
+                    lap: 0,
+                    factor: factor.max(1),
+                    origin: Instant::now(),
+                })
+            }
+            None => {
+                let mut pattern = TestPatternSource::new();
+                let frames = pattern.start(config).await.map_err(|e| e.to_string())?;
+                Ok(Self::Live(pattern, frames))
+            }
+        }
+    }
+
+    async fn next(&mut self) -> Option<Frame> {
+        match self {
+            Self::Live(_, frames) => frames.recv().await.map(media),
+            Self::Burst {
+                clip,
+                span_us,
+                next,
+                lap,
+                factor,
+                origin,
+            } => {
+                let mut frame = clip.get(*next)?.clone();
+                frame.pts_us += *lap * *span_us;
+                let due = u64::try_from(frame.pts_us).unwrap_or(0) / u64::from(*factor);
+                sleep_until(*origin + Duration::from_micros(due)).await;
+                *next += 1;
+                if *next == clip.len() {
+                    *next = 0;
+                    *lap += 1;
+                }
+                Some(frame)
+            }
+        }
+    }
+
+    fn request_keyframe(&self) {
+        if let Self::Live(pattern, _) = self {
+            pattern.request_keyframe();
+        }
+    }
+
+    /// Skips what piled up during a stall and restarts at a keyframe.
+    fn resume(&mut self) {
+        match self {
+            Self::Live(pattern, frames) => {
+                while frames.try_recv().is_ok() {}
+                pattern.request_keyframe();
+            }
+            Self::Burst { .. } => {}
+        }
+    }
+
+    async fn stop(self) {
+        if let Self::Live(mut pattern, _) = self {
+            let _ = pattern.stop().await;
+        }
+    }
+}
+
+/// A frame the service must refuse for `kind`, built from the last frames sent.
+fn corrupted(kind: Corrupt, last_video_pts: i64, keyframe: &[u8]) -> Result<BytesMut, String> {
+    let mut buf = BytesMut::new();
+    let nalus: Vec<&[u8]> = annexb::nal_units(keyframe).collect();
+    let mut without_sps = Vec::new();
+    for n in nalus
+        .iter()
+        .filter(|n| annexb::h264_nal_type(n) != Some(annexb::H264_NAL_SPS))
+    {
+        annexb::append_nalu(&mut without_sps, n);
+    }
+    let encoded = |f: Frame, buf: &mut BytesMut| {
+        tokio_util::codec::Encoder::encode(&mut ProducerCodec, f, buf).map_err(|e| e.to_string())
+    };
+    let next = last_video_pts + 1;
+    match kind {
+        Corrupt::NoStartCode => {
+            let stripped = keyframe
+                .strip_prefix(&annexb::START_CODE)
+                .ok_or("keyframe lacks a start code")?;
+            encoded(frame(Kind::Video, next, true, stripped.to_vec()), &mut buf)?;
+        }
+        Corrupt::IdrWithoutFlag => {
+            encoded(frame(Kind::Video, next, false, keyframe.to_vec()), &mut buf)?
+        }
+        Corrupt::KeyframeWithoutSps => {
+            encoded(frame(Kind::Video, next, true, without_sps), &mut buf)?
+        }
+        Corrupt::PtsNeDts => encoded(
+            frame(Kind::Video, last_video_pts - 1, true, keyframe.to_vec()),
+            &mut buf,
+        )?,
+        // RFC 6716 §3.1: config 31 (CELT FB 20 ms) with code 1, two frames.
+        Corrupt::Opus40ms => encoded(frame(Kind::Opus, 0, false, vec![0xF9, 0, 0]), &mut buf)?,
+        Corrupt::Oversized => {
+            buf.put_u32(dstreamy_ipc::producer::MAX_FRAME_LEN + 1);
+            buf.put_u8(Kind::Video as u8);
+        }
+    }
+    Ok(buf)
+}
+
+async fn connect(endpoint: &Endpoint, args: &Args) -> Result<Option<(Lines, Sink)>, String> {
+    let stream = dstreamy_ipc::connect(endpoint)
+        .await
+        .map_err(|e| format!("connecting to {endpoint}: {e}"))?;
+    let (read, write) = tokio::io::split(stream);
+    let mut lines = FramedRead::new(read, ControlCodec::new());
+    let mut hello_writer = FramedWrite::new(write, ControlCodec::new());
+    hello_writer
+        .send(hello(args))
+        .await
+        .map_err(|e| format!("sending hello: {e}"))?;
+    let reply = match lines.next().await {
+        Some(Ok(Ok(reply))) => reply,
+        other => return Err(format!("no hello reply: {other:?}")),
+    };
+    report(json!({"hello": reply}));
+    if reply.get("attached").is_none() {
+        return Ok(None);
+    }
+    let write = hello_writer.into_inner();
+    Ok(Some((lines, FramedWrite::new(write, ProducerCodec::new()))))
+}
+
+/// Sends test-pattern media until the duration, a fault, or the service ends the attachment.
+async fn attach(
+    args: &Args,
+    mut lines: Lines,
+    mut sink: Sink,
+    deadline: Option<Instant>,
+) -> Result<Outcome, String> {
+    let config = CaptureConfig {
+        width: args.width,
+        height: args.height,
+        fps: args.fps,
+        bitrate_bps: args.bitrate_kbps * 1000,
+        codec: VideoCodec::H264,
+        ..CaptureConfig::default()
+    };
+    let mut source = Media::new(config, args.burst).await?;
+    let started = Instant::now();
+    let at = |ms: Option<u64>| ms.map(|ms| started + Duration::from_millis(ms));
+    let disconnect_at = at(args.disconnect_after);
+    let mut stall_at = at(args.stall_after);
+    let mut corrupt_at = args.corrupt.and(at(Some(args.corrupt_after)));
+    let mut last_video_pts = 0i64;
+    let mut last_keyframe: Option<Vec<u8>> = None;
+    let outcome = loop {
+        let wake = [deadline, disconnect_at, stall_at, corrupt_at]
+            .into_iter()
+            .flatten()
+            .min();
+        tokio::select! {
+            biased;
+            line = lines.next() => match line {
+                Some(Ok(Ok(event))) => {
+                    report(json!({"event": event}));
+                    if event["type"] == "keyframe_request" {
+                        source.request_keyframe();
+                    }
+                    if event["type"] == "detached" {
+                        break Outcome::Detached(event);
+                    }
+                }
+                Some(Ok(Err(e))) => return Err(format!("malformed event: {e}")),
+                None | Some(Err(_)) => break Outcome::Disconnected,
+            },
+            () = sleep_until_opt(wake) => {
+                let now = Instant::now();
+                if deadline.is_some_and(|d| now >= d) {
+                    let _ = sink.send(Frame::end_of_stream(last_video_pts)).await;
+                    break Outcome::Finished;
+                }
+                if disconnect_at.is_some_and(|d| now >= d) {
+                    report(json!({"fault": "disconnect"}));
+                    break Outcome::Disconnected;
+                }
+                if stall_at.is_some_and(|d| now >= d) {
+                    stall_at = None;
+                    report(json!({"fault": "stall"}));
+                    sleep(Duration::from_millis(args.stall_for)).await;
+                    source.resume();
+                    report(json!({"fault": "resume"}));
+                }
+                if corrupt_at.is_some_and(|d| now >= d)
+                    && let (Some(kind), Some(keyframe)) = (args.corrupt, last_keyframe.as_deref())
+                {
+                    corrupt_at = None;
+                    let bytes = corrupted(kind, last_video_pts, keyframe)?;
+                    report(json!({"fault": "corrupt", "kind": format!("{kind:?}")}));
+                    let io = sink.get_mut();
+                    if io.write_all(&bytes).await.is_err() || io.flush().await.is_err() {
+                        break Outcome::Disconnected;
+                    }
+                }
+            }
+            next = source.next() => {
+                let Some(frame) = next else {
+                    return Err("the test pattern ended".into());
+                };
+                if frame.kind == Kind::Video {
+                    last_video_pts = frame.pts_us;
+                    if frame.keyframe {
+                        last_keyframe = Some(frame.payload.to_vec());
+                    }
+                }
+                if sink.send(frame).await.is_err() {
+                    break Outcome::Disconnected;
+                }
+            }
+        }
+    };
+    source.stop().await;
+    Ok(outcome)
+}
+
+async fn sleep_until_opt(at: Option<Instant>) {
+    match at {
+        Some(at) => sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn run(args: Args) -> Result<(), String> {
+    let endpoint = match &args.endpoint {
+        Some(path) => Endpoint::new(path),
+        None => Endpoint::default_for_user().map_err(|e| e.to_string())?,
+    };
+    let deadline = args
+        .duration
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
+    let mut left = args.reconnect;
+    loop {
+        let Some((lines, sink)) = connect(&endpoint, &args).await? else {
+            return Err("the service refused the producer".into());
+        };
+        let outcome = attach(&args, lines, sink, deadline).await?;
+        report(json!({"outcome": format!("{outcome:?}")}));
+        match outcome {
+            Outcome::Disconnected if left > 0 => {
+                left -= 1;
+                sleep(RECONNECT_DELAY).await;
+            }
+            Outcome::Finished | Outcome::Disconnected => return Ok(()),
+            Outcome::Detached(event) => return Err(format!("detached: {event}")),
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    let args = Args::parse();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("mock-producer: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(run(args)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("mock-producer: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
