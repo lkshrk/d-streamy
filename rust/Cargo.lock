@@ -1270,13 +1270,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dstreamy-obs-packet"
+version = "0.1.0"
+dependencies = [
+ "openh264",
+ "proptest",
+]
+
+[[package]]
 name = "dstreamy-test-producer"
 version = "0.1.0"
 dependencies = [
- "cc",
  "clap",
  "dstreamy-ipc",
  "dstreamy-media",
+ "dstreamy-obs-packet",
  "futures-util",
  "openh264",
  "serde_json",

@@ -43,7 +43,11 @@ impl RtpPacketizer {
         format: PayloadFormat,
         playout_delay: (u16, u16),
     ) -> Self {
-        let start_timestamp = rand::random();
+        let start_timestamp = if cfg!(feature = "test-rtp-start") {
+            0
+        } else {
+            rand::random()
+        };
         Self {
             ssrc,
             payload_type,

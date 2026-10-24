@@ -1,10 +1,10 @@
-//! `obs-harness` traces (`obs/tests/traces/*/PROVENANCE.md` has the format) and their conversion through `packet.c`.
+//! `obs-harness` traces (`obs/tests/traces/*/PROVENANCE.md` has the format) converted by `dstreamy-obs-packet`.
 
 use std::path::Path;
 
 use serde_json::Value;
 
-use crate::packet::{self, Converter, PacketError};
+use dstreamy_obs_packet::{self as packet, Converter, PacketError};
 
 const MAGIC: &[u8; 8] = b"DSTRACE1";
 const HEADER: usize = 40;
@@ -170,7 +170,7 @@ impl Replay {
                 .converter
                 .convert_video(&p.data, p.keyframe, p.pts, p.dts, p.timebase)?;
             Converted::Video {
-                data: f.data.to_vec(),
+                data: f.data.into_owned(),
                 pts_us: f.pts_us,
                 keyframe: f.keyframe,
             }

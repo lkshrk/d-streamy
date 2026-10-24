@@ -435,8 +435,9 @@ fn audio_and_video_stay_aligned_across_a_producer_restart() {
     let _s = h.serve();
     let mut c = h.external_session();
     let mut recorded = None;
+    let mut sent = Vec::new();
     for n in 0..3 {
-        let mut p = h.producer(&[]);
+        let mut p = h.producer(&["--report-sent"]);
         let id = p.attached();
         c.source("producing", |e| e["attachment"] == id);
         let (v0, a0) = recorded.as_ref().map_or((0, 0), |r: &Recorded| {
@@ -448,33 +449,22 @@ fn audio_and_video_stay_aligned_across_a_producer_restart() {
             c.source("interrupted", |e| e["state"] == "interrupted");
             std::thread::sleep(Duration::from_millis(1_000));
         }
+        sent.push(p.lines());
     }
     let recorded = recorded.unwrap();
     let video: Vec<&RecordedVideoFrame> = stream_video(&recorded);
-    let audio: Vec<u32> = producer_audio(&recorded)
-        .iter()
-        .map(|a| a.rtp_timestamp)
-        .collect();
+    let audio = producer_audio(&recorded);
     let video_ts: Vec<u32> = video.iter().map(|v| v.rtp_timestamp).collect();
+    let audio_ts: Vec<u32> = audio.iter().map(|a| a.rtp_timestamp).collect();
     let (vr, ar) = (
         runs(&video_ts, 90_000, 500_000),
-        runs(&audio, 48_000, 500_000),
+        runs(&audio_ts, 48_000, 500_000),
     );
     assert_eq!(
         (vr.len(), ar.len()),
         (3, 3),
         "attachments: video {vr:?}, audio {ar:?}"
     );
-    // Both tracks start at pts 0 and RTP clocks at random values (RFC 3550 §5.1), so only offset changes count.
-    let rtp_us =
-        |t: u32, base: u32, hz: i64| i64::from(t.wrapping_sub(base) as i32) * 1_000_000 / hz;
-    let offsets: Vec<i64> = vr
-        .iter()
-        .zip(&ar)
-        .map(|(&v, &a)| {
-            rtp_us(video_ts[v], video_ts[0], 90_000) - rtp_us(audio[a], audio[0], 48_000)
-        })
-        .collect();
     for &v in &vr[1..] {
         assert!(
             is_keyframe(&video[v].data),
@@ -482,14 +472,28 @@ fn audio_and_video_stay_aligned_across_a_producer_restart() {
         );
     }
     let frame_us = 1_000_000 / i64::from(FPS);
-    let first_unreliable =
-        !is_keyframe(&video[0].data) || recorded.dropped_frames.iter().any(|d| d.contains("video"));
-    let from = usize::from(first_unreliable);
-    for pair in offsets[from..].windows(2) {
+    let end = |r: &[usize], i: usize, len: usize| r.get(i + 1).copied().unwrap_or(len);
+    for (i, sent) in sent.iter().enumerate() {
+        let v = &video[vr[i]..end(&vr, i, video.len())];
+        let a = &audio[ar[i]..end(&ar, i, audio.len())];
+        let vs = shift_us(
+            v.iter().map(|f| (f.data.as_slice(), f.rtp_timestamp)),
+            sent,
+            true,
+            90_000,
+        );
+        let as_ = shift_us(
+            a.iter().map(|f| (f.data.as_slice(), f.rtp_timestamp)),
+            sent,
+            false,
+            48_000,
+        );
+        let (Some(vs), Some(as_)) = (vs, as_) else {
+            panic!("attachment {i}: too few recorded frames matched what was sent");
+        };
         assert!(
-            (pair[1] - pair[0]).abs() <= frame_us,
-            "A/V offset moved by {} µs across a restart (offsets {offsets:?} µs, one frame is {frame_us} µs)",
-            pair[1] - pair[0]
+            (as_ - vs).abs() <= frame_us,
+            "attachment {i}: serve moved audio by {as_} µs and video by {vs} µs; one frame is {frame_us} µs"
         );
     }
 }

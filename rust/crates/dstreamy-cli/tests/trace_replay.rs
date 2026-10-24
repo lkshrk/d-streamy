@@ -1,14 +1,14 @@
-//! `serve` + mock Discord + `mock-producer --replay`: real OBS traces converted by `obs/src/packet.c`.
+//! `serve` + mock Discord + `mock-producer --replay`: real OBS traces converted by `dstreamy-obs-packet`.
 #![cfg(unix)]
 
 mod support;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dstreamy_media::annexb;
-use dstreamy_mock_discord::{RecordedAudioFrame, RecordedVideoFrame};
+use dstreamy_mock_discord::{Recorded, RecordedAudioFrame, RecordedVideoFrame, VoiceKind};
 use dstreamy_test_producer::sync::{
     self, H264LumaDecoder, LumaFrame, MarkerPair, OpusMonoDecoder, SAMPLE_RATE, TONE_HZ,
 };
@@ -17,41 +17,74 @@ use support::*;
 
 const VIDEO_HZ: i64 = 90_000;
 const AUDIO_HZ: i64 = 48_000;
+const PACING_SLACK_US: i64 = 20_000;
 
 fn traces_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../obs/tests/traces")
-}
-
-fn trace_dir(name: &str) -> PathBuf {
-    traces_dir().join(name)
 }
 
 fn uses_b_frames(name: &str) -> bool {
     name.contains("-bf2-") || name.contains("-bfunset-")
 }
 
-const POSITIVE: [&str; 6] = [
-    "linux-ffmpeg_opus-defaults",
-    "linux-x264-baseline-bf0-keyint2-30fps",
-    "linux-x264-baseline-bf0-keyint2-60fps",
-    "linux-x264-main-bf0-keyint0-30fps",
-    "linux-x264-main-bf0-keyint2-30fps",
-    "linux-x264-main-bf0-keyint2-60fps",
-];
+/// Every committed trace, read at test time so a new trace directory is covered without a code change.
+fn traces() -> Vec<(String, PathBuf, Trace)> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(traces_dir())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs.into_iter()
+        .map(|d| {
+            let name = d.file_name().unwrap().to_string_lossy().into_owned();
+            let trace = Trace::load(&d).unwrap();
+            (name, d, trace)
+        })
+        .collect()
+}
 
-/// What the producer sends for a trace, as `packet.c` converts it: payload and pts in µs per track.
+fn positive(name: &str, trace: &Trace) -> bool {
+    !uses_b_frames(name) && trace.audio_codec() == "opus"
+}
+
+/// One frame the producer sends, as `dstreamy-obs-packet` converts it.
+struct Sent {
+    key: Vec<u8>,
+    pts_us: i64,
+    dts_usec: i64,
+}
+
 struct Expected {
     fps: i64,
-    video: Vec<(Vec<u8>, i64)>,
-    audio: Vec<(Vec<u8>, i64)>,
+    video: Vec<Sent>,
+    audio: Vec<Sent>,
+}
+
+/// The transport rewrites the SPS and start codes, so video frames are matched on their slice NAL units.
+fn slices(au: &[u8]) -> Vec<u8> {
+    annexb::nal_units(au)
+        .filter(|n| matches!(annexb::h264_nal_type(n), Some(1 | 5)))
+        .flatten()
+        .copied()
+        .collect()
 }
 
 fn expected(trace: &Trace) -> Expected {
     let (mut video, mut audio) = (Vec::new(), Vec::new());
     for r in trace.clone().replay() {
-        match r.expect("positive trace converts").frame {
-            Converted::Video { data, pts_us, .. } => video.push((data, pts_us)),
-            Converted::Audio { data, pts_us } => audio.push((data, pts_us)),
+        let r = r.expect("positive trace converts");
+        match r.frame {
+            Converted::Video { data, pts_us, .. } => video.push(Sent {
+                key: slices(&data),
+                pts_us,
+                dts_usec: r.dts_usec,
+            }),
+            Converted::Audio { data, pts_us } => audio.push(Sent {
+                key: data,
+                pts_us,
+                dts_usec: r.dts_usec,
+            }),
         }
     }
     Expected {
@@ -61,88 +94,112 @@ fn expected(trace: &Trace) -> Expected {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Clock {
-    base: u32,
-    hz: i64,
+/// `test-hooks` starts every RTP clock at 0, so a timestamp is the pts `serve` stamped on its shared timeline.
+fn rtp_us(rtp: u32, hz: i64) -> i64 {
+    i64::from(rtp) * 1_000_000 / hz
 }
 
-impl Clock {
-    /// RTP bases are random (RFC 3550 §5.1), so each track is anchored on the pts of the frames whose payload was sent once.
-    fn anchored<'a>(
-        recorded: impl Iterator<Item = (u32, &'a [u8])>,
-        sent: &[(Vec<u8>, i64)],
-        hz: i64,
-    ) -> Self {
-        let mut by_payload: HashMap<&[u8], Option<i64>> = HashMap::new();
-        for (data, pts) in sent {
-            by_payload
-                .entry(data)
-                .and_modify(|p| *p = None)
-                .or_insert(Some(*pts));
-        }
-        let bases: Vec<u32> = recorded
-            .filter_map(|(rtp, data)| {
-                let pts = (*by_payload.get(data)?)?;
-                Some(rtp.wrapping_sub((pts * hz).div_euclid(1_000_000) as u32))
-            })
-            .collect();
-        assert!(
-            bases.len() >= 10,
-            "only {} frames matched what was sent",
-            bases.len()
-        );
-        let first = bases[0];
-        let mut deltas: Vec<i32> = bases.iter().map(|b| b.wrapping_sub(first) as i32).collect();
-        deltas.sort_unstable();
-        Self {
-            base: first.wrapping_add(deltas[deltas.len() / 2] as u32),
-            hz,
-        }
+/// Recorded frames paired with what was sent; payloads sent more than once are left out.
+fn matched<'a, F>(
+    recorded: &[&'a F],
+    key: impl Fn(&F) -> Vec<u8>,
+    sent: &'a [Sent],
+) -> Vec<(&'a F, &'a Sent)> {
+    let mut by_key: HashMap<&[u8], Option<&Sent>> = HashMap::new();
+    for s in sent {
+        by_key
+            .entry(&s.key)
+            .and_modify(|v| *v = None)
+            .or_insert(Some(s));
     }
-
-    /// The transport rewrites the SPS and start codes, so video frames are matched on their slice NAL units.
-    fn video(frames: &[&RecordedVideoFrame], sent: &[(Vec<u8>, i64)]) -> Self {
-        let sent: Vec<(Vec<u8>, i64)> = sent.iter().map(|(d, p)| (slices(d), *p)).collect();
-        let recorded: Vec<(u32, Vec<u8>)> = frames
-            .iter()
-            .map(|f| (f.rtp_timestamp, slices(&f.data)))
-            .collect();
-        Self::anchored(
-            recorded.iter().map(|(t, d)| (*t, d.as_slice())),
-            &sent,
-            VIDEO_HZ,
-        )
-    }
-
-    fn audio(frames: &[&RecordedAudioFrame], sent: &[(Vec<u8>, i64)]) -> Self {
-        Self::anchored(
-            frames.iter().map(|f| (f.rtp_timestamp, f.data.as_slice())),
-            sent,
-            AUDIO_HZ,
-        )
-    }
-
-    fn us(&self, rtp: u32) -> i64 {
-        i64::from(rtp.wrapping_sub(self.base) as i32) * 1_000_000 / self.hz
-    }
-}
-
-fn slices(au: &[u8]) -> Vec<u8> {
-    annexb::nal_units(au)
-        .filter(|n| matches!(annexb::h264_nal_type(n), Some(1 | 5)))
-        .flatten()
-        .copied()
+    recorded
+        .iter()
+        .filter_map(|f| Some((*f, (*by_key.get(key(f).as_slice())?)?)))
         .collect()
 }
 
-fn luma_frames(video: &[&RecordedVideoFrame], clock: Clock) -> Vec<LumaFrame> {
+fn median(mut v: Vec<i64>) -> i64 {
+    assert!(
+        v.len() >= 10,
+        "only {} frames matched what was sent",
+        v.len()
+    );
+    v.sort_unstable();
+    v[v.len() / 2]
+}
+
+/// Output pts minus input pts per track: equal on both tracks when `serve` kept A/V alignment.
+fn shifts(
+    video: &[&RecordedVideoFrame],
+    audio: &[&RecordedAudioFrame],
+    want: &Expected,
+) -> (i64, i64) {
+    let v = matched(video, |f| slices(&f.data), &want.video);
+    let a = matched(audio, |f| f.data.clone(), &want.audio);
+    (
+        median(
+            v.iter()
+                .map(|(f, s)| rtp_us(f.rtp_timestamp, VIDEO_HZ) - s.pts_us)
+                .collect(),
+        ),
+        median(
+            a.iter()
+                .map(|(f, s)| rtp_us(f.rtp_timestamp, AUDIO_HZ) - s.pts_us)
+                .collect(),
+        ),
+    )
+}
+
+fn assert_av_aligned(
+    video: &[&RecordedVideoFrame],
+    audio: &[&RecordedAudioFrame],
+    want: &Expected,
+    what: &str,
+) {
+    let (v, a) = shifts(video, audio, want);
+    let frame_us = 1_000_000 / want.fps;
+    assert!(
+        (a - v).abs() <= frame_us,
+        "{what}: serve moved audio by {a} µs and video by {v} µs; one frame is {frame_us} µs"
+    );
+}
+
+/// Arrival at the mock follows the trace's libobs dts, so the producer paces in real time.
+fn assert_paced<F>(
+    recorded: &[&F],
+    key: impl Fn(&F) -> Vec<u8>,
+    at: impl Fn(&F) -> Instant,
+    sent: &[Sent],
+    frame_us: i64,
+    what: &str,
+) {
+    let pairs = matched(recorded, key, sent);
+    let (f0, s0) = pairs[0];
+    let slack = PACING_SLACK_US.max(frame_us);
+    let mut lags: Vec<i64> = pairs
+        .iter()
+        .map(|(f, s)| {
+            let arrived = at(f).duration_since(at(f0)).as_micros() as i64;
+            arrived - (s.dts_usec - s0.dts_usec)
+        })
+        .collect();
+    let mid = median(lags.clone());
+    lags.retain(|l| (l - mid).abs() > slack);
+    assert!(
+        lags.len() * 50 <= pairs.len(),
+        "{what}: {} of {} frames off the trace's dts pace by more than {slack} µs: {lags:?}",
+        lags.len(),
+        pairs.len()
+    );
+}
+
+fn luma_frames(video: &[&RecordedVideoFrame]) -> Vec<LumaFrame> {
     let mut decoder = H264LumaDecoder::new().unwrap();
     let mut frames = Vec::new();
     for (i, v) in video.iter().enumerate() {
         frames.extend(
             decoder
-                .decode(&v.data, clock.us(v.rtp_timestamp))
+                .decode(&v.data, rtp_us(v.rtp_timestamp, VIDEO_HZ))
                 .unwrap_or_else(|e| panic!("video {i} does not decode: {e}")),
         );
     }
@@ -192,18 +249,17 @@ fn tone_is_440(pcm: &[f32], beeps: &[i64], start_us: i64, what: &str) {
     );
 }
 
-/// Flash/beep pairs of one attachment's media, every beep - flash offset within the tightened check.
+/// Flash/beep pairs on `serve`'s own timeline, every beep - flash offset within the tightened check.
 fn markers(
     video: &[&RecordedVideoFrame],
     audio: &[&RecordedAudioFrame],
-    clocks: (Clock, Clock),
     fps: i64,
     what: &str,
 ) -> Vec<MarkerPair> {
-    let frames = luma_frames(video, clocks.0);
+    let frames = luma_frames(video);
     let flashes = sync::flash_onsets(&frames);
     let pcm = pcm(audio);
-    let start_us = clocks.1.us(audio[0].rtp_timestamp);
+    let start_us = rtp_us(audio[0].rtp_timestamp, AUDIO_HZ);
     let beeps = sync::beep_onsets(&pcm, start_us, SAMPLE_RATE);
     tone_is_440(&pcm, &beeps, start_us, what);
     let frame_us = 1_000_000 / fps;
@@ -219,26 +275,103 @@ fn markers(
     pairs
 }
 
-fn replay_trace_through_serve(name: &str) {
-    let dir = trace_dir(name);
-    let trace = Trace::load(&dir).unwrap();
-    let want = expected(&trace);
+/// One whole replay at the mock: frame and packet counts, decoding, RTP steps, pacing, A/V alignment and markers.
+fn check_replay(
+    video: &[&RecordedVideoFrame],
+    audio: &[&RecordedAudioFrame],
+    want: &Expected,
+    what: &str,
+) -> Vec<MarkerPair> {
+    assert_eq!(
+        video.len(),
+        want.video.len(),
+        "{what}: video frames at the mock"
+    );
+    assert_eq!(
+        audio.len(),
+        want.audio.len(),
+        "{what}: audio packets at the mock"
+    );
+    let video_ts: Vec<u32> = video.iter().map(|v| v.rtp_timestamp).collect();
+    let audio_ts: Vec<u32> = audio.iter().map(|a| a.rtp_timestamp).collect();
+    consecutive(
+        &format!("{what} video"),
+        &video_ts,
+        (VIDEO_HZ / want.fps) as u32,
+    );
+    consecutive(&format!("{what} audio"), &audio_ts, 960);
+    assert_eq!(
+        luma_frames(video).len(),
+        video.len(),
+        "{what}: decoded frames"
+    );
+    let frame_us = 1_000_000 / want.fps;
+    assert_paced(
+        video,
+        |f| slices(&f.data),
+        |f| f.received_at,
+        &want.video,
+        frame_us,
+        &format!("{what} video"),
+    );
+    assert_paced(
+        audio,
+        |f| f.data.clone(),
+        |f| f.received_at,
+        &want.audio,
+        frame_us,
+        &format!("{what} audio"),
+    );
+    assert_av_aligned(video, audio, want, what);
+    let pairs = markers(video, audio, want.fps, what);
+    assert!(
+        pairs.len() >= 4,
+        "{what}: only {} markers: {pairs:?}",
+        pairs.len()
+    );
+    pairs
+}
+
+fn monotonic(recorded: &Recorded) {
+    increasing(
+        "video",
+        &stream_video(recorded)
+            .iter()
+            .map(|v| v.rtp_timestamp)
+            .collect::<Vec<_>>(),
+    );
+    increasing(
+        "audio",
+        &stream_audio(recorded)
+            .iter()
+            .map(|a| a.rtp_timestamp)
+            .collect::<Vec<_>>(),
+    );
+}
+
+fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
+    let want = expected(trace);
     let h = Harness::new("");
     let _s = h.serve();
     let mut c = h.external_session();
-    let p = h.replay(&dir, &[]);
+    let p = h.replay(dir, &[]);
     let id = p.attached();
     c.source("producing", |e| {
         e["state"] == "producing" && e["attachment"] == id
     });
     let (frames, packets) = (want.video.len(), want.audio.len());
-    let recorded = h.wait(
-        &format!("{name}: {frames} video and {packets} audio"),
-        |r| {
-            (stream_video(r).len() >= frames && producer_audio(r).len() >= packets)
-                .then(|| r.clone())
-        },
-    );
+    let mut sent_plis = 0;
+    let recorded = loop {
+        if plis && sent_plis < 40 && h.rt.block_on(h.mock.send_pli(VoiceKind::Stream)) {
+            sent_plis += 1;
+        }
+        let r = h.mock.recorded();
+        if stream_video(&r).len() >= frames && producer_audio(&r).len() >= packets {
+            break r;
+        }
+        std::thread::sleep(Duration::from_millis(if plis { 50 } else { 100 }));
+    };
+    let lines = p.lines();
     let (status, stderr) = p.finish();
     assert!(status.success(), "{name}: {stderr}");
     assert!(
@@ -246,91 +379,60 @@ fn replay_trace_through_serve(name: &str) {
         "{name}: {:?}",
         recorded.dropped_frames
     );
-
-    let video = stream_video(&recorded);
-    let audio = producer_audio(&recorded);
-    assert_eq!(video.len(), frames, "{name}: video frames at the mock");
-    assert_eq!(audio.len(), packets, "{name}: audio packets at the mock");
-    let video_ts: Vec<u32> = video.iter().map(|v| v.rtp_timestamp).collect();
-    let audio_ts: Vec<u32> = audio.iter().map(|a| a.rtp_timestamp).collect();
-    increasing("video", &video_ts);
-    increasing(
-        "audio",
-        &stream_audio(&recorded)
+    if plis {
+        let requests = lines
             .iter()
-            .map(|a| a.rtp_timestamp)
-            .collect::<Vec<_>>(),
-    );
-    consecutive("video", &video_ts, (VIDEO_HZ / want.fps) as u32);
-    consecutive("audio", &audio_ts, 960);
-
-    let clocks = (
-        Clock::video(&video, &want.video),
-        Clock::audio(&audio, &want.audio),
-    );
-    let decoded = luma_frames(&video, clocks.0);
-    assert_eq!(decoded.len(), frames, "{name}: decoded frames");
-    let pairs = markers(&video, &audio, clocks, want.fps, name);
-    assert!(
-        pairs.len() >= 4,
-        "{name}: only {} markers: {pairs:?}",
-        pairs.len()
+            .filter(|v| v["event"]["type"] == "keyframe_request")
+            .count();
+        assert!(
+            sent_plis >= 20 && requests >= 3,
+            "{sent_plis} PLIs gave {requests} keyframe requests at the producer"
+        );
+    }
+    monotonic(&recorded);
+    check_replay(
+        &stream_video(&recorded),
+        &producer_audio(&recorded),
+        &want,
+        name,
     );
 }
 
 #[test]
-fn every_positive_trace_is_covered() {
-    let mut names: Vec<String> = std::fs::read_dir(traces_dir())
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| traces_dir().join(n).is_dir())
-        .filter(|n| !uses_b_frames(n))
-        .filter(|n| Trace::load(&trace_dir(n)).unwrap().audio_codec() == "opus")
+fn every_positive_trace_replays_through_serve() {
+    let positives: Vec<_> = traces()
+        .into_iter()
+        .filter(|(n, _, t)| positive(n, t))
         .collect();
-    names.sort();
-    assert_eq!(names, POSITIVE);
+    assert!(positives.len() >= 6, "{} positive traces", positives.len());
+    std::thread::scope(|s| {
+        for (name, dir, trace) in &positives {
+            s.spawn(move || replay_through_serve(name, dir, trace, false));
+        }
+    });
 }
 
 #[test]
-fn replays_ffmpeg_opus_defaults() {
-    replay_trace_through_serve(POSITIVE[0]);
-}
-
-#[test]
-fn replays_x264_baseline_bf0_keyint2_30fps() {
-    replay_trace_through_serve(POSITIVE[1]);
-}
-
-#[test]
-fn replays_x264_baseline_bf0_keyint2_60fps() {
-    replay_trace_through_serve(POSITIVE[2]);
-}
-
-#[test]
-fn replays_x264_main_bf0_keyint0_30fps() {
-    replay_trace_through_serve(POSITIVE[3]);
-}
-
-#[test]
-fn replays_x264_main_bf0_keyint2_30fps() {
-    replay_trace_through_serve(POSITIVE[4]);
-}
-
-#[test]
-fn replays_x264_main_bf0_keyint2_60fps() {
-    replay_trace_through_serve(POSITIVE[5]);
+fn control_events_during_a_replay_lose_no_packet() {
+    let (name, dir, trace) = traces()
+        .into_iter()
+        .find(|(n, _, _)| n == "linux-x264-main-bf0-keyint2-30fps")
+        .unwrap();
+    replay_through_serve(&name, &dir, &trace, true);
 }
 
 #[test]
 fn b_frame_traces_are_refused_at_conversion() {
+    let negatives: Vec<_> = traces()
+        .into_iter()
+        .filter(|(n, _, _)| uses_b_frames(n))
+        .collect();
+    assert!(negatives.len() >= 2, "{} B-frame traces", negatives.len());
     let h = Harness::new("[serve]\ngrace_secs = 30\n");
     let _s = h.serve();
     let mut c = h.external_session();
-    for name in [
-        "linux-x264-main-bf2-keyint2-30fps",
-        "linux-x264-main-bfunset-keyint2-30fps",
-    ] {
-        let p = h.replay(&trace_dir(name), &[]);
+    for (name, dir, _) in &negatives {
+        let p = h.replay(dir, &[]);
         p.attached();
         let refused = p.wait_line("refusal", |v| v.get("refused").is_some());
         assert!(
@@ -347,25 +449,34 @@ fn b_frame_traces_are_refused_at_conversion() {
             e["state"] == "interrupted" && e["reason"] == "detached"
         });
     }
-    let recorded = h.mock.recorded();
     assert!(
-        stream_video(&recorded).is_empty(),
+        stream_video(&h.mock.recorded()).is_empty(),
         "B-frame video reached the mock"
     );
 }
 
 #[test]
-fn the_aac_trace_is_refused_at_hello() {
+fn non_opus_traces_are_refused_at_hello() {
+    let refused: Vec<_> = traces()
+        .into_iter()
+        .filter(|(_, _, t)| t.audio_codec() != "opus")
+        .collect();
+    assert!(!refused.is_empty());
     let h = Harness::new("");
     let _s = h.serve();
     let _c = h.external_session();
-    let p = h.replay(&trace_dir("linux-ffmpeg_aac-defaults"), &[]);
-    let reply = p.wait_line("hello reply", |v| v.get("hello").is_some());
-    assert_eq!(reply["hello"]["code"], "incompatible", "{reply}");
-    let message = reply["hello"]["message"].as_str().unwrap();
-    assert!(message.contains("audio encoder must be Opus"), "{reply}");
-    let (status, _) = p.finish();
-    assert!(!status.success());
+    for (name, dir, _) in &refused {
+        let p = h.replay(dir, &[]);
+        let reply = p.wait_line("hello reply", |v| v.get("hello").is_some());
+        assert_eq!(reply["hello"]["code"], "incompatible", "{name}: {reply}");
+        let message = reply["hello"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("audio encoder must be Opus"),
+            "{name}: {reply}"
+        );
+        let (status, _) = p.finish();
+        assert!(!status.success(), "{name}");
+    }
 }
 
 /// Splits one track's recorded frames at the restart's RTP jump; `None` until there are two runs.
@@ -381,11 +492,13 @@ fn split<'a, T>(
     Some((frames[..at].to_vec(), frames[at..].to_vec()))
 }
 
-fn replay_killed_and_restarted(grace_secs: u64, gap: Duration) {
-    let name = "linux-x264-main-bf0-keyint2-30fps";
-    let dir = trace_dir(name);
-    let want = expected(&Trace::load(&dir).unwrap());
-    let h = Harness::new(&format!("[serve]\ngrace_secs = {grace_secs}\n"));
+fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
+    let (_, dir, trace) = traces()
+        .into_iter()
+        .find(|(n, _, _)| n == "linux-x264-main-bf0-keyint2-30fps")
+        .unwrap();
+    let want = expected(&trace);
+    let h = Harness::new(&format!("[serve]\ngrace_secs = {}\n", grace.as_secs()));
     let _s = h.serve();
     let mut c = h.external_session();
 
@@ -396,12 +509,18 @@ fn replay_killed_and_restarted(grace_secs: u64, gap: Duration) {
     });
     h.stream_media(75, 125);
     first.kill();
+    let killed = Instant::now();
     c.source("interrupted", |e| {
         e["state"] == "interrupted" && e["reason"] == "detached"
     });
-    std::thread::sleep(gap);
+    std::thread::sleep(gap.saturating_sub(killed.elapsed()));
     let second = h.replay(&dir, &[]);
     let id2 = second.attached();
+    let detached_for = killed.elapsed();
+    assert!(
+        detached_for < grace,
+        "detached for {detached_for:?}, beyond the {grace:?} grace period"
+    );
     c.source("producing again", |e| {
         e["state"] == "producing" && e["attachment"] == id2
     });
@@ -419,59 +538,35 @@ fn replay_killed_and_restarted(grace_secs: u64, gap: Duration) {
         recorded.dropped_frames
     );
     assert_eq!(c.status()["session"]["state"], "streaming");
+    monotonic(&recorded);
 
-    increasing(
-        "video",
-        &stream_video(&recorded)
-            .iter()
-            .map(|v| v.rtp_timestamp)
-            .collect::<Vec<_>>(),
-    );
-    increasing(
-        "audio",
-        &stream_audio(&recorded)
-            .iter()
-            .map(|a| a.rtp_timestamp)
-            .collect::<Vec<_>>(),
-    );
     let (v1, v2) = split(&stream_video(&recorded), |v| v.rtp_timestamp, VIDEO_HZ).unwrap();
     let (a1, a2) = split(&producer_audio(&recorded), |a| a.rtp_timestamp, AUDIO_HZ).unwrap();
-    assert_eq!(
-        (v2.len(), a2.len()),
-        (frames, packets),
-        "second replay at the mock"
-    );
     assert!(
         is_keyframe(&v2[0].data),
         "first video after the gap is not an IDR"
     );
-
-    // Both attachments are read on the first one's clocks, so any shift at the restart moves the markers.
-    let clocks = (
-        Clock::video(&v1, &want.video),
-        Clock::audio(&a1, &want.audio),
-    );
     let fps = want.fps;
-    let before = markers(&v1, &a1, clocks, fps, "before the kill");
-    let after = markers(&v2, &a2, clocks, fps, "after the restart");
+    let before = markers(&v1, &a1, fps, "before the kill");
+    assert!(!before.is_empty(), "{before:?}");
+    assert_av_aligned(&v1, &a1, &want, "before the kill");
+    check_replay(&v2, &a2, &want, "after the restart");
+
+    let last_before = rtp_us(v1.last().unwrap().rtp_timestamp, VIDEO_HZ);
+    let resumed = rtp_us(v2[0].rtp_timestamp, VIDEO_HZ) - last_before;
+    let frame_us = 1_000_000 / fps;
     assert!(
-        !before.is_empty() && after.len() >= 4,
-        "{before:?} {after:?}"
-    );
-    let resumed_us =
-        clocks.0.us(v2[0].rtp_timestamp) - clocks.0.us(v1.last().unwrap().rtp_timestamp);
-    assert!(
-        resumed_us >= gap.as_micros() as i64,
-        "the second attachment resumed {resumed_us} µs after the first, within the {gap:?} gap"
+        resumed >= gap.as_micros() as i64 && resumed <= detached_for.as_micros() as i64 + 1_000_000,
+        "video resumed {resumed} µs after the last frame; detached for {detached_for:?}, gap {gap:?}, one frame {frame_us} µs"
     );
 }
 
 #[test]
 fn a_replay_killed_and_restarted_after_1_s_stays_aligned() {
-    replay_killed_and_restarted(30, Duration::from_secs(1));
+    replay_killed_and_restarted(Duration::from_secs(30), Duration::from_secs(1));
 }
 
 #[test]
 fn a_replay_killed_and_restarted_after_grace_minus_1_s_stays_aligned() {
-    replay_killed_and_restarted(3, Duration::from_secs(2));
+    replay_killed_and_restarted(Duration::from_secs(10), Duration::from_secs(9));
 }

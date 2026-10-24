@@ -1,6 +1,7 @@
 //! Reassembles received RTP into frames, removes DAVE and records them.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use davey::{MediaType, OPUS_SILENCE_PACKET};
 use tokio::sync::mpsc;
@@ -137,6 +138,7 @@ impl Sink {
             data,
             e2ee,
             playout_delay,
+            received_at: Instant::now(),
         };
         self.shared.record(|r| r.video.push(frame));
     }
@@ -154,6 +156,7 @@ impl Sink {
             rtp_timestamp: packet.header.timestamp,
             data,
             e2ee,
+            received_at: Instant::now(),
         };
         self.shared.record(|r| r.audio.push(frame));
     }
@@ -193,7 +196,6 @@ impl Sink {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU16;
-    use std::time::Instant;
 
     use davey::{Codec, DaveSession, ProposalsOperationType};
     use webrtc::rtp::header::Header;

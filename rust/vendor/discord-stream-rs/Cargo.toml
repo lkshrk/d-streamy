@@ -19,6 +19,8 @@ exclude = [
 [features]
 default = []
 media = ["dep:ffmpeg-next"]
+# Integration tests only: RTP timestamps start at 0, so a receiver reads pts from them.
+test-rtp-start = []
 
 [dependencies]
 # DAVE / E2EE

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
@@ -81,6 +81,8 @@ pub struct RecordedVideoFrame {
     pub data: Vec<u8>,
     pub e2ee: bool,
     pub playout_delay: Option<[u8; 3]>,
+    /// When the access unit's last packet reached the mock.
+    pub received_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,6 +94,7 @@ pub struct RecordedAudioFrame {
     pub rtp_timestamp: u32,
     pub data: Vec<u8>,
     pub e2ee: bool,
+    pub received_at: Instant,
 }
 
 /// Everything the mock received, for assertions.

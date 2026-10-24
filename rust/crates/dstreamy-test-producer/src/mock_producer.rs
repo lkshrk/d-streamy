@@ -42,7 +42,7 @@ struct Args {
     /// Encodes `TestPatternSource` live.
     #[arg(long)]
     pattern: bool,
-    /// Replays an `obs-harness` trace at real-time pace through `obs/src/packet.c`; its size and codecs replace the flags.
+    /// Replays an `obs-harness` trace at real-time pace through `dstreamy-obs-packet`; its size and codecs replace the flags.
     #[arg(long, value_name = "TRACE_DIR")]
     replay: Option<PathBuf>,
     #[arg(long, default_value_t = 320)]
@@ -80,6 +80,9 @@ struct Args {
     /// Connects again after each disconnect, `--reconnect` times at most.
     #[arg(long, value_name = "N", default_value_t = 0)]
     reconnect: u32,
+    /// Prints `{"sent": {kind, pts_us, hash}}` for every frame sent.
+    #[arg(long)]
+    report_sent: bool,
 }
 
 type Lines = FramedRead<ReadHalf<dstreamy_ipc::Stream>, ControlCodec>;
@@ -195,7 +198,7 @@ impl Media {
         }
     }
 
-    /// `None` when the media ends; an error when `packet.c` refuses a trace packet.
+    /// `None` when the media ends; an error when `dstreamy-obs-packet` refuses a trace packet.
     async fn next(&mut self) -> Option<Result<Frame, String>> {
         match self {
             Self::Live(_, frames) => frames.recv().await.map(|f| Ok(media(f))),
@@ -464,6 +467,13 @@ async fn attach(
                     }
                 }
                 sent_bytes += frame.payload.len() as u64;
+                if args.report_sent {
+                    report(json!({"sent": {
+                        "kind": if frame.kind == Kind::Video { "video" } else { "audio" },
+                        "pts_us": frame.pts_us,
+                        "hash": payload_hash(frame.kind, &frame.payload),
+                    }}));
+                }
                 if sink.send(frame).await.is_err() {
                     break pending_detached(&mut lines).await;
                 }
@@ -493,6 +503,26 @@ async fn pending_detached(lines: &mut Lines) -> Outcome {
     tokio::time::timeout(Duration::from_secs(1), drain)
         .await
         .unwrap_or(Outcome::Disconnected)
+}
+
+/// FNV-1a over what the mock records unchanged: Opus bytes, or the slice NAL units of an access unit.
+fn payload_hash(kind: Kind, payload: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    if kind == Kind::Video {
+        for n in
+            annexb::nal_units(payload).filter(|n| matches!(annexb::h264_nal_type(n), Some(1 | 5)))
+        {
+            feed(n);
+        }
+    } else {
+        feed(payload);
+    }
+    format!("{h:016x}")
 }
 
 async fn sleep_until_opt(at: Option<Instant>) {

@@ -439,3 +439,60 @@ pub fn runs(timestamps: &[u32], hz: i64, gap_us: i64) -> Vec<usize> {
     }
     starts
 }
+
+/// `test-hooks` starts every RTP clock at 0, so a timestamp is the pts `serve` stamped on its shared timeline.
+pub fn rtp_us(rtp: u32, hz: i64) -> i64 {
+    i64::from(rtp) * 1_000_000 / hz
+}
+
+/// The same FNV-1a hash `mock-producer --report-sent` prints: Opus bytes, or an access unit's slice NAL units.
+pub fn payload_hash(video: bool, payload: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    if video {
+        for n in dstreamy_media::annexb::nal_units(payload)
+            .filter(|n| matches!(dstreamy_media::annexb::h264_nal_type(n), Some(1 | 5)))
+        {
+            feed(n);
+        }
+    } else {
+        feed(payload);
+    }
+    format!("{h:016x}")
+}
+
+/// Median output-minus-input pts of the recorded frames whose payload a producer reported sending once.
+pub fn shift_us<'a>(
+    recorded: impl Iterator<Item = (&'a [u8], u32)>,
+    sent: &[Value],
+    video: bool,
+    hz: i64,
+) -> Option<i64> {
+    let kind = if video { "video" } else { "audio" };
+    let mut by_hash: std::collections::HashMap<&str, Option<i64>> = Default::default();
+    for s in sent
+        .iter()
+        .filter_map(|v| v.get("sent"))
+        .filter(|s| s["kind"] == kind)
+    {
+        by_hash
+            .entry(s["hash"].as_str().unwrap())
+            .and_modify(|p| *p = None)
+            .or_insert(s["pts_us"].as_i64());
+    }
+    let mut d: Vec<i64> = recorded
+        .filter_map(|(data, rtp)| {
+            let pts = (*by_hash.get(payload_hash(video, data).as_str())?)?;
+            Some(rtp_us(rtp, hz) - pts)
+        })
+        .collect();
+    if d.len() < 10 {
+        return None;
+    }
+    d.sort_unstable();
+    Some(d[d.len() / 2])
+}

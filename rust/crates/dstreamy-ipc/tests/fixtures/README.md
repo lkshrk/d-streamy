@@ -30,4 +30,4 @@ Each `<name>.bin` is a byte stream of producer frames (`u32 BE length | u8 kind 
 
 ## OBS traces
 
-The recorded OBS packets under `obs/tests/traces/` are not producer frames. `obs/src/packet.c` converts them into producer frames, and both `obs/tests/packet_test.c` (ctest) and `mock-producer --replay` (`rust/crates/dstreamy-cli/tests/trace_replay.rs`) run them through it.
+The recorded OBS packets under `obs/tests/traces/` are not producer frames. `rust/crates/dstreamy-obs-packet` converts them into producer frames; its unit tests and `mock-producer --replay` (`rust/crates/dstreamy-cli/tests/trace_replay.rs`) run every trace through it.

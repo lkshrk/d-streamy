@@ -65,13 +65,18 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      - name: Shipped crates never enable dstreamy-ipc test-support
+      - name: Shipped crates never enable test-only features
         shell: bash
         run: |
           set -euo pipefail
           out=$(cargo tree --locked --target all -e features,normal -i dstreamy-ipc --workspace)
           if grep -F 'feature "test-support"' <<<"$out"; then
             echo "dstreamy-ipc test-support is enabled through a normal dependency" >&2
+            exit 1
+          fi
+          out=$(cargo tree --locked --target all -e features,normal -i discord-stream-rs --workspace)
+          if grep -F 'feature "test-rtp-start"' <<<"$out"; then
+            echo "discord-stream-rs test-rtp-start is enabled through a normal dependency" >&2
             exit 1
           fi
       - name: Cross-user IPC tests
