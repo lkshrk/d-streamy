@@ -57,9 +57,9 @@ External facts this ADR relies on are pinned in `docs/specs.md`. A behaviour wit
 
 ### OBS plugin
 
-- **Written in C** from `obs-plugintemplate`, with the template's build raised to OBS 32.2.2. It holds no Discord, token or WebRTC code. Only its IPC client is platform-specific. It connects to a running `serve` and never spawns or owns it.
+- **Written in Rust**, built as a `cdylib` inside the `obs-plugintemplate` CMake project (template build raised to OBS 32.2.2), against libobs bindings generated with bindgen from the pinned headers. A crash in a plugin takes OBS down, so the plugin core is memory-safe Rust, and it reuses the service's crates directly: the IPC codecs, the producer frame rules and the packet conversion are one implementation, not a C copy kept in step through fixtures. Every function libobs calls catches panics, so none unwinds into OBS. Only the dock is C++/Qt, in one small file, because docks are `QWidget`s. The plugin holds no Discord, token or WebRTC code, connects to a running `serve` and never spawns or owns it.
 - **A separate output, next to the normal stream.** The plugin registers the encoded output `dstreamy_output` and starts and stops it itself, from:
-  - a dock (`obs_frontend_add_dock_by_id`, one small C++/Qt file; the rest of the plugin is C) with Start/Stop, a server and voice channel picker, and the session state;
+  - a dock (`obs_frontend_add_dock_by_id`, one small C++/Qt file calling into the Rust core) with Start/Stop, a server and voice channel picker, and the session state;
   - a Tools menu toggle;
   - an optional "start and stop with Start Streaming".
 
@@ -118,7 +118,8 @@ Unix-only code already exists behind `cfg(unix)`: the 0600 token and config file
 ## Rejected
 
 - **OBS as the stream service** (a custom service on the `DSTREAMY` protocol, selected from the Tools menu). It occupies the only stream service slot, so the user can't stream to Twitch at the same time, and saving Settings › Stream replaces it.
-- **Discord transport inside the OBS plugin.** It would duplicate the DAVE, WebRTC and gateway code in C or C++, tie the stream's life to OBS's process, and leak the token into OBS.
+- **Discord transport inside the OBS plugin.** It would tie the stream's life to OBS's process and put the token into OBS.
+- **The plugin in C.** It would duplicate the IPC codecs and the packet rules in a second language, and a memory bug in it crashes OBS; a review of an early C packet converter found two NULL dereferences and a parameter-set ordering bug that breaks decoding.
 - **RTMP or another media server between OBS and `dstreamy`.** It adds a hop, a protocol and its latency for no gain over a local socket.
 - **Per-track timestamp rebasing.** It desyncs audio and video by the gap length, because the pump does not pace by wall clock.
 - **A token or password on the local socket.** It adds secret handling without adding protection beyond the per-user directory, the DACL and the peer check.
