@@ -596,6 +596,29 @@ async fn negative_first_pts_map_to_zero_and_never_below() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn extreme_pts_saturate_instead_of_overflowing() {
+    let rig = Rig::started(IdleMode::None).await;
+    let a = rig.handle.attach(info()).unwrap();
+    a.send(video(i64::MIN, true)).unwrap();
+    for pts in [0, 20_000, i64::MAX, 40_000] {
+        a.send(audio(pts)).unwrap();
+    }
+    a.send(video(i64::MAX, false)).unwrap();
+    a.send(video(i64::MAX, false)).unwrap();
+    settle().await;
+    let frames = rig.collector.frames();
+    assert_eq!(frames.len(), 7, "{frames:?}");
+    for track in [VIDEO, AUDIO] {
+        let pts: Vec<i64> = frames
+            .iter()
+            .filter(|f| f.track() == track)
+            .map(Received::pts)
+            .collect();
+        assert!(pts.windows(2).all(|w| w[1] >= w[0]), "{pts:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_non_monotonic_input_pts_is_clamped_to_one_tick_after_the_last() {
     let rig = Rig::started(IdleMode::None).await;
     let a = rig.handle.attach(info()).unwrap();
@@ -833,6 +856,44 @@ async fn a_full_queue_stays_bounded_and_counts_every_loss_exactly() {
     let lost = stats.skipped + stats.dropped_video + stats.dropped_audio;
     assert_eq!(sent, queued + delivered + lost);
     source.stop().await.unwrap();
+}
+
+async fn feed_8_mib_keyframes(with_audio: bool) {
+    let mut source = ExternalSource::new(options(IdleMode::None)).unwrap();
+    let handle = source.handle();
+    let _rx = source.start(CaptureConfig::default()).await.unwrap();
+    let a = handle.attach(info()).unwrap();
+    for i in 0..40i64 {
+        let frame = ProducerFrame::Video {
+            data: vec![0; 8 << 20],
+            pts_us: i * FRAME_US,
+            keyframe: true,
+        };
+        a.send(frame).unwrap();
+        if with_audio {
+            a.send(audio(i * FRAME_US)).unwrap();
+        }
+        let state = source.inner.lock();
+        let held: usize = state.queue.iter().map(Queued::len).sum::<usize>()
+            + state
+                .current
+                .as_ref()
+                .map_or(0, |c| c.held.iter().map(|h| h.frame.len()).sum());
+        assert!(held <= QUEUE_MAX_BYTES, "{held} bytes held after frame {i}");
+    }
+    let stats = handle.stats().unwrap();
+    assert!(stats.lost.dropped_video > 0, "{stats:?}");
+    source.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_undrained_source_fed_8_mib_keyframes_holds_at_most_its_byte_budget() {
+    feed_8_mib_keyframes(true).await;
+}
+
+#[tokio::test]
+async fn a_video_only_producer_waiting_for_audio_holds_at_most_the_byte_budget() {
+    feed_8_mib_keyframes(false).await;
 }
 
 fn delivered(rx: &mut FrameReceiver) -> u64 {
@@ -1252,6 +1313,29 @@ fn queue_overflow_drops_video_to_the_next_keyframe_and_the_oldest_audio() {
     assert_eq!(lost[0].frame, oldest);
     assert_eq!(queue.back().map(|q| &q.frame), Some(&v(4_000, true)));
     assert_eq!(queue.len(), QUEUE_CAPACITY);
+}
+
+#[test]
+fn the_queue_holds_at_most_its_byte_budget() {
+    let link = Arc::new(Link::default());
+    let big = 8 << 20;
+    let v = |pts: u64, keyframe: bool| Queued {
+        frame: MediaFrame::Video(EncodedVideoFrame {
+            codec: VideoCodec::H264,
+            data: vec![0; big],
+            pts_us: pts,
+            keyframe,
+        }),
+        owner: Some(link.clone()),
+    };
+    let mut queue = VecDeque::new();
+    let mut lost = 0;
+    for i in 0..QUEUE_CAPACITY as u64 {
+        lost += enqueue(&mut queue, v(i, true)).len();
+        let bytes: usize = queue.iter().map(Queued::len).sum();
+        assert!(bytes <= QUEUE_MAX_BYTES, "{bytes} bytes queued after {i}");
+    }
+    assert!(lost > 0);
 }
 
 #[test]

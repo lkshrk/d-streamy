@@ -18,7 +18,7 @@ pub use external::{
     AttachError, Attachment, AttachmentStats, CloseReason, DOCUMENTED_SILENCE_FRAMES,
     EXTERNAL_TARGET_ID, ExternalHandle, ExternalOptions, ExternalSource, FIRST_FRAMES_WAIT,
     IdleMode, InterruptReason, MAX_GRACE, MAX_STALL, OPUS_SILENCE_FRAME, OptionsError,
-    ProducerFrame, ProducerInfo, SendError, SourceState, SourceStats,
+    ProducerFrame, ProducerInfo, QUEUE_MAX_BYTES, SendError, SourceState, SourceStats,
 };
 pub use frame::{
     AudioFrame, EncodedVideoFrame, MediaFrame, OPUS_CHANNELS, OPUS_FRAME_DURATION_US,

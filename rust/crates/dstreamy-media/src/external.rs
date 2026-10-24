@@ -34,6 +34,8 @@ const VIDEO: usize = 0;
 const AUDIO: usize = 1;
 const CHANNEL_CAPACITY: usize = 1;
 const QUEUE_CAPACITY: usize = FRAME_CHANNEL_CAPACITY - CHANNEL_CAPACITY;
+/// Bytes the source queue may hold; with 8 MiB frames the count limit alone would allow about 500 MiB.
+pub const QUEUE_MAX_BYTES: usize = 64 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IdleMode {
@@ -109,6 +111,12 @@ impl ProducerFrame {
     fn pts_us(&self) -> i64 {
         match self {
             Self::Video { pts_us, .. } | Self::Audio { pts_us, .. } => *pts_us,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Video { data, .. } | Self::Audio { data, .. } => data.len(),
         }
     }
 }
@@ -273,6 +281,8 @@ pub struct SourceStats {
     pub lost: AttachmentStats,
     pub queued: usize,
     pub max_queued: usize,
+    /// Keyframes asked for because the queue overflowed and video was lost.
+    pub overflow_keyframe_requests: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,7 +317,9 @@ impl Current {
     }
 
     fn ready(&self) -> bool {
-        self.first_in.iter().all(Option::is_some) || self.held.len() >= QUEUE_CAPACITY
+        self.first_in.iter().all(Option::is_some)
+            || self.held.len() >= QUEUE_CAPACITY
+            || self.held.iter().map(|h| h.frame.len()).sum::<usize>() >= QUEUE_MAX_BYTES
     }
 
     fn drop_held(&mut self) {
@@ -353,14 +365,14 @@ impl Timeline {
             .into_iter()
             .filter_map(|t| Some(self.clock(t, now)?.saturating_sub(first_in[t]?)))
             .max()
-            .unwrap_or_else(|| -earliest)
+            .unwrap_or_else(|| earliest.saturating_neg())
     }
 
     fn stamp(&mut self, track: usize, pts: i64) -> u64 {
-        let floor = self.last_out[track].map_or(0, |last| last + TICK_US[track]);
+        let floor = self.last_out[track].map_or(0, |last| last.saturating_add(TICK_US[track]));
         let out = pts.max(floor);
         self.last_out[track] = Some(out);
-        out as u64
+        u64::try_from(out).unwrap_or(0)
     }
 }
 
@@ -370,6 +382,13 @@ struct Queued {
 }
 
 impl Queued {
+    fn len(&self) -> usize {
+        match &self.frame {
+            MediaFrame::Video(v) => v.data.len(),
+            MediaFrame::Audio(a) => a.data.len(),
+        }
+    }
+
     fn track(&self) -> usize {
         match self.frame {
             MediaFrame::Video(_) => VIDEO,
@@ -391,7 +410,11 @@ impl Queued {
 /// Queues `item` and returns what a full queue lost: video up to a keyframe, else the oldest audio; idle frames never displace video.
 fn enqueue(queue: &mut VecDeque<Queued>, item: Queued) -> Vec<Queued> {
     let mut lost = Vec::new();
-    if queue.len() >= QUEUE_CAPACITY {
+    let full = |queue: &VecDeque<Queued>| {
+        queue.len() >= QUEUE_CAPACITY
+            || queue.iter().map(Queued::len).sum::<usize>() + item.len() > QUEUE_MAX_BYTES
+    };
+    while full(queue) && !queue.is_empty() {
         let oldest_audio = queue.iter().position(Queued::is_audio);
         match &item.frame {
             MediaFrame::Audio(_) if item.owner.is_none() => match oldest_audio {
@@ -411,7 +434,7 @@ fn enqueue(queue: &mut VecDeque<Queued>, item: Queued) -> Vec<Queued> {
                     lost.push(item);
                     return lost;
                 }
-                if queue.len() >= QUEUE_CAPACITY {
+                if full(queue) {
                     lost.extend(queue.pop_front());
                 }
             }
@@ -445,6 +468,7 @@ struct State {
     idle: Option<Idle>,
     queue: VecDeque<Queued>,
     max_queued: usize,
+    overflow_keyframe_requests: u64,
     timeline: Timeline,
     logged_ignored: bool,
 }
@@ -565,6 +589,7 @@ impl State {
         {
             cur.gate = Gate::Overflow;
             cur.request_keyframe();
+            self.overflow_keyframe_requests += 1;
         }
     }
 
@@ -969,6 +994,7 @@ impl ExternalHandle {
             lost: inner.totals.snapshot(),
             queued: state.queue.len(),
             max_queued: state.max_queued,
+            overflow_keyframe_requests: state.overflow_keyframe_requests,
         })
     }
 }
