@@ -258,7 +258,9 @@ async fn close(client: Arc<DiscordClient>) {
         Ok(client) => {
             let _ = timeout(CLOSE_TIMEOUT, client.close()).await;
         }
-        Err(_) => tracing::debug!("client still shared; dropping it without a close frame"),
+        Err(_) => {
+            tracing::warn!("the Discord client is still shared; dropping it without a close frame")
+        }
     }
 }
 

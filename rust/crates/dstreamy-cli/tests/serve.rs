@@ -596,7 +596,10 @@ fn sigterm_stops_the_session_and_exits_zero() {
     s.signal("TERM");
     let (status, stderr) = s.finish();
     assert!(status.success(), "{status}: {stderr}");
-    assert!(h.voice_left());
+    assert!(
+        h.voice_left(),
+        "no op 4 leaving voice; serve stderr:\n{stderr}"
+    );
 }
 
 #[test]
@@ -785,8 +788,19 @@ fn a_connection_that_never_says_hello_is_closed() {
 fn connections_over_the_cap_are_refused_with_busy() {
     let h = Harness::new();
     let s = h.serve(&[]);
-    let mut held: Vec<Client> = (0..64).map(|_| h.client()).collect();
-    for c in &mut held[..63] {
+    let (mut probe, _) = h.control();
+    let deadline = Instant::now() + T;
+    // serve's readiness probe may still count until its close is processed.
+    while probe.request(&json!({"id": "n", "cmd": "test_connections"}))["data"]["live"] != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the readiness probe never closed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut held: Vec<Client> = vec![probe];
+    held.extend((0..63).map(|_| h.client()));
+    for c in &mut held[1..63] {
         assert_eq!(c.request(&hello("control", 2))["type"], "result");
     }
     let mut extra = h.client();
@@ -851,7 +865,10 @@ fn shutdown_waits_for_commands_still_holding_the_connection() {
         !stderr.contains("still in use"),
         "shutdown ran while a command held the connection: {stderr}"
     );
-    assert!(h.voice_left());
+    assert!(
+        h.voice_left(),
+        "no op 4 leaving voice; serve stderr:\n{stderr}"
+    );
 }
 
 #[test]
@@ -877,7 +894,10 @@ fn shutdown_waits_for_commands_of_clients_that_already_left() {
         !stderr.contains("still in use"),
         "shutdown ran while a departed client's command held the connection: {stderr}"
     );
-    assert!(h.voice_left());
+    assert!(
+        h.voice_left(),
+        "no op 4 leaving voice; serve stderr:\n{stderr}"
+    );
 }
 
 #[test]
@@ -946,7 +966,10 @@ fn the_endpoint_stays_bound_until_the_session_is_torn_down_and_is_removed_after(
     );
     let (status, stderr) = s.finish();
     assert!(status.success(), "{status}: {stderr}");
-    assert!(h.voice_left());
+    assert!(
+        h.voice_left(),
+        "no op 4 leaving voice; serve stderr:\n{stderr}"
+    );
 }
 
 /// One scenario per fixture pair, as the daemon fixtures: replies in request order, then kept events.
