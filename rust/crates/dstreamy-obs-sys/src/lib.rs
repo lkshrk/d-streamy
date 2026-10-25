@@ -6,3 +6,8 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 /// `MAKE_SEMANTIC_VERSION(LIBOBS_API_MAJOR_VER, ...)` from `libobs/obs-config.h`, which bindgen skips.
 pub const LIBOBS_API_VER: u32 =
     (LIBOBS_API_MAJOR_VER << 24) | (LIBOBS_API_MINOR_VER << 16) | LIBOBS_API_PATCH_VER;
+
+pub use DSTREAMY_LOG_DEBUG as LOG_DEBUG;
+pub use DSTREAMY_LOG_ERROR as LOG_ERROR;
+pub use DSTREAMY_LOG_INFO as LOG_INFO;
+pub use DSTREAMY_LOG_WARNING as LOG_WARNING;
