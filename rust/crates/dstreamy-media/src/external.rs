@@ -367,6 +367,7 @@ impl Timeline {
             .into_iter()
             .filter_map(|t| Some(self.clock(t, now)?.saturating_sub(first_in[t]?)))
             .max()
+            .map(whole_ms)
             .unwrap_or_else(|| earliest.saturating_neg())
     }
 
@@ -375,6 +376,14 @@ impl Timeline {
         let out = pts.max(floor);
         self.last_out[track] = Some(out);
         u64::try_from(out).unwrap_or(0)
+    }
+}
+
+/// Rounds up to a whole millisecond, a whole number of ticks on both RTP clocks, so per-frame tick rounding stays even.
+fn whole_ms(us: i64) -> i64 {
+    match us.rem_euclid(1000) {
+        0 => us,
+        r => us.saturating_add(1000 - r),
     }
 }
 

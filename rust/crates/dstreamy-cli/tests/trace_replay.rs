@@ -360,6 +360,9 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
         e["state"] == "producing" && e["attachment"] == id
     });
     let (frames, packets) = (want.video.len(), want.audio.len());
+    let dts = || want.video.iter().chain(&want.audio).map(|s| s.dts_usec);
+    let span_us = dts().max().unwrap_or(0) - dts().min().unwrap_or(0);
+    let deadline = Instant::now() + Duration::from_micros(span_us.unsigned_abs()) + T;
     let mut sent_plis = 0;
     let recorded = loop {
         if plis && sent_plis < 40 && h.rt.block_on(h.mock.send_pli(VoiceKind::Stream)) {
@@ -369,6 +372,13 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
         if stream_video(&r).len() >= frames && producer_audio(&r).len() >= packets {
             break r;
         }
+        assert!(
+            Instant::now() < deadline,
+            "{name}: {} of {frames} video and {} of {packets} audio frames arrived, dropped {:?}",
+            stream_video(&r).len(),
+            producer_audio(&r).len(),
+            r.dropped_frames
+        );
         std::thread::sleep(Duration::from_millis(if plis { 50 } else { 100 }));
     };
     let lines = p.lines();
