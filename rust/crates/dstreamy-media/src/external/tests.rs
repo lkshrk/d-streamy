@@ -1666,6 +1666,8 @@ async fn a_reattach_offset_is_a_whole_millisecond_on_both_tracks() {
         })
         .collect();
     assert!(offsets.len() > 20, "{offsets:?}");
+    strictly_increasing(&frames);
+    on_wall_clock(&frames, 0);
     let offset = offsets[0].1;
     assert_eq!(offset.rem_euclid(1_000), 0, "{offset}");
     assert!(offsets.iter().all(|&(_, o)| o == offset), "{offsets:?}");

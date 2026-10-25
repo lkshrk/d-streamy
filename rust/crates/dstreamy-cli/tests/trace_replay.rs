@@ -96,7 +96,6 @@ fn expected(trace: &Trace) -> Expected {
     }
 }
 
-/// `test-hooks` starts every RTP clock at 0, so a timestamp is the pts `serve` stamped on its shared timeline.
 fn rtp_us(rtp: u32, hz: i64) -> i64 {
     i64::from(rtp) * 1_000_000 / hz
 }
@@ -152,6 +151,7 @@ fn shifts(
     )
 }
 
+/// Catches `serve` moving one track against the other; a skew in the conversion itself only the markers can see.
 fn assert_av_aligned(
     video: &[&RecordedVideoFrame],
     audio: &[&RecordedAudioFrame],
@@ -186,6 +186,8 @@ fn assert_paced<F>(
         })
         .collect();
     let mid = median(lags.clone());
+    // The reference frame's lag is 0 by construction, so a late reference would count as its own outlier.
+    lags.remove(0);
     lags.retain(|l| (l - mid).abs() > slack);
     assert!(
         lags.len() * 50 <= pairs.len(),
@@ -251,7 +253,7 @@ fn tone_is_440(pcm: &[f32], beeps: &[i64], start_us: i64, what: &str) {
     );
 }
 
-/// Flash/beep pairs on `serve`'s own timeline, every beep - flash offset within the tightened check.
+/// Flash/beep pairs on `serve`'s own timeline, each beep within a quarter frame of its flash.
 fn markers(
     video: &[&RecordedVideoFrame],
     audio: &[&RecordedAudioFrame],
@@ -387,7 +389,11 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
             sent_plis += 1;
         }
         let r = h.mock.recorded();
-        let lost = r.dropped_frames.len();
+        let lost = r
+            .dropped_frames
+            .iter()
+            .filter(|d| d.starts_with(&format!("{FIRST_FRAME_DAVE_DROP}audio")))
+            .count();
         if stream_video(&r).len() >= frames && producer_audio(&r).len() + lost >= packets {
             break r;
         }
@@ -558,7 +564,7 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
         let (_, a2) = split(&producer_audio(r), |a| a.rtp_timestamp, AUDIO_HZ)?;
         (v2.len() >= frames && a2.len() >= packets).then(|| r.clone())
     });
-    start_drops(&recorded, "a restarted replay");
+    let lost_first = start_drops(&recorded, "a restarted replay");
     assert_eq!(c.status()["session"]["state"], "streaming");
     monotonic(&recorded);
 
@@ -567,6 +573,10 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
     assert!(
         is_keyframe(&v2[0].data),
         "first video after the gap is not an IDR"
+    );
+    assert_eq!(
+        a1[0].data, want.audio[lost_first].key,
+        "audio lost before the kill"
     );
     let fps = want.fps;
     let before = markers(&v1, &a1, fps, "before the kill");

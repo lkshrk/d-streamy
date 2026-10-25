@@ -295,6 +295,7 @@ async fn a_producer_swap_keeps_streaming_with_continuous_decodable_media() {
             drops
                 .iter()
                 .any(|d| d.starts_with(&format!("{FIRST_FRAME_DAVE_DROP}video")))
+                && drops.len() == 1
                 && drops.iter().all(|d| d.starts_with(FIRST_FRAME_DAVE_DROP)),
             "video before the first keyframe; drops: {drops:?}"
         );

@@ -1,6 +1,4 @@
-//! OBS `encoded_packet` to producer frame conversion, shared by the OBS plugin and `mock-producer` (ADR 0004, OBS plugin).
-//!
-//! Dependency-free so the plugin's `cdylib` links nothing else for it.
+//! OBS `encoded_packet` to producer frames for the plugin and `mock-producer`; dependency-free so the `cdylib` links nothing else.
 
 use std::borrow::Cow;
 use std::fmt;
