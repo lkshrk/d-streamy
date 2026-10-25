@@ -6,7 +6,7 @@ use crate::voice::types::{
     BinaryMessage, ClientDisconnect, ClientsConnect, DaveExecuteTransition, DavePrepareEpoch,
     DavePrepareTransition, GatewayMessage, Hello, Ready, SelectProtocolAck,
 };
-use crate::voice::webrtc::{VideoProgress, WebRtcError, WebRtcWrapper};
+use crate::voice::webrtc::{Flushed, VideoGate, VideoProgress, WebRtcError, WebRtcWrapper};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -116,6 +116,7 @@ struct Shared {
     dave: Arc<StdMutex<DaveHandler>>,
     keyframe_requests: watch::Receiver<u64>,
     video_progress: watch::Receiver<VideoProgress>,
+    video_gate: Arc<VideoGate>,
 }
 
 /// Cloneable handle to a running connection, like `WebRtcConnWrapper` plus its `mediaConnection` in JS.
@@ -159,9 +160,19 @@ impl MediaConnection {
         self.shared.keyframe_requests.clone()
     }
 
-    /// Drops queued video the pacer has not started; the frame being sent finishes.
-    pub async fn flush_video(&self) -> u64 {
-        self.shared.webrtc.lock().await.flush_video()
+    /// Drops queued video the pacer has not started; the frame being sent finishes. Never waits.
+    pub fn flush_video(&self) -> Flushed {
+        self.shared.video_gate.flush()
+    }
+
+    /// The video flush and generation, shared by every handle to this connection.
+    pub fn video_gate(&self) -> Arc<VideoGate> {
+        self.shared.video_gate.clone()
+    }
+
+    /// Pass to `send_video_frame_at_generation` so a flush after this point drops the frame.
+    pub fn video_generation(&self) -> u64 {
+        self.shared.video_gate.generation()
     }
 
     /// What became of video after `send_video_frame*` returned `Ok`: written or lost in the pacer.
@@ -225,6 +236,20 @@ impl MediaConnection {
             .lock()
             .await
             .send_video_frame_at(frame, pts)
+            .await
+    }
+
+    pub async fn send_video_frame_at_generation(
+        &self,
+        frame: &[u8],
+        pts: Duration,
+        generation: u64,
+    ) -> Result<(), WebRtcError> {
+        self.shared
+            .webrtc
+            .lock()
+            .await
+            .send_video_frame_at_generation(frame, pts, generation)
             .await
     }
 
@@ -438,6 +463,7 @@ impl VoiceConnection {
             cmd_tx,
             keyframe_requests: webrtc.keyframe_requests(),
             video_progress: webrtc.video_progress(),
+            video_gate: webrtc.video_gate(),
             webrtc: Mutex::new(webrtc),
             params: StdMutex::new(None),
             dave: self.dave.clone(),

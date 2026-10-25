@@ -24,7 +24,6 @@ pub struct FrameQueue {
     awaiting_keyframe: bool,
     last_request: Option<Instant>,
     closed: bool,
-    flush_transport: bool,
 }
 
 impl FrameQueue {
@@ -38,7 +37,6 @@ impl FrameQueue {
             awaiting_keyframe: true,
             last_request: None,
             closed: false,
-            flush_transport: false,
         }
     }
 
@@ -90,14 +88,8 @@ impl FrameQueue {
         Some(frame)
     }
 
-    /// Whether video queued in the transport must be dropped before the next send; clears it.
-    pub fn take_flush(&mut self) -> bool {
-        std::mem::take(&mut self.flush_transport)
-    }
-
-    /// A video frame was lost in transport: skip queued video up to the next keyframe, here and in the transport.
-    pub fn video_lost(&mut self, now: Instant) -> Effects {
-        self.flush_transport = true;
+    /// Skips queued video to the next keyframe; one the transport just flushed is asked for again at once.
+    pub fn video_lost(&mut self, now: Instant, keyframe_flushed: bool) -> Effects {
         let next_key = self
             .frames
             .iter()
@@ -108,7 +100,12 @@ impl FrameQueue {
         };
         if next_key.is_none() {
             self.awaiting_keyframe = true;
-            effects.request_keyframe = self.should_request(now);
+            effects.request_keyframe = if keyframe_flushed {
+                self.last_request = Some(now);
+                true
+            } else {
+                self.should_request(now)
+            };
         }
         effects
     }
@@ -308,7 +305,7 @@ mod tests {
         q.push(audio(20), now);
         q.push(video(66, true), now);
         q.push(video(100, false), now);
-        let e = q.video_lost(now);
+        let e = q.video_lost(now, false);
         assert_eq!((e.dropped_video, e.request_keyframe), (1, false));
         assert!(!q.awaiting_keyframe());
         assert_eq!(drain(&mut q), [(false, 20), (true, 66), (true, 100)]);
@@ -321,7 +318,7 @@ mod tests {
         q.push(video(0, true), now);
         q.pop();
         q.push(video(33, false), now);
-        let e = q.video_lost(now);
+        let e = q.video_lost(now, false);
         assert_eq!((e.dropped_video, e.request_keyframe), (1, true));
         let e = q.push(video(66, false), now);
         assert_eq!((e.dropped_video, e.request_keyframe), (1, false));
@@ -329,6 +326,21 @@ mod tests {
         assert_eq!((e.dropped_video, e.request_keyframe), (1, true));
         q.push(video(133, true), now);
         assert_eq!(drain(&mut q), [(true, 133)]);
+    }
+
+    #[test]
+    fn a_keyframe_flushed_in_transport_is_asked_for_again_at_once() {
+        let now = Instant::now();
+        let mut q = FrameQueue::new(8, 8);
+        q.push(video(0, true), now);
+        q.pop();
+        q.push(video(33, false), now);
+        assert!(q.video_lost(now, false).request_keyframe);
+        assert!(!q.video_lost(now, false).request_keyframe, "rate-limited");
+        assert!(
+            q.video_lost(now, true).request_keyframe,
+            "the requested keyframe was flushed"
+        );
     }
 
     #[test]

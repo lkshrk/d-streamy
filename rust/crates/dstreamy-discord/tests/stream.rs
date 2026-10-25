@@ -509,10 +509,11 @@ impl CaptureSource for FloodSource {
             let mut served = 0;
             for index in 0u64.. {
                 let wanted = requests.load(Ordering::Relaxed);
-                let keyframe = index % 300 == 0 || wanted > served;
+                let requested = wanted > served;
+                let keyframe = index % 300 == 0 || requested;
                 served = wanted;
                 let mut data = vec![0, 0, 0, 1, if keyframe { 0x65 } else { 0x41 }];
-                data.resize(size, 0x55);
+                data.resize(size, if requested { REQUESTED_FILL } else { 0x55 });
                 let frame = MediaFrame::Video(EncodedVideoFrame {
                     codec: VideoCodec::H264,
                     data,
@@ -580,6 +581,9 @@ async fn left_voice_times(mock: &MockDiscord, n: usize) {
         .expect("voice left");
 }
 
+/// Filler of a FloodSource keyframe produced because a keyframe was requested.
+const REQUESTED_FILL: u8 = 0x5A;
+
 #[tokio::test(flavor = "multi_thread")]
 async fn transport_lag_drops_video_until_a_requested_keyframe() {
     let mock = MockDiscord::start().await.unwrap();
@@ -597,17 +601,15 @@ async fn transport_lag_drops_video_until_a_requested_keyframe() {
     let lagged = handle.stats();
     assert!(lagged.video_frames_dropped > 0, "{lagged:?}");
     assert!(requests.load(Ordering::Relaxed) > 0);
-    let is_idr =
-        |f: &&RecordedVideoFrame| nal_units(&f.data).first().is_some_and(|n| n[0] & 0x1F == 5);
+    let requested_idr = |f: &RecordedVideoFrame| {
+        nal_units(&f.data)
+            .first()
+            .is_some_and(|n| n[0] & 0x1F == 5 && n.last() == Some(&REQUESTED_FILL))
+    };
     // Far below the seconds of backlog the pacer held before the lag.
     let requested = mock
         .wait_for(Duration::from_secs(1), |r| {
-            let first = r.video.first()?.rtp_timestamp;
-            r.video
-                .iter()
-                .filter(is_idr)
-                .any(|f| f.rtp_timestamp != first)
-                .then_some(())
+            r.video.iter().any(requested_idr).then_some(())
         })
         .await;
     assert!(

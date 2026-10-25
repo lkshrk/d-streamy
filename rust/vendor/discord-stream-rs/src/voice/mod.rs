@@ -12,4 +12,4 @@ pub use connection::{
     VoiceConnection, VoiceEvent, WebRtcParams,
 };
 pub use opcodes::{VoiceOpCode, VoiceOpCodeBinary};
-pub use webrtc::{VideoProgress, WebRtcError, WebRtcWrapper};
+pub use webrtc::{Flushed, VideoGate, VideoProgress, WebRtcError, WebRtcWrapper};

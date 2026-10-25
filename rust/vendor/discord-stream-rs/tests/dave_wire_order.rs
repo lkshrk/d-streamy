@@ -32,10 +32,10 @@ const VIDEO_SSRC: u32 = 2222;
 const CLIENT: u64 = 42;
 const CHANNEL: u64 = 7;
 
-/// (ssrc, seq, marker) of each RTP packet in the order it reached the socket; SRTP leaves the header clear.
+/// (ssrc, seq, marker, timestamp) of each RTP packet in the order it reached the socket; SRTP leaves the header clear.
 struct WireTap {
     socket: UdpSocket,
-    wire: mpsc::UnboundedSender<(u32, u16, bool)>,
+    wire: mpsc::UnboundedSender<WireKey>,
 }
 
 impl WireTap {
@@ -44,7 +44,8 @@ impl WireTap {
         if buf.len() >= 12 && (128..=191).contains(&buf[0]) && !(192..=223).contains(&buf[1]) {
             let ssrc = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
             let seq = u16::from_be_bytes([buf[2], buf[3]]);
-            let _ = self.wire.send((ssrc, seq, buf[1] & 0x80 != 0));
+            let ts = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            let _ = self.wire.send((ssrc, seq, buf[1] & 0x80 != 0, ts));
         }
     }
 }
@@ -84,7 +85,8 @@ impl Conn for WireTap {
     }
 }
 
-type Wire = mpsc::UnboundedReceiver<(u32, u16, bool)>;
+type WireKey = (u32, u16, bool, u32);
+type Wire = mpsc::UnboundedReceiver<WireKey>;
 
 async fn tapped_discord_peer() -> (
     Arc<RTCPeerConnection>,
@@ -220,31 +222,32 @@ async fn frames_complete_on_the_wire_in_dave_nonce_order() {
     idr.extend((0..60_000u32).map(|i| (i % 251) as u8 + 1));
     let au = annexb(&[&[0x09, 0xF0], &idr]);
     let opus = [0xFC, 0xFF, 0xFE, 0x01];
-    let mut order: Vec<(u32, u16, bool)> = Vec::new();
+    let mut order: Vec<WireKey> = Vec::new();
+    let mut previous_ts = None;
     for i in 0..FRAMES as u64 {
         client
             .send_video_frame_at(&au, Duration::from_millis(33 * i))
             .await
             .unwrap();
-        let markers = |order: &[(u32, u16, bool)]| {
-            order
-                .iter()
-                .filter(|&&(ssrc, _, m)| ssrc == VIDEO_SSRC && m)
-                .count()
-        };
-        let started = order.iter().filter(|k| k.0 == VIDEO_SSRC).count() + 1;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while order.iter().filter(|k| k.0 == VIDEO_SSRC).count() < started {
-                order.push(wire.recv().await.unwrap());
+        let ts = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let key = wire.recv().await.unwrap();
+                order.push(key);
+                if key.0 == VIDEO_SSRC && Some(key.3) != previous_ts {
+                    return key.3;
+                }
             }
         })
         .await
         .expect("keyframe did not reach the wire");
+        previous_ts = Some(ts);
         while let Ok(key) = wire.try_recv() {
             order.push(key);
         }
         assert!(
-            markers(&order) <= i as usize,
+            !order
+                .iter()
+                .any(|&(ssrc, _, m, t)| ssrc == VIDEO_SSRC && m && t == ts),
             "keyframe {i} was fully on the wire before audio was sent"
         );
         client
@@ -255,7 +258,7 @@ async fn frames_complete_on_the_wire_in_dave_nonce_order() {
 
     let mut packets: HashMap<(u32, u16), Packet> = HashMap::new();
     tokio::time::timeout(Duration::from_secs(10), async {
-        while order.iter().filter(|&&(_, _, m)| m).count() < 2 * FRAMES
+        while order.iter().filter(|&&(_, _, m, _)| m).count() < 2 * FRAMES
             || packets.len() < order.len()
         {
             tokio::select! {
@@ -272,7 +275,7 @@ async fn frames_complete_on_the_wire_in_dave_nonce_order() {
     let mut depacketizer = webrtc::rtp::codecs::h264::H264Packet::default();
     let mut video = Vec::new();
     let mut completed = Vec::new();
-    for (ssrc, seq, _) in &order {
+    for (ssrc, seq, _, _) in &order {
         let p = &packets[&(*ssrc, *seq)];
         match *ssrc {
             AUDIO_SSRC => completed.push(("audio", p.payload.to_vec())),
