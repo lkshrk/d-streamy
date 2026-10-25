@@ -20,6 +20,8 @@ Every external behaviour `dstreamy serve`, the IPC layer and the OBS plugin depe
 | Opus | RFC 6716 (updated by RFC 8251), RFC 7587 |
 | RTCP feedback | RFC 4585, RFC 5104 |
 | Rust | 1.99.0 (`rust/rust-toolchain.toml`) |
+| bindgen | 0.72.1 (`rust/crates/dstreamy-obs/Cargo.lock`), libclang from the runner (Ubuntu `libclang-dev`, Xcode clang, Visual Studio's LLVM) |
+| Rust panics at `extern "C"` | since Rust 1.81.0 a panic reaching an `extern "C"` function aborts the process (`rust-lang/rust` `RELEASES.md` "Version 1.81.0", PR 116088); `std::panic::catch_unwind` stops it first |
 | tokio | 1.54.0 (`rust/Cargo.lock`) |
 | WebSocket | RFC 6455; `tungstenite` 0.24.0 (`rust/Cargo.lock`) |
 | Win32 docs | `MicrosoftDocs/sdk-api@656e9656bfaef34dd29cd7ee9e1146aec17e924c`, `MicrosoftDocs/win32@ca8274decead49403d70ceeed4af8d4ca74eaf11` |
@@ -35,6 +37,16 @@ Every external behaviour `dstreamy serve`, the IPC layer and the OBS plugin depe
 
 | Behaviour | Source | Used by |
 |---|---|---|
+| A module must export `obs_module_load`, `obs_module_set_pointer` and `obs_module_ver`; `obs_module_unload` and the locale and metadata exports are optional. `OBS_DECLARE_MODULE` defines `set_pointer`, `obs_current_module` and `ver` (returning `LIBOBS_API_VER`) | `libobs/obs-module.c:38-61`, `libobs/obs-module.h:76-91` | Rust plugin entry points |
+| `set_pointer` is called before `load`; libobs rejects a module whose `obs_module_ver()` major.minor is newer than its own and ignores the patch | `libobs/obs-module.c:169-175,199,245`; `LIBOBS_API_VER` is `(major << 24) \| (minor << 16) \| patch` at `libobs/obs-config.h:30-48` | Rust plugin entry points |
+| `obs_register_output_s` copies `size` bytes of `obs_output_info` and rejects a size larger than libobs knows; `get_name`, `create`, `destroy`, `start`, `stop` and, for encoded outputs, `encoded_packet` are required | `libobs/obs-output.h:90-92`, `libobs/obs-module.c:894-912,1061-1096` | Rust plugin output |
+| An output's proc handler outlives `info.destroy` (it is freed in `obs_context_data_free`), so a proc must only be called on a live output | `libobs/obs-output.c:307`, `libobs/obs.c:2669` | Rust plugin `get_stats` proc |
+| Ending data capture from `stop` must happen on another thread: libobs joins its own end-capture thread, as `null_output` does | `plugins/obs-outputs/null-output.c:66-80`, `libobs/obs-output.c:2837-2924` | Rust plugin output |
+| Modules are never `dlclose`d; `obs_shutdown` only calls `obs_module_unload` | `libobs/obs-module.c:780-795` | Rust plugin statics and threads |
+| Module discovery per OS: Linux and Windows take `<name>` plus `.so` / `.dll` (Linux also `lib<name>.so`) from each bin path; macOS needs a `%module%` bin path into a `<name>.plugin/Contents/MacOS/<name>` bundle, and the frontend adds `PlugIns/%module%.plugin/Contents/MacOS/` | `libobs/obs-module.c:635-748`, `libobs/obs-nix.c:45-48`, `libobs/obs-windows.c:32-35`, `libobs/obs-cocoa.m:33-45` | plugin layout, load test |
+| macOS opens modules with `RTLD_NOW \| RTLD_FIRST \| RTLD_LOCAL`, so the plugin resolves libobs through its own load commands (rpath `@executable_path/../Frameworks`) | `libobs/util/platform-nix.c:62-90`, obs-plugintemplate `cmake/macos/defaults.cmake:39` | plugin link flags |
+| Windows reads the DLL's export name table and skips a file without an unmangled `obs_module_load` before loading it | `libobs/obs-module.c:499-506`, `libobs/util/platform-windows.c:138-256` | plugin exports |
+| libobs headers include SIMDe through `util/sse-intrin.h` except under MSVC or MinGW on x86/x64; the exported `OBS::libobs` target carries the SIMDe include directory and `HAVE_OBSCONFIG_H` | `libobs/util/sse-intrin.h:22-41`, `libobs/CMakeLists.txt:10,252`, `libobs/cmake/libobsConfig.cmake.in` | bindgen include paths |
 | Encoded A/V output: `obs_output_info` with `OBS_OUTPUT_AV \| OBS_OUTPUT_ENCODED`; `get_name`, `create`, `destroy`, `start`, `stop` and `encoded_packet` required | `libobs/obs-output.h:25-88`, `libobs/obs-module.c:1061-1113` | plugin output |
 | `encoded_video_codecs` and `encoded_audio_codecs` are only reported, never enforced; the output checks `obs_encoder_get_codec` itself | `libobs/obs-output.c:3253-3304` | plugin output |
 | Start sequence: `obs_output_can_begin_data_capture`, `obs_output_initialize_encoders`, a connect thread, then `obs_output_begin_data_capture` | `plugins/obs-outputs/rtmp-stream.c:1540-1551,1088` | plugin start thread |
