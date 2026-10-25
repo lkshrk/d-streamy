@@ -8,6 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
+use dstreamy_cli::engine::ANNOUNCE_INTERVAL;
 use dstreamy_core::ConfigPaths;
 use dstreamy_media::{OPUS_SILENCE_FRAME, QUEUE_MAX_BYTES};
 use dstreamy_mock_discord::opcodes::voice::OP_VIDEO;
@@ -266,6 +267,10 @@ impl Proc {
             .unwrap_or_else(|| panic!("not attached: {hello}"))
     }
 
+    fn exited(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_some()
+    }
+
     fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -516,18 +521,30 @@ fn op_12_follows_each_producer_and_comes_before_its_media() {
         ops.contains(&(320, 180, u64::from(FPS)))
             .then_some(ops.len())
     });
+    let mut previous_spawn: Option<Instant> = None;
     for want in [(640, 360, 15), (160, 90, 30), (640, 360, 15)] {
         let args = size_args(want.0, want.1, want.2);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let spawned = Instant::now();
         let mut p = h.producer(&args);
         p.attached();
-        // The producer sends media only after `attached`, so op 12 recorded by now preceded its media.
-        let ops = video_ops(&h.mock.recorded());
-        let at = ops[seen.min(ops.len())..]
-            .iter()
-            .position(|&op| op == want)
-            .unwrap_or_else(|| panic!("op 12 {want:?} not sent before attached: {ops:?}"));
-        seen += at + 1;
+        // The previous op 12 went out after the previous spawn, so this one is rate limited past it.
+        if let Some(previous) = previous_spawn {
+            let waited = previous.elapsed();
+            assert!(
+                waited >= ANNOUNCE_INTERVAL,
+                "attached {waited:?} after the previous producer, before its rate-limited op 12"
+            );
+        }
+        previous_spawn = Some(spawned);
+        // The mock records op 12 asynchronously, so it may land after `attached`.
+        seen = h.wait(&format!("op 12 {want:?}"), |r| {
+            let ops = video_ops(r);
+            ops[seen.min(ops.len())..]
+                .iter()
+                .position(|&op| op == want)
+                .map(|at| seen + at + 1)
+        });
         p.kill();
     }
 }
@@ -945,7 +962,7 @@ impl Overload {
     }
 }
 
-/// Runs a producer for `secs` and samples the source queue depth every 50 ms.
+/// Runs a producer for at most `secs` and samples the source queue depth every 50 ms.
 fn overload_run(burst: Option<u32>, secs: u64) -> Overload {
     overload_run_with(burst, secs, &[])
 }
@@ -960,11 +977,11 @@ fn overload_run_with(burst: Option<u32>, secs: u64, extra: &[&str]) -> Overload 
     }
     let mut args: Vec<&str> = args.iter().map(String::as_str).collect();
     args.extend(extra);
-    let p = h.producer(&args);
+    let mut p = h.producer(&args);
     p.attached();
     let mut depths = Vec::new();
     let end = Instant::now() + Duration::from_secs(secs);
-    while Instant::now() < end {
+    while Instant::now() < end && !p.exited() {
         depths.push(c.status()["source"]["stats"]["queued"].as_u64().unwrap());
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1064,7 +1081,19 @@ fn a_producer_faster_than_serve_can_send_is_dropped_not_buffered() {
 fn a_flood_of_8_mib_keyframes_keeps_serve_memory_bounded() {
     let baseline = overload_run(None, 5);
     let pad = (8 << 20) - 64;
-    let flood = overload_run_with(Some(50), 12, &["--pad-keyframes", &pad.to_string()]);
+    // Queues and in-flight copies measured up to ~260 MiB with glibc arenas; keeping what was sent would exceed it.
+    let bound_kib = (QUEUE_MAX_BYTES as u64 + 40 * (8 << 20)) / 1024;
+    let target = (bound_kib + bound_kib / 2) * 1024 + (16 << 20);
+    let flood = overload_run_with(
+        Some(50),
+        120,
+        &[
+            "--pad-keyframes",
+            &pad.to_string(),
+            "--until-bytes",
+            &target.to_string(),
+        ],
+    );
     assert_within_capacity(&flood);
     let source_lost = flood.source["dropped_video"].as_u64().unwrap();
     assert!(
@@ -1082,8 +1111,6 @@ fn a_flood_of_8_mib_keyframes_keeps_serve_memory_bounded() {
         flood.keyframe_requests > 0,
         "the producer saw no keyframe request"
     );
-    // Queues and in-flight copies measured up to ~260 MiB with glibc arenas; keeping what was sent would exceed it.
-    let bound_kib = (QUEUE_MAX_BYTES as u64 + 40 * (8 << 20)) / 1024;
     assert!(
         flood.sent_bytes / 1024 > bound_kib + bound_kib / 2,
         "the flood sent only {} KiB, too little to tell buffering from the bound",

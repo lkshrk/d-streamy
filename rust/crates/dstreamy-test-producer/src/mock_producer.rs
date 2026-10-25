@@ -57,6 +57,9 @@ struct Args {
     /// Stops after this long; runs until killed otherwise.
     #[arg(long, value_name = "MS")]
     duration: Option<u64>,
+    /// Stops once this many payload bytes were sent.
+    #[arg(long, value_name = "BYTES")]
+    until_bytes: Option<u64>,
     #[arg(long, value_name = "MS")]
     disconnect_after: Option<u64>,
     /// Stops sending, but stays connected, for `stall_for` ms.
@@ -385,6 +388,10 @@ async fn attach(
                 sent_bytes += frame.payload.len() as u64;
                 if sink.send(frame).await.is_err() {
                     break pending_detached(&mut lines).await;
+                }
+                if args.until_bytes.is_some_and(|n| sent_bytes >= n) {
+                    let _ = sink.send(Frame::end_of_stream(last_video_pts)).await;
+                    break Outcome::Finished;
                 }
             }
         }
