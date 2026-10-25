@@ -279,7 +279,7 @@ fn markers(
     pairs
 }
 
-/// The first audio packet lost because video set the shared DAVE nonce baseline; a lost first IDR would break every check, so it fails.
+/// Tolerates one first audio packet lost to receive-side track reordering, so only `dave_wire_order` guards the sender's nonce order.
 fn start_drops(recorded: &Recorded, what: &str) -> usize {
     let tolerated = format!("{FIRST_FRAME_DAVE_DROP}audio");
     let drops = &recorded.dropped_frames;

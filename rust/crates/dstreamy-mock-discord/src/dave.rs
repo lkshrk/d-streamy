@@ -27,6 +27,8 @@ pub enum DaveServerError {
     WrongUser(u64, u64),
     #[error("no participant session")]
     NoParticipant,
+    #[error("davey: {0}")]
+    Decrypt(#[from] davey::errors::DecryptError),
 }
 
 fn mls(e: impl std::fmt::Display) -> DaveServerError {
@@ -169,9 +171,7 @@ impl DaveServer {
             .participant
             .as_mut()
             .ok_or(DaveServerError::NoParticipant)?;
-        participant
-            .decrypt(self.client_user_id, media_type, frame)
-            .map_err(davey)
+        Ok(participant.decrypt(self.client_user_id, media_type, frame)?)
     }
 }
 

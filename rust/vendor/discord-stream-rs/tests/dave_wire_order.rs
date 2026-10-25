@@ -220,12 +220,33 @@ async fn frames_complete_on_the_wire_in_dave_nonce_order() {
     idr.extend((0..60_000u32).map(|i| (i % 251) as u8 + 1));
     let au = annexb(&[&[0x09, 0xF0], &idr]);
     let opus = [0xFC, 0xFF, 0xFE, 0x01];
+    let mut order: Vec<(u32, u16, bool)> = Vec::new();
     for i in 0..FRAMES as u64 {
         client
             .send_video_frame_at(&au, Duration::from_millis(33 * i))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        let markers = |order: &[(u32, u16, bool)]| {
+            order
+                .iter()
+                .filter(|&&(ssrc, _, m)| ssrc == VIDEO_SSRC && m)
+                .count()
+        };
+        let started = order.iter().filter(|k| k.0 == VIDEO_SSRC).count() + 1;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while order.iter().filter(|k| k.0 == VIDEO_SSRC).count() < started {
+                order.push(wire.recv().await.unwrap());
+            }
+        })
+        .await
+        .expect("keyframe did not reach the wire");
+        while let Ok(key) = wire.try_recv() {
+            order.push(key);
+        }
+        assert!(
+            markers(&order) <= i as usize,
+            "keyframe {i} was fully on the wire before audio was sent"
+        );
         client
             .send_audio_frame_at(&opus, Duration::from_millis(20 * i))
             .await
@@ -233,7 +254,6 @@ async fn frames_complete_on_the_wire_in_dave_nonce_order() {
     }
 
     let mut packets: HashMap<(u32, u16), Packet> = HashMap::new();
-    let mut order = Vec::new();
     tokio::time::timeout(Duration::from_secs(10), async {
         while order.iter().filter(|&&(_, _, m)| m).count() < 2 * FRAMES
             || packets.len() < order.len()

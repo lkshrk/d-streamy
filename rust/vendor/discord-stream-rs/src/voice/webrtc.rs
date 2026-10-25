@@ -11,7 +11,7 @@ use crate::voice::packetizer::{PayloadFormat, RtpPacketizer};
 use async_trait::async_trait;
 use davey::{Codec, MediaType};
 use std::any::Any;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -54,6 +54,8 @@ const AUDIO_PLAYOUT_DELAY: (u16, u16) = (0, 1);
 const VIDEO_PLAYOUT_DELAY: (u16, u16) = (0, 10);
 /// Queued video bytes; whole frames are dropped beyond it.
 pub const PACER_QUEUE_BYTES: usize = 10 * 1024 * 1024;
+/// An uncompressed 1920x1080 4:2:0 picture; a larger frame would hold the send order (and audio) for over a second.
+pub const MAX_VIDEO_FRAME_BYTES: usize = 1920 * 1080 * 3 / 2;
 
 #[derive(Debug, Error)]
 pub enum WebRtcError {
@@ -65,6 +67,8 @@ pub enum WebRtcError {
     NotConnected,
     #[error("Video pacer queue is full; frame dropped")]
     PacerQueueFull,
+    #[error("Video frame of {0} bytes exceeds the {MAX_VIDEO_FRAME_BYTES}-byte limit")]
+    FrameTooLarge(usize),
     #[error("Unknown video codec: {0}")]
     UnknownCodec(String),
     #[error("No packetizer for video codec {0}")]
@@ -156,13 +160,14 @@ impl TrackLocal for DiscordTrack {
     }
 }
 
-/// Video frames the pacer lost after `send_video` accepted them, across peer connection restarts.
+/// What became of the video frames `send_video` accepted, cumulative across peer connection restarts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VideoLosses {
-    /// Frames not sent: DAVE encrypt failed or the packetizer was gone.
+pub struct VideoProgress {
+    /// Frames whose last packet was written without a write error.
+    pub sent_frames: u64,
+    pub sent_bytes: u64,
+    /// Frames not fully sent: DAVE encrypt failed, the packetizer was gone, an RTP write failed or the pacer stopped.
     pub dropped_frames: u64,
-    /// Frames with at least one RTP write that failed.
-    pub failed_writes: u64,
     pub last_error: Option<String>,
 }
 
@@ -179,12 +184,24 @@ struct PacerShared {
     dave: Arc<StdMutex<DaveHandler>>,
     send_order: Arc<Mutex<()>>,
     queued_bytes: Arc<AtomicUsize>,
-    losses: Arc<watch::Sender<VideoLosses>>,
+    outstanding: Arc<AtomicU64>,
+    progress: Arc<watch::Sender<VideoProgress>>,
+}
+
+impl PacerShared {
+    /// False when `Pacer::drop` already counted the frame as dropped.
+    fn settle(&self) -> bool {
+        self.outstanding
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+    }
 }
 
 struct Pacer {
     tx: mpsc::UnboundedSender<PacedFrame>,
     queued_bytes: Arc<AtomicUsize>,
+    outstanding: Arc<AtomicU64>,
+    progress: Arc<watch::Sender<VideoProgress>>,
     task: JoinHandle<()>,
 }
 
@@ -192,10 +209,14 @@ impl Pacer {
     fn spawn(shared: PacerShared, bits_per_second: f64) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let queued_bytes = shared.queued_bytes.clone();
+        let outstanding = shared.outstanding.clone();
+        let progress = shared.progress.clone();
         let task = tokio::spawn(run_pacer(shared, rx, bits_per_second / 8.0));
         Self {
             tx,
             queued_bytes,
+            outstanding,
+            progress,
             task,
         }
     }
@@ -204,6 +225,14 @@ impl Pacer {
 impl Drop for Pacer {
     fn drop(&mut self) {
         self.task.abort();
+        let lost = self.outstanding.swap(0, Ordering::AcqRel);
+        if lost > 0 {
+            warn!("video pacer stopped with {} frames unsent", lost);
+            self.progress.send_modify(|p| {
+                p.dropped_frames += lost;
+                p.last_error = Some(format!("video pacer stopped with {lost} frames unsent"));
+            });
+        }
     }
 }
 
@@ -227,14 +256,23 @@ async fn run_pacer(
                 .ok_or_else(|| WebRtcError::PacketizerNotConfigured.to_string()),
             Err(e) => Err(WebRtcError::Dave(e.to_string()).to_string()),
         };
-        let packets = packets.unwrap_or_else(|e| {
-            warn!("video frame dropped in the pacer: {}", e);
-            shared.losses.send_modify(|l| {
-                l.dropped_frames += 1;
-                l.last_error = Some(e);
-            });
-            Vec::new()
-        });
+        let packets = match packets {
+            Ok(packets) => packets,
+            Err(e) => {
+                drop(order);
+                shared
+                    .queued_bytes
+                    .fetch_sub(frame.data.len(), Ordering::Relaxed);
+                if shared.settle() {
+                    warn!("video frame dropped in the pacer: {}", e);
+                    shared.progress.send_modify(|p| {
+                        p.dropped_frames += 1;
+                        p.last_error = Some(e);
+                    });
+                }
+                continue;
+            }
+        };
         let mut write_error = None;
         for packet in &packets {
             let size = (packet.payload.len() + 12) as f64;
@@ -254,16 +292,25 @@ async fn run_pacer(
             }
         }
         drop(order);
-        if let Some(e) = write_error {
-            warn!("video RTP write failed: {}", e);
-            shared.losses.send_modify(|l| {
-                l.failed_writes += 1;
-                l.last_error = Some(e.to_string());
-            });
-        }
         shared
             .queued_bytes
             .fetch_sub(frame.data.len(), Ordering::Relaxed);
+        if !shared.settle() {
+            continue;
+        }
+        match write_error {
+            Some(e) => {
+                warn!("video RTP write failed: {}", e);
+                shared.progress.send_modify(|p| {
+                    p.dropped_frames += 1;
+                    p.last_error = Some(e.to_string());
+                });
+            }
+            None => shared.progress.send_modify(|p| {
+                p.sent_frames += 1;
+                p.sent_bytes += frame.data.len() as u64;
+            }),
+        }
     }
 }
 
@@ -281,7 +328,7 @@ pub struct WebRtcWrapper {
     setting_engine: SettingEngine,
     dave: Arc<StdMutex<DaveHandler>>,
     keyframe_requests: Arc<watch::Sender<u64>>,
-    video_losses: Arc<watch::Sender<VideoLosses>>,
+    video_progress: Arc<watch::Sender<VideoProgress>>,
 }
 
 impl WebRtcWrapper {
@@ -299,12 +346,12 @@ impl WebRtcWrapper {
             setting_engine: SettingEngine::default(),
             dave,
             keyframe_requests: Arc::new(watch::channel(0).0),
-            video_losses: Arc::new(watch::channel(VideoLosses::default()).0),
+            video_progress: Arc::new(watch::channel(VideoProgress::default()).0),
         }
     }
 
-    pub fn video_losses(&self) -> watch::Receiver<VideoLosses> {
-        self.video_losses.subscribe()
+    pub fn video_progress(&self) -> watch::Receiver<VideoProgress> {
+        self.video_progress.subscribe()
     }
 
     /// Count of PLI and FIR packets received from viewers, across peer connection restarts.
@@ -426,7 +473,8 @@ impl WebRtcWrapper {
                 dave: self.dave.clone(),
                 send_order: self.send_order.clone(),
                 queued_bytes: Arc::default(),
-                losses: self.video_losses.clone(),
+                outstanding: Arc::default(),
+                progress: self.video_progress.clone(),
             },
             VIDEO_PACING_BITS_PER_SECOND,
         ));
@@ -557,6 +605,9 @@ impl WebRtcWrapper {
     }
 
     fn send_video(&mut self, frame: &[u8], timing: Timing) -> Result<(), WebRtcError> {
+        if frame.len() > MAX_VIDEO_FRAME_BYTES {
+            return Err(WebRtcError::FrameTooLarge(frame.len()));
+        }
         if !self.is_ready() {
             return Err(WebRtcError::NotConnected);
         }
@@ -575,6 +626,7 @@ impl WebRtcWrapper {
             return Err(WebRtcError::PacerQueueFull);
         }
         pacer.queued_bytes.fetch_add(len, Ordering::Relaxed);
+        pacer.outstanding.fetch_add(1, Ordering::AcqRel);
         let paced = PacedFrame {
             data,
             codec,
@@ -582,6 +634,7 @@ impl WebRtcWrapper {
         };
         if pacer.tx.send(paced).is_err() {
             pacer.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+            pacer.outstanding.fetch_sub(1, Ordering::AcqRel);
             warn!("video pacer stopped");
             return Err(WebRtcError::NotInitialized);
         }
@@ -843,6 +896,149 @@ mod tests {
         assert_eq!(nalus.len(), 2);
         assert!(nalus[0].len() > 9);
         assert_eq!(nalus[1], [0x65, 0x88]);
+    }
+
+    #[derive(Debug)]
+    enum TestWriter {
+        Ok,
+        Fails,
+        Hangs,
+    }
+
+    #[async_trait]
+    impl TrackLocalWriter for TestWriter {
+        async fn write_rtp_with_attributes(
+            &self,
+            pkt: &Packet,
+            _: &webrtc::interceptor::Attributes,
+        ) -> webrtc::error::Result<usize> {
+            match self {
+                TestWriter::Ok => Ok(pkt.payload.len()),
+                TestWriter::Fails => Err(webrtc::Error::ErrClosedPipe),
+                TestWriter::Hangs => std::future::pending().await,
+            }
+        }
+
+        async fn write(&self, b: &[u8]) -> webrtc::error::Result<usize> {
+            Ok(b.len())
+        }
+    }
+
+    async fn pacer(writer: TestWriter) -> (Pacer, watch::Receiver<VideoProgress>) {
+        let track = Arc::new(DiscordTrack::new(RTPCodecType::Video, MIME_TYPE_H264, 2));
+        *track.writer.lock().await = Some(Arc::new(writer));
+        let progress = Arc::new(watch::channel(VideoProgress::default()).0);
+        let rx = progress.subscribe();
+        let packetizer = RtpPacketizer::new(
+            2,
+            codec_payload::H264.payload_type,
+            90_000,
+            PayloadFormat::Video(VideoCodec::H264),
+            VIDEO_PLAYOUT_DELAY,
+        );
+        let shared = PacerShared {
+            track,
+            packetizer: Arc::new(StdMutex::new(Some(packetizer))),
+            dave: Arc::new(StdMutex::new(DaveHandler::new(1, 2))),
+            send_order: Arc::default(),
+            queued_bytes: Arc::default(),
+            outstanding: Arc::default(),
+            progress,
+        };
+        (Pacer::spawn(shared, VIDEO_PACING_BITS_PER_SECOND), rx)
+    }
+
+    fn queue(pacer: &Pacer, frames: usize) {
+        for _ in 0..frames {
+            pacer.queued_bytes.fetch_add(3000, Ordering::Relaxed);
+            pacer.outstanding.fetch_add(1, Ordering::AcqRel);
+            let frame = PacedFrame {
+                data: vec![0, 0, 0, 1, 0x65]
+                    .into_iter()
+                    .chain([7; 2995])
+                    .collect(),
+                codec: VideoCodec::H264,
+                timing: Timing::Advance(33.0),
+            };
+            pacer.tx.send(frame).unwrap();
+        }
+    }
+
+    async fn settled(rx: &mut watch::Receiver<VideoProgress>, frames: u64) -> VideoProgress {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            rx.wait_for(|p| p.sent_frames + p.dropped_frames >= frames),
+        )
+        .await
+        .expect("pacer progress")
+        .unwrap()
+        .clone()
+    }
+
+    #[tokio::test]
+    async fn a_frame_counts_as_sent_once_its_last_packet_is_written() {
+        let (pacer, mut rx) = pacer(TestWriter::Ok).await;
+        queue(&pacer, 3);
+        let p = settled(&mut rx, 3).await;
+        assert_eq!(
+            (p.sent_frames, p.sent_bytes, p.dropped_frames),
+            (3, 9000, 0)
+        );
+        drop(pacer);
+        assert_eq!(rx.borrow().dropped_frames, 0);
+    }
+
+    #[tokio::test]
+    async fn a_frame_with_a_failed_write_counts_as_dropped() {
+        let (pacer, mut rx) = pacer(TestWriter::Fails).await;
+        queue(&pacer, 2);
+        let p = settled(&mut rx, 2).await;
+        assert_eq!((p.sent_frames, p.dropped_frames), (0, 2));
+        assert!(p.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn frames_queued_or_in_flight_when_the_pacer_stops_count_as_dropped_once() {
+        let (pacer, rx) = pacer(TestWriter::Hangs).await;
+        queue(&pacer, 4);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(*rx.borrow(), VideoProgress::default());
+        drop(pacer);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let p = rx.borrow().clone();
+        assert_eq!((p.sent_frames, p.dropped_frames), (0, 4));
+    }
+
+    #[tokio::test]
+    async fn a_frame_finishing_after_the_stop_counted_it_is_not_published_again() {
+        let (pacer, rx) = pacer(TestWriter::Hangs).await;
+        queue(&pacer, 1);
+        let shared = PacerShared {
+            track: Arc::new(DiscordTrack::new(RTPCodecType::Video, MIME_TYPE_H264, 2)),
+            packetizer: Arc::default(),
+            dave: Arc::new(StdMutex::new(DaveHandler::new(1, 2))),
+            send_order: Arc::default(),
+            queued_bytes: pacer.queued_bytes.clone(),
+            outstanding: pacer.outstanding.clone(),
+            progress: pacer.progress.clone(),
+        };
+        drop(pacer);
+        assert!(!shared.settle());
+        assert_eq!(rx.borrow().dropped_frames, 1);
+    }
+
+    #[test]
+    fn a_frame_above_the_cap_is_refused_before_anything_else() {
+        let mut w = WebRtcWrapper::new(Arc::new(StdMutex::new(DaveHandler::new(1, 2))));
+        let big = vec![0; MAX_VIDEO_FRAME_BYTES + 1];
+        assert!(matches!(
+            w.send_video(&big, Timing::Advance(33.0)),
+            Err(WebRtcError::FrameTooLarge(n)) if n == big.len()
+        ));
+        assert!(matches!(
+            w.send_video(&big[1..], Timing::Advance(33.0)),
+            Err(WebRtcError::NotConnected)
+        ));
     }
 
     #[test]

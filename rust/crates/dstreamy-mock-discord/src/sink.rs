@@ -3,11 +3,12 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
+use davey::errors::{DecryptError, DecryptorDecryptError};
 use davey::{MediaType, OPUS_SILENCE_PACKET};
 use tokio::sync::mpsc;
 use webrtc::rtp::packet::Packet;
 
-use crate::dave::{DaveServer, is_dave_frame};
+use crate::dave::{DaveServer, DaveServerError, is_dave_frame};
 use crate::depacketize::{Depacketizer, VideoCodec};
 use crate::state::{RecordedAudioFrame, RecordedVideoFrame, Shared, VoiceKind};
 
@@ -60,6 +61,16 @@ pub(crate) struct Sink {
     negotiated: Negotiated,
     video: Assembly,
     decrypted: Decrypted,
+}
+
+/// davey reports a nonce below its baseline and a failed authentication alike (`cryptor/decryptor.rs:130,159`).
+fn could_be_reordered(e: &DaveServerError) -> bool {
+    matches!(
+        e,
+        DaveServerError::Decrypt(DecryptError::DecryptionFailed(
+            DecryptorDecryptError::NoValidCryptorFound { .. }
+        ))
+    )
 }
 
 impl Sink {
@@ -208,7 +219,7 @@ impl Sink {
                 this.succeeded = true;
                 Ok((plain, true))
             }
-            Err(e) if first_failure => {
+            Err(e) if first_failure && could_be_reordered(&e) => {
                 this.tagged = true;
                 Err(format!("{FIRST_FRAME_DAVE_DROP}{name}: {e}"))
             }
@@ -371,5 +382,89 @@ mod tests {
         assert!(sink.decrypt(MediaType::AUDIO, later).is_ok());
         let replayed = sink.decrypt(MediaType::AUDIO, audio).unwrap_err();
         assert!(!replayed.starts_with(FIRST_FRAME_DAVE_DROP), "{replayed}");
+    }
+
+    #[test]
+    fn a_first_video_frame_behind_decrypted_audio_is_tagged_too() {
+        let (server, mut client) = dave_pair();
+        let mut sink = sink(Some(server));
+        lock_dave(&sink.dave).as_mut().unwrap().execute_transition();
+        let idr = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33, 0xFF];
+        let video = client
+            .encrypt(MediaType::VIDEO, Codec::H264, &idr)
+            .unwrap()
+            .to_vec();
+        let audio = client
+            .encrypt(MediaType::AUDIO, Codec::OPUS, &[0xFC, 0xFF, 0xFE, 0x01])
+            .unwrap()
+            .to_vec();
+        assert!(sink.decrypt(MediaType::AUDIO, audio).is_ok());
+        let first = sink.decrypt(MediaType::VIDEO, video.clone()).unwrap_err();
+        assert!(
+            first.starts_with(&format!("{FIRST_FRAME_DAVE_DROP}video")),
+            "{first}"
+        );
+        let again = sink.decrypt(MediaType::VIDEO, video).unwrap_err();
+        assert!(!again.starts_with(FIRST_FRAME_DAVE_DROP), "{again}");
+    }
+
+    #[test]
+    fn a_drop_while_neither_track_decrypted_is_not_tagged() {
+        let (server, mut client) = dave_pair();
+        let mut sink = sink(Some(server));
+        lock_dave(&sink.dave).as_mut().unwrap().execute_transition();
+        let mut forged = client
+            .encrypt(
+                MediaType::VIDEO,
+                Codec::H264,
+                &[0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00],
+            )
+            .unwrap()
+            .to_vec();
+        forged[5] ^= 0xff;
+        for _ in 0..2 {
+            let e = sink.decrypt(MediaType::VIDEO, forged.clone()).unwrap_err();
+            assert!(!e.starts_with(FIRST_FRAME_DAVE_DROP), "{e}");
+        }
+    }
+
+    #[test]
+    fn only_a_rejected_nonce_or_tag_can_be_receive_reordering() {
+        let no_cryptor = DecryptorDecryptError::NoValidCryptorFound {
+            media_type: MediaType::AUDIO,
+            encrypted_size: 0,
+            plaintext_size: 0,
+            manager_count: 1,
+        };
+        assert!(could_be_reordered(
+            &DecryptError::DecryptionFailed(no_cryptor).into()
+        ));
+        for e in [
+            DecryptError::NoDecryptorForUser,
+            DecryptError::DecryptionFailed(
+                DecryptorDecryptError::UnencryptedWhenPassthroughDisabled,
+            ),
+        ] {
+            assert!(!could_be_reordered(&e.into()));
+        }
+        assert!(!could_be_reordered(&DaveServerError::NoParticipant));
+    }
+
+    #[test]
+    fn a_dave_frame_without_a_participant_is_not_tagged() {
+        let (_, mut client) = dave_pair();
+        let server = DaveServer::new(NonZeroU16::new(1).unwrap(), CLIENT, 7, 9999).unwrap();
+        let mut sink = sink(Some(server));
+        sink.decrypted.audio.succeeded = true;
+        let video = client
+            .encrypt(
+                MediaType::VIDEO,
+                Codec::H264,
+                &[0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00],
+            )
+            .unwrap()
+            .to_vec();
+        let e = sink.decrypt(MediaType::VIDEO, video).unwrap_err();
+        assert!(!e.starts_with(FIRST_FRAME_DAVE_DROP), "{e}");
     }
 }

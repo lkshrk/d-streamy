@@ -287,19 +287,18 @@ async fn a_producer_swap_keeps_streaming_with_continuous_decodable_media() {
         "frames lost after the reattach: {:?}",
         &recorded.dropped_frames[before.dropped_frames.len()..]
     );
-    // davey may reject the first keyframe after DAVE comes up; video then resumes at the next one.
+    let drops = &before.dropped_frames;
+    // A receiver that demuxes tracks can still lose the first video frame to audio decrypted ahead of it.
+    let tolerated = format!("{FIRST_FRAME_DAVE_DROP}video");
+    assert!(
+        drops.len() <= 1 && drops.iter().all(|d| d.starts_with(&tolerated)),
+        "drops before the reattach: {drops:?}"
+    );
     let start = video.iter().position(|v| is_keyframe(&v.data)).unwrap();
-    if start > 0 {
-        let drops = &before.dropped_frames;
-        assert!(
-            drops
-                .iter()
-                .any(|d| d.starts_with(&format!("{FIRST_FRAME_DAVE_DROP}video")))
-                && drops.len() == 1
-                && drops.iter().all(|d| d.starts_with(FIRST_FRAME_DAVE_DROP)),
-            "video before the first keyframe; drops: {drops:?}"
-        );
-    }
+    assert!(
+        start == 0 || drops.len() == 1,
+        "video before the first keyframe without a lost one; drops: {drops:?}"
+    );
     assert!(split > start);
     assert!(
         is_keyframe(&video[split].data),

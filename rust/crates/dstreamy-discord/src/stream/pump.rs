@@ -12,7 +12,7 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 use super::queue::{Effects, FrameQueue};
 use super::timebase::{Timebase, Track};
 use super::{StreamError, StreamOptions, StreamStats};
-use crate::transport::{MediaConnection, VideoLosses};
+use crate::transport::{MediaConnection, VideoProgress};
 
 pub(crate) const TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const FPS_WINDOW: Duration = Duration::from_secs(1);
@@ -36,12 +36,26 @@ impl StatsState {
         self.stats.audio_frames_dropped += effects.dropped_audio;
     }
 
-    fn video_sent(&mut self, bytes: usize, now: Instant) {
-        self.stats.video_frames_sent += 1;
-        self.stats.bytes_sent += bytes as u64;
-        self.video_sent_at.push_back(now);
-        self.intervals.record(now);
+    fn video_sent(&mut self, frames: u64, bytes: u64, now: Instant) {
+        self.stats.video_frames_sent += frames;
+        self.stats.bytes_sent += bytes;
+        for _ in 0..frames {
+            self.video_sent_at.push_back(now);
+            self.intervals.record(now);
+        }
         self.prune(now);
+    }
+
+    /// Applies what the pacer did with accepted video; true when frames were lost.
+    fn video_progress(&mut self, delta: VideoProgress, now: Instant) -> bool {
+        self.video_sent(delta.sent_frames, delta.sent_bytes, now);
+        self.stats.video_frames_dropped += delta.dropped_frames;
+        if delta.dropped_frames > 0
+            && let Some(e) = delta.last_error
+        {
+            self.stats.last_error = Some(e);
+        }
+        delta.dropped_frames > 0
     }
 
     fn prune(&mut self, now: Instant) {
@@ -63,6 +77,8 @@ struct Shared {
     /// Latest mapped pts per track (video, audio) in µs plus one, 0 before the first frame.
     last_pts: [AtomicU64; 2],
     source: RwLock<Option<Box<dyn CaptureSource>>>,
+    /// The attached connection's video progress last applied to the stats.
+    progress_seen: Mutex<Option<(MediaConnection, VideoProgress)>>,
 }
 
 impl Shared {
@@ -125,6 +141,7 @@ pub(crate) struct Resume {
     last_frame_at: Option<Instant>,
     stats: StreamStats,
     video_sent_at: VecDeque<Instant>,
+    progress_seen: Option<(MediaConnection, VideoProgress)>,
     /// DAVE already came up on this connection, so its keyframe request is not repeated.
     pub(crate) same_connection: bool,
 }
@@ -159,6 +176,7 @@ impl MediaPump {
             Err(e) => return Err((source, e.into())),
         };
         let fps = options.capture.fps;
+        let progress_seen = resume.as_ref().and_then(|r| r.progress_seen.clone());
         let (timebase, stats, dave_seen) = match resume {
             Some(resume) => {
                 let timebase = if resume.last_pts_us.iter().any(Option::is_some) {
@@ -194,6 +212,7 @@ impl MediaPump {
             configured_fps: AtomicU32::new(options.capture.fps),
             last_pts: [AtomicU64::new(0), AtomicU64::new(0)],
             source: RwLock::new(Some(source)),
+            progress_seen: Mutex::new(progress_seen),
         });
         let (conn, conn_rx) = watch::channel(conn);
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -285,6 +304,7 @@ impl MediaPump {
             last_frame_at: state.last_frame_at,
             stats: state.stats.clone(),
             video_sent_at: state.video_sent_at.clone(),
+            progress_seen: lock_seen(&shared).clone(),
             same_connection: false,
         };
         drop(state);
@@ -406,7 +426,7 @@ async fn send_frames(
                 let pts = timebase.map(Track::Video, video.pts_us);
                 shared.note_pts(Track::Video, pts);
                 match current.send_video_frame_at(&video.data, pts).await {
-                    Ok(()) => shared.stats().video_sent(video.data.len(), Instant::now()),
+                    Ok(()) => {}
                     Err(e) => {
                         let effects = shared.queue().video_lost(Instant::now());
                         shared.stats().stats.video_frames_dropped += 1;
@@ -434,7 +454,7 @@ async fn send_frames(
     }
 }
 
-/// Turns viewer PLI/FIR and DAVE coming up on the attached connection into keyframe requests, and pacer losses into lost video.
+/// Turns viewer PLI/FIR and DAVE coming up on the attached connection into keyframe requests, and pacer progress into sent or lost video.
 async fn watch_keyframes(
     mut conn: watch::Receiver<Option<MediaConnection>>,
     shared: Arc<Shared>,
@@ -443,17 +463,16 @@ async fn watch_keyframes(
 ) {
     let mut poll = interval(DAVE_POLL);
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut progress = ProgressWatch::<MediaConnection>::default();
     loop {
         let current = conn.borrow_and_update().clone();
+        let carried = lock_seen(&shared).take();
+        progress.attach(current.as_ref(), carried);
+        *lock_seen(&shared) = progress.seen();
         let mut viewer_requests = current.as_ref().map(|c| {
             let mut requests = c.keyframe_requests();
             requests.borrow_and_update();
             requests
-        });
-        let mut losses = current.as_ref().map(|c| {
-            let mut losses = c.video_losses();
-            let seen = losses.borrow_and_update().clone();
-            (losses, seen)
         });
         let mut dave_ready = std::mem::take(&mut dave_seen)
             && current.as_ref().is_some_and(MediaConnection::dave_ready);
@@ -467,16 +486,13 @@ async fn watch_keyframes(
                     Ok(()) => break,
                     Err(_) => return,
                 },
-                lost = next_loss(&mut losses) => {
-                    let effects = shared.queue().video_lost(Instant::now());
-                    {
-                        let mut state = shared.stats();
-                        state.stats.video_frames_dropped += lost.dropped_frames;
-                        if let Some(e) = lost.last_error {
-                            state.stats.last_error = Some(e);
-                        }
+                delta = progress.next() => {
+                    *lock_seen(&shared) = progress.seen();
+                    let now = Instant::now();
+                    if shared.stats().video_progress(delta, now) {
+                        let effects = shared.queue().video_lost(now);
+                        shared.handle(effects);
                     }
-                    shared.handle(effects);
                 }
                 () = next_request(&mut viewer_requests) => {
                     shared.stats().stats.viewer_keyframe_requests += 1;
@@ -504,24 +520,139 @@ async fn watch_keyframes(
     }
 }
 
-/// The losses since the last call; `last_error` is the newest one.
-async fn next_loss(
-    losses: &mut Option<(watch::Receiver<VideoLosses>, VideoLosses)>,
-) -> VideoLosses {
-    if let Some((rx, seen)) = losses.as_mut()
-        && rx.changed().await.is_ok()
-    {
-        let now = rx.borrow_and_update().clone();
-        let delta = VideoLosses {
-            dropped_frames: now.dropped_frames - seen.dropped_frames,
-            failed_writes: now.failed_writes - seen.failed_writes,
+trait Conn: Clone {
+    fn same(&self, other: &Self) -> bool;
+    fn video_progress(&self) -> watch::Receiver<VideoProgress>;
+}
+
+impl Conn for MediaConnection {
+    fn same(&self, other: &Self) -> bool {
+        self.ptr_eq(other)
+    }
+
+    fn video_progress(&self) -> watch::Receiver<VideoProgress> {
+        MediaConnection::video_progress(self)
+    }
+}
+
+/// One connection's cumulative video progress and the part already applied.
+struct Tracked {
+    rx: watch::Receiver<VideoProgress>,
+    seen: VideoProgress,
+}
+
+impl Tracked {
+    fn delta(&mut self) -> VideoProgress {
+        let now = self.rx.borrow_and_update().clone();
+        let delta = VideoProgress {
+            sent_frames: now.sent_frames - self.seen.sent_frames,
+            sent_bytes: now.sent_bytes - self.seen.sent_bytes,
+            dropped_frames: now.dropped_frames - self.seen.dropped_frames,
             last_error: now.last_error.clone(),
         };
-        *seen = now;
-        return delta;
+        self.seen = now;
+        delta
     }
-    *losses = None;
-    std::future::pending().await
+}
+
+/// Follows the attached connection's pacer and, until they close, the connections it replaced.
+struct ProgressWatch<C> {
+    current: Option<(C, Tracked)>,
+    // Only receivers: holding a retired connection would keep its sender, and so this entry, alive.
+    retired: Vec<Tracked>,
+}
+
+impl<C> Default for ProgressWatch<C> {
+    fn default() -> Self {
+        Self {
+            current: None,
+            retired: Vec::new(),
+        }
+    }
+}
+
+impl<C: Conn> ProgressWatch<C> {
+    /// `carried` is where a previous pump on the same connection stopped applying progress.
+    fn attach(&mut self, conn: Option<&C>, carried: Option<(C, VideoProgress)>) {
+        if let (Some((current, _)), Some(c)) = (&self.current, conn)
+            && current.same(c)
+        {
+            return;
+        }
+        if let Some((_, old)) = self.current.take() {
+            self.retired.push(old);
+        }
+        self.current = conn.map(|c| {
+            let mut rx = c.video_progress();
+            let now = rx.borrow_and_update().clone();
+            let seen = carried
+                .filter(|(prev, _)| prev.same(c))
+                .map_or(now, |(_, seen)| seen);
+            rx.mark_changed();
+            (c.clone(), Tracked { rx, seen })
+        });
+    }
+
+    fn seen(&self) -> Option<(C, VideoProgress)> {
+        self.current
+            .as_ref()
+            .map(|(c, t)| (c.clone(), t.seen.clone()))
+    }
+
+    /// The next change on any followed connection; a closed retired one is let go.
+    async fn next(&mut self) -> VideoProgress {
+        loop {
+            if let Some(i) = self
+                .retired
+                .iter()
+                .position(|t| t.rx.has_changed().is_err())
+            {
+                let delta = self.retired.remove(i).delta();
+                if delta != VideoProgress::default() {
+                    return delta;
+                }
+                continue;
+            }
+            if self.current.is_none() && self.retired.is_empty() {
+                return std::future::pending().await;
+            }
+            let (index, open) = {
+                let mut changes: Vec<_> = self
+                    .current
+                    .iter_mut()
+                    .map(|(_, t)| t)
+                    .chain(self.retired.iter_mut())
+                    .map(|t| Box::pin(t.rx.changed()))
+                    .collect();
+                let (result, index, _) = futures_util::future::select_all(changes.iter_mut()).await;
+                (index, result.is_ok())
+            };
+            let current = self.current.is_some();
+            let tracked = match (current, index) {
+                (true, 0) => &mut self.current.as_mut().unwrap().1,
+                (true, i) => &mut self.retired[i - 1],
+                (false, i) => &mut self.retired[i],
+            };
+            let delta = tracked.delta();
+            if !open {
+                if current && index == 0 {
+                    self.current = None;
+                } else {
+                    self.retired.remove(index - usize::from(current));
+                }
+            }
+            if open || delta != VideoProgress::default() {
+                return delta;
+            }
+        }
+    }
+}
+
+fn lock_seen(shared: &Shared) -> MutexGuard<'_, Option<(MediaConnection, VideoProgress)>> {
+    shared
+        .progress_seen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 async fn next_request(requests: &mut Option<watch::Receiver<u64>>) {
@@ -538,31 +669,142 @@ async fn next_request(requests: &mut Option<watch::Receiver<u64>>) {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn pacer_losses_arrive_as_deltas_with_the_newest_error() {
-        let (tx, mut rx) = watch::channel(VideoLosses::default());
-        let seen = rx.borrow_and_update().clone();
-        let mut losses = Some((rx, seen));
-        tx.send_modify(|l| {
-            l.dropped_frames = 2;
-            l.last_error = Some("first".into());
-        });
-        let lost = next_loss(&mut losses).await;
-        assert_eq!((lost.dropped_frames, lost.failed_writes), (2, 0));
-        tx.send_modify(|l| {
-            l.dropped_frames = 3;
-            l.failed_writes = 1;
-            l.last_error = Some("second".into());
-        });
-        let lost = next_loss(&mut losses).await;
-        assert_eq!((lost.dropped_frames, lost.failed_writes), (1, 1));
-        assert_eq!(lost.last_error.as_deref(), Some("second"));
-        drop(tx);
-        assert!(
-            timeout(Duration::from_millis(50), next_loss(&mut losses))
-                .await
-                .is_err()
+    #[derive(Clone)]
+    struct FakeConn(u32, Arc<watch::Sender<VideoProgress>>);
+
+    impl FakeConn {
+        fn new(id: u32) -> Self {
+            Self(id, Arc::new(watch::channel(VideoProgress::default()).0))
+        }
+
+        fn publish(&self, f: impl FnOnce(&mut VideoProgress)) {
+            self.1.send_modify(f);
+        }
+    }
+
+    impl Conn for FakeConn {
+        fn same(&self, other: &Self) -> bool {
+            self.0 == other.0
+        }
+
+        fn video_progress(&self) -> watch::Receiver<VideoProgress> {
+            self.1.subscribe()
+        }
+    }
+
+    #[test]
+    fn video_counts_as_sent_and_in_the_fps_window_only_once_written() {
+        let mut state = StatsState::default();
+        let now = Instant::now();
+        let lost = state.video_progress(
+            VideoProgress {
+                sent_frames: 2,
+                sent_bytes: 300,
+                dropped_frames: 0,
+                last_error: Some("old".into()),
+            },
+            now,
         );
-        assert!(losses.is_none());
+        assert!(!lost);
+        assert_eq!(
+            (state.stats.video_frames_sent, state.stats.bytes_sent),
+            (2, 300)
+        );
+        assert_eq!(state.video_sent_at.len(), 2);
+        assert_eq!(state.stats.last_error, None);
+        let lost = state.video_progress(
+            VideoProgress {
+                dropped_frames: 1,
+                last_error: Some("write failed".into()),
+                ..VideoProgress::default()
+            },
+            now,
+        );
+        assert!(lost);
+        assert_eq!(state.stats.video_frames_sent, 2);
+        assert_eq!(state.stats.video_frames_dropped, 1);
+        assert_eq!(state.video_sent_at.len(), 2);
+        assert_eq!(state.stats.last_error.as_deref(), Some("write failed"));
+    }
+
+    async fn drain(watch: &mut ProgressWatch<FakeConn>) -> VideoProgress {
+        let mut total = VideoProgress::default();
+        while let Ok(d) = timeout(Duration::from_millis(50), watch.next()).await {
+            total.sent_frames += d.sent_frames;
+            total.sent_bytes += d.sent_bytes;
+            total.dropped_frames += d.dropped_frames;
+            total.last_error = d.last_error.or(total.last_error);
+        }
+        total
+    }
+
+    #[tokio::test]
+    async fn progress_arrives_as_deltas_and_survives_a_connection_swap() {
+        let (a, b) = (FakeConn::new(1), FakeConn::new(2));
+        a.publish(|p| p.sent_frames = 5);
+        let mut watch = ProgressWatch::default();
+        watch.attach(Some(&a), None);
+        assert_eq!(drain(&mut watch).await, VideoProgress::default());
+
+        a.publish(|p| {
+            p.sent_frames = 7;
+            p.sent_bytes = 70;
+            p.dropped_frames = 1;
+            p.last_error = Some("write failed".into());
+        });
+        let d = drain(&mut watch).await;
+        assert_eq!((d.sent_frames, d.sent_bytes, d.dropped_frames), (2, 70, 1));
+        assert_eq!(d.last_error.as_deref(), Some("write failed"));
+
+        a.publish(|p| p.dropped_frames = 2);
+        watch.attach(Some(&b), None);
+        assert_eq!(
+            drain(&mut watch).await.dropped_frames,
+            1,
+            "loss not yet applied when the connection was swapped"
+        );
+        a.publish(|p| p.dropped_frames = 5);
+        b.publish(|p| p.sent_frames = 1);
+        let d = drain(&mut watch).await;
+        assert_eq!(
+            (d.sent_frames, d.dropped_frames),
+            (1, 3),
+            "loss on the old connection after the swap"
+        );
+
+        a.publish(|p| p.dropped_frames = 6);
+        drop(a);
+        assert_eq!(
+            drain(&mut watch).await.dropped_frames,
+            1,
+            "last loss before close"
+        );
+        assert!(watch.retired.is_empty(), "a closed connection is let go");
+    }
+
+    #[tokio::test]
+    async fn a_pump_resumed_on_the_same_connection_applies_what_happened_in_between() {
+        let a = FakeConn::new(1);
+        let mut first = ProgressWatch::default();
+        first.attach(Some(&a), None);
+        a.publish(|p| p.sent_frames = 3);
+        assert_eq!(drain(&mut first).await.sent_frames, 3);
+        let carried = first.seen();
+        drop(first);
+
+        a.publish(|p| {
+            p.sent_frames = 4;
+            p.dropped_frames = 1;
+        });
+        let mut resumed = ProgressWatch::default();
+        resumed.attach(Some(&a), carried.clone());
+        let d = drain(&mut resumed).await;
+        assert_eq!((d.sent_frames, d.dropped_frames), (1, 1));
+
+        let other = FakeConn::new(2);
+        other.publish(|p| p.sent_frames = 9);
+        let mut elsewhere = ProgressWatch::default();
+        elsewhere.attach(Some(&other), carried);
+        assert_eq!(drain(&mut elsewhere).await, VideoProgress::default());
     }
 }
