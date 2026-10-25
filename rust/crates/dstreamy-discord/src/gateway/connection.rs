@@ -200,6 +200,10 @@ impl Runner {
                 }
             }
         };
+        let dropped = usize::from(self.unsent.is_some()) + self.commands.len();
+        if dropped > 0 {
+            warn!(dropped, "gateway closed with commands unsent");
+        }
         if let Some(tx) = self.ready_tx.take() {
             let _ = tx.send(Err(error.clone()));
         }
