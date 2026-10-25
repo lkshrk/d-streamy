@@ -171,7 +171,7 @@ fn waiting_for_a_rate_limited_op_12_does_not_count_as_a_stall() {
 fn producers_cycling_sizes_get_at_most_one_op_12_a_second_and_the_last_size_wins() {
     let h = Harness::new("");
     let _s = h.serve();
-    let _c = h.external_session();
+    let mut c = h.external_session();
     let before = h.wait("the session's own op 12", |r| {
         let ops = video_ops(r);
         ops.contains(&(320, 180, u64::from(FPS)))
@@ -186,6 +186,7 @@ fn producers_cycling_sizes_get_at_most_one_op_12_a_second_and_the_last_size_wins
         let mut p = h.producer(&args);
         p.attached();
         p.kill();
+        c.source("detached", |e| e["reason"] == "detached");
     }
     let elapsed = started.elapsed();
     let last = sizes[9 % 2];
