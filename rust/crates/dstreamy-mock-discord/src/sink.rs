@@ -37,13 +37,19 @@ struct Assembly {
     broken: bool,
 }
 
-/// Prefix of a DAVE drop before the track's first frame but after the other track's; davey shares one nonce baseline across tracks.
+/// Prefix of the one DAVE drop per track that can come from receive-side reordering: before the track's first frame, after the other track's.
 pub const FIRST_FRAME_DAVE_DROP: &str = "DAVE decrypt before the first frame: ";
+
+#[derive(Default, Clone, Copy)]
+struct TrackDecrypt {
+    succeeded: bool,
+    tagged: bool,
+}
 
 #[derive(Default)]
 struct Decrypted {
-    audio: bool,
-    video: bool,
+    audio: TrackDecrypt,
+    video: TrackDecrypt,
 }
 
 pub(crate) struct Sink {
@@ -196,12 +202,16 @@ impl Sink {
         } else {
             ("audio", &mut decrypted.audio, decrypted.video)
         };
+        let first_failure = !this.succeeded && !this.tagged && other.succeeded;
         match server.decrypt(media_type, &frame) {
             Ok(plain) => {
-                *this = true;
+                this.succeeded = true;
                 Ok((plain, true))
             }
-            Err(e) if !*this && other => Err(format!("{FIRST_FRAME_DAVE_DROP}{name}: {e}")),
+            Err(e) if first_failure => {
+                this.tagged = true;
+                Err(format!("{FIRST_FRAME_DAVE_DROP}{name}: {e}"))
+            }
             Err(e) => Err(format!("DAVE decrypt ({name}): {e}")),
         }
     }
@@ -356,6 +366,8 @@ mod tests {
         assert!(sink.decrypt(MediaType::VIDEO, video).is_ok());
         let first = sink.decrypt(MediaType::AUDIO, audio.clone()).unwrap_err();
         assert!(first.starts_with(FIRST_FRAME_DAVE_DROP), "{first}");
+        let again = sink.decrypt(MediaType::AUDIO, audio.clone()).unwrap_err();
+        assert!(!again.starts_with(FIRST_FRAME_DAVE_DROP), "{again}");
         assert!(sink.decrypt(MediaType::AUDIO, later).is_ok());
         let replayed = sink.decrypt(MediaType::AUDIO, audio).unwrap_err();
         assert!(!replayed.starts_with(FIRST_FRAME_DAVE_DROP), "{replayed}");

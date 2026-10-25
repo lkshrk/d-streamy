@@ -12,12 +12,12 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 use super::queue::{Effects, FrameQueue};
 use super::timebase::{Timebase, Track};
 use super::{StreamError, StreamOptions, StreamStats};
-use crate::transport::MediaConnection;
+use crate::transport::{MediaConnection, VideoLosses};
 
 pub(crate) const TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const FPS_WINDOW: Duration = Duration::from_secs(1);
 const DAVE_POLL: Duration = Duration::from_millis(100);
-/// davey can reject the first keyframe after DAVE comes up (audio overtakes video), so ask again.
+/// A receiver may still lose the first keyframe after DAVE comes up (it demuxes tracks), so ask again.
 const DAVE_KEYFRAME_DELAY: Duration = Duration::from_millis(500);
 /// Viewer PLIs arrive per viewer; one keyframe answers them all.
 const VIEWER_KEYFRAME_INTERVAL: Duration = Duration::from_millis(500);
@@ -434,7 +434,7 @@ async fn send_frames(
     }
 }
 
-/// Turns viewer PLI/FIR and DAVE coming up on the attached connection into keyframe requests.
+/// Turns viewer PLI/FIR and DAVE coming up on the attached connection into keyframe requests, and pacer losses into lost video.
 async fn watch_keyframes(
     mut conn: watch::Receiver<Option<MediaConnection>>,
     shared: Arc<Shared>,
@@ -450,6 +450,11 @@ async fn watch_keyframes(
             requests.borrow_and_update();
             requests
         });
+        let mut losses = current.as_ref().map(|c| {
+            let mut losses = c.video_losses();
+            let seen = losses.borrow_and_update().clone();
+            (losses, seen)
+        });
         let mut dave_ready = std::mem::take(&mut dave_seen)
             && current.as_ref().is_some_and(MediaConnection::dave_ready);
         let mut due: Option<Instant> = None;
@@ -462,6 +467,17 @@ async fn watch_keyframes(
                     Ok(()) => break,
                     Err(_) => return,
                 },
+                lost = next_loss(&mut losses) => {
+                    let effects = shared.queue().video_lost(Instant::now());
+                    {
+                        let mut state = shared.stats();
+                        state.stats.video_frames_dropped += lost.dropped_frames;
+                        if let Some(e) = lost.last_error {
+                            state.stats.last_error = Some(e);
+                        }
+                    }
+                    shared.handle(effects);
+                }
                 () = next_request(&mut viewer_requests) => {
                     shared.stats().stats.viewer_keyframe_requests += 1;
                     let now = Instant::now();
@@ -488,6 +504,26 @@ async fn watch_keyframes(
     }
 }
 
+/// The losses since the last call; `last_error` is the newest one.
+async fn next_loss(
+    losses: &mut Option<(watch::Receiver<VideoLosses>, VideoLosses)>,
+) -> VideoLosses {
+    if let Some((rx, seen)) = losses.as_mut()
+        && rx.changed().await.is_ok()
+    {
+        let now = rx.borrow_and_update().clone();
+        let delta = VideoLosses {
+            dropped_frames: now.dropped_frames - seen.dropped_frames,
+            failed_writes: now.failed_writes - seen.failed_writes,
+            last_error: now.last_error.clone(),
+        };
+        *seen = now;
+        return delta;
+    }
+    *losses = None;
+    std::future::pending().await
+}
+
 async fn next_request(requests: &mut Option<watch::Receiver<u64>>) {
     if let Some(rx) = requests.as_mut()
         && rx.changed().await.is_ok()
@@ -496,4 +532,37 @@ async fn next_request(requests: &mut Option<watch::Receiver<u64>>) {
     }
     *requests = None;
     std::future::pending().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pacer_losses_arrive_as_deltas_with_the_newest_error() {
+        let (tx, mut rx) = watch::channel(VideoLosses::default());
+        let seen = rx.borrow_and_update().clone();
+        let mut losses = Some((rx, seen));
+        tx.send_modify(|l| {
+            l.dropped_frames = 2;
+            l.last_error = Some("first".into());
+        });
+        let lost = next_loss(&mut losses).await;
+        assert_eq!((lost.dropped_frames, lost.failed_writes), (2, 0));
+        tx.send_modify(|l| {
+            l.dropped_frames = 3;
+            l.failed_writes = 1;
+            l.last_error = Some("second".into());
+        });
+        let lost = next_loss(&mut losses).await;
+        assert_eq!((lost.dropped_frames, lost.failed_writes), (1, 1));
+        assert_eq!(lost.last_error.as_deref(), Some("second"));
+        drop(tx);
+        assert!(
+            timeout(Duration::from_millis(50), next_loss(&mut losses))
+                .await
+                .is_err()
+        );
+        assert!(losses.is_none());
+    }
 }

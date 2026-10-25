@@ -11,6 +11,7 @@ use crate::voice::packetizer::{PayloadFormat, RtpPacketizer};
 use async_trait::async_trait;
 use davey::{Codec, MediaType};
 use std::any::Any;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -51,8 +52,8 @@ pub const VIDEO_PACING_BITS_PER_SECOND: f64 = 25_000_000.0;
 
 const AUDIO_PLAYOUT_DELAY: (u16, u16) = (0, 1);
 const VIDEO_PLAYOUT_DELAY: (u16, u16) = (0, 10);
-/// About 10 MB of queued video packets; whole frames are dropped beyond it.
-pub const PACER_QUEUE_PACKETS: usize = 8192;
+/// Queued video bytes; whole frames are dropped beyond it.
+pub const PACER_QUEUE_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum WebRtcError {
@@ -155,16 +156,48 @@ impl TrackLocal for DiscordTrack {
     }
 }
 
+/// Video frames the pacer lost after `send_video` accepted them, across peer connection restarts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VideoLosses {
+    /// Frames not sent: DAVE encrypt failed or the packetizer was gone.
+    pub dropped_frames: u64,
+    /// Frames with at least one RTP write that failed.
+    pub failed_writes: u64,
+    pub last_error: Option<String>,
+}
+
+struct PacedFrame {
+    data: Vec<u8>,
+    codec: VideoCodec,
+    timing: Timing,
+}
+
+#[derive(Clone)]
+struct PacerShared {
+    track: Arc<DiscordTrack>,
+    packetizer: Arc<StdMutex<Option<RtpPacketizer>>>,
+    dave: Arc<StdMutex<DaveHandler>>,
+    send_order: Arc<Mutex<()>>,
+    queued_bytes: Arc<AtomicUsize>,
+    losses: Arc<watch::Sender<VideoLosses>>,
+}
+
 struct Pacer {
-    tx: mpsc::Sender<Packet>,
+    tx: mpsc::UnboundedSender<PacedFrame>,
+    queued_bytes: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
 
 impl Pacer {
-    fn spawn(track: Arc<DiscordTrack>, bits_per_second: f64) -> Self {
-        let (tx, rx) = mpsc::channel(PACER_QUEUE_PACKETS);
-        let task = tokio::spawn(run_pacer(track, rx, bits_per_second / 8.0));
-        Self { tx, task }
+    fn spawn(shared: PacerShared, bits_per_second: f64) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let queued_bytes = shared.queued_bytes.clone();
+        let task = tokio::spawn(run_pacer(shared, rx, bits_per_second / 8.0));
+        Self {
+            tx,
+            queued_bytes,
+            task,
+        }
     }
 }
 
@@ -174,30 +207,63 @@ impl Drop for Pacer {
     }
 }
 
+/// DAVE-encrypts each frame when it is sent, so nonces follow wire order on both tracks.
 async fn run_pacer(
-    track: Arc<DiscordTrack>,
-    mut rx: mpsc::Receiver<Packet>,
+    shared: PacerShared,
+    mut rx: mpsc::UnboundedReceiver<PacedFrame>,
     bytes_per_second: f64,
 ) {
     let burst = bytes_per_second / 1000.0;
     let mut budget = burst;
     let mut last = Instant::now();
-    while let Some(packet) = rx.recv().await {
-        let size = (packet.payload.len() + 12) as f64;
-        loop {
-            let now = Instant::now();
-            budget = (budget + now.duration_since(last).as_secs_f64() * bytes_per_second)
-                .min(burst.max(size));
-            last = now;
-            if budget >= size {
-                budget -= size;
-                break;
+    while let Some(frame) = rx.recv().await {
+        let order = shared.send_order.lock().await;
+        let encrypted =
+            lock_dave(&shared.dave).encrypt(MediaType::VIDEO, dave_codec(frame.codec), &frame.data);
+        let packets = match encrypted {
+            Ok(payload) => lock_packetizer(&shared.packetizer)
+                .as_mut()
+                .map(|p| frame.timing.packetize(p, &payload))
+                .ok_or_else(|| WebRtcError::PacketizerNotConfigured.to_string()),
+            Err(e) => Err(WebRtcError::Dave(e.to_string()).to_string()),
+        };
+        let packets = packets.unwrap_or_else(|e| {
+            warn!("video frame dropped in the pacer: {}", e);
+            shared.losses.send_modify(|l| {
+                l.dropped_frames += 1;
+                l.last_error = Some(e);
+            });
+            Vec::new()
+        });
+        let mut write_error = None;
+        for packet in &packets {
+            let size = (packet.payload.len() + 12) as f64;
+            loop {
+                let now = Instant::now();
+                budget = (budget + now.duration_since(last).as_secs_f64() * bytes_per_second)
+                    .min(burst.max(size));
+                last = now;
+                if budget >= size {
+                    budget -= size;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            if let Err(e) = shared.track.write_rtp(packet).await {
+                write_error.get_or_insert(e);
+            }
         }
-        if let Err(e) = track.write_rtp(&packet).await {
-            debug!("video RTP write failed: {}", e);
+        drop(order);
+        if let Some(e) = write_error {
+            warn!("video RTP write failed: {}", e);
+            shared.losses.send_modify(|l| {
+                l.failed_writes += 1;
+                l.last_error = Some(e.to_string());
+            });
         }
+        shared
+            .queued_bytes
+            .fetch_sub(frame.data.len(), Ordering::Relaxed);
     }
 }
 
@@ -207,12 +273,15 @@ pub struct WebRtcWrapper {
     video_track: Option<Arc<DiscordTrack>>,
     pacer: Option<Pacer>,
     audio: Option<RtpPacketizer>,
-    video: Option<RtpPacketizer>,
+    video: Arc<StdMutex<Option<RtpPacketizer>>>,
+    // Held from DAVE encrypt until a frame's last packet is written: receivers decrypt a frame once it is complete.
+    send_order: Arc<Mutex<()>>,
     video_codec: Option<VideoCodec>,
     ice_servers: Vec<String>,
     setting_engine: SettingEngine,
     dave: Arc<StdMutex<DaveHandler>>,
     keyframe_requests: Arc<watch::Sender<u64>>,
+    video_losses: Arc<watch::Sender<VideoLosses>>,
 }
 
 impl WebRtcWrapper {
@@ -223,13 +292,19 @@ impl WebRtcWrapper {
             video_track: None,
             pacer: None,
             audio: None,
-            video: None,
+            video: Arc::default(),
+            send_order: Arc::default(),
             video_codec: None,
             ice_servers: DEFAULT_ICE_SERVERS.iter().map(|s| s.to_string()).collect(),
             setting_engine: SettingEngine::default(),
             dave,
             keyframe_requests: Arc::new(watch::channel(0).0),
+            video_losses: Arc::new(watch::channel(VideoLosses::default()).0),
         }
+    }
+
+    pub fn video_losses(&self) -> watch::Receiver<VideoLosses> {
+        self.video_losses.subscribe()
     }
 
     /// Count of PLI and FIR packets received from viewers, across peer connection restarts.
@@ -344,7 +419,17 @@ impl WebRtcWrapper {
             });
         }
 
-        self.pacer = Some(Pacer::spawn(video.clone(), VIDEO_PACING_BITS_PER_SECOND));
+        self.pacer = Some(Pacer::spawn(
+            PacerShared {
+                track: video.clone(),
+                packetizer: self.video.clone(),
+                dave: self.dave.clone(),
+                send_order: self.send_order.clone(),
+                queued_bytes: Arc::default(),
+                losses: self.video_losses.clone(),
+            },
+            VIDEO_PACING_BITS_PER_SECOND,
+        ));
         self.audio_track = Some(audio);
         self.video_track = Some(video);
         self.peer_connection = Some(pc.clone());
@@ -397,7 +482,7 @@ impl WebRtcWrapper {
             PayloadFormat::Opus,
             AUDIO_PLAYOUT_DELAY,
         ));
-        self.video = Some(RtpPacketizer::new(
+        *lock_packetizer(&self.video) = Some(RtpPacketizer::new(
             params.video_ssrc,
             info.payload_type,
             info.clock_rate,
@@ -460,6 +545,7 @@ impl WebRtcWrapper {
             .audio
             .as_mut()
             .ok_or(WebRtcError::PacketizerNotConfigured)?;
+        let _order = self.send_order.lock().await;
         let payload = lock_dave(&self.dave)
             .encrypt_opus(frame)
             .map_err(|e| WebRtcError::Dave(e.to_string()))?;
@@ -477,30 +563,27 @@ impl WebRtcWrapper {
         let pacer = self.pacer.as_ref().ok_or(WebRtcError::NotInitialized)?;
         let codec = self
             .video_codec
+            .filter(|_| lock_packetizer(&self.video).is_some())
             .ok_or(WebRtcError::PacketizerNotConfigured)?;
-        let packetizer = self
-            .video
-            .as_mut()
-            .ok_or(WebRtcError::PacketizerNotConfigured)?;
-        let rewritten;
-        let frame = if codec == VideoCodec::H264 {
-            rewritten = rewrite_h264_sps_vui(frame);
-            rewritten.as_deref().unwrap_or(frame)
+        let data = if codec == VideoCodec::H264 {
+            rewrite_h264_sps_vui(frame).unwrap_or_else(|| frame.to_vec())
         } else {
-            frame
+            frame.to_vec()
         };
-        let payload = lock_dave(&self.dave)
-            .encrypt(MediaType::VIDEO, dave_codec(codec), frame)
-            .map_err(|e| WebRtcError::Dave(e.to_string()))?;
-        let packets = timing.packetize(packetizer, &payload);
-        if pacer.tx.capacity() < packets.len() {
+        let len = data.len();
+        if pacer.queued_bytes.load(Ordering::Relaxed) + len > PACER_QUEUE_BYTES {
             return Err(WebRtcError::PacerQueueFull);
         }
-        for packet in packets {
-            if pacer.tx.try_send(packet).is_err() {
-                warn!("video pacer stopped");
-                return Err(WebRtcError::NotInitialized);
-            }
+        pacer.queued_bytes.fetch_add(len, Ordering::Relaxed);
+        let paced = PacedFrame {
+            data,
+            codec,
+            timing,
+        };
+        if pacer.tx.send(paced).is_err() {
+            pacer.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+            warn!("video pacer stopped");
+            return Err(WebRtcError::NotInitialized);
         }
         Ok(())
     }
@@ -523,7 +606,7 @@ impl WebRtcWrapper {
     pub async fn close(&mut self) {
         self.close_peer_connection().await;
         self.audio = None;
-        self.video = None;
+        *lock_packetizer(&self.video) = None;
     }
 
     pub fn peer_connection(&self) -> Option<&Arc<RTCPeerConnection>> {
@@ -560,6 +643,12 @@ impl Timing {
 // A poisoned DAVE lock only means another task panicked mid-call; the state is still usable.
 fn lock_dave(dave: &StdMutex<DaveHandler>) -> std::sync::MutexGuard<'_, DaveHandler> {
     dave.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_packetizer(
+    packetizer: &StdMutex<Option<RtpPacketizer>>,
+) -> std::sync::MutexGuard<'_, Option<RtpPacketizer>> {
+    packetizer.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn feedback(typ: &str, parameter: &str) -> RTCPFeedback {

@@ -6,7 +6,7 @@ use crate::voice::types::{
     BinaryMessage, ClientDisconnect, ClientsConnect, DaveExecuteTransition, DavePrepareEpoch,
     DavePrepareTransition, GatewayMessage, Hello, Ready, SelectProtocolAck,
 };
-use crate::voice::webrtc::{WebRtcError, WebRtcWrapper};
+use crate::voice::webrtc::{VideoLosses, WebRtcError, WebRtcWrapper};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -115,6 +115,7 @@ struct Shared {
     params: StdMutex<Option<WebRtcParams>>,
     dave: Arc<StdMutex<DaveHandler>>,
     keyframe_requests: watch::Receiver<u64>,
+    video_losses: watch::Receiver<VideoLosses>,
 }
 
 /// Cloneable handle to a running connection, like `WebRtcConnWrapper` plus its `mediaConnection` in JS.
@@ -156,6 +157,11 @@ impl MediaConnection {
     /// Bumped for every viewer PLI or FIR; the sender should emit a keyframe.
     pub fn keyframe_requests(&self) -> watch::Receiver<u64> {
         self.shared.keyframe_requests.clone()
+    }
+
+    /// Video the pacer lost after `send_video_frame*` returned `Ok`.
+    pub fn video_losses(&self) -> watch::Receiver<VideoLosses> {
+        self.shared.video_losses.clone()
     }
 
     pub fn voice_privacy_code(&self) -> Option<String> {
@@ -426,6 +432,7 @@ impl VoiceConnection {
             kind: self.kind.clone(),
             cmd_tx,
             keyframe_requests: webrtc.keyframe_requests(),
+            video_losses: webrtc.video_losses(),
             webrtc: Mutex::new(webrtc),
             params: StdMutex::new(None),
             dave: self.dave.clone(),
