@@ -592,3 +592,27 @@ fn keyframes_missing_a_pps_or_sps_decode_after_conversion() {
         assert_eq!(decodes(&aus), video.len(), "{drop:?}");
     }
 }
+
+#[test]
+fn extra_data_over_the_cap_is_refused_and_keeps_the_previous_sets() {
+    let mut conv = with_extra(4);
+    let mut extra = au(&[(4, SPS), (4, PPS)]);
+    extra.resize(MAX_EXTRA_DATA + 1, 0xff);
+    assert_eq!(
+        conv.set_video_extra_data(&extra),
+        Err(PacketError::ExtraDataTooLarge)
+    );
+    assert!(conv.has_video_extra_data());
+}
+
+#[test]
+fn the_nal_scan_stops_at_the_first_slice() {
+    let slices: Vec<(usize, &[u8])> = std::iter::repeat_n((3, IDR_B), 10_000).collect();
+    let mut nals = vec![(4, AUD), (3, IDR_A)];
+    nals.extend(slices);
+    let data = au(&nals);
+    assert_eq!(nal_units(&data).len(), 2);
+    let out = key(&with_extra(4), &data).unwrap();
+    assert!(out.data.ends_with(&data[6..]));
+    assert_eq!(&kinds(&out.data)[..4], [NAL_AUD, NAL_SPS, NAL_PPS, NAL_IDR]);
+}

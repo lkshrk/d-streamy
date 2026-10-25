@@ -10,12 +10,15 @@ const NAL_IDR: u8 = 5;
 const NAL_SPS: u8 = 7;
 const NAL_PPS: u8 = 8;
 const NAL_AUD: u8 = 9;
+/// Far above any SPS plus PPS (H.264 §7.3.2.1, §7.3.2.2); bounds what a converter retains.
+const MAX_EXTRA_DATA: usize = 64 << 10;
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketError {
     AvccExtraData,
     ExtraDataIncomplete,
+    ExtraDataTooLarge,
     NotAnnexB,
     NoParameterSets,
     ParameterSetMismatch,
@@ -30,6 +33,7 @@ impl fmt::Display for PacketError {
         f.write_str(match self {
             Self::AvccExtraData => "the video encoder's extra data is avcC, not Annex B",
             Self::ExtraDataIncomplete => "the video encoder's extra data lacks an SPS or a PPS",
+            Self::ExtraDataTooLarge => "the video encoder's extra data is larger than 64 KiB",
             Self::NotAnnexB => "video packet is not Annex B: it does not start with a start code",
             Self::NoParameterSets => {
                 "keyframe has no SPS/PPS and the encoder has no extra data yet"
@@ -82,12 +86,16 @@ fn is_annex_b(data: &[u8]) -> bool {
     zeros >= 2 && data.get(zeros) == Some(&1)
 }
 
+/// Stops at the first VCL NAL unit, whose payload then runs to the end: only the parameter-set head is ever needed.
 fn nal_units(data: &[u8]) -> Vec<Nal> {
     let mut starts = Vec::new();
     let mut i = 0;
     while i + 3 <= data.len() {
         if start_code_at(data, i) {
             starts.push(i);
+            if is_vcl(data.get(i + 3).map(|b| b & 0x1f)) {
+                break;
+            }
             i += 3;
         } else {
             i += 1;
@@ -131,6 +139,9 @@ impl Converter {
 
     /// Takes the SPS and PPS from Annex B extra data; callable at any time, and a refused update keeps the previous sets.
     pub fn set_video_extra_data(&mut self, extra: &[u8]) -> Result<(), PacketError> {
+        if extra.len() > MAX_EXTRA_DATA {
+            return Err(PacketError::ExtraDataTooLarge);
+        }
         if !is_annex_b(extra) {
             return Err(PacketError::AvccExtraData);
         }
@@ -220,7 +231,7 @@ impl Converter {
                 let i = nals
                     .iter()
                     .position(|n| n.code_at == last_sps.code_at)
-                    .unwrap_or(0);
+                    .expect("last_sps is one of nals");
                 (boundary(i + 1), vec![p])
             }
             (None, Some(first_pps)) => {

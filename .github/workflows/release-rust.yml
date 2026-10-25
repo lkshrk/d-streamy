@@ -105,6 +105,16 @@ jobs:
         run: |
           rustup toolchain install
           rustup target add ${{ matrix.target }}
+      - name: Refuse test-only features in the release build
+        run: |
+          set -euo pipefail
+          out=$(for c in dstreamy-cli discord-stream-rs dstreamy-ipc; do
+            cargo tree --locked -p dstreamy-cli -e features,normal --target ${{ matrix.target }} -i "$c"
+          done)
+          if grep -E 'feature "(test-hooks|test-rtp-start|test-support)"' <<<"$out"; then
+            echo "a test-only feature reaches the release binary" >&2
+            exit 1
+          fi
       - run: cargo build --release --locked -p dstreamy-cli --target ${{ matrix.target }}
       - name: Install Rosetta
         if: matrix.rosetta

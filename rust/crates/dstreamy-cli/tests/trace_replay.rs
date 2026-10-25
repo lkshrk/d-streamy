@@ -277,7 +277,7 @@ fn markers(
     pairs
 }
 
-/// Audio packets lost at stream start because video set the shared DAVE nonce baseline; any other drop fails.
+/// The first audio packet lost because video set the shared DAVE nonce baseline; a lost first IDR would break every check, so it fails.
 fn start_drops(recorded: &Recorded, what: &str) -> usize {
     let tolerated = format!("{FIRST_FRAME_DAVE_DROP}audio");
     let drops = &recorded.dropped_frames;
