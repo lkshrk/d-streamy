@@ -489,11 +489,31 @@ fn a_stale_socket_file_is_replaced() {
     let dir = h.endpoint().parent().unwrap().to_owned();
     std::fs::create_dir(&dir).unwrap();
     std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-    drop(std::os::unix::net::UnixListener::bind(h.endpoint()).unwrap());
+    bind_stale_socket(&h.endpoint());
     assert!(h.endpoint().exists());
     let s = h.serve(&[]);
     h.control();
     shutdown_and_exit(&h, s);
+}
+
+/// In a child: on macOS std marks sockets close-on-exec after creation, so a parallel spawn could inherit it.
+fn bind_stale_socket(path: &Path) {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "stale_socket_helper", "--nocapture"])
+        .env(STALE_SOCKET_ENV, path)
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "{status}");
+}
+
+const STALE_SOCKET_ENV: &str = "DSTREAMY_TEST_STALE_SOCKET";
+
+#[test]
+fn stale_socket_helper() {
+    if let Some(path) = std::env::var_os(STALE_SOCKET_ENV) {
+        drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+    }
 }
 
 #[test]
