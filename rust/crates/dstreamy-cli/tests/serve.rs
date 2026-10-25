@@ -107,18 +107,7 @@ impl Harness {
     /// Waits until the service holds exactly `n` connections, counting the one that asks.
     fn wait_for_connections(&self, n: u64) {
         let (mut probe, _) = self.control();
-        let deadline = Instant::now() + T;
-        loop {
-            let live = probe.request(&json!({"id": "n", "cmd": "test_connections"}));
-            if live["data"]["live"] == n + 1 {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "connections never reached {n}: {live}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_for_live(&mut probe, n + 1);
     }
 
     fn voice_left(&self) -> bool {
@@ -360,6 +349,22 @@ fn start(target: &str) -> Value {
         "fps": 15,
         "bitrate_kbps": 1000,
     })
+}
+
+/// Waits until the service holds exactly `n` connections, `probe` included.
+fn wait_for_live(probe: &mut Client, n: u64) {
+    let deadline = Instant::now() + T;
+    loop {
+        let live = probe.request(&json!({"id": "n", "cmd": "test_connections"}));
+        if live["data"]["live"] == n {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connections never reached {n}: {live}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn shutdown_and_exit(h: &Harness, s: Service) {
@@ -789,15 +794,8 @@ fn connections_over_the_cap_are_refused_with_busy() {
     let h = Harness::new();
     let s = h.serve(&[]);
     let (mut probe, _) = h.control();
-    let deadline = Instant::now() + T;
     // serve's readiness probe may still count until its close is processed.
-    while probe.request(&json!({"id": "n", "cmd": "test_connections"}))["data"]["live"] != 1 {
-        assert!(
-            Instant::now() < deadline,
-            "the readiness probe never closed"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for_live(&mut probe, 1);
     let mut held: Vec<Client> = vec![probe];
     held.extend((0..63).map(|_| h.client()));
     for c in &mut held[1..63] {
@@ -810,7 +808,8 @@ fn connections_over_the_cap_are_refused_with_busy() {
     let last = held.last_mut().unwrap();
     assert_eq!(last.request(&hello("control", 2))["type"], "result");
     held.truncate(1);
-    h.wait_for_connections(1);
+    // A fresh probe could be refused while the dropped connections still hold slots.
+    wait_for_live(&mut held[0], 1);
     shutdown_and_exit(&h, s);
 }
 
