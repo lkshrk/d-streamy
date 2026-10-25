@@ -19,9 +19,9 @@ Every external behaviour `dstreamy serve`, the IPC layer and the OBS plugin depe
 | AAC AudioSpecificConfig | ISO/IEC 14496-3 (paywalled). Public description: `FFmpeg/FFmpeg@c4c791c2cd02e4e50a5644e868c2a44950cbddc7:libavcodec/mpeg4audio.c:77-101` (5-bit object type, 4-bit sampling index, 4-bit channel configuration), `libavcodec/mpeg4audio_sample_rates.h:30-33` (index 3 = 48 kHz), `libavcodec/mpeg4audio.h:75` (`AOT_AAC_LC` = 2) |
 | Opus | RFC 6716 (updated by RFC 8251), RFC 7587 |
 | RTCP feedback | RFC 4585, RFC 5104 |
-| WebSocket | RFC 6455; `tungstenite` 0.24.0 (`rust/Cargo.lock`) |
 | Rust | 1.99.0 (`rust/rust-toolchain.toml`) |
 | tokio | 1.54.0 (`rust/Cargo.lock`) |
+| WebSocket | RFC 6455; `tungstenite` 0.24.0 (`rust/Cargo.lock`) |
 | Win32 docs | `MicrosoftDocs/sdk-api@656e9656bfaef34dd29cd7ee9e1146aec17e924c`, `MicrosoftDocs/win32@ca8274decead49403d70ceeed4af8d4ca74eaf11` |
 | systemd | v255 (ubuntu-24.04 ships 255.4), `systemd/systemd@db11bab38ccf1ed257f310d29070843d4c58ea01` |
 | Linux man-pages | 6.19 |
@@ -95,7 +95,7 @@ Every external behaviour `dstreamy serve`, the IPC layer and the OBS plugin depe
 | davey may reject the first keyframe after DAVE comes up, so the pump requests another 500 ms later | `rust/crates/dstreamy-discord/src/stream/pump.rs:20-21,473-481` | keyframe consequences |
 | Reference client ignores PLI and FIR; asks for keyframes every 1 s and no B-frames | `@dank074/discord-video-stream` `src/client/voice/WebRtcWrapper.ts:175-176,207-209`, `src/media/newApi.ts:29,283-287` | keyframe policy |
 | PLI/FIR become keyframe requests in our transport (our vendor patch `f5b44f0`, not upstream) | `rust/vendor/discord-stream-rs/src/voice/webrtc.rs:332-344` | `ExternalSource`, mock tests |
-| Gateway close: the client sends Close, waits for the server's Close, then drops TCP; closing with unread data sends RST, which can discard the peer's unread data (seen as a lost op 4 on macOS CI) | RFC 6455 §1.4, §5.5.1; `tungstenite` `src/protocol/mod.rs:256-276` | `close_handshake` in `rust/crates/dstreamy-discord/src/gateway/connection.rs` |
+| Gateway close: the client sends Close and reads until the server's Close (at most 2 s), then may drop TCP; closing with unread data sends RST, which can discard what the peer has not read yet. Discord's own close behaviour is unverified; the mock follows the RFC | RFC 6455 §1.4 (RST), §5.5.1 ("MAY close the connection at any time after sending and receiving a Close message"); `tungstenite` `src/protocol/mod.rs:256-276`; lost op 4 on macOS CI, runs `40190910321` and `40193700980` | `close_handshake` in `rust/crates/dstreamy-discord/src/gateway/connection.rs`; the test pins ordering, not RST |
 
 ## H.264
 

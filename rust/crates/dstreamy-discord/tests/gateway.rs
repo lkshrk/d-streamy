@@ -118,7 +118,10 @@ async fn close_waits_for_the_servers_close_before_dropping_the_socket() {
         "the client dropped the socket before the server's Close"
     );
     assert_eq!(conn.closed().await, Some(1000));
-    timeout(STEP, closing).await.unwrap().unwrap();
+    timeout(Duration::from_secs(1), closing)
+        .await
+        .expect("the client missed the server's Close and waited out its timeout")
+        .unwrap();
 }
 
 #[tokio::test]
