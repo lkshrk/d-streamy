@@ -159,6 +159,11 @@ impl MediaConnection {
         self.shared.keyframe_requests.clone()
     }
 
+    /// Drops queued video the pacer has not started; the frame being sent finishes.
+    pub async fn flush_video(&self) -> u64 {
+        self.shared.webrtc.lock().await.flush_video()
+    }
+
     /// What became of video after `send_video_frame*` returned `Ok`: written or lost in the pacer.
     pub fn video_progress(&self) -> watch::Receiver<VideoProgress> {
         self.shared.video_progress.clone()

@@ -17,7 +17,7 @@ use dstreamy_mock_discord::depacketize::nal_units;
 use dstreamy_mock_discord::opcodes::{gateway as gw, voice as vo};
 use dstreamy_mock_discord::{
     MOCK_GUILD_ID, MOCK_TOKEN, MOCK_VOICE_CHANNEL_ID, MockConfig, MockDiscord, Recorded,
-    VideoCodec as MockCodec, VoiceKind, rtc,
+    RecordedVideoFrame, VideoCodec as MockCodec, VoiceKind, rtc,
 };
 use secrecy::SecretString;
 use serde_json::Value;
@@ -597,17 +597,27 @@ async fn transport_lag_drops_video_until_a_requested_keyframe() {
     let lagged = handle.stats();
     assert!(lagged.video_frames_dropped > 0, "{lagged:?}");
     assert!(requests.load(Ordering::Relaxed) > 0);
-    wait_sent(|| handle.stats(), lagged.video_frames_sent + 5).await;
+    let is_idr =
+        |f: &&RecordedVideoFrame| nal_units(&f.data).first().is_some_and(|n| n[0] & 0x1F == 5);
+    // Far below the seconds of backlog the pacer held before the lag.
+    let requested = mock
+        .wait_for(Duration::from_secs(1), |r| {
+            let first = r.video.first()?.rtp_timestamp;
+            r.video
+                .iter()
+                .filter(is_idr)
+                .any(|f| f.rtp_timestamp != first)
+                .then_some(())
+        })
+        .await;
+    assert!(
+        requested.is_some(),
+        "no keyframe produced after the request reached the mock: {:?}",
+        handle.stats()
+    );
 
     let stats = timeout(T, handle.stop()).await.unwrap().unwrap();
     assert!(stats.video_frames_sent > lagged.video_frames_sent);
-    let keyframes = mock
-        .recorded()
-        .video
-        .iter()
-        .filter(|f| nal_units(&f.data).first().is_some_and(|n| n[0] & 0x1F == 5))
-        .count();
-    assert!(keyframes >= 1);
     Arc::try_unwrap(client).ok().unwrap().close().await;
     mock.shutdown().await;
 }

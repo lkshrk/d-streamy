@@ -11,11 +11,12 @@ use crate::voice::packetizer::{PayloadFormat, RtpPacketizer};
 use async_trait::async_trait;
 use davey::{Codec, MediaType};
 use std::any::Any;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, Notify, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -163,12 +164,22 @@ impl TrackLocal for DiscordTrack {
 /// What became of the video frames `send_video` accepted, cumulative across peer connection restarts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VideoProgress {
+    /// Frames `send_video` queued; once the pacer settles, the sum of sent, dropped and flushed.
+    pub accepted_frames: u64,
     /// Frames whose last packet was written without a write error.
     pub sent_frames: u64,
     pub sent_bytes: u64,
     /// Frames not fully sent: DAVE encrypt failed, the packetizer was gone, an RTP write failed or the pacer stopped.
     pub dropped_frames: u64,
+    /// Frames dropped unstarted by `flush_video`, which the caller already knows about.
+    pub flushed_frames: u64,
     pub last_error: Option<String>,
+}
+
+impl VideoProgress {
+    pub fn settled(&self) -> bool {
+        self.sent_frames + self.dropped_frames + self.flushed_frames >= self.accepted_frames
+    }
 }
 
 struct PacedFrame {
@@ -177,12 +188,36 @@ struct PacedFrame {
     timing: Timing,
 }
 
+/// Frames accepted by `send_video` that the pacer has not started; a started frame is no longer here.
+#[derive(Default)]
+struct PacerQueue {
+    frames: StdMutex<VecDeque<PacedFrame>>,
+    ready: Notify,
+}
+
+impl PacerQueue {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<PacedFrame>> {
+        self.frames.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    async fn next(&self) -> PacedFrame {
+        loop {
+            let notified = self.ready.notified();
+            if let Some(frame) = self.lock().pop_front() {
+                return frame;
+            }
+            notified.await;
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PacerShared {
     track: Arc<DiscordTrack>,
     packetizer: Arc<StdMutex<Option<RtpPacketizer>>>,
     dave: Arc<StdMutex<DaveHandler>>,
     send_order: Arc<Mutex<()>>,
+    queue: Arc<PacerQueue>,
     queued_bytes: Arc<AtomicUsize>,
     outstanding: Arc<AtomicU64>,
     progress: Arc<watch::Sender<VideoProgress>>,
@@ -198,37 +233,54 @@ impl PacerShared {
 }
 
 struct Pacer {
-    tx: mpsc::UnboundedSender<PacedFrame>,
-    queued_bytes: Arc<AtomicUsize>,
-    outstanding: Arc<AtomicU64>,
-    progress: Arc<watch::Sender<VideoProgress>>,
+    shared: PacerShared,
     task: JoinHandle<()>,
 }
 
 impl Pacer {
     fn spawn(shared: PacerShared, bits_per_second: f64) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let queued_bytes = shared.queued_bytes.clone();
-        let outstanding = shared.outstanding.clone();
-        let progress = shared.progress.clone();
-        let task = tokio::spawn(run_pacer(shared, rx, bits_per_second / 8.0));
-        Self {
-            tx,
-            queued_bytes,
-            outstanding,
-            progress,
-            task,
+        let task = tokio::spawn(run_pacer(shared.clone(), bits_per_second / 8.0));
+        Self { shared, task }
+    }
+
+    fn enqueue(&self, frame: PacedFrame) -> Result<(), WebRtcError> {
+        let len = frame.data.len();
+        let mut queue = self.shared.queue.lock();
+        if self.shared.queued_bytes.load(Ordering::Relaxed) + len > PACER_QUEUE_BYTES {
+            return Err(WebRtcError::PacerQueueFull);
         }
+        self.shared.queued_bytes.fetch_add(len, Ordering::Relaxed);
+        self.shared.outstanding.fetch_add(1, Ordering::AcqRel);
+        queue.push_back(frame);
+        drop(queue);
+        self.shared.progress.send_modify(|p| p.accepted_frames += 1);
+        self.shared.queue.ready.notify_one();
+        Ok(())
+    }
+
+    /// Drops the frames not started yet, counting each as dropped once; the frame being sent finishes.
+    fn flush(&self) -> u64 {
+        let flushed: Vec<PacedFrame> = self.shared.queue.lock().drain(..).collect();
+        let bytes: usize = flushed.iter().map(|f| f.data.len()).sum();
+        self.shared.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        let counted = flushed.iter().filter(|_| self.shared.settle()).count() as u64;
+        if counted > 0 {
+            debug!("video pacer flushed {} queued frames", counted);
+            self.shared
+                .progress
+                .send_modify(|p| p.flushed_frames += counted);
+        }
+        counted
     }
 }
 
 impl Drop for Pacer {
     fn drop(&mut self) {
         self.task.abort();
-        let lost = self.outstanding.swap(0, Ordering::AcqRel);
+        let lost = self.shared.outstanding.swap(0, Ordering::AcqRel);
         if lost > 0 {
             warn!("video pacer stopped with {} frames unsent", lost);
-            self.progress.send_modify(|p| {
+            self.shared.progress.send_modify(|p| {
                 p.dropped_frames += lost;
                 p.last_error = Some(format!("video pacer stopped with {lost} frames unsent"));
             });
@@ -237,15 +289,12 @@ impl Drop for Pacer {
 }
 
 /// DAVE-encrypts each frame when it is sent, so nonces follow wire order on both tracks.
-async fn run_pacer(
-    shared: PacerShared,
-    mut rx: mpsc::UnboundedReceiver<PacedFrame>,
-    bytes_per_second: f64,
-) {
+async fn run_pacer(shared: PacerShared, bytes_per_second: f64) {
     let burst = bytes_per_second / 1000.0;
     let mut budget = burst;
     let mut last = Instant::now();
-    while let Some(frame) = rx.recv().await {
+    loop {
+        let frame = shared.queue.next().await;
         let order = shared.send_order.lock().await;
         let encrypted =
             lock_dave(&shared.dave).encrypt(MediaType::VIDEO, dave_codec(frame.codec), &frame.data);
@@ -472,6 +521,7 @@ impl WebRtcWrapper {
                 packetizer: self.video.clone(),
                 dave: self.dave.clone(),
                 send_order: self.send_order.clone(),
+                queue: Arc::default(),
                 queued_bytes: Arc::default(),
                 outstanding: Arc::default(),
                 progress: self.video_progress.clone(),
@@ -621,24 +671,16 @@ impl WebRtcWrapper {
         } else {
             frame.to_vec()
         };
-        let len = data.len();
-        if pacer.queued_bytes.load(Ordering::Relaxed) + len > PACER_QUEUE_BYTES {
-            return Err(WebRtcError::PacerQueueFull);
-        }
-        pacer.queued_bytes.fetch_add(len, Ordering::Relaxed);
-        pacer.outstanding.fetch_add(1, Ordering::AcqRel);
-        let paced = PacedFrame {
+        pacer.enqueue(PacedFrame {
             data,
             codec,
             timing,
-        };
-        if pacer.tx.send(paced).is_err() {
-            pacer.queued_bytes.fetch_sub(len, Ordering::Relaxed);
-            pacer.outstanding.fetch_sub(1, Ordering::AcqRel);
-            warn!("video pacer stopped");
-            return Err(WebRtcError::NotInitialized);
-        }
-        Ok(())
+        })
+    }
+
+    /// Drops queued video the pacer has not started, counting it in `VideoProgress::flushed_frames`.
+    pub fn flush_video(&self) -> u64 {
+        self.pacer.as_ref().map_or(0, Pacer::flush)
     }
 
     pub fn is_ready(&self) -> bool {
@@ -903,6 +945,8 @@ mod tests {
         Ok,
         Fails,
         Hangs,
+        /// Holds every write until opened; records the RTP timestamp of each frame's marker packet.
+        Gate(Arc<watch::Sender<bool>>, Arc<StdMutex<Vec<u32>>>),
     }
 
     #[async_trait]
@@ -916,6 +960,13 @@ mod tests {
                 TestWriter::Ok => Ok(pkt.payload.len()),
                 TestWriter::Fails => Err(webrtc::Error::ErrClosedPipe),
                 TestWriter::Hangs => std::future::pending().await,
+                TestWriter::Gate(open, written) => {
+                    let _ = open.subscribe().wait_for(|o| *o).await;
+                    if pkt.header.marker {
+                        written.lock().unwrap().push(pkt.header.timestamp);
+                    }
+                    Ok(pkt.payload.len())
+                }
             }
         }
 
@@ -941,6 +992,7 @@ mod tests {
             packetizer: Arc::new(StdMutex::new(Some(packetizer))),
             dave: Arc::new(StdMutex::new(DaveHandler::new(1, 2))),
             send_order: Arc::default(),
+            queue: Arc::default(),
             queued_bytes: Arc::default(),
             outstanding: Arc::default(),
             progress,
@@ -948,19 +1000,20 @@ mod tests {
         (Pacer::spawn(shared, VIDEO_PACING_BITS_PER_SECOND), rx)
     }
 
+    fn frame(pts_ms: u64) -> PacedFrame {
+        PacedFrame {
+            data: vec![0, 0, 0, 1, 0x65]
+                .into_iter()
+                .chain([7; 2995])
+                .collect(),
+            codec: VideoCodec::H264,
+            timing: Timing::Pts(Duration::from_millis(pts_ms)),
+        }
+    }
+
     fn queue(pacer: &Pacer, frames: usize) {
-        for _ in 0..frames {
-            pacer.queued_bytes.fetch_add(3000, Ordering::Relaxed);
-            pacer.outstanding.fetch_add(1, Ordering::AcqRel);
-            let frame = PacedFrame {
-                data: vec![0, 0, 0, 1, 0x65]
-                    .into_iter()
-                    .chain([7; 2995])
-                    .collect(),
-                codec: VideoCodec::H264,
-                timing: Timing::Advance(33.0),
-            };
-            pacer.tx.send(frame).unwrap();
+        for i in 0..frames {
+            pacer.enqueue(frame(33 * i as u64)).unwrap();
         }
     }
 
@@ -1002,11 +1055,15 @@ mod tests {
         let (pacer, rx) = pacer(TestWriter::Hangs).await;
         queue(&pacer, 4);
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(*rx.borrow(), VideoProgress::default());
+        assert!(!rx.borrow().settled());
         drop(pacer);
         tokio::time::sleep(Duration::from_millis(20)).await;
         let p = rx.borrow().clone();
-        assert_eq!((p.sent_frames, p.dropped_frames), (0, 4));
+        assert_eq!(
+            (p.accepted_frames, p.sent_frames, p.dropped_frames),
+            (4, 0, 4)
+        );
+        assert!(p.settled());
     }
 
     #[tokio::test]
@@ -1018,13 +1075,61 @@ mod tests {
             packetizer: Arc::default(),
             dave: Arc::new(StdMutex::new(DaveHandler::new(1, 2))),
             send_order: Arc::default(),
-            queued_bytes: pacer.queued_bytes.clone(),
-            outstanding: pacer.outstanding.clone(),
-            progress: pacer.progress.clone(),
+            queue: Arc::default(),
+            queued_bytes: pacer.shared.queued_bytes.clone(),
+            outstanding: pacer.shared.outstanding.clone(),
+            progress: pacer.shared.progress.clone(),
         };
         drop(pacer);
         assert!(!shared.settle());
         assert_eq!(rx.borrow().dropped_frames, 1);
+    }
+
+    #[tokio::test]
+    async fn a_flush_drops_unstarted_frames_once_and_lets_the_one_in_flight_finish() {
+        let open = Arc::new(watch::channel(false).0);
+        let written = Arc::new(StdMutex::new(Vec::new()));
+        let (pacer, mut rx) = pacer(TestWriter::Gate(open.clone(), written.clone())).await;
+        queue(&pacer, 5);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pacer.shared.queue.lock().len() == 5 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("first frame started");
+        assert_eq!(pacer.flush(), 4);
+        assert_eq!(pacer.flush(), 0);
+        assert_eq!(pacer.shared.queued_bytes.load(Ordering::Relaxed), 3000);
+        assert_eq!(rx.borrow().flushed_frames, 4);
+        pacer.enqueue(frame(1000)).unwrap();
+        open.send_replace(true);
+        let p = settled(&mut rx, 2).await;
+        assert_eq!(
+            (p.sent_frames, p.dropped_frames, p.flushed_frames),
+            (2, 0, 4)
+        );
+        let written = written.lock().unwrap().clone();
+        assert_eq!(written.len(), 2);
+        assert_eq!(
+            written[1].wrapping_sub(written[0]),
+            90_000,
+            "the frame queued after the flush went next"
+        );
+        assert_eq!(pacer.shared.queued_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(pacer.shared.outstanding.load(Ordering::Acquire), 0);
+        drop(pacer);
+        assert_eq!(rx.borrow().dropped_frames, 0);
+    }
+
+    #[tokio::test]
+    async fn a_flush_after_the_stop_counted_the_frames_counts_none() {
+        let (pacer, rx) = pacer(TestWriter::Hangs).await;
+        queue(&pacer, 3);
+        let lost = pacer.shared.outstanding.swap(0, Ordering::AcqRel);
+        assert_eq!(lost, 3);
+        assert_eq!(pacer.flush(), 0);
+        assert_eq!(rx.borrow().flushed_frames, 0);
     }
 
     #[test]

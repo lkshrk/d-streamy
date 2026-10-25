@@ -24,6 +24,7 @@ pub struct FrameQueue {
     awaiting_keyframe: bool,
     last_request: Option<Instant>,
     closed: bool,
+    flush_transport: bool,
 }
 
 impl FrameQueue {
@@ -37,6 +38,7 @@ impl FrameQueue {
             awaiting_keyframe: true,
             last_request: None,
             closed: false,
+            flush_transport: false,
         }
     }
 
@@ -88,8 +90,14 @@ impl FrameQueue {
         Some(frame)
     }
 
-    /// A video frame was lost in transport: skip queued video up to the next keyframe.
+    /// Whether video queued in the transport must be dropped before the next send; clears it.
+    pub fn take_flush(&mut self) -> bool {
+        std::mem::take(&mut self.flush_transport)
+    }
+
+    /// A video frame was lost in transport: skip queued video up to the next keyframe, here and in the transport.
     pub fn video_lost(&mut self, now: Instant) -> Effects {
+        self.flush_transport = true;
         let next_key = self
             .frames
             .iter()
