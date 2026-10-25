@@ -528,7 +528,6 @@ fn op_12_follows_each_producer_and_comes_before_its_media() {
         let spawned = Instant::now();
         let mut p = h.producer(&args);
         p.attached();
-        // The previous op 12 went out after the previous spawn, so this one is rate limited past it.
         if let Some(previous) = previous_spawn {
             let waited = previous.elapsed();
             assert!(
@@ -993,9 +992,10 @@ fn overload_run_with(burst: Option<u32>, secs: u64, extra: &[&str]) -> Overload 
     let lines = p.lines.clone();
     let (status, stderr) = p.finish();
     assert!(status.success(), "{stderr}");
+    let lines = lines.lock().unwrap().clone();
+    let outcome = lines.iter().find_map(|v| v["outcome"].as_str());
+    assert_eq!(outcome, Some("Finished"), "{lines:?}");
     let sent_bytes = lines
-        .lock()
-        .unwrap()
         .iter()
         .find_map(|v| v["sent_bytes"].as_u64())
         .expect("mock-producer reports the bytes it sent");
@@ -1112,9 +1112,10 @@ fn a_flood_of_8_mib_keyframes_keeps_serve_memory_bounded() {
         "the producer saw no keyframe request"
     );
     assert!(
-        flood.sent_bytes / 1024 > bound_kib + bound_kib / 2,
-        "the flood sent only {} KiB, too little to tell buffering from the bound",
-        flood.sent_bytes / 1024
+        flood.sent_bytes >= target,
+        "the flood sent only {} of {} KiB within its time cap",
+        flood.sent_bytes / 1024,
+        target / 1024
     );
     assert!(
         flood.peak_rss_kib <= baseline.peak_rss_kib + bound_kib,

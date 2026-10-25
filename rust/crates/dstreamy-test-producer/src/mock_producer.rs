@@ -57,7 +57,7 @@ struct Args {
     /// Stops after this long; runs until killed otherwise.
     #[arg(long, value_name = "MS")]
     duration: Option<u64>,
-    /// Stops once this many payload bytes were sent.
+    /// Stops once this many frame payload bytes, video and audio, were sent.
     #[arg(long, value_name = "BYTES")]
     until_bytes: Option<u64>,
     #[arg(long, value_name = "MS")]
