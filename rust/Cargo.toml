@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "vendor/discord-stream-rs"]
-exclude = ["fuzz", "vendor/webrtc"]
+exclude = ["fuzz", "vendor/webrtc", "crates/dstreamy-obs", "crates/dstreamy-obs-sys"]
 
 [workspace.package]
 version = "0.1.0"

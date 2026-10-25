@@ -1,0 +1,38 @@
+[package]
+name = "dstreamy-obs"
+description = "D-Streamy OBS plugin module"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dstreamy-obs-sys = { path = "../dstreamy-obs-sys" }
+
+[lints]
+workspace = true
+
+# Own workspace: building needs libobs, so it stays out of `cargo test --workspace` in rust/.
+[workspace]
+members = ["."]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+panic = "unwind"

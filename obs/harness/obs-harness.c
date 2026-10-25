@@ -21,6 +21,7 @@
 #define TRACE_OUTPUT_ID "dstreamy_trace_recorder"
 #define AUDIO_SOURCE_ID "dstreamy_harness_audio"
 #define TRACE_MAGIC "DSTRACE1"
+#define PLUGIN_PANIC_LOG "[obs-dstreamy] panic caught in "
 
 #define SAMPLE_RATE 48000
 #define AUDIO_CHUNK 480
@@ -43,6 +44,7 @@ struct harness_args {
 	const char *video_encoder;
 	const char *audio_encoder;
 	const char *output_id;
+	const char *output_settings;
 	const char *trace_dir;
 	const char *plugin_bin;
 	const char *plugin_data;
@@ -59,6 +61,7 @@ struct harness_args {
 	int audio_bitrate;
 	int bf;
 	int keyint_sec;
+	int expect_panics;
 	bool bf_set;
 	bool keyint_set;
 	int argc;
@@ -67,6 +70,7 @@ struct harness_args {
 
 static struct harness_args args;
 static volatile long obs_errors;
+static volatile long plugin_panics_logged;
 static int log_max_level = LOG_INFO;
 
 // Written once before the audio thread and tick callback exist, so they read it without a lock.
@@ -78,12 +82,16 @@ static os_event_t *full_event;
 static void log_handler(int lvl, const char *msg, va_list va, void *param)
 {
 	UNUSED_PARAMETER(param);
-	if (lvl <= LOG_ERROR)
-		os_atomic_inc_long(&obs_errors);
-	if (lvl > log_max_level)
-		return;
 	char buf[4096];
 	vsnprintf(buf, sizeof(buf), msg, va);
+	if (lvl <= LOG_ERROR) {
+		if (strstr(buf, PLUGIN_PANIC_LOG))
+			os_atomic_inc_long(&plugin_panics_logged);
+		else
+			os_atomic_inc_long(&obs_errors);
+	}
+	if (lvl > log_max_level)
+		return;
 	FILE *f = lvl <= LOG_ERROR ? stderr : stdout;
 	fprintf(f, "[obs %s] %s\n", lvl <= LOG_ERROR ? "error" : lvl == LOG_WARNING ? "warn" : "info", buf);
 	fflush(f);
@@ -453,7 +461,8 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: obs-harness [--trace-dir DIR] [--seconds N] [--fps N] [--width N] [--height N]\n"
-		"  [--video-encoder ID] [--audio-encoder ID] [--output ID] [--bitrate KBPS] [--audio-bitrate KBPS]\n"
+		"  [--video-encoder ID] [--audio-encoder ID] [--output ID] [--output-settings JSON] [--expect-panics N]\n"
+		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
 		"  [--modules a,b,c] [--plugin-bin DIR --plugin-data DIR] [--note TEXT] [--x264opts OPTS] [--verbose]\n");
 }
@@ -514,6 +523,10 @@ static int parse_args(int argc, char **argv)
 			args.audio_encoder = v;
 		else if (strcmp(a, "--output") == 0)
 			args.output_id = v;
+		else if (strcmp(a, "--output-settings") == 0)
+			args.output_settings = v;
+		else if (strcmp(a, "--expect-panics") == 0)
+			ok = parse_int(a, v, 0, &args.expect_panics);
 		else if (strcmp(a, "--trace-dir") == 0)
 			args.trace_dir = v;
 		else if (strcmp(a, "--plugin-bin") == 0)
@@ -573,6 +586,28 @@ static struct frame_counts frame_counts(void)
 }
 
 static struct frame_counts frame_delta;
+
+static bool check_output_stats(obs_output_t *output)
+{
+	calldata_t cd = {0};
+	bool ok = proc_handler_call(obs_output_get_proc_handler(output), "get_stats", &cd);
+	long long video = calldata_int(&cd, "video_packets");
+	long long audio = calldata_int(&cd, "audio_packets");
+	long long panics = calldata_int(&cd, "panics");
+	calldata_free(&cd);
+	if (!ok) {
+		harness_error("output %s has no get_stats proc", args.output_id);
+		return false;
+	}
+	printf("HARNESS output=%s video=%lld audio=%lld panics=%lld\n", args.output_id, video, audio, panics);
+	if (stop_code != OBS_OUTPUT_SUCCESS)
+		harness_error("output stopped with code %lld", stop_code);
+	if (panics != args.expect_panics)
+		harness_error("output counted %lld panic(s), expected %d", panics, args.expect_panics);
+	if (!video || !audio)
+		harness_error("output counted no video or no audio packets");
+	return stop_code == OBS_OUTPUT_SUCCESS && panics == args.expect_panics && video && audio;
+}
 
 static void describe_os(struct dstr *out)
 {
@@ -837,7 +872,10 @@ int main(int argc, char **argv)
 		FAIL("audio encoder %s create failed", args.audio_encoder);
 	obs_encoder_set_audio(aenc, obs_get_audio());
 
-	obs_data_t *os = obs_data_create();
+	bool recording = strcmp(args.output_id, TRACE_OUTPUT_ID) == 0;
+	obs_data_t *os = args.output_settings ? obs_data_create_from_json(args.output_settings) : obs_data_create();
+	if (!os)
+		FAIL("--output-settings is not a JSON object");
 	obs_data_set_string(os, "path", args.trace_dir);
 	obs_data_set_int(os, "video_packets", (long long)args.seconds * args.fps);
 	output = obs_output_create(args.output_id, "harness output", os, NULL);
@@ -859,7 +897,9 @@ int main(int argc, char **argv)
 	struct frame_counts at_start = frame_counts();
 
 	unsigned long budget_ms = (unsigned long)args.seconds * 1000 + 30000;
-	if (os_event_timedwait(full_event, budget_ms) != 0)
+	if (!recording)
+		os_event_timedwait(full_event, (unsigned long)args.seconds * 1000);
+	else if (os_event_timedwait(full_event, budget_ms) != 0)
 		FAIL("no %d s of video within %lu ms", args.seconds, budget_ms);
 
 	struct frame_counts at_end = frame_counts();
@@ -875,6 +915,12 @@ int main(int argc, char **argv)
 		os_sleep_ms(10);
 	}
 	started = false;
+
+	if (!recording) {
+		if (!check_output_stats(output))
+			rc = 1;
+		goto cleanup;
+	}
 
 	struct trace_recorder *rec = obs_obj_get_data(output);
 	join_stop_thread(rec);
@@ -921,6 +967,17 @@ cleanup:
 	long errors = os_atomic_load_long(&obs_errors);
 	if (errors) {
 		harness_error("libobs logged %ld error(s)", errors);
+		rc = 1;
+	}
+	long panics = os_atomic_load_long(&plugin_panics_logged);
+	if (panics != args.expect_panics) {
+		harness_error("plugin logged %ld caught panic(s), expected %d", panics, args.expect_panics);
+		rc = 1;
+	}
+	long leaks = bnum_allocs();
+	printf("HARNESS shutdown leaks=%ld\n", leaks);
+	if (initialized && leaks) {
+		harness_error("%ld allocation(s) leaked after obs_shutdown", leaks);
 		rc = 1;
 	}
 	printf("HARNESS result=%s\n", rc == 0 ? "PASS" : "FAIL");

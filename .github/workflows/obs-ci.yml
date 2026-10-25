@@ -8,6 +8,8 @@ on:
       - "rust/crates/dstreamy-test-producer/**"
       - "rust/crates/dstreamy-media/**"
       - "rust/crates/dstreamy-core/**"
+      - "rust/crates/dstreamy-obs/**"
+      - "rust/crates/dstreamy-obs-sys/**"
       - "rust/Cargo.toml"
       - "rust/Cargo.lock"
       - "rust/rust-toolchain.toml"
@@ -19,6 +21,8 @@ on:
       - "rust/crates/dstreamy-test-producer/**"
       - "rust/crates/dstreamy-media/**"
       - "rust/crates/dstreamy-core/**"
+      - "rust/crates/dstreamy-obs/**"
+      - "rust/crates/dstreamy-obs-sys/**"
       - "rust/Cargo.toml"
       - "rust/Cargo.lock"
       - "rust/rust-toolchain.toml"
@@ -70,7 +74,7 @@ jobs:
             libfreetype6-dev libspeexdsp-dev libudev-dev libv4l-dev libva-dev libpci-dev libdrm-dev \
             nlohmann-json3-dev libwebsocketpp-dev libasio-dev libqrcodegencpp-dev \
             qt6-base-dev libqt6svg6-dev qt6-base-private-dev \
-            xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils
+            xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils libclang-dev
 
       - name: Restore OBS build
         id: obs-cache
@@ -138,6 +142,15 @@ jobs:
           xvfb-run -a -s "-screen 0 1280x720x24" ctest --preset ubuntu-ci-x86_64
           echo "HARNESS=$PWD/build_x86_64/harness/obs-harness" >> "$GITHUB_ENV"
 
+      - name: Plugin crate gates
+        working-directory: rust/crates/dstreamy-obs
+        env:
+          DSTREAMY_OBS_CONFIG: ${{ github.workspace }}/obs/build_x86_64/obs-config-RelWithDebInfo.txt
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
       - name: Harness 5 s trace with A/V marker check
         run: |
           set -o pipefail
@@ -186,3 +199,197 @@ jobs:
             ${{ runner.temp }}/obs-logs
             ${{ runner.temp }}/trace-5s
             obs/build_x86_64/Testing/Temporary
+            obs/build_x86_64/harness/rust-plugin
+
+  obs-macos:
+    runs-on: xcode-27
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode 27.1
+        run: sudo xcode-select -s /Applications/Xcode_27.1.app
+
+      - name: Set paths
+        run: |
+          {
+            echo "OBS_PREFIX=$RUNNER_TEMP/obs-prefix"
+            echo "OBS_LOGS=$RUNNER_TEMP/obs-logs"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/obs-logs"
+
+      - name: Restore OBS build
+        id: obs-cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/obs-prefix
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-arm64-r${{ env.OBS_BUILD_REV }}
+
+      - name: Build OBS ${{ env.OBS_TAG }}
+        if: steps.obs-cache.outputs.cache-hit != 'true'
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          git clone --depth 1 --branch "$OBS_TAG" --recurse-submodules --shallow-submodules \
+            https://github.com/obsproject/obs-studio.git "$RUNNER_TEMP/obs-src"
+          cd "$RUNNER_TEMP/obs-src"
+          test "$(git rev-parse HEAD)" = "$OBS_COMMIT"
+          cmake --preset macos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF \
+            -DENABLE_BROWSER=OFF -DENABLE_SCRIPTING=OFF -DENABLE_VIRTUALCAM=OFF -DENABLE_AJA=OFF \
+            -DSPARKLE_APPCAST_URL= -DSPARKLE_PUBLIC_KEY=
+          cmake --build build_macos --config RelWithDebInfo --target obs-studio -- -quiet 2>&1 \
+            | xcbeautify --quiet --renderer github-actions
+          mkdir -p "$OBS_PREFIX"
+          cmake --install build_macos --config RelWithDebInfo --prefix "$OBS_PREFIX"
+          echo "OBS build took $(( $(date +%s) - start )) s" | tee "$OBS_PREFIX/build-time.txt"
+
+      - name: Save OBS build
+        if: steps.obs-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/obs-prefix
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-arm64-r${{ env.OBS_BUILD_REV }}
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Configure and build obs/ (universal)
+        working-directory: obs
+        run: |
+          set -o pipefail
+          cat "$OBS_PREFIX/build-time.txt" || true
+          cmake --preset macos-ci
+          cmake --build --preset macos-ci -- -quiet 2>&1 | xcbeautify --quiet --renderer github-actions
+
+      - name: Check the plugin bundle
+        working-directory: obs/build_macos/rundir/obs-dstreamy.plugin/Contents
+        run: |
+          set -o pipefail
+          {
+            find . -print
+            lipo -archs MacOS/obs-dstreamy
+            nm -gU -arch arm64 MacOS/obs-dstreamy | grep ' _obs_'
+            nm -gU -arch x86_64 MacOS/obs-dstreamy | grep ' _obs_'
+            otool -L -arch arm64 MacOS/obs-dstreamy
+            otool -l -arch arm64 MacOS/obs-dstreamy | grep -A2 LC_RPATH
+            codesign -dv MacOS/obs-dstreamy 2>&1 || true
+          } | tee "$OBS_LOGS/plugin-bundle.log"
+          test "$(lipo -archs MacOS/obs-dstreamy)" = "x86_64 arm64"
+
+      - name: Load and panic tests
+        run: |
+          set -o pipefail
+          app="$OBS_PREFIX/OBS.app/Contents"
+          cp obs/build_macos/harness/RelWithDebInfo/obs-harness "$app/MacOS/"
+          plugin="$GITHUB_WORKSPACE/obs/build_macos/rundir/%module%.plugin/Contents"
+          bash obs/tests/rust-plugin.sh "$app/MacOS/obs-harness" "$plugin/MacOS" "$plugin/Resources" \
+            "$OBS_LOGS/rust-plugin" --graphics "$app/Frameworks/libobs-opengl.dylib" | tee "$OBS_LOGS/rust-plugin.log"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-logs-macos
+          path: ${{ runner.temp }}/obs-logs
+
+  obs-windows:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set paths
+        run: |
+          "OBS_PREFIX=$env:RUNNER_TEMP\obs-prefix" >> $env:GITHUB_ENV
+          "OBS_LOGS=$env:RUNNER_TEMP\obs-logs" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\obs-logs" | Out-Null
+
+      - name: Restore OBS build
+        id: obs-cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}\obs-prefix
+          key: obs-${{ env.OBS_TAG }}-windows-2025-x64-r${{ env.OBS_BUILD_REV }}
+
+      - name: Build OBS ${{ env.OBS_TAG }}
+        if: steps.obs-cache.outputs.cache-hit != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $start = Get-Date
+          git clone --depth 1 --branch $env:OBS_TAG --recurse-submodules --shallow-submodules `
+            https://github.com/obsproject/obs-studio.git "$env:RUNNER_TEMP\obs-src"
+          Set-Location "$env:RUNNER_TEMP\obs-src"
+          if ((git rev-parse HEAD) -ne $env:OBS_COMMIT) { throw "unexpected OBS commit" }
+          cmake --preset windows-x64 `
+            -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF `
+            -DENABLE_BROWSER=OFF -DENABLE_SCRIPTING=OFF -DENABLE_VIRTUALCAM=OFF -DENABLE_AJA=OFF
+          cmake --build --preset windows-x64 --parallel -- /consoleLoggerParameters:Summary /noLogo /verbosity:minimal
+          cmake --install build_x64 --config RelWithDebInfo --prefix $env:OBS_PREFIX
+          $secs = [int]((Get-Date) - $start).TotalSeconds
+          "OBS build took $secs s" | Tee-Object -FilePath "$env:OBS_PREFIX\build-time.txt"
+
+      - name: Save OBS build
+        if: steps.obs-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}\obs-prefix
+          key: obs-${{ env.OBS_TAG }}-windows-2025-x64-r${{ env.OBS_BUILD_REV }}
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: rustup toolchain install
+
+      - name: Locate libclang for bindgen
+        run: |
+          $dll = Get-ChildItem "$env:ProgramFiles\LLVM\bin\libclang.dll" -ErrorAction Stop
+          "LIBCLANG_PATH=$($dll.DirectoryName)" >> $env:GITHUB_ENV
+
+      - name: Configure and build obs/
+        working-directory: obs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Get-Content "$env:OBS_PREFIX\build-time.txt" -ErrorAction SilentlyContinue
+          cmake --preset windows-ci-x64
+          cmake --build --preset windows-ci-x64 -- /consoleLoggerParameters:Summary /noLogo /verbosity:minimal
+
+      - name: Check the plugin DLL
+        shell: bash
+        run: |
+          set -o pipefail
+          dumpbin=$(find "/c/Program Files/Microsoft Visual Studio" -path '*Hostx64/x64/dumpbin.exe' | head -n 1)
+          {
+            ls -l obs/build_x64/rundir
+            "$dumpbin" -nologo -exports obs/build_x64/rundir/obs-dstreamy.dll
+            "$dumpbin" -nologo -dependents obs/build_x64/rundir/obs-dstreamy.dll
+          } | tee "$OBS_LOGS/plugin-dll.log"
+          grep -qw obs_module_load "$OBS_LOGS/plugin-dll.log"
+
+      - name: Load and panic tests
+        shell: bash
+        run: |
+          set -o pipefail
+          ws=$(cygpath -m "$GITHUB_WORKSPACE")
+          bindir="$(cygpath -u "$OBS_PREFIX")/bin/64bit"
+          cp obs/build_x64/harness/RelWithDebInfo/obs-harness.exe "$bindir/"
+          cd "$bindir"
+          bash "$ws/obs/tests/rust-plugin.sh" ./obs-harness.exe "$ws/obs/build_x64/rundir" \
+            "$ws/obs/build_x64/plugin-data" "$OBS_LOGS/rust-plugin" | tee "$OBS_LOGS/rust-plugin.log"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-logs-windows
+          path: ${{ runner.temp }}\obs-logs
