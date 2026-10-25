@@ -21,6 +21,7 @@ pub use config::{
     MOCK_USER_ID, MOCK_VOICE_CHANNEL_ID, MockChannel, MockConfig, MockGuild, MockUser,
 };
 pub use depacketize::VideoCodec;
+pub use sink::FIRST_FRAME_DAVE_DROP;
 pub use state::{
     OpPayload, ReceivedOp, Recorded, RecordedAudioFrame, RecordedVideoFrame, Socket,
     StreamSnapshot, VoiceKind, VoiceStateSnapshot,

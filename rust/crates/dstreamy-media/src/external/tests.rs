@@ -1637,3 +1637,37 @@ proptest! {
         runtime.block_on(run_ops(ops));
     }
 }
+
+#[test]
+fn reattach_offsets_round_up_to_a_whole_millisecond() {
+    assert_eq!(
+        [-1_500, -1_000, 0, 1, 999, 1_000, 1_001].map(whole_ms),
+        [-1_000, -1_000, 0, 1_000, 1_000, 1_000, 2_000]
+    );
+    assert_eq!(whole_ms(i64::MAX), i64::MAX);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reattach_offset_is_a_whole_millisecond_on_both_tracks() {
+    let rig = Rig::started(IdleMode::None).await;
+    let mut p = rig.producer(1, 0);
+    p.run(Duration::from_millis(500)).await;
+    drop(p);
+    sleep(Duration::from_micros(1_234_567)).await;
+    let mut p = rig.producer(2, 777);
+    p.run(Duration::from_millis(500)).await;
+    drop(p);
+    let frames = rig.collector.frames();
+    let offsets: Vec<(usize, i64)> = frames
+        .iter()
+        .filter_map(|f| {
+            let m = Marker::decode(f.data())?;
+            (m.attachment == 2).then(|| (f.track(), f.pts() - m.pts_in))
+        })
+        .collect();
+    assert!(offsets.len() > 20, "{offsets:?}");
+    let offset = offsets[0].1;
+    assert_eq!(offset.rem_euclid(1_000), 0, "{offset}");
+    assert!(offsets.iter().all(|&(_, o)| o == offset), "{offsets:?}");
+    assert!(offsets.iter().any(|&(t, _)| t == AUDIO) && offsets.iter().any(|&(t, _)| t == VIDEO));
+}

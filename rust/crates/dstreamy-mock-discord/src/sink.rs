@@ -37,6 +37,9 @@ struct Assembly {
     broken: bool,
 }
 
+/// Prefix of a DAVE drop before the track's first decrypted frame: one shared nonce sequence lets the other track set the baseline.
+pub const FIRST_FRAME_DAVE_DROP: &str = "DAVE decrypt before the first frame: ";
+
 pub(crate) struct Sink {
     shared: Arc<Shared>,
     kind: VoiceKind,
@@ -44,6 +47,8 @@ pub(crate) struct Sink {
     dave: SharedDave,
     negotiated: Negotiated,
     video: Assembly,
+    /// Whether audio and video each decrypted a DAVE frame on this connection.
+    decrypted: [bool; 2],
 }
 
 impl Sink {
@@ -67,6 +72,7 @@ impl Sink {
                 next_seq: None,
                 broken: false,
             },
+            decrypted: [false; 2],
         };
         tokio::spawn(async move {
             while let Some(packet) = rx.recv().await {
@@ -161,8 +167,13 @@ impl Sink {
         self.shared.record(|r| r.audio.push(frame));
     }
 
-    fn decrypt(&self, media_type: MediaType, frame: Vec<u8>) -> Result<(Vec<u8>, bool), String> {
+    fn decrypt(
+        &mut self,
+        media_type: MediaType,
+        frame: Vec<u8>,
+    ) -> Result<(Vec<u8>, bool), String> {
         let mut dave = lock_dave(&self.dave);
+        let decrypted = &mut self.decrypted;
         if !is_dave_frame(&frame) {
             let rejected = dave
                 .as_ref()
@@ -175,17 +186,19 @@ impl Sink {
         let server = dave
             .as_mut()
             .ok_or_else(|| "DAVE frame without a DAVE session".to_owned())?;
-        server
-            .decrypt(media_type, &frame)
-            .map(|plain| (plain, true))
-            .map_err(|e| {
-                let track = if media_type == MediaType::VIDEO {
-                    "video"
-                } else {
-                    "audio"
-                };
-                format!("DAVE decrypt ({track}): {e}")
-            })
+        let (track, name) = if media_type == MediaType::VIDEO {
+            (1, "video")
+        } else {
+            (0, "audio")
+        };
+        match server.decrypt(media_type, &frame) {
+            Ok(plain) => {
+                decrypted[track] = true;
+                Ok((plain, true))
+            }
+            Err(e) if !decrypted[track] => Err(format!("{FIRST_FRAME_DAVE_DROP}{name}: {e}")),
+            Err(e) => Err(format!("DAVE decrypt ({name}): {e}")),
+        }
     }
 
     fn drop_frame(&self, reason: String) {
@@ -231,6 +244,7 @@ mod tests {
                 next_seq: None,
                 broken: false,
             },
+            decrypted: [false; 2],
         }
     }
 
@@ -309,5 +323,32 @@ mod tests {
         let e2ee: Vec<bool> = r.audio.iter().map(|a| a.e2ee).collect();
         assert_eq!(e2ee, [false, false, true, false, false]);
         assert_eq!(r.dropped_frames.len(), 1, "{:?}", r.dropped_frames);
+    }
+
+    #[test]
+    fn only_a_drop_before_the_track_decrypted_a_frame_is_tagged_as_first_frame() {
+        let (server, mut client) = dave_pair();
+        let mut sink = sink(Some(server));
+        lock_dave(&sink.dave).as_mut().unwrap().execute_transition();
+        let opus = [0xFC, 0xFF, 0xFE, 0x01];
+        let idr = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33, 0xFF];
+        let audio = client
+            .encrypt(MediaType::AUDIO, Codec::OPUS, &opus)
+            .unwrap()
+            .to_vec();
+        let video = client
+            .encrypt(MediaType::VIDEO, Codec::H264, &idr)
+            .unwrap()
+            .to_vec();
+        let later = client
+            .encrypt(MediaType::AUDIO, Codec::OPUS, &opus)
+            .unwrap()
+            .to_vec();
+        assert!(sink.decrypt(MediaType::VIDEO, video).is_ok());
+        let first = sink.decrypt(MediaType::AUDIO, audio.clone()).unwrap_err();
+        assert!(first.starts_with(FIRST_FRAME_DAVE_DROP), "{first}");
+        assert!(sink.decrypt(MediaType::AUDIO, later).is_ok());
+        let replayed = sink.decrypt(MediaType::AUDIO, audio).unwrap_err();
+        assert!(!replayed.starts_with(FIRST_FRAME_DAVE_DROP), "{replayed}");
     }
 }

@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use dstreamy_media::annexb;
-use dstreamy_mock_discord::{Recorded, RecordedAudioFrame, RecordedVideoFrame, VoiceKind};
+use dstreamy_mock_discord::{
+    FIRST_FRAME_DAVE_DROP, Recorded, RecordedAudioFrame, RecordedVideoFrame, VoiceKind,
+};
 use dstreamy_test_producer::sync::{
     self, H264LumaDecoder, LumaFrame, MarkerPair, OpusMonoDecoder, SAMPLE_RATE, TONE_HZ,
 };
@@ -275,11 +277,23 @@ fn markers(
     pairs
 }
 
+/// Audio packets lost at stream start because video set the shared DAVE nonce baseline; any other drop fails.
+fn start_drops(recorded: &Recorded, what: &str) -> usize {
+    let tolerated = format!("{FIRST_FRAME_DAVE_DROP}audio");
+    let drops = &recorded.dropped_frames;
+    assert!(
+        drops.len() <= 1 && drops.iter().all(|d| d.starts_with(&tolerated)),
+        "{what}: {drops:?}"
+    );
+    drops.len()
+}
+
 /// One whole replay at the mock: frame and packet counts, decoding, RTP steps, pacing, A/V alignment and markers.
 fn check_replay(
     video: &[&RecordedVideoFrame],
     audio: &[&RecordedAudioFrame],
     want: &Expected,
+    lost_audio: usize,
     what: &str,
 ) -> Vec<MarkerPair> {
     assert_eq!(
@@ -289,8 +303,12 @@ fn check_replay(
     );
     assert_eq!(
         audio.len(),
-        want.audio.len(),
+        want.audio.len() - lost_audio,
         "{what}: audio packets at the mock"
+    );
+    assert_eq!(
+        audio[0].data, want.audio[lost_audio].key,
+        "{what}: lost audio other than the first packet"
     );
     let video_ts: Vec<u32> = video.iter().map(|v| v.rtp_timestamp).collect();
     let audio_ts: Vec<u32> = audio.iter().map(|a| a.rtp_timestamp).collect();
@@ -369,7 +387,8 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
             sent_plis += 1;
         }
         let r = h.mock.recorded();
-        if stream_video(&r).len() >= frames && producer_audio(&r).len() >= packets {
+        let lost = r.dropped_frames.len();
+        if stream_video(&r).len() >= frames && producer_audio(&r).len() + lost >= packets {
             break r;
         }
         assert!(
@@ -384,11 +403,7 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
     let lines = p.lines();
     let (status, stderr) = p.finish();
     assert!(status.success(), "{name}: {stderr}");
-    assert!(
-        recorded.dropped_frames.is_empty(),
-        "{name}: {:?}",
-        recorded.dropped_frames
-    );
+    let lost_audio = start_drops(&recorded, name);
     if plis {
         let requests = lines
             .iter()
@@ -404,6 +419,7 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
         &stream_video(&recorded),
         &producer_audio(&recorded),
         &want,
+        lost_audio,
         name,
     );
 }
@@ -542,11 +558,7 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
         let (_, a2) = split(&producer_audio(r), |a| a.rtp_timestamp, AUDIO_HZ)?;
         (v2.len() >= frames && a2.len() >= packets).then(|| r.clone())
     });
-    assert!(
-        recorded.dropped_frames.is_empty(),
-        "{:?}",
-        recorded.dropped_frames
-    );
+    start_drops(&recorded, "a restarted replay");
     assert_eq!(c.status()["session"]["state"], "streaming");
     monotonic(&recorded);
 
@@ -560,7 +572,7 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
     let before = markers(&v1, &a1, fps, "before the kill");
     assert!(!before.is_empty(), "{before:?}");
     assert_av_aligned(&v1, &a1, &want, "before the kill");
-    check_replay(&v2, &a2, &want, "after the restart");
+    check_replay(&v2, &a2, &want, 0, "after the restart");
 
     let last_before = rtp_us(v1.last().unwrap().rtp_timestamp, VIDEO_HZ);
     let resumed = rtp_us(v2[0].rtp_timestamp, VIDEO_HZ) - last_before;

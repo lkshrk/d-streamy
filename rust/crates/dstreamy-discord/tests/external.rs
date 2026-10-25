@@ -10,8 +10,8 @@ use dstreamy_media::{
     IdleMode, OPUS_SILENCE_FRAME, ProducerInfo, TestPatternSource, VideoCodec,
 };
 use dstreamy_mock_discord::{
-    MOCK_GUILD_ID, MOCK_TOKEN, MOCK_VOICE_CHANNEL_ID, MockDiscord, Recorded, RecordedAudioFrame,
-    VoiceKind, rtc,
+    FIRST_FRAME_DAVE_DROP, MOCK_GUILD_ID, MOCK_TOKEN, MOCK_VOICE_CHANNEL_ID, MockDiscord, Recorded,
+    RecordedAudioFrame, VoiceKind, rtc,
 };
 use openh264::decoder::Decoder;
 use secrecy::SecretString;
@@ -292,8 +292,10 @@ async fn a_producer_swap_keeps_streaming_with_continuous_decodable_media() {
     if start > 0 {
         let drops = &before.dropped_frames;
         assert!(
-            drops.iter().any(|d| d.starts_with("DAVE decrypt (video)"))
-                && drops.iter().all(|d| d.starts_with("DAVE decrypt (")),
+            drops
+                .iter()
+                .any(|d| d.starts_with(&format!("{FIRST_FRAME_DAVE_DROP}video")))
+                && drops.iter().all(|d| d.starts_with(FIRST_FRAME_DAVE_DROP)),
             "video before the first keyframe; drops: {drops:?}"
         );
     }
