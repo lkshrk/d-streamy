@@ -490,7 +490,10 @@ fn a_stale_socket_file_is_replaced() {
     std::fs::create_dir(&dir).unwrap();
     std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     bind_stale_socket(&h.endpoint());
-    assert!(h.endpoint().exists());
+    let meta = std::fs::symlink_metadata(h.endpoint()).unwrap();
+    assert!(std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type()));
+    let refused = UnixStream::connect(h.endpoint()).unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
     let s = h.serve(&[]);
     h.control();
     shutdown_and_exit(&h, s);
