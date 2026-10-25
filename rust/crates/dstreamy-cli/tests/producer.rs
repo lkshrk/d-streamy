@@ -108,7 +108,7 @@ fn size_args(w: u64, hgt: u64, fps: u64) -> Vec<String> {
 fn op_12_follows_each_producer_and_comes_before_its_media() {
     let h = Harness::new("");
     let _s = h.serve();
-    let _c = h.external_session();
+    let mut c = h.external_session();
     let mut seen = h.wait("the session's own op 12", |r| {
         let ops = video_ops(r);
         ops.contains(&(320, 180, u64::from(FPS)))
@@ -120,7 +120,8 @@ fn op_12_follows_each_producer_and_comes_before_its_media() {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let spawned = Instant::now();
         let mut p = h.producer(&args);
-        p.attached();
+        let id = p.attached();
+        c.source("producing", |e| e["attachment"] == id);
         if let Some(previous) = previous_spawn {
             let waited = previous.elapsed();
             assert!(
@@ -138,6 +139,7 @@ fn op_12_follows_each_producer_and_comes_before_its_media() {
                 .map(|at| seen + at + 1)
         });
         p.kill();
+        c.source("detached", |e| e["reason"] == "detached");
     }
 }
 
