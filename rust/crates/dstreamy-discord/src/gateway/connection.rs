@@ -22,6 +22,7 @@ use super::{GatewayError, Shared};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = futures_util::stream::SplitSink<Socket, Message>;
+type Stream = futures_util::stream::SplitStream<Socket>;
 
 const OP_DISPATCH: u8 = 0;
 const OP_HEARTBEAT: u8 = 1;
@@ -35,6 +36,8 @@ const OP_HEARTBEAT_ACK: u8 = 11;
 /// Close code that keeps the session resumable (1000/1001 end it).
 const CLOSE_RESUMABLE: u16 = 4000;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds the wait for the server's Close after ours.
+const CLOSE_HANDSHAKE: Duration = Duration::from_secs(2);
 const RATE_LIMIT: u32 = 120;
 const RATE_RESERVED: u32 = 10;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -239,7 +242,7 @@ impl Runner {
                     if ready {
                         self.flush(&mut sink, &mut rate).await;
                     }
-                    close(&mut sink, 1000).await;
+                    close_handshake(&mut sink, &mut stream).await;
                     return End::Shutdown;
                 }
                 msg = stream.next() => match msg {
@@ -291,7 +294,7 @@ impl Runner {
                 cmd = self.commands.recv(), if commands_open && self.unsent.is_none() => match cmd {
                     Some(payload) => Step::Send(payload),
                     None => {
-                        close(&mut sink, 1000).await;
+                        close_handshake(&mut sink, &mut stream).await;
                         return End::Shutdown;
                     }
                 },
@@ -608,6 +611,19 @@ async fn open(url: &str, connector: &Connector, limit: Duration) -> Result<Socke
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err("handshake timed out".into()),
     }
+}
+
+/// Closing TCP with frames unread sends RST, which can discard our last frames (RFC 6455 §1.4).
+async fn close_handshake(sink: &mut Sink, stream: &mut Stream) {
+    close(sink, 1000).await;
+    let _ = timeout(CLOSE_HANDSHAKE, async {
+        while let Some(Ok(msg)) = stream.next().await {
+            if matches!(msg, Message::Close(_)) {
+                return;
+            }
+        }
+    })
+    .await;
 }
 
 async fn close(sink: &mut Sink, code: u16) {

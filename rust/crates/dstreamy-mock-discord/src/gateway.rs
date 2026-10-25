@@ -95,7 +95,11 @@ async fn run(
                         return;
                     }
                 }
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                Some(Ok(Message::Close(_))) => {
+                    let _ = ws.flush().await;
+                    return;
+                }
+                None | Some(Err(_)) => return,
                 Some(Ok(_)) => {}
             },
             ctl = rx.recv() => match ctl {

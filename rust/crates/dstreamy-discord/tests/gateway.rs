@@ -107,6 +107,21 @@ async fn subscribers_made_after_connect_never_see_the_first_ready() {
 }
 
 #[tokio::test]
+async fn close_waits_for_the_servers_close_before_dropping_the_socket() {
+    let server = Server::bind().await;
+    let (client, mut conn) = connect(&server, options(&server.url)).await;
+    conn.dispatch(2, "SESSIONS_REPLACE", json!([])).await;
+    let closing = tokio::spawn(client.close());
+    sleep(Duration::from_millis(300)).await;
+    assert!(
+        !closing.is_finished(),
+        "the client dropped the socket before the server's Close"
+    );
+    assert_eq!(conn.closed().await, Some(1000));
+    timeout(STEP, closing).await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn ready_and_guild_dispatches_fill_the_cache() {
     let server = Server::bind().await;
     let (client, mut conn) = connect(&server, options(&server.url)).await;

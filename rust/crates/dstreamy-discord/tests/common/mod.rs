@@ -159,7 +159,10 @@ impl Conn {
         timeout(STEP, async {
             loop {
                 match self.ws.next().await {
-                    Some(Ok(Message::Close(frame))) => return frame.map(|f| u16::from(f.code)),
+                    Some(Ok(Message::Close(frame))) => {
+                        let _ = self.ws.flush().await;
+                        return frame.map(|f| u16::from(f.code));
+                    }
                     Some(Ok(_)) => continue,
                     _ => return None,
                 }
