@@ -282,6 +282,7 @@ jobs:
             codesign -dv MacOS/obs-dstreamy 2>&1 || true
           } | tee "$OBS_LOGS/plugin-bundle.log"
           test "$(lipo -archs MacOS/obs-dstreamy)" = "x86_64 arm64"
+          test "$(otool -D -arch arm64 MacOS/obs-dstreamy | tail -n 1)" = "@rpath/obs-dstreamy"
 
       - name: Load and panic tests
         run: |
