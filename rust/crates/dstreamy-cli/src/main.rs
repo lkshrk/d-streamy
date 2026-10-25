@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use clap::{ArgAction, Parser, Subcommand};
 use dstreamy_cli::discord::{self, Persistence};
 use dstreamy_cli::output::{Out, table};
-use dstreamy_cli::{CliError, Ctx, capture, daemon, serve, stream, tui};
+use dstreamy_cli::{CliError, Ctx, capture, daemon, serve, service, stream, tui};
 use dstreamy_core::{ConfigPaths, RotatingFileWriter};
 use dstreamy_discord::{DEFAULT_GATEWAY_URL, VoiceChannelKind};
 use serde::Serialize;
@@ -95,6 +95,11 @@ enum Command {
         #[arg(long, hide = true)]
         test_hooks: bool,
     },
+    /// Keep `dstreamy serve` running under the user's service manager
+    ///
+    /// Linux: a systemd user unit in ~/.config/systemd/user. A restart of the service ends
+    /// the Discord session; nothing is carried over.
+    Service(service::ServiceArgs),
 }
 
 fn main() -> ExitCode {
@@ -247,6 +252,7 @@ async fn run(
             };
             serve::run(ctx, out, opts).await
         }
+        Command::Service(args) => service::run(out, args).await,
         Command::Tui { skip_platform } => {
             let opts = tui::Options {
                 include_platform: !skip_platform,

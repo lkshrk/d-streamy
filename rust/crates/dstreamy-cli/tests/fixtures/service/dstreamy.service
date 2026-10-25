@@ -1,0 +1,10 @@
+[Unit]
+Description=D-Streamy service
+
+[Service]
+ExecStart=/usr/local/bin/dstreamy serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

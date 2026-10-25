@@ -7,6 +7,7 @@ pub mod engine;
 pub mod lock;
 pub mod output;
 pub mod serve;
+pub mod service;
 pub mod signals;
 pub mod stream;
 pub mod tui;
@@ -63,4 +64,6 @@ pub enum CliError {
     NoTerminal,
     #[error("terminal: {0}")]
     Terminal(String),
+    #[error(transparent)]
+    Service(#[from] service::ServiceError),
 }

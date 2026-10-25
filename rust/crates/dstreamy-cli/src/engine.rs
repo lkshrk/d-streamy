@@ -197,6 +197,7 @@ impl From<CliError> for Failure {
             | CliError::Stopped(_)
             | CliError::NoTerminal
             | CliError::Terminal(_)
+            | CliError::Service(_)
             | CliError::Ipc(_)
             | CliError::Lock(LockError::Io { .. }) => "internal",
         };

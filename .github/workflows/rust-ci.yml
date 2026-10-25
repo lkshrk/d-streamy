@@ -90,6 +90,54 @@ jobs:
         env:
           DSTREAMY_CROSS_USER_TESTS: "1"
 
+  service-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev \
+            libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libopus-dev
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: rust
+          key: service
+      - name: Build the service tests
+        run: cargo test -p dstreamy-cli --locked --test service --no-run
+      - name: Start a user manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          systemctl --version | head -n1
+          sudo loginctl enable-linger "$USER"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          for _ in $(seq 1 60); do
+            state=$(systemctl --user is-system-running 2>/dev/null || true)
+            echo "user manager: ${state:-unreachable}"
+            case "$state" in running|degraded) exit 0 ;; esac
+            sleep 1
+          done
+          exit 1
+      - name: Install, kill and restart the real service
+        run: cargo test -p dstreamy-cli --locked --test service -- --include-ignored --test-threads 1
+        timeout-minutes: 10
+        env:
+          DSTREAMY_DISPOSABLE_HOST: "1"
+      - name: Service log
+        if: failure()
+        run: journalctl --user -u dstreamy.service --no-pager -n 200 || true
+
   rust-fuzz:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
