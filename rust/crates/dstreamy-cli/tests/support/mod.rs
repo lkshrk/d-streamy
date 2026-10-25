@@ -76,6 +76,7 @@ pub struct Harness {
     pub mock: MockDiscord,
     pub dir: TempDir,
     pub run: TempDir,
+    serve_log: Mutex<Option<Arc<Mutex<String>>>>,
 }
 
 impl Harness {
@@ -96,6 +97,7 @@ impl Harness {
                 .prefix("ds")
                 .tempdir_in("/tmp")
                 .unwrap(),
+            serve_log: Mutex::new(None),
         }
     }
 
@@ -114,6 +116,7 @@ impl Harness {
             .args(["-v", "serve", "--skip-platform", "--endpoint"])
             .arg(self.endpoint());
         let p = Proc::spawn(&mut cmd);
+        *self.serve_log.lock().unwrap() = Some(p.err.clone());
         let deadline = Instant::now() + T;
         while UnixStream::connect(self.endpoint()).is_err() {
             assert!(Instant::now() < deadline, "serve never listened");
@@ -160,8 +163,23 @@ impl Harness {
         }));
         let reply = c.reply("start");
         assert_eq!(reply["type"], "result", "{reply}");
-        c.until("streaming", |m| m["event"]["state"]["state"] == "streaming");
+        let streaming = c.try_until(|m| m["event"]["state"]["state"] == "streaming");
+        assert!(
+            streaming.is_some(),
+            "no streaming; seen {:#?}\nserve stderr:\n{}",
+            c.seen,
+            self.serve_log()
+        );
         c
+    }
+
+    fn serve_log(&self) -> String {
+        self.serve_log
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|log| log.lock().unwrap().clone())
+            .unwrap_or_default()
     }
 
     pub fn wait<V>(&self, what: &str, f: impl FnMut(&Recorded) -> Option<V>) -> V {
@@ -339,16 +357,22 @@ impl Client {
     }
 
     pub fn until(&mut self, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+        self.try_until(pred)
+            .unwrap_or_else(|| panic!("no {what}; seen {:#?}", self.seen))
+    }
+
+    /// `None` once `T` passes without a match.
+    pub fn try_until(&mut self, pred: impl Fn(&Value) -> bool) -> Option<Value> {
         if let Some(i) = self.seen.iter().position(&pred) {
-            return self.seen.remove(i);
+            return Some(self.seen.remove(i));
         }
         let deadline = Instant::now() + T;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.lines.recv_timeout(left) {
-                Ok(m) if pred(&m) => return m,
+                Ok(m) if pred(&m) => return Some(m),
                 Ok(m) => self.seen.push(m),
-                Err(_) => panic!("no {what}; seen {:#?}", self.seen),
+                Err(_) => return None,
             }
         }
     }
