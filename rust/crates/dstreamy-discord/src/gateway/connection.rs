@@ -232,6 +232,9 @@ impl Runner {
             let heartbeat_at = heartbeat.as_ref().map(|h| h.next);
             let step = tokio::select! {
                 _ = self.shutdown.changed() => {
+                    if ready {
+                        self.flush(&mut sink, &mut rate).await;
+                    }
                     close(&mut sink, 1000).await;
                     return End::Shutdown;
                 }
@@ -567,6 +570,20 @@ enum Step {
     Send(Value),
     Identify,
     HeartbeatDue,
+}
+
+impl Runner {
+    /// Sends the commands already queued, within the rate limit, so a closing client still leaves voice.
+    async fn flush(&mut self, sink: &mut Sink, rate: &mut RateLimit) {
+        while rate.commands_allowed() {
+            let Some(payload) = self.unsent.take().or_else(|| self.commands.try_recv().ok()) else {
+                return;
+            };
+            if send(sink, rate, &payload).await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 async fn send(sink: &mut Sink, rate: &mut RateLimit, payload: &Value) -> Result<(), String> {

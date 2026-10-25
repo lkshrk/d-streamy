@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde_json::json;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::gateway::{
@@ -15,6 +15,7 @@ pub struct DiscordClient {
     gateway: GatewayClient,
     streamer: Arc<Mutex<Streamer>>,
     bridge: AbortOnDrop,
+    stop_bridge: oneshot::Sender<()>,
 }
 
 struct AbortOnDrop(JoinHandle<()>);
@@ -31,6 +32,7 @@ impl DiscordClient {
         opts.dispatch_tx = Some(dispatch_tx);
         let gateway = GatewayClient::connect(opts).await?;
         let (payload_tx, payload_rx) = mpsc::unbounded_channel();
+        let (stop_bridge, stop_rx) = oneshot::channel();
         let streamer = Arc::new(Mutex::new(Streamer::new(
             gateway.user().id.clone(),
             payload_tx,
@@ -41,11 +43,13 @@ impl DiscordClient {
             payload_rx,
             gateway.command_sender(),
             gateway.shared(),
+            stop_rx,
         ));
         Ok(Self {
             gateway,
             streamer,
             bridge: AbortOnDrop(bridge),
+            stop_bridge,
         })
     }
 
@@ -108,8 +112,10 @@ impl DiscordClient {
         self.streamer().set_voice_channel(guild_id, channel_id);
     }
 
-    pub async fn close(self) {
-        drop(self.bridge);
+    /// Forwards what the Streamer already queued, such as a leave's op 4, before closing the gateway.
+    pub async fn close(mut self) {
+        let _ = self.stop_bridge.send(());
+        let _ = (&mut self.bridge.0).await;
         self.gateway.close().await;
     }
 }
@@ -120,9 +126,16 @@ async fn bridge(
     mut payloads: mpsc::UnboundedReceiver<transport::GatewayPayload>,
     commands: mpsc::UnboundedSender<serde_json::Value>,
     gateway: Arc<crate::gateway::Shared>,
+    mut stop: oneshot::Receiver<()>,
 ) {
     loop {
         tokio::select! {
+            _ = &mut stop => {
+                while let Ok(p) = payloads.try_recv() {
+                    let _ = commands.send(json!({ "op": p.op, "d": p.d }));
+                }
+                break;
+            }
             dispatch = dispatches.recv() => {
                 let Some(Dispatch { name, data, .. }) = dispatch else { break };
                 // The Streamer adopts any voice state of this user as its voice session; another device's is not ours.

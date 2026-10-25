@@ -101,6 +101,25 @@ async fn dispatches_reach_the_streamer_and_its_payloads_go_out() {
     client.close().await;
 }
 
+#[tokio::test]
+async fn a_leave_right_before_close_still_reaches_the_gateway() {
+    for _ in 0..20 {
+        let server = Server::bind().await;
+        let client = tokio::spawn(DiscordClient::connect(options(&server.url)));
+        let mut conn = server.accept().await;
+        conn.handshake("ws://unused").await;
+        let client = timeout(STEP, client).await.unwrap().unwrap().unwrap();
+        let _voice = client.join_voice(Some(GUILD.into()), CHANNEL.into());
+        assert_eq!(conn.recv_op(4).await["d"]["channel_id"], CHANNEL);
+
+        client.leave_voice();
+        let closing = tokio::spawn(client.close());
+        assert_eq!(conn.recv_op(4).await["d"]["channel_id"], Value::Null);
+        assert_eq!(conn.closed().await, Some(1000));
+        timeout(STEP, closing).await.unwrap().unwrap();
+    }
+}
+
 async fn voice_identify(listener: &TcpListener) -> Value {
     let (tcp, _) = timeout(STEP, listener.accept()).await.unwrap().unwrap();
     let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
