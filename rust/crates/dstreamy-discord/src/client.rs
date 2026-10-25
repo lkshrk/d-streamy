@@ -18,6 +18,8 @@ pub struct DiscordClient {
     stop_bridge: oneshot::Sender<()>,
 }
 
+const BRIDGE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 struct AbortOnDrop(JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -112,10 +114,9 @@ impl DiscordClient {
         self.streamer().set_voice_channel(guild_id, channel_id);
     }
 
-    /// Forwards what the Streamer already queued, such as a leave's op 4, before closing the gateway.
     pub async fn close(mut self) {
         let _ = self.stop_bridge.send(());
-        let _ = (&mut self.bridge.0).await;
+        let _ = tokio::time::timeout(BRIDGE_DRAIN, &mut self.bridge.0).await;
         self.gateway.close().await;
     }
 }

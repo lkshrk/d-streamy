@@ -101,9 +101,9 @@ async fn dispatches_reach_the_streamer_and_its_payloads_go_out() {
     client.close().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_leave_right_before_close_still_reaches_the_gateway() {
-    for _ in 0..20 {
+    for _ in 0..50 {
         let server = Server::bind().await;
         let client = tokio::spawn(DiscordClient::connect(options(&server.url)));
         let mut conn = server.accept().await;

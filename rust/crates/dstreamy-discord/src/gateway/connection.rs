@@ -573,9 +573,9 @@ enum Step {
 }
 
 impl Runner {
-    /// Sends the commands already queued, within the rate limit, so a closing client still leaves voice.
+    /// Closing needs no heartbeat, so the slots reserved for one may carry queued commands.
     async fn flush(&mut self, sink: &mut Sink, rate: &mut RateLimit) {
-        while rate.commands_allowed() {
+        while rate.sent < RATE_LIMIT {
             let Some(payload) = self.unsent.take().or_else(|| self.commands.try_recv().ok()) else {
                 return;
             };
