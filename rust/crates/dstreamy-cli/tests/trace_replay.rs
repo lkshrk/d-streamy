@@ -16,6 +16,7 @@ use dstreamy_test_producer::sync::{
     self, H264LumaDecoder, LumaFrame, MarkerPair, OpusMonoDecoder, SAMPLE_RATE, TONE_HZ,
 };
 use dstreamy_test_producer::trace::{Converted, Trace};
+use serde_json::Value;
 use support::*;
 
 const VIDEO_HZ: i64 = 90_000;
@@ -348,6 +349,9 @@ fn markers(
     let start_us = rtp_us(audio[0].rtp_timestamp, AUDIO_HZ);
     let beeps = sync::beep_onsets(&pcm, start_us, SAMPLE_RATE);
     tone_is_440(&pcm, &beeps, start_us, what);
+    if flashes.is_empty() || beeps.is_empty() {
+        return Vec::new();
+    }
     let frame_us = 1_000_000 / fps;
     let video_span = (frames[0].pts_us, frames.last().unwrap().pts_us);
     let audio_span = (
@@ -491,10 +495,13 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
                 r.dropped_frames
             );
             match c.try_status() {
-                Ok(s) => panic!(
-                    "{counts}; session {}; source {}",
-                    s["stats"], s["source"]["stats"]
-                ),
+                Ok(s) => match serve_drops(&s, &canary.stalls()) {
+                    Some(drops) => panic!("{counts}; {drops}"),
+                    None => panic!(
+                        "{counts}; session {}; source {}",
+                        s["stats"], s["source"]["stats"]
+                    ),
+                },
                 Err(e) => panic!("{counts}; {e}"),
             }
         }
@@ -709,17 +716,46 @@ fn non_opus_traces_are_refused_at_hello() {
     }
 }
 
-/// Splits one track's recorded frames at the restart's RTP jump; `None` until there are two runs.
+/// Serve's own drops to a keyframe, which a stall that overfills its video queue causes by design.
+fn serve_drops(status: &Value, stalls: &[Stall]) -> Option<String> {
+    let dropped = status["stats"]["video_frames_dropped"]
+        .as_u64()
+        .filter(|&n| n > 0)?;
+    let lengths: Vec<Duration> = stalls.iter().map(|&(from, to)| to - from).collect();
+    Some(format!(
+        "serve dropped {dropped} video frames to a keyframe ({} keyframe requests); stalls: {lengths:?}",
+        status["stats"]["keyframe_requests"]
+    ))
+}
+
+/// `Harness::wait`, failing with serve's drops when they explain the missing frames.
+fn wait_or_drops<V>(
+    h: &Harness,
+    c: &mut Client,
+    canary: &StallCanary,
+    what: &str,
+    f: impl FnMut(&Recorded) -> Option<V>,
+) -> V {
+    h.rt.block_on(h.mock.wait_for(T, f)).unwrap_or_else(|| {
+        let drops = c
+            .try_status()
+            .ok()
+            .and_then(|s| serve_drops(&s, &canary.stalls()));
+        match drops {
+            Some(drops) => panic!("mock never saw {what}; {drops}"),
+            None => panic!("mock never saw {what}"),
+        }
+    })
+}
+
+/// Frames the mock received before `at` and after it; an RTP jump also marks serve dropping video to a keyframe.
 fn split<'a, T>(
     frames: &[&'a T],
-    ts: impl Fn(&T) -> u32,
-    hz: i64,
-) -> Option<(Vec<&'a T>, Vec<&'a T>)> {
-    let rtp: Vec<u32> = frames.iter().map(|f| ts(f)).collect();
-    let starts = runs(&rtp, hz, 500_000);
-    assert!(starts.len() <= 2, "attachments in {starts:?}");
-    let at = *starts.get(1)?;
-    Some((frames[..at].to_vec(), frames[at..].to_vec()))
+    received: impl Fn(&T) -> Instant,
+    at: Instant,
+) -> (Vec<&'a T>, Vec<&'a T>) {
+    let i = frames.partition_point(|f| received(f) < at);
+    (frames[..i].to_vec(), frames[i..].to_vec())
 }
 
 fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
@@ -738,13 +774,16 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
     c.source("producing", |e| {
         e["state"] == "producing" && e["attachment"] == id
     });
-    h.stream_media(75, 125);
+    wait_or_drops(&h, &mut c, &canary, "75 video and 125 audio frames", |r| {
+        (stream_video(r).len() >= 75 && producer_audio(r).len() >= 125).then_some(())
+    });
     first.kill();
     let killed = Instant::now();
     c.source("interrupted", |e| {
         e["state"] == "interrupted" && e["reason"] == "detached"
     });
     std::thread::sleep(gap.saturating_sub(killed.elapsed()));
+    let reattached = Instant::now();
     let second = h.replay(&dir, &[]);
     let id2 = second.attached();
     let detached_for = killed.elapsed();
@@ -758,17 +797,17 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
     let (status, stderr) = second.finish();
     assert!(status.success(), "{stderr}");
     let (frames, packets) = (want.video.len(), want.audio.len());
-    let recorded = h.wait("the whole second replay", |r| {
-        let (_, v2) = split(&stream_video(r), |v| v.rtp_timestamp, VIDEO_HZ)?;
-        let (_, a2) = split(&producer_audio(r), |a| a.rtp_timestamp, AUDIO_HZ)?;
+    let recorded = wait_or_drops(&h, &mut c, &canary, "the whole second replay", |r| {
+        let (_, v2) = split(&stream_video(r), |v| v.received_at, reattached);
+        let (_, a2) = split(&producer_audio(r), |a| a.received_at, reattached);
         (v2.len() >= frames && a2.len() >= packets).then(|| r.clone())
     });
     let lost_first = start_drops(&recorded, "a restarted replay");
     assert_eq!(c.status()["session"]["state"], "streaming");
     monotonic(&recorded);
 
-    let (v1, v2) = split(&stream_video(&recorded), |v| v.rtp_timestamp, VIDEO_HZ).unwrap();
-    let (a1, a2) = split(&producer_audio(&recorded), |a| a.rtp_timestamp, AUDIO_HZ).unwrap();
+    let (v1, v2) = split(&stream_video(&recorded), |v| v.received_at, reattached);
+    let (a1, a2) = split(&producer_audio(&recorded), |a| a.received_at, reattached);
     assert!(
         is_keyframe(&v2[0].data),
         "first video after the gap is not an IDR"
@@ -778,9 +817,27 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
         "audio lost before the kill"
     );
     let fps = want.fps;
-    let before = markers(&v1, &a1, fps, "before the kill");
-    assert!(!before.is_empty(), "{before:?}");
-    assert_av_aligned(&v1, &a1, &want, "before the kill");
+    let step = (VIDEO_HZ / fps) as u32;
+    let undropped = v1
+        .windows(2)
+        .position(|w| w[1].rtp_timestamp.wrapping_sub(w[0].rtp_timestamp) != step)
+        .map_or(v1.len(), |i| i + 1);
+    let v1_kept = &v1[..undropped];
+    let kept_until = rtp_us(v1_kept[v1_kept.len() - 1].rtp_timestamp, VIDEO_HZ);
+    let a1_kept: Vec<_> = a1
+        .iter()
+        .copied()
+        .filter(|a| rtp_us(a.rtp_timestamp, AUDIO_HZ) <= kept_until)
+        .collect();
+    let drops = serve_drops(&c.status(), &canary.stalls());
+    let before = markers(v1_kept, &a1_kept, fps, "before the kill");
+    assert!(
+        !before.is_empty() || drops.is_some(),
+        "no markers before the kill in {} of {} frames: {before:?}",
+        v1_kept.len(),
+        v1.len()
+    );
+    assert_av_aligned(v1_kept, &a1_kept, &want, "before the kill");
     check_replay(&v2, &a2, &want, 0, &canary.stalls(), "after the restart");
 
     let last_before = rtp_us(v1.last().unwrap().rtp_timestamp, VIDEO_HZ);
