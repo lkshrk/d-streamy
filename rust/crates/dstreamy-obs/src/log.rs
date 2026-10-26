@@ -1,5 +1,6 @@
 use std::ffi::{CString, c_int};
 
+#[cfg(unix)]
 use dstreamy_obs_producer::{Level, Log};
 use dstreamy_obs_sys as sys;
 
@@ -28,8 +29,10 @@ pub fn debug(msg: &str) {
     blog(sys::LOG_DEBUG, msg);
 }
 
+#[cfg(unix)]
 pub struct Obs;
 
+#[cfg(unix)]
 impl Log for Obs {
     fn log(&self, level: Level, message: &str) {
         match level {

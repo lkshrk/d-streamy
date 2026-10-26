@@ -6,11 +6,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+use dstreamy_obs_producer::End;
+use dstreamy_obs_producer::Hello;
+#[cfg(unix)]
 use dstreamy_obs_producer::{self as producer, Endpoint, StartError};
-use dstreamy_obs_producer::{End, Hello};
 use dstreamy_obs_sys as sys;
 use futures_util::FutureExt;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -19,6 +22,7 @@ use crate::guard;
 use crate::log;
 use crate::output::{OutputPtr, Shared, set_last_error};
 
+#[cfg(unix)]
 /// How long `destroy` waits for a capture that began after libobs decided the output was inactive.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 /// bindgen types the macro `0` as `u32` and the negative codes as `i32`; `obs_output_signal_stop` takes `int`.
@@ -38,7 +42,7 @@ pub enum Command {
     Shutdown,
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(unix)]
 enum Reason {
     Stop,
     Fail(String),
@@ -46,13 +50,28 @@ enum Reason {
     Shutdown,
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
 enum Outcome {
+    #[cfg(unix)]
     Cancelled(Reason),
     StartFailed(String),
+    #[cfg(unix)]
     CaptureRefused,
+    #[cfg(unix)]
     Ended(End<Reason>),
     Panicked(String),
+}
+
+impl Outcome {
+    /// destroy cancelled the session, so the worker exits after finishing it.
+    fn ends_worker(&self) -> bool {
+        #[cfg(unix)]
+        return matches!(
+            self,
+            Self::Cancelled(Reason::Shutdown) | Self::Ended(End::Stopped(Reason::Shutdown))
+        );
+        #[cfg(not(unix))]
+        false
+    }
 }
 
 pub fn spawn(
@@ -91,11 +110,7 @@ fn run(
                                 guard::record_panic("worker", payload.as_ref())
                             ))
                         });
-                    let shutdown = matches!(
-                        outcome,
-                        Outcome::Cancelled(Reason::Shutdown)
-                            | Outcome::Ended(End::Stopped(Reason::Shutdown))
-                    );
+                    let shutdown = outcome.ends_worker();
                     guard::guard("worker", (), || finish(shared, outcome));
                     if shutdown {
                         break;
@@ -106,8 +121,11 @@ fn run(
                 Command::StopFailed(message) => {
                     guard::guard("worker", (), || fail(shared.output, &message))
                 }
-                Command::Fail(_) | Command::EncodeError => {
-                    log::debug("ignoring an error reported after the output stopped")
+                Command::Fail(message) => log::debug(&format!(
+                    "ignoring an error after the output stopped: {message}"
+                )),
+                Command::EncodeError => {
+                    log::debug("ignoring an encoder error after the output stopped")
                 }
                 Command::Shutdown => break,
             }
@@ -213,21 +231,26 @@ fn finish(shared: &Shared, outcome: Outcome) {
     // Before the stop signal, so a restart from its handler isn't refused as "already starting".
     shared.busy.store(false, Ordering::Release);
     match outcome {
+        #[cfg(unix)]
         Outcome::Cancelled(Reason::Shutdown) => {}
-        Outcome::Cancelled(Reason::Fail(message)) | Outcome::Panicked(message) => {
-            fail(output, &message)
-        }
+        #[cfg(unix)]
+        Outcome::Cancelled(Reason::Fail(message)) => fail(output, &message),
+        Outcome::Panicked(message) => fail(output, &message),
+        #[cfg(unix)]
         Outcome::Cancelled(Reason::Stop | Reason::EncodeError) => signal_stop(output, SUCCESS),
         Outcome::StartFailed(message) => {
             log::warn(&message);
             set_last_error(output, &message);
             signal_stop(output, sys::OBS_OUTPUT_CONNECT_FAILED);
         }
+        #[cfg(unix)]
         Outcome::CaptureRefused => fail(output, "D-Streamy could not begin data capture"),
+        #[cfg(unix)]
         Outcome::Ended(end) => ended(shared, end),
     }
 }
 
+#[cfg(unix)]
 fn ended(shared: &Shared, end: End<Reason>) {
     let output = shared.output;
     match end {
