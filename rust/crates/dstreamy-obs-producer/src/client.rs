@@ -291,7 +291,8 @@ async fn write_packets<T>(
     WriterEnd::Stopped(stopped)
 }
 
-/// Blocks SIGPIPE for this thread only (POSIX sends it to the writing thread), so a dead service gives EPIPE.
+/// Blocks SIGPIPE for this thread; only Linux raises it on the writing thread (macOS signals the process).
+#[cfg(target_os = "linux")]
 pub fn block_sigpipe_on_this_thread() -> std::io::Result<()> {
     // SAFETY: sigemptyset/sigaddset initialise a local set; pthread_sigmask reads it and changes only this thread.
     let rc = unsafe {

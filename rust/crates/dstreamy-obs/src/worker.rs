@@ -91,7 +91,7 @@ fn run(
     runtime: &tokio::runtime::Runtime,
     mut commands: UnboundedReceiver<Command>,
 ) {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     if let Err(e) = producer::block_sigpipe_on_this_thread() {
         log::warn(&format!(
             "cannot block SIGPIPE on the D-Streamy thread: {e}"

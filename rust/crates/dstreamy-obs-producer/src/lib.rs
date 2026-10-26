@@ -5,8 +5,10 @@ pub mod client;
 pub mod ring;
 mod types;
 
+#[cfg(target_os = "linux")]
+pub use client::block_sigpipe_on_this_thread;
 #[cfg(unix)]
-pub use client::{Connection, StartError, attach, block_sigpipe_on_this_thread, run};
+pub use client::{Connection, StartError, attach, run};
 #[cfg(unix)]
 pub use dstreamy_ipc::Endpoint;
 pub use ring::{Packet, Ring, RingStats, Track};
