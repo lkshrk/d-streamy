@@ -453,8 +453,11 @@ fn earlier(now: Instant, by: Duration) -> Instant {
 async fn run_pacer(shared: Arc<PacerShared>, bytes_per_second: f64) {
     let _exit = PacerExit(shared.clone());
     let mut pacing = Pacing::new(bytes_per_second, Instant::now());
+    // Kept until a frame is sent: a waited-for frame dropped as stale or unencryptable leaves the idle to the next one.
+    let mut after_idle = false;
     loop {
         let (frame, waited) = shared.queue.next().await;
+        after_idle |= waited;
         let order = shared.send_order.lock().await;
         if frame.generation < shared.gate.generation() {
             drop(order);
@@ -488,7 +491,7 @@ async fn run_pacer(shared: Arc<PacerShared>, bytes_per_second: f64) {
             }
         };
         // After the lock wait and encrypt, so neither adds to the burst allowed after idle.
-        if waited {
+        if std::mem::take(&mut after_idle) {
             pacing.idle(Instant::now());
         }
         let mut write_error = None;
@@ -1458,6 +1461,45 @@ mod tests {
         assert!(
             burst as f64 <= BYTES_PER_SECOND / 1000.0 + 1300.0,
             "{burst} bytes at once after a 10 ms wait for the send order"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_burst_after_idle_holds_when_the_waited_for_frame_is_dropped_as_stale() {
+        let writes = Arc::new(StdMutex::new(Vec::new()));
+        let (pacer, mut rx, gate) =
+            gated_pacer(TestWriter::Timed(writes.clone(), |_| Duration::ZERO)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let audio = pacer.shared.send_order.clone().lock_owned().await;
+        pacer.enqueue(sized(0, 100_000)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pacer.shared.queue.lock().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stale frame popped");
+        gate.flush();
+        let mut fresh = sized(33, 100_000);
+        fresh.generation = gate.generation();
+        pacer.enqueue(fresh).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(audio);
+        tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|p| p.sent_frames >= 1))
+            .await
+            .unwrap()
+            .unwrap();
+        let writes = writes.lock().unwrap().clone();
+        let first = writes[0].0;
+        let burst: usize = writes.iter().filter(|w| w.0 == first).map(|w| w.1).sum();
+        assert_eq!(
+            rx.borrow().flushed_frames,
+            1,
+            "the waited-for frame went stale"
+        );
+        assert!(
+            burst as f64 <= BYTES_PER_SECOND / 1000.0 + 1300.0,
+            "{burst} bytes at once from the frame after the stale one"
         );
     }
 
