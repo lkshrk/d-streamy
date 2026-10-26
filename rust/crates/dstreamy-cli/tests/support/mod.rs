@@ -431,14 +431,13 @@ impl Client {
 
     /// Whether serve closed this connection, and what it sent that was not an event, for failure messages.
     pub fn connection_report(&mut self) -> String {
-        loop {
-            match self.lines.try_recv() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !self.closed {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
                 Ok(m) => self.seen.push(m),
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.closed = true;
-                    break;
-                }
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => self.closed = true,
             }
         }
         let replies: Vec<&Value> = self.seen.iter().filter(|m| m["type"] != "event").collect();

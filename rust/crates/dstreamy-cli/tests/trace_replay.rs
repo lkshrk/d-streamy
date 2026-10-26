@@ -490,7 +490,7 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
     let want = expected(trace);
     let h = Harness::new("");
     let canary = StallCanary::start(&h.rt);
-    let mut s = h.serve();
+    let mut serve = h.serve();
     let mut c = h.external_session();
     let p = h.replay(dir, &[]);
     let id = p.attached();
@@ -531,12 +531,16 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
                     ),
                 },
                 Err(e) => {
+                    let connection = c.connection_report();
+                    let exit = serve.exit_report();
+                    if exit.starts_with("exited") {
+                        // The stderr reader may still be copying a dying serve's last lines.
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
                     let log = h.serve_log();
                     let tail: Vec<&str> = log.lines().rev().take(30).collect();
                     panic!(
-                        "{counts}; {e}; {}; serve {}; the end of serve's log:\n{}",
-                        c.connection_report(),
-                        s.exit_report(),
+                        "{counts}; {e}; {connection}; serve {exit}; the end of serve's log:\n{}",
                         tail.into_iter().rev().collect::<Vec<_>>().join("\n")
                     )
                 }
