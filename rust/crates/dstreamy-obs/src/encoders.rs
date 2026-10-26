@@ -19,7 +19,7 @@ const AUDIO_ENCODER: &CStr = c"ffmpeg_opus";
 /// A reference to a libobs encoder that this plugin holds and releases.
 pub struct EncoderRef(*mut sys::obs_encoder_t);
 
-// SAFETY: libobs encoders are reference-counted objects; we only create, configure and release them on OBS threads.
+// SAFETY: encoder references are atomic counts (obs-encoder.c:1974-1986, obs-internal.h:680-683); we drop ours on OBS threads.
 unsafe impl Send for EncoderRef {}
 
 impl EncoderRef {
@@ -30,8 +30,40 @@ impl EncoderRef {
 
 impl Drop for EncoderRef {
     fn drop(&mut self) {
-        // SAFETY: we hold one reference from obs_*_encoder_create; the output holds its own (obs-output.c:1024-1040).
+        // SAFETY: we hold one strong reference; the output holds its own (obs-output.c:1048-1049).
         unsafe { sys::obs_encoder_release(self.0) };
+    }
+}
+
+/// A weak reference: it never keeps a stream encoder the frontend recreated alive.
+pub struct WeakEncoder(*mut sys::obs_weak_encoder_t);
+
+// SAFETY: as for EncoderRef; weak references are counted the same way.
+unsafe impl Send for WeakEncoder {}
+
+impl WeakEncoder {
+    fn of(encoder: *mut sys::obs_encoder_t) -> Option<Self> {
+        // SAFETY: a live encoder; this adds one weak reference (obs-encoder.c:2014-2022).
+        let weak = unsafe { sys::obs_encoder_get_weak_encoder(encoder) };
+        (!weak.is_null()).then_some(Self(weak))
+    }
+
+    /// The encoder if it still exists, as a strong reference for this start.
+    fn upgrade(&self) -> Option<EncoderRef> {
+        // SAFETY: we hold a weak reference; this returns NULL once the encoder is gone (obs-encoder.c:2024-2033).
+        let strong = unsafe { sys::obs_weak_encoder_get_encoder(self.0) };
+        (!strong.is_null()).then_some(EncoderRef(strong))
+    }
+
+    fn refers_to(&self, encoder: *mut sys::obs_encoder_t) -> bool {
+        self.upgrade().is_some_and(|strong| strong.get() == encoder)
+    }
+}
+
+impl Drop for WeakEncoder {
+    fn drop(&mut self) {
+        // SAFETY: we hold one weak reference.
+        unsafe { sys::obs_weak_encoder_release(self.0) };
     }
 }
 
@@ -40,7 +72,7 @@ pub struct Owned {
     audio: Option<EncoderRef>,
     video: Option<EncoderRef>,
     /// The last stream encoder attached in share mode, kept so a start after a fallback checks it again.
-    share: Option<EncoderRef>,
+    share: Option<WeakEncoder>,
 }
 
 struct Config {
@@ -82,7 +114,58 @@ unsafe fn encoder_settings(encoder: *mut sys::obs_encoder_t) -> Result<EncoderSe
             &text(sys::obs_data_get_json(data)),
         );
         sys::obs_data_release(data);
-        parsed
+        parsed.map(|mut s| {
+            s.format = Some(format_name(effective_format(encoder)).to_owned());
+            s
+        })
+    }
+}
+
+/// The format libobs feeds the encoder: its preferred format, else the canvas's (obs-encoder.c:194-206,257).
+///
+/// # Safety
+/// `encoder` is a live video encoder with its video set.
+unsafe fn effective_format(encoder: *mut sys::obs_encoder_t) -> sys::video_format {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let preferred = sys::obs_encoder_get_preferred_video_format(encoder);
+        if preferred != sys::VIDEO_FORMAT_NONE {
+            return preferred;
+        }
+        sys::video_output_get_info(sys::obs_encoder_video(encoder))
+            .as_ref()
+            .map_or(sys::VIDEO_FORMAT_NONE, |info| info.format)
+    }
+}
+
+fn format_name(format: sys::video_format) -> &'static str {
+    match format {
+        sys::VIDEO_FORMAT_I420 => "I420",
+        sys::VIDEO_FORMAT_NV12 => "NV12",
+        sys::VIDEO_FORMAT_YVYU => "YVYU",
+        sys::VIDEO_FORMAT_YUY2 => "YUY2",
+        sys::VIDEO_FORMAT_UYVY => "UYVY",
+        sys::VIDEO_FORMAT_RGBA => "RGBA",
+        sys::VIDEO_FORMAT_BGRA => "BGRA",
+        sys::VIDEO_FORMAT_BGRX => "BGRX",
+        sys::VIDEO_FORMAT_Y800 => "Y800",
+        sys::VIDEO_FORMAT_I444 => "I444",
+        sys::VIDEO_FORMAT_BGR3 => "BGR3",
+        sys::VIDEO_FORMAT_I422 => "I422",
+        sys::VIDEO_FORMAT_I40A => "I40A",
+        sys::VIDEO_FORMAT_I42A => "I42A",
+        sys::VIDEO_FORMAT_YUVA => "YUVA",
+        sys::VIDEO_FORMAT_AYUV => "AYUV",
+        sys::VIDEO_FORMAT_I010 => "I010",
+        sys::VIDEO_FORMAT_P010 => "P010",
+        sys::VIDEO_FORMAT_I210 => "I210",
+        sys::VIDEO_FORMAT_I412 => "I412",
+        sys::VIDEO_FORMAT_YA2L => "YA2L",
+        sys::VIDEO_FORMAT_P216 => "P216",
+        sys::VIDEO_FORMAT_P416 => "P416",
+        sys::VIDEO_FORMAT_V210 => "V210",
+        sys::VIDEO_FORMAT_R10L => "R10L",
+        _ => "NONE",
     }
 }
 
@@ -205,8 +288,10 @@ fn create_video(config: &Config) -> Result<EncoderRef, String> {
     unsafe {
         if (width, height) != (ovi.output_width, ovi.output_height) {
             sys::obs_encoder_set_scaled_size(encoder.get(), width, height);
-            sys::obs_encoder_set_gpu_scale_type(encoder.get(), sys::OBS_SCALE_BICUBIC);
         }
+        // NV12 whatever the canvas format; libobs converts it on the GPU (obs-encoder.c:245-262).
+        sys::obs_encoder_set_gpu_scale_type(encoder.get(), sys::OBS_SCALE_BICUBIC);
+        sys::obs_encoder_set_preferred_video_format(encoder.get(), sys::VIDEO_FORMAT_NV12);
         if divisor > 1 && !sys::obs_encoder_set_frame_rate_divisor(encoder.get(), divisor) {
             return Err(format!(
                 "D-Streamy can't divide the frame rate down to {fps} FPS"
@@ -259,14 +344,13 @@ pub fn prepare(output: OutputPtr, owned: &Mutex<Owned>) -> Result<(), String> {
     // SAFETY: as above.
     let attached = unsafe { sys::obs_output_get_video_encoder(output.0) };
     let ours = owned.video.as_ref().map(EncoderRef::get);
-    let shared = owned.share.as_ref().map(EncoderRef::get);
-    if !attached.is_null() && Some(attached) != ours && Some(attached) != shared {
-        // SAFETY: `attached` is the output's live video encoder; get_ref adds our own reference.
-        let candidate = unsafe { sys::obs_encoder_get_ref(attached) };
-        owned.share = (!candidate.is_null()).then_some(EncoderRef(candidate));
+    let known_share = owned.share.as_ref().is_some_and(|w| w.refers_to(attached));
+    if !attached.is_null() && Some(attached) != ours && !known_share {
+        owned.share = WeakEncoder::of(attached);
     }
     if config.share {
-        match owned.share.as_ref().map(EncoderRef::get) {
+        let candidate = owned.share.as_ref().and_then(WeakEncoder::upgrade);
+        match candidate.as_ref().map(EncoderRef::get) {
             None => log::info("share mode: no stream encoder to share, so D-Streamy uses its own"),
             Some(candidate) => {
                 let problems = share_problems(candidate)?;
