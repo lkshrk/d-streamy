@@ -6,6 +6,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use dstreamy_obs_sys as sys;
 
@@ -32,6 +33,7 @@ struct Output {
     output: *mut sys::obs_output_t,
     stats: Arc<Stats>,
     panic_at: i64,
+    started: Mutex<Option<Instant>>,
     stop_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -55,7 +57,16 @@ impl Output {
             &stats.audio
         };
         let seen = stats.video.load(Ordering::Relaxed) + stats.audio.load(Ordering::Relaxed) + 1;
-        counter.fetch_add(1, Ordering::Relaxed);
+        if counter.fetch_add(1, Ordering::Relaxed) == 0 {
+            let started = *self.started.lock().unwrap_or_else(|e| e.into_inner());
+            let kind = if packet.type_ == sys::OBS_ENCODER_VIDEO {
+                "video"
+            } else {
+                "audio"
+            };
+            let ms = started.map_or(-1, |t| t.elapsed().as_millis() as i64);
+            log::info(&format!("first {kind} packet {ms} ms after start"));
+        }
         if self.panic_at > 0 && seen == self.panic_at {
             panic!("test panic at packet {seen}");
         }
@@ -97,6 +108,7 @@ extern "C" fn output_create(
             output,
             stats,
             panic_at,
+            started: Mutex::new(None),
             stop_thread: Mutex::new(None),
         }))
         .cast()
@@ -116,12 +128,18 @@ extern "C" fn output_start(data: *mut c_void) -> bool {
         // SAFETY: libobs passes the pointer create returned.
         let state = unsafe { state(data) };
         state.join_stop_thread();
+        *state.started.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         // SAFETY: `state.output` is the live output this state belongs to.
-        unsafe {
-            sys::obs_output_can_begin_data_capture(state.output, 0)
-                && sys::obs_output_initialize_encoders(state.output, 0)
-                && sys::obs_output_begin_data_capture(state.output, 0)
-        }
+        let (can_begin, initialized, began) = unsafe {
+            let can_begin = sys::obs_output_can_begin_data_capture(state.output, 0);
+            let initialized = can_begin && sys::obs_output_initialize_encoders(state.output, 0);
+            let began = initialized && sys::obs_output_begin_data_capture(state.output, 0);
+            (can_begin, initialized, began)
+        };
+        log::info(&format!(
+            "start: can_begin_data_capture={can_begin} initialize_encoders={initialized} begin_data_capture={began}"
+        ));
+        began
     })
 }
 

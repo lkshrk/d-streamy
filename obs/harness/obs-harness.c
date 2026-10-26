@@ -894,6 +894,7 @@ int main(int argc, char **argv)
 		     verr ? verr : "-", aerr ? aerr : "-");
 	}
 	started = true;
+	printf("HARNESS obs_output_start=ok\n");
 	struct frame_counts at_start = frame_counts();
 
 	unsigned long budget_ms = (unsigned long)args.seconds * 1000 + 30000;

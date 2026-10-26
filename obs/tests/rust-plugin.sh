@@ -9,7 +9,7 @@ logs=$4
 shift 4
 mkdir -p "$logs"
 modules="image-source,obs-x264,obs-ffmpeg,obs-outputs,obs-dstreamy"
-seconds=3
+seconds=${RUST_PLUGIN_SECONDS:-3}
 min_video=$((seconds * 30 / 2))
 min_audio=$((seconds * 50 / 2))
 
