@@ -211,10 +211,11 @@ fn assert_paced<F>(
     let slack = PACING_SLACK_US.max(frame_us);
     let (first, last) = (at(f0), at(pairs[pairs.len() - 1].0));
     let clipped = |(from, to): Stall| (from.max(first), to.min(last));
+    let window = |(from, to): Stall| (from, to + (to - from) + Duration::from_micros(slack as u64));
     let stalls: Vec<Stall> = stalls
         .iter()
         .copied()
-        .filter(|&(from, to)| to >= first && from <= last)
+        .filter(|&s| window(s).1 >= first && s.0 <= last)
         .collect();
     let stalled: Duration = stalls
         .iter()
@@ -228,10 +229,7 @@ fn assert_paced<F>(
         .map(|&(from, to)| to - from)
         .max()
         .unwrap_or_default();
-    let mut windows: Vec<Stall> = stalls
-        .iter()
-        .map(|&(from, to)| (from, to + (to - from) + Duration::from_micros(slack as u64)))
-        .collect();
+    let mut windows: Vec<Stall> = stalls.iter().copied().map(window).collect();
     windows.sort();
     let mut excused = Duration::ZERO;
     let mut covered_to = first;
@@ -616,6 +614,41 @@ fn many_short_stalls_cannot_excuse_half_a_trace() {
         .collect();
     let (sent, arrived) = paced_arrivals(start, &[], Duration::ZERO);
     check_arrivals(&sent, &arrived, &stalls);
+}
+
+#[test]
+fn overlapping_stalls_excuse_their_union_once() {
+    let start = Instant::now();
+    let stalls: Vec<Stall> = (0..30u64)
+        .map(|i| {
+            let from = start + Duration::from_millis(1_000 + i * 30);
+            (from, from + Duration::from_millis(12))
+        })
+        .collect();
+    let (sent, arrived) = paced_arrivals(start, &[], Duration::ZERO);
+    check_arrivals(&sent, &arrived, &stalls);
+}
+
+#[test]
+fn a_stall_before_the_first_frame_is_excused_only_inside_the_trace() {
+    let start = Instant::now() + Duration::from_secs(1);
+    let stalls = [(
+        start - Duration::from_millis(800),
+        start + Duration::from_millis(50),
+    )];
+    let (sent, arrived) = paced_arrivals(start, &[], Duration::ZERO);
+    check_arrivals(&sent, &arrived, &stalls);
+}
+
+#[test]
+fn a_stall_that_ends_before_the_first_frame_still_excuses_the_frames_behind_it() {
+    let start = Instant::now();
+    let stall = (start, start + Duration::from_millis(180));
+    let (sent, mut arrived) = paced_arrivals(start, &[], Duration::ZERO);
+    for (i, a) in arrived.iter_mut().take(6).enumerate() {
+        a.1 = stall.1 + Duration::from_micros(1_000 + 100 * i as u64);
+    }
+    check_arrivals(&sent, &arrived, &[stall]);
 }
 
 #[test]
