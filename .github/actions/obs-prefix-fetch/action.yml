@@ -1,6 +1,6 @@
 name: Fetch the OBS prefix
 description: >-
-  Restore a pinned OBS install prefix from the newest successful rust-rewrite push or dispatch run of obs-ci,
+  Restore a pinned OBS install prefix from a recent successful rust-rewrite push or dispatch run of obs-ci,
   else from the Actions cache.
 inputs:
   key:
@@ -25,20 +25,28 @@ runs:
         ARTIFACT: ${{ inputs.key }}.tar.gz
       run: |
         set -euo pipefail
-        # Only rust-rewrite's own runs: a pull_request run can come from a fork branch of any name.
-        runs=$(gh api "repos/$REPO/actions/workflows/obs-ci.yml/runs?branch=rust-rewrite&status=success&per_page=30" \
-          --jq '.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")
-            | select(.head_repository.full_name == $ENV.REPO) | .id') || runs=
-        for id in $runs; do
-          found=$(gh api "repos/$REPO/actions/runs/$id/artifacts?name=$ARTIFACT" \
-            --jq '[.artifacts[] | select(.expired | not)] | length') || found=0
-          if [ "$found" -gt 0 ]; then
-            echo "$ARTIFACT from run $id"
-            echo "run-id=$id" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-        done
-        echo "No unexpired $ARTIFACT in a successful rust-rewrite run; trying the cache"
+        branch=$(gh api "repos/$REPO/branches/rust-rewrite" --jq .commit.sha) || branch=
+        candidates=
+        if [ -n "$branch" ]; then
+          candidates=$(gh api "repos/$REPO/actions/artifacts?name=$ARTIFACT&per_page=100" --jq '
+            [.artifacts[] | select((.expired | not) and .workflow_run.head_branch == "rust-rewrite"
+              and .workflow_run.head_repository_id == .workflow_run.repository_id)]
+            | sort_by(.created_at) | reverse | .[:5][] | "\(.workflow_run.id) \(.workflow_run.head_sha)"') || candidates=
+        fi
+        while read -r id sha; do
+          [ -n "$id" ] || continue
+          # pull_request runs carry a fork-chosen head branch name, so only push and dispatch runs count.
+          run=$(gh api "repos/$REPO/actions/runs/$id" --jq 'select((.event == "push" or .event == "workflow_dispatch")
+            and .conclusion == "success" and (.path | startswith(".github/workflows/obs-ci.yml"))) | .id') || run=
+          [ -n "$run" ] || continue
+          # head_branch is only a name, not a ref; the run's commit must also be on the branch.
+          status=$(gh api "repos/$REPO/compare/$sha...$branch" --jq .status) || status=
+          case "$status" in identical | ahead) ;; *) continue ;; esac
+          echo "$ARTIFACT from run $id"
+          echo "run-id=$id" >> "$GITHUB_OUTPUT"
+          exit 0
+        done <<<"$candidates"
+        echo "No usable $ARTIFACT from a successful rust-rewrite run; trying the cache"
 
     - name: Download the prefix
       id: download
@@ -54,22 +62,27 @@ runs:
     - name: Unpack the prefix
       id: unpack
       if: steps.download.outcome == 'success'
+      continue-on-error: true
       shell: bash
       env:
         ARTIFACT: ${{ inputs.key }}.tar.gz
         DOWNLOAD: ${{ runner.temp }}/obs-prefix-download
         PREFIX: ${{ inputs.path }}
       run: |
-        set -euo pipefail
+        set -uo pipefail
         unix() { if command -v cygpath >/dev/null; then cygpath -u "$1"; else printf '%s\n' "$1"; fi; }
         download=$(unix "$DOWNLOAD")
         prefix=$(unix "$PREFIX")
         archive=$(find "$download" -type f -name "$ARTIFACT" | head -n 1)
-        test -n "$archive"
-        mkdir -p "$prefix"
-        tar -xzf "$archive" -C "$prefix"
+        rm -rf "$prefix" "$prefix.unpack"
+        if [ -n "$archive" ] && mkdir -p "$prefix.unpack" && tar -xzf "$archive" -C "$prefix.unpack" &&
+          mv "$prefix.unpack" "$prefix"; then
+          echo hit=true >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::Could not unpack $ARTIFACT; trying the cache"
+          rm -rf "$prefix" "$prefix.unpack"
+        fi
         rm -rf "$download"
-        echo hit=true >> "$GITHUB_OUTPUT"
 
     - name: Restore the prefix from the cache
       id: cache
