@@ -222,6 +222,7 @@ pub struct Proc {
     pub lines: Arc<Mutex<Vec<Value>>>,
     pub err: Arc<Mutex<String>>,
     pub stderr: Option<std::thread::JoinHandle<String>>,
+    stdout: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Proc {
@@ -235,7 +236,7 @@ impl Proc {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let stdout = child.stdout.take().unwrap();
         let sink = lines.clone();
-        std::thread::spawn(move || {
+        let stdout = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if let Ok(v) = serde_json::from_str(&line) {
                     sink.lock().unwrap().push(v);
@@ -258,6 +259,7 @@ impl Proc {
             lines,
             err,
             stderr: Some(stderr),
+            stdout: Some(stdout),
         }
     }
 
@@ -300,6 +302,13 @@ impl Proc {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.join_stdout();
+    }
+
+    fn join_stdout(&mut self) {
+        if let Some(stdout) = self.stdout.take() {
+            let _ = stdout.join();
+        }
     }
 
     /// Exit status and stderr, killing it after `T`.
@@ -315,6 +324,7 @@ impl Proc {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
+        self.join_stdout();
         (status, self.stderr.take().unwrap().join().unwrap())
     }
 }
