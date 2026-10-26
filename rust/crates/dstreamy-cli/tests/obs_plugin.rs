@@ -757,7 +757,7 @@ fn the_own_encoder_runs_at_60_fps_on_a_60_fps_canvas() {
     );
 }
 
-/// PRD decision 9: audio is always D-Streamy's own Opus, even when the stream's AAC encoder is attached.
+/// Audio is always D-Streamy's own Opus, even when the stream's AAC encoder is attached.
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn share_mode_replaces_an_attached_aac_encoder_with_opus() {
@@ -839,4 +839,45 @@ fn the_own_encoder_restarts_on_the_same_output() {
         .filter(|l| l.contains("[obs-dstreamy] own video encoder obs_x264"))
         .count();
     assert_eq!(own, 2, "{lines:#?}");
+}
+
+/// profile_idc, the byte after the SPS NAL header (H.264 7.3.2.1.1).
+fn sps_profile(video: &[&RecordedVideoFrame]) -> u8 {
+    video
+        .iter()
+        .find_map(|v| {
+            v.data
+                .windows(5)
+                .find(|w| w[..3] == [0, 0, 1] && w[3] & 0x1f == 7)
+                .map(|w| w[4])
+        })
+        .expect("an SPS reached the mock")
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn the_own_encoder_sends_4_2_0_from_an_i444_canvas() {
+    let (_, recorded) = stream(json!({}), &["--format", "I444"], 90);
+    let profile = sps_profile(&stream_video(&recorded));
+    assert!(
+        [66, 77, 100].contains(&profile),
+        "profile_idc {profile}: not 8-bit 4:2:0"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn share_mode_falls_back_from_an_i444_stream_encoder() {
+    let (lines, _) = stream(
+        json!({"mode": "share"}),
+        &["--bf", "0", "--keyint-sec", "2", "--format", "I444"],
+        90,
+    );
+    assert!(
+        has_plugin_line(
+            &lines,
+            "not I444: Settings › Advanced › Color Format), so D-Streamy uses its own"
+        ),
+        "{lines:#?}"
+    );
 }

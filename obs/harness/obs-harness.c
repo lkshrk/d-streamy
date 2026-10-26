@@ -57,6 +57,7 @@ struct harness_args {
 	const char *expect_error;
 	const char *dump_encoder_settings;
 	const char *restart_video_settings;
+	const char *format;
 	bool no_encoders;
 	bool stream_output;
 	int seconds;
@@ -548,6 +549,20 @@ static void on_output_start(void *param, calldata_t *cd)
 	printf("HARNESS capture_start_ns=%" PRIu64 "\n", os_gettime_ns());
 }
 
+static enum video_format canvas_format(void)
+{
+	if (!args.format || strcmp(args.format, "NV12") == 0)
+		return VIDEO_FORMAT_NV12;
+	if (strcmp(args.format, "I420") == 0)
+		return VIDEO_FORMAT_I420;
+	if (strcmp(args.format, "I444") == 0)
+		return VIDEO_FORMAT_I444;
+	if (strcmp(args.format, "P010") == 0)
+		return VIDEO_FORMAT_P010;
+	fprintf(stderr, "unknown --format %s, using NV12\n", args.format);
+	return VIDEO_FORMAT_NV12;
+}
+
 static void usage(void)
 {
 	fprintf(stderr,
@@ -558,6 +573,7 @@ static void usage(void)
 		"   after a stop OBS keeps running until --seconds)]\n"
 		"  [--release-after-start MS (release the output MS after a successful start, without stopping it)]\n"
 		"  [--no-encoders (the output brings its own encoders)]\n"
+		"  [--format NV12|I420|I444|P010 (canvas color format)]\n"
 		"  [--stream-output (start a stand-in stream output on the harness encoders first, so they are active)]\n"
 		"  [--restart-video-settings JSON (after a passing run, stop everything, update the video encoder, run again)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
@@ -636,6 +652,8 @@ static int parse_args(int argc, char **argv)
 			ok = parse_int(a, v, 0, &args.expect_panics);
 		else if (strcmp(a, "--until-video") == 0)
 			ok = parse_int(a, v, 1, &args.until_video);
+		else if (strcmp(a, "--format") == 0)
+			args.format = v;
 		else if (strcmp(a, "--restart-video-settings") == 0)
 			args.restart_video_settings = v;
 		else if (strcmp(a, "--dump-encoder-settings") == 0)
@@ -1066,7 +1084,7 @@ int main(int argc, char **argv)
 		.base_height = (uint32_t)args.height,
 		.output_width = (uint32_t)args.width,
 		.output_height = (uint32_t)args.height,
-		.output_format = VIDEO_FORMAT_NV12,
+		.output_format = canvas_format(),
 		.adapter = 0,
 		.gpu_conversion = true,
 		.colorspace = VIDEO_CS_709,
