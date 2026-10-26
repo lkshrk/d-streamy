@@ -269,7 +269,7 @@ fn install_writes_the_unit_then_reloads_and_enables_it_and_uninstall_reverses_it
     );
 }
 
-/// Polls until `child` has been running for a moment, so a failed start can't pass as a match.
+/// Waits 300 ms and checks that `child` still runs, so a failed start can't pass as a match.
 fn alive(mut child: Child) -> KillOnDrop {
     std::thread::sleep(Duration::from_millis(300));
     assert!(
@@ -523,6 +523,41 @@ fn uninstall_leaves_a_unit_loaded_from_elsewhere_and_a_link_to_it_alone() {
         serde_json::from_str(&stdout(&fake.run(&["--json", "service", "uninstall"]))).unwrap();
     assert_eq!(v["action"], "absent", "{v}");
     assert!(fs::symlink_metadata(wants.join("dstreamy.service")).is_ok());
+}
+
+#[test]
+fn uninstall_through_a_symlinked_config_dir_still_treats_the_unit_as_ours() {
+    let fake = Fake::new();
+    let real = fake.dir.path().join("real-config");
+    let shell = fake.dir.path().join("shell-config");
+    let manager_units = real.join("systemd/user");
+    fs::create_dir_all(manager_units.join("default.target.wants")).unwrap();
+    std::os::unix::fs::symlink(&real, &shell).unwrap();
+    let link = manager_units.join("default.target.wants/dstreamy.service");
+    std::os::unix::fs::symlink(manager_units.join("dstreamy.service"), &link).unwrap();
+    fake.set_unit_path(&[&manager_units]);
+    fake.answer_show(&state(
+        "loaded",
+        "active",
+        "running",
+        std::process::id(),
+        "no",
+        manager_units.join("dstreamy.service").to_str().unwrap(),
+    ));
+    let v: Value = serde_json::from_str(&stdout(
+        &fake
+            .command(&dstreamy(), &["--json", "service", "uninstall"])
+            .env("XDG_CONFIG_HOME", &shell)
+            .output()
+            .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(v["action"], "uninstalled", "{v}");
+    assert_eq!(
+        fake.actions(),
+        "--user stop dstreamy.service\n--user daemon-reload\n"
+    );
+    assert!(fs::symlink_metadata(&link).is_err());
 }
 
 #[test]

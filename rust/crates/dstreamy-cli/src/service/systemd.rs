@@ -1,6 +1,7 @@
 //! A systemd user unit for `dstreamy serve`.
 
 use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use super::{Backend, InstallPlan, QUERY_TIMEOUT, ServiceError, Step, Supervision, checked_output};
@@ -49,7 +50,13 @@ impl Systemd {
     }
 
     fn owns_wants_link(&self) -> bool {
-        std::fs::read_link(self.wants_link()).is_ok_and(|target| target == self.unit_path)
+        let link = self.wants_link();
+        std::fs::read_link(&link).is_ok_and(|target| {
+            let target = link
+                .parent()
+                .map_or(target.clone(), |dir| dir.join(&target));
+            same_file_path(&target, &self.unit_path)
+        })
     }
 
     fn systemctl(&self, args: &[&str]) -> Vec<OsString> {
@@ -143,18 +150,23 @@ impl Backend for Systemd {
         state.foreign = property(&show, "FragmentPath")
             .filter(|fragment| !fragment.is_empty())
             .map(PathBuf::from)
-            .filter(|fragment| fragment.components().ne(self.unit_path.components()));
+            .filter(|fragment| !same_file_path(fragment, &self.unit_path));
         Ok(state)
     }
 
     fn check_location(&self) -> Result<(), ServiceError> {
         let (command, show) = self.read(&["show", "--property=UnitPath"])?;
-        let search_path = property(&show, "UnitPath").ok_or(ServiceError::Unexpected {
-            command,
+        let search_path = property(&show, "UnitPath").ok_or_else(|| ServiceError::Unexpected {
+            command: command.clone(),
             what: "UnitPath".to_owned(),
         })?;
         let dir = self.unit_path.parent().unwrap_or(Path::new("/"));
-        if searched(&shell_words_unquoted(search_path), dir) {
+        let entries =
+            shell_words_unquoted(search_path).map_err(|what| ServiceError::Unexpected {
+                command,
+                what: format!("UnitPath it can decode: {what}"),
+            })?;
+        if searched(&entries, dir) {
             Ok(())
         } else {
             Err(ServiceError::NotSearched {
@@ -182,50 +194,93 @@ fn property<'a>(show: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
 }
 
-/// Splits a `show` list value; elements with whitespace or shell metacharacters arrive double-quoted with `\` escapes.
-fn shell_words_unquoted(value: &str) -> Vec<String> {
+/// Splits a `show` list value as `shell_maybe_quote` wrote its elements, joined by single spaces.
+fn shell_words_unquoted(value: &str) -> Result<Vec<PathBuf>, String> {
     let mut words = Vec::new();
-    let mut word = String::new();
+    let mut word = Vec::new();
     let mut in_word = false;
     let mut quoted = false;
-    let mut chars = value.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
+    let mut bytes = value.bytes();
+    while let Some(b) = bytes.next() {
+        match b {
+            b'"' => {
                 quoted = !quoted;
                 in_word = true;
             }
-            '\\' => {
-                word.extend(chars.next());
+            b'\\' => {
+                let escaped = match bytes.next() {
+                    Some(b'a') => 0x07,
+                    Some(b'b') => 0x08,
+                    Some(b'f') => 0x0c,
+                    Some(b'n') => b'\n',
+                    Some(b'r') => b'\r',
+                    Some(b't') => b'\t',
+                    Some(b'v') => 0x0b,
+                    Some(d @ b'0'..=b'3') => {
+                        let digits = [Some(d), bytes.next(), bytes.next()];
+                        let mut value = 0u8;
+                        for digit in digits {
+                            match digit {
+                                Some(o @ b'0'..=b'7') => value = value * 8 + (o - b'0'),
+                                _ => return Err(format!("a bad octal escape in {value:?}")),
+                            }
+                        }
+                        value
+                    }
+                    Some(c @ (b'\\' | b'"' | b'\'' | b'`' | b'$')) => c,
+                    Some(c) => {
+                        return Err(format!("an unknown escape \\{} in {value:?}", c as char));
+                    }
+                    None => return Err(format!("a trailing backslash in {value:?}")),
+                };
+                word.push(escaped);
                 in_word = true;
             }
-            c if c.is_whitespace() && !quoted => {
+            b' ' if !quoted => {
                 if in_word {
-                    words.push(std::mem::take(&mut word));
+                    words.push(PathBuf::from(OsString::from_vec(std::mem::take(&mut word))));
                     in_word = false;
                 }
             }
-            c => {
-                word.push(c);
+            b => {
+                word.push(b);
                 in_word = true;
             }
         }
     }
-    if in_word {
-        words.push(word);
+    if quoted {
+        return Err(format!("an unterminated quote in {value:?}"));
     }
-    words
+    if in_word {
+        words.push(PathBuf::from(OsString::from_vec(word)));
+    }
+    Ok(words)
 }
 
 /// Whether `dir` is one of `entries`, compared by path components, then canonicalised.
-fn searched(entries: &[String], dir: &Path) -> bool {
+fn searched(entries: &[PathBuf], dir: &Path) -> bool {
     let canonical_dir = std::fs::canonicalize(dir).ok();
-    entries.iter().map(Path::new).any(|entry| {
+    entries.iter().any(|entry| {
         entry.components().eq(dir.components())
             || canonical_dir
                 .as_ref()
                 .is_some_and(|dir| std::fs::canonicalize(entry).ok().as_ref() == Some(dir))
     })
+}
+
+/// Equal by components, else by canonicalised parent directory and file name; the file itself may be missing.
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    if a.components().eq(b.components()) {
+        return true;
+    }
+    let canonical = |p: &Path| {
+        Some(
+            std::fs::canonicalize(p.parent()?)
+                .ok()?
+                .join(p.file_name()?),
+        )
+    };
+    matches!((canonical(a), canonical(b)), (Some(a), Some(b)) if a == b)
 }
 
 fn supervision(show: &str) -> Supervision {
@@ -385,7 +440,7 @@ mod tests {
     }
 
     fn on_path(search: &str, dir: &Path) -> bool {
-        searched(&shell_words_unquoted(search), dir)
+        searched(&shell_words_unquoted(search).unwrap(), dir)
     }
 
     #[test]
@@ -400,13 +455,14 @@ mod tests {
     fn quoted_search_path_entries_with_spaces_and_dollars_match() {
         let search = r#"/a "/home/my user/.config/systemd/user" "/srv/\$x \"q\"/systemd/user" /b"#;
         assert_eq!(
-            shell_words_unquoted(search),
+            shell_words_unquoted(search).unwrap(),
             [
                 "/a",
                 "/home/my user/.config/systemd/user",
                 "/srv/$x \"q\"/systemd/user",
                 "/b"
             ]
+            .map(PathBuf::from)
         );
         assert!(on_path(
             search,
@@ -414,6 +470,39 @@ mod tests {
         ));
         assert!(on_path(search, Path::new("/srv/$x \"q\"/systemd/user")));
         assert!(!on_path(search, Path::new("/home/my")));
+    }
+
+    #[test]
+    fn c_escapes_in_quoted_entries_are_decoded_and_only_spaces_separate() {
+        assert_eq!(
+            shell_words_unquoted(r#""/a\tb/\n\001\303\274" /c\td"#).unwrap(),
+            [
+                PathBuf::from(OsString::from_vec(b"/a\tb/\n\x01\xc3\xbc".to_vec())),
+                PathBuf::from("/c\td"),
+            ]
+        );
+        assert_eq!(
+            shell_words_unquoted("/a\tb /c").unwrap(),
+            [PathBuf::from("/a\tb"), PathBuf::from("/c")]
+        );
+        assert!(shell_words_unquoted(r#""/a\q""#).is_err());
+        assert!(shell_words_unquoted(r#""/a"#).is_err());
+        assert!(shell_words_unquoted(r#""/a\9""#).is_err());
+    }
+
+    #[test]
+    fn a_file_path_matches_through_a_symlinked_directory_even_when_the_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        assert!(same_file_path(
+            &dir.path().join("link/dstreamy.service"),
+            &dir.path().join("real/dstreamy.service")
+        ));
+        assert!(!same_file_path(
+            &dir.path().join("link/other.service"),
+            &dir.path().join("real/dstreamy.service")
+        ));
     }
 
     #[test]
