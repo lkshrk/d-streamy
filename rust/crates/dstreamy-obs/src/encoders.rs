@@ -39,6 +39,8 @@ impl Drop for EncoderRef {
 pub struct Owned {
     audio: Option<EncoderRef>,
     video: Option<EncoderRef>,
+    /// The last stream encoder attached in share mode, kept so a start after a fallback checks it again.
+    share: Option<EncoderRef>,
 }
 
 struct Config {
@@ -97,6 +99,19 @@ unsafe fn shape_problems(encoder: *mut sys::obs_encoder_t) -> Vec<Problem> {
             Some(info) => settings::check_shape(width, height, info.fps_num, info.fps_den),
             None => settings::check_shape(width, height, 0, 0),
         }
+    }
+}
+
+/// Share only an encoder the stream is running: an idle one would be started and configured by us.
+fn share_problems(candidate: *mut sys::obs_encoder_t) -> Result<Vec<Problem>, String> {
+    // SAFETY: `candidate` is a live encoder we hold a reference to.
+    unsafe {
+        if !sys::obs_encoder_active(candidate) {
+            return Ok(vec![Problem::StreamNotRunning]);
+        }
+        let mut problems = settings::check_video_encoder(&encoder_settings(candidate)?);
+        problems.extend(shape_problems(candidate));
+        Ok(problems)
     }
 }
 
@@ -239,28 +254,33 @@ pub fn prepare(output: OutputPtr, owned: &Mutex<Owned>) -> Result<(), String> {
     // SAFETY: as above.
     let attached = unsafe { sys::obs_output_get_video_encoder(output.0) };
     let ours = owned.video.as_ref().map(EncoderRef::get);
+    let shared = owned.share.as_ref().map(EncoderRef::get);
+    if !attached.is_null() && Some(attached) != ours && Some(attached) != shared {
+        // SAFETY: `attached` is the output's live video encoder; get_ref adds our own reference.
+        let candidate = unsafe { sys::obs_encoder_get_ref(attached) };
+        owned.share = (!candidate.is_null()).then_some(EncoderRef(candidate));
+    }
     if config.share {
-        if attached.is_null() || Some(attached) == ours {
-            log::info("share mode: no stream encoder to share, so D-Streamy uses its own");
-        } else {
-            // SAFETY: `attached` is the output's live video encoder.
-            let mut problems =
-                settings::check_video_encoder(&unsafe { encoder_settings(attached) }?);
-            // SAFETY: as above.
-            problems.extend(unsafe { shape_problems(attached) });
-            if problems.is_empty() {
-                // SAFETY: as above.
-                let id = unsafe { text(sys::obs_encoder_get_id(attached)) };
-                log::info(&format!("sharing the stream's video encoder {id}"));
-                return Ok(());
+        match owned.share.as_ref().map(EncoderRef::get) {
+            None => log::info("share mode: no stream encoder to share, so D-Streamy uses its own"),
+            Some(candidate) => {
+                let problems = share_problems(candidate)?;
+                // SAFETY: `candidate` is live while we hold its reference.
+                let id = unsafe { text(sys::obs_encoder_get_id(candidate)) };
+                if problems.is_empty() {
+                    // SAFETY: the output is inactive; it takes its own reference.
+                    unsafe { sys::obs_output_set_video_encoder(output.0, candidate) };
+                    log::info(&format!("sharing the stream's video encoder {id}"));
+                    return Ok(());
+                }
+                let message = messages(&problems);
+                if !config.fallback {
+                    return Err(message);
+                }
+                log::warn(&format!(
+                    "not sharing the stream's video encoder {id} ({message}), so D-Streamy uses its own"
+                ));
             }
-            let message = messages(&problems);
-            if !config.fallback {
-                return Err(message);
-            }
-            log::warn(&format!(
-                "not sharing the stream's video encoder ({message}), so D-Streamy uses its own"
-            ));
         }
     }
     let video = create_video(&config)?;
@@ -337,8 +357,13 @@ pub extern "C" fn get_properties(_data: *mut c_void) -> *mut sys::obs_properties
             let mut i = 0;
             while sys::obs_enum_encoder_types(i, &mut id) {
                 i += 1;
-                let codec = text(sys::obs_get_encoder_codec(id));
-                if codec == "h264" && sys::obs_get_encoder_type(id) == sys::OBS_ENCODER_VIDEO {
+                let deprecated =
+                    sys::obs_get_encoder_caps(id) & sys::OBS_ENCODER_CAP_DEPRECATED != 0;
+                if !deprecated
+                    && sys::obs_get_encoder_type(id) == sys::OBS_ENCODER_VIDEO
+                    && text(sys::obs_get_encoder_codec(id)) == "h264"
+                    && Family::of(&text(id)).is_some()
+                {
                     sys::obs_property_list_add_string(
                         encoders,
                         sys::obs_encoder_get_display_name(id),

@@ -31,7 +31,8 @@ impl Family {
             "h264_texture_amf" | "h264_fallback_amf" => Self::Amf,
             "obs_qsv11" | "obs_qsv11_soft" | "obs_qsv11_v2" | "obs_qsv11_soft_v2" => Self::Qsv,
             "ffmpeg_openh264" => Self::OpenH264,
-            _ if id.starts_with("com.apple.videotoolbox.") => Self::VideoToolbox,
+            // The system's encoder ids, e.g. "paravirtualized:com.apple.videotoolbox.videoencoder.ave.avc" in a VM.
+            _ if id.contains("com.apple.videotoolbox.videoencoder.") => Self::VideoToolbox,
             _ => return None,
         })
     }
@@ -145,6 +146,7 @@ pub enum Problem {
     Size { width: u32, height: u32 },
     Fps { num: u32, den: u32 },
     Audio { detail: String },
+    StreamNotRunning,
 }
 
 impl Problem {
@@ -185,6 +187,9 @@ impl Problem {
                 )
             }
             Self::Audio { detail } => format!("D-Streamy's audio encoder {detail}"),
+            Self::StreamNotRunning => {
+                "D-Streamy can share the stream's encoder only while streaming: start streaming first, or use D-Streamy's own encoder".into()
+            }
         }
     }
 }
@@ -554,6 +559,17 @@ mod tests {
         assert!(!b(json!({"bf": 0})));
         assert!(!b(json!({"bframes": 0})));
         assert!(b(json!({"bframes": 0, "bf": 2})));
+    }
+
+    #[test]
+    fn videotoolbox_ids_from_ci_runners_are_videotoolbox() {
+        for id in [
+            "com.apple.videotoolbox.videoencoder.h264",
+            "com.apple.videotoolbox.videoencoder.ave.avc",
+            "paravirtualized:com.apple.videotoolbox.videoencoder.ave.avc",
+        ] {
+            assert_eq!(Family::of(id), Some(Family::VideoToolbox), "{id}");
+        }
     }
 
     #[test]
