@@ -490,7 +490,7 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
     let want = expected(trace);
     let h = Harness::new("");
     let canary = StallCanary::start(&h.rt);
-    let _s = h.serve();
+    let mut s = h.serve();
     let mut c = h.external_session();
     let p = h.replay(dir, &[]);
     let id = p.attached();
@@ -530,7 +530,16 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
                         s["stats"], s["source"]["stats"]
                     ),
                 },
-                Err(e) => panic!("{counts}; {e}"),
+                Err(e) => {
+                    let log = h.serve_log();
+                    let tail: Vec<&str> = log.lines().rev().take(30).collect();
+                    panic!(
+                        "{counts}; {e}; {}; serve {}; the end of serve's log:\n{}",
+                        c.connection_report(),
+                        s.exit_report(),
+                        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+                    )
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(if plis { 50 } else { 100 }));

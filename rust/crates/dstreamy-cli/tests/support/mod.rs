@@ -173,7 +173,7 @@ impl Harness {
         c
     }
 
-    fn serve_log(&self) -> String {
+    pub fn serve_log(&self) -> String {
         self.serve_log
             .lock()
             .unwrap()
@@ -299,6 +299,15 @@ impl Proc {
         self.child.try_wait().unwrap().is_some()
     }
 
+    /// `exited`, saying how, for failure messages.
+    pub fn exit_report(&mut self) -> String {
+        match self.child.try_wait() {
+            Ok(Some(status)) => format!("exited with {status}"),
+            Ok(None) => "still running".to_owned(),
+            Err(e) => format!("unknown: {e}"),
+        }
+    }
+
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -418,6 +427,27 @@ impl Client {
     pub fn status(&mut self) -> Value {
         self.send(&json!({"id": "st", "cmd": "status"}));
         self.reply("st")["data"].clone()
+    }
+
+    /// Whether serve closed this connection, and what it sent that was not an event, for failure messages.
+    pub fn connection_report(&mut self) -> String {
+        loop {
+            match self.lines.try_recv() {
+                Ok(m) => self.seen.push(m),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.closed = true;
+                    break;
+                }
+            }
+        }
+        let replies: Vec<&Value> = self.seen.iter().filter(|m| m["type"] != "event").collect();
+        let side = if self.closed {
+            "serve closed the connection"
+        } else {
+            "the connection is open"
+        };
+        format!("{side}; non-event messages unclaimed {replies:?}")
     }
 
     /// Like `status`, for failure messages: an error instead of a panic when serve is gone or hung.
