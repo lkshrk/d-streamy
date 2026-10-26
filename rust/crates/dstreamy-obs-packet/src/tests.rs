@@ -293,7 +293,8 @@ fn pts_conversion_known_values() {
         (-1024, (1, 48_000), -21_333),
         (-1, (1, 30), -33_333),
         (-2, (1, 30), -66_666),
-        (1001, (1001, 30_000), 33_400_033),
+        (1001, (1001, 30_000), 33_366),
+        (3, (3, 90), 33_333),
         (7, (1, 1_000_000), 7),
         (30_000_000_000_001, (1, 30), 1_000_000_000_000_033_333),
     ] {
@@ -311,8 +312,8 @@ fn pts_conversion_known_values() {
     );
 }
 
-fn reference_us(pts: i64, (num, den): (i32, i32)) -> Option<i64> {
-    i64::try_from(i128::from(pts) * 1_000_000 * i128::from(num) / i128::from(den)).ok()
+fn reference_us(pts: i64, (_, den): (i32, i32)) -> Option<i64> {
+    i64::try_from(i128::from(pts) * 1_000_000 / i128::from(den)).ok()
 }
 
 fn timebase() -> impl Strategy<Value = (i32, i32)> {

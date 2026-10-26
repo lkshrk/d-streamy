@@ -254,18 +254,17 @@ impl Converter {
     }
 }
 
-/// OBS pts in timebase units (`encoder_packet`, `libobs/obs-encoder.h:100-121`) to µs, truncated toward zero.
+/// OBS pts to µs, truncated toward zero: libobs counts pts in 1/`timebase_den` and uses `timebase_num` only as a frame's
+/// duration (obs-encoder.c:1473-1474,1637; obs-internal.h:55-58), so the numerator is checked but not multiplied in.
 pub fn pts_to_us(pts: i64, (num, den): (i32, i32)) -> Result<i64, PacketError> {
     if num <= 0 || den <= 0 {
         return Err(PacketError::BadTimebase);
     }
-    let (num, den) = (i64::from(num), i64::from(den));
-    // Split so no product overflows; quotient and remainders share the sign of pts, so truncation composes.
+    let den = i64::from(den);
+    // Split so no product overflows; quotient and remainder share the sign of pts, so truncation composes.
     let (q, r) = (pts / den, pts % den);
-    let t = r * num;
-    let tail = (t / den) * 1_000_000 + (t % den) * 1_000_000 / den;
-    q.checked_mul(num * 1_000_000)
-        .and_then(|head| head.checked_add(tail))
+    q.checked_mul(1_000_000)
+        .and_then(|head| head.checked_add(r * 1_000_000 / den))
         .ok_or(PacketError::PtsOverflow)
 }
 

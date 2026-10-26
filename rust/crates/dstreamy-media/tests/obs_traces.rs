@@ -348,7 +348,7 @@ fn opus_toc_durations_follow_rfc_6716() {
 }
 
 fn pts_us(p: &Packet) -> i64 {
-    p.pts * 1_000_000 * i64::from(p.timebase.0) / i64::from(p.timebase.1)
+    p.pts * 1_000_000 / i64::from(p.timebase.1)
 }
 
 /// Feeds a trace's packets through `Ingest` as the plugin will send them; the first refusal, if any.

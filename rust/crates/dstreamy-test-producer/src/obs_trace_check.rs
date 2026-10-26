@@ -19,7 +19,7 @@ struct Packet<'a> {
 
 impl Packet<'_> {
     fn pts_us(&self) -> i64 {
-        self.pts * 1_000_000 * self.timebase.0 / self.timebase.1
+        self.pts * 1_000_000 / self.timebase.1
     }
 }
 
@@ -123,9 +123,8 @@ fn check(dir: &Path, fps: i64, seconds: i64) -> Result<(), String> {
                 ));
             }
             let samples = opus.decode(p.data).map_err(|e| e.to_string())?;
-            next_audio_pts = Some(
-                p.pts + samples.len() as i64 * p.timebase.1 / i64::from(SAMPLE_RATE) / p.timebase.0,
-            );
+            next_audio_pts =
+                Some(p.pts + samples.len() as i64 * p.timebase.1 / i64::from(SAMPLE_RATE));
             pcm.extend(samples);
         }
     }
