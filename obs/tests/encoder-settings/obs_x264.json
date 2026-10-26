@@ -1,8 +1,7 @@
 {
     "id": "obs_x264",
     "codec": "h264",
-    "kind": "source",
-    "source": "plugins/obs-x264/obs-x264.c:100-117 (defaults, vfr only with ENABLE_VFR), :179-219 (properties; vfr only with ENABLE_VFR, off in OBS builds) at obs-studio ba2f32b",
+    "source": "obs-harness --dump-encoder-settings on ubuntu-24.04, OBS 32.2.2 (ba2f32b) built in OBS CI run 40367367754 (obs-linux); matches plugins/obs-x264/obs-x264.c:100-117,179-219",
     "defaults": {
         "bitrate": 6000,
         "use_bufsize": false,
@@ -18,37 +17,49 @@
     },
     "properties": [
         {
-            "name": "rate_control"
+            "name": "rate_control",
+            "type": 6
         },
         {
-            "name": "bitrate"
+            "name": "bitrate",
+            "type": 2
         },
         {
-            "name": "use_bufsize"
+            "name": "use_bufsize",
+            "type": 1
         },
         {
-            "name": "buffer_size"
+            "name": "buffer_size",
+            "type": 2
         },
         {
-            "name": "crf"
+            "name": "crf",
+            "type": 2
         },
         {
-            "name": "keyint_sec"
+            "name": "keyint_sec",
+            "type": 2
         },
         {
-            "name": "preset"
+            "name": "preset",
+            "type": 6
         },
         {
-            "name": "profile"
+            "name": "profile",
+            "type": 6
         },
         {
-            "name": "tune"
+            "name": "tune",
+            "type": 6
         },
         {
-            "name": "x264opts"
+            "name": "x264opts",
+            "type": 4
         },
         {
-            "name": "repeat_headers"
+            "name": "repeat_headers",
+            "type": 1
         }
-    ]
+    ],
+    "kind": "captured"
 }
