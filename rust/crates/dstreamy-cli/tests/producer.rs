@@ -548,6 +548,15 @@ impl Overload {
             &["video_frames_dropped", "audio_frames_dropped"],
         ) + sum(&self.source, &["dropped_video", "dropped_audio"])
     }
+
+    /// Video frames serve took from the producer: sent, or dropped by the pump or the source.
+    fn video_received(&self) -> u64 {
+        ["video_frames_sent", "video_frames_dropped"]
+            .iter()
+            .map(|k| self.session[k].as_u64().unwrap())
+            .sum::<u64>()
+            + self.source["dropped_video"].as_u64().unwrap()
+    }
 }
 
 /// Runs a producer for at most `secs` and samples the source queue depth every 50 ms.
@@ -568,9 +577,20 @@ fn overload_run_with(burst: Option<u32>, secs: u64, extra: &[&str]) -> Overload 
     let mut p = h.producer(&args);
     p.attached();
     let mut depths = Vec::new();
-    let end = Instant::now() + Duration::from_secs(secs);
+    let started = Instant::now();
+    let end = started + Duration::from_secs(secs);
+    let mut last = Value::Null;
     while Instant::now() < end && !p.exited() {
-        depths.push(c.status()["source"]["stats"]["queued"].as_u64().unwrap());
+        let status = c.try_status().unwrap_or_else(|e| {
+            panic!(
+                "burst {burst:?}: status {} at {:?}: {e}; producer exited: {}; last status {last}",
+                depths.len() + 1,
+                started.elapsed(),
+                p.exited()
+            )
+        });
+        depths.push(status["source"]["stats"]["queued"].as_u64().unwrap());
+        last = status;
         std::thread::sleep(Duration::from_millis(50));
     }
     let lines = p.lines.clone();
@@ -635,12 +655,13 @@ fn a_burst_10_producer_keeps_serve_memory_within_a_margin_of_a_real_time_baselin
         burst.peak_rss_kib,
         baseline.peak_rss_kib
     );
-    let sent = |r: &Overload| r.session["video_frames_sent"].as_u64().unwrap();
     assert!(
-        sent(&burst) > 5 * sent(&baseline),
-        "the burst was not faster than real time: {} vs {} video frames",
-        sent(&burst),
-        sent(&baseline)
+        burst.video_received() > 5 * baseline.video_received(),
+        "the burst was not faster than real time: serve took {} vs {} video frames; burst session {}, source {}",
+        burst.video_received(),
+        baseline.video_received(),
+        burst.session,
+        burst.source
     );
 }
 

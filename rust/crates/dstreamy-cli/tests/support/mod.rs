@@ -339,6 +339,7 @@ pub struct Client {
     pub stream: UnixStream,
     pub lines: mpsc::Receiver<Value>,
     pub seen: Vec<Value>,
+    closed: bool,
 }
 
 impl Client {
@@ -348,7 +349,9 @@ impl Client {
         let (tx, lines) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(read).lines().map_while(Result::ok) {
-                if tx.send(serde_json::from_str(&line).unwrap()).is_err() {
+                let message =
+                    serde_json::from_str(&line).unwrap_or_else(|_| json!({ "unparsed": line }));
+                if tx.send(message).is_err() {
                     return;
                 }
             }
@@ -357,6 +360,7 @@ impl Client {
             stream,
             lines,
             seen: Vec::new(),
+            closed: false,
         }
     }
 
@@ -368,10 +372,18 @@ impl Client {
 
     pub fn until(&mut self, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
         self.try_until(pred)
-            .unwrap_or_else(|| panic!("no {what}; seen {:#?}", self.seen))
+            .unwrap_or_else(|| panic!("no {what} {}; seen {:#?}", self.missed(), self.seen))
     }
 
-    /// `None` once `T` passes without a match.
+    fn missed(&self) -> String {
+        if self.closed {
+            "before serve closed the connection".to_owned()
+        } else {
+            format!("within {T:?}")
+        }
+    }
+
+    /// `None` once `T` passes without a match, or once serve closes the connection.
     pub fn try_until(&mut self, pred: impl Fn(&Value) -> bool) -> Option<Value> {
         if let Some(i) = self.seen.iter().position(&pred) {
             return Some(self.seen.remove(i));
@@ -382,7 +394,11 @@ impl Client {
             match self.lines.recv_timeout(left) {
                 Ok(m) if pred(&m) => return Some(m),
                 Ok(m) => self.seen.push(m),
-                Err(_) => return None,
+                Err(mpsc::RecvTimeoutError::Timeout) => return None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.closed = true;
+                    return None;
+                }
             }
         }
     }
@@ -411,7 +427,7 @@ impl Client {
             .map_err(|e| format!("status unavailable: {e}"))?;
         self.try_until(|m| m["type"] != "event" && m["id"] == "st")
             .map(|m| m["data"].clone())
-            .ok_or_else(|| "status unavailable: no reply".to_owned())
+            .ok_or_else(|| format!("status unavailable: no reply {}", self.missed()))
     }
 
     pub fn drain(&mut self) {
