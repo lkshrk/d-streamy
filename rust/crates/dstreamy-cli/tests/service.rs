@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
@@ -67,15 +68,12 @@ impl Fake {
     }
 
     fn script(&self, body: &str) {
-        let script = self.systemctl();
-        fs::write(
-            &script,
-            format!(
+        write_executable(
+            &self.systemctl(),
+            &format!(
                 "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s\\n' \"$*\" >> \"$d/calls\"\n{body}"
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        );
     }
 
     fn set_unit_path(&self, dirs: &[&Path]) {
@@ -569,16 +567,38 @@ fn uninstall_removes_a_dangling_enablement_link_left_without_a_loaded_unit() {
     assert!(fs::symlink_metadata(&link).is_err());
 }
 
-/// Spawns `cmd`, retrying while a concurrent test's fork still holds the fresh copy open for writing (ETXTBSY).
-fn spawn_copy(cmd: &mut Command) -> KillOnDrop {
-    for _ in 0..50 {
-        match cmd.spawn() {
-            Ok(child) => return alive(child),
-            Err(e) if e.raw_os_error() == Some(26) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => panic!("{e}"),
-        }
-    }
-    panic!("the copy stayed busy");
+/// Written by a child process, so no fork of this test process holds a write descriptor that makes the exec fail with ETXTBSY.
+fn write_executable(path: &Path, body: &str) {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("cat > \"$1\" && chmod 755 \"$1\"")
+        .arg("sh")
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(body.as_bytes())
+        .unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "writing {}",
+        path.display()
+    );
+}
+
+/// `fs::copy` from a child process, for the same reason as `write_executable`.
+fn copy_executable(from: &Path, to: &Path) {
+    let status = Command::new("cp").arg(from).arg(to).status().unwrap();
+    assert!(
+        status.success(),
+        "copying {} to {}",
+        from.display(),
+        to.display()
+    );
 }
 
 #[test]
@@ -586,14 +606,16 @@ fn a_service_whose_binary_was_replaced_at_the_same_path_is_restarted() {
     let fake = Fake::new();
     let exe = copy_of_dstreamy_in(&fake.dir.path().join("bin"));
     let runtime = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let old = spawn_copy(
+    let old = alive(
         Command::new(&exe)
             .arg("serve")
             .env("XDG_RUNTIME_DIR", runtime.path())
             .env("DSTREAMY_CONFIG_DIR", fake.dir.path().join("serve-config"))
             .env("HOME", fake.dir.path())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()),
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
     );
     stdout(
         &fake
@@ -602,7 +624,7 @@ fn a_service_whose_binary_was_replaced_at_the_same_path_is_restarted() {
             .unwrap(),
     );
     let upgrade = fake.dir.path().join("bin/dstreamy.new");
-    fs::copy(dstreamy(), &upgrade).unwrap();
+    copy_executable(&dstreamy(), &upgrade);
     fs::rename(&upgrade, &exe).unwrap();
     fake.answer_show(&running(old.0.id()));
     fs::remove_file(fake.dir.path().join("calls")).unwrap();
@@ -841,7 +863,7 @@ fn a_relative_config_directory_is_refused() {
 fn copy_of_dstreamy_in(dir: &Path) -> PathBuf {
     fs::create_dir_all(dir).unwrap();
     let exe = dir.join("dstreamy");
-    fs::copy(dstreamy(), &exe).unwrap();
+    copy_executable(&dstreamy(), &exe);
     exe
 }
 
