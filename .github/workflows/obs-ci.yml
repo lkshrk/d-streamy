@@ -495,15 +495,25 @@ jobs:
           cargo clippy --workspace --all-targets --locked --features test-hooks -- -D warnings
           cargo test --workspace --locked
 
+      - name: Locate dumpbin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "no Visual Studio with the x64 VC tools" }
+          $version = (Get-Content -Raw "$vs\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt").Trim()
+          $dumpbin = Get-Item "$vs\VC\Tools\MSVC\$version\bin\Hostx64\x64\dumpbin.exe" -ErrorAction Stop
+          "DUMPBIN=$($dumpbin.FullName -replace '\\', '/')" >> $env:GITHUB_ENV
+
       - name: Check the plugin DLL
         shell: bash
         run: |
           set -o pipefail
-          dumpbin=$(find "/c/Program Files/Microsoft Visual Studio" -path '*Hostx64/x64/dumpbin.exe' | head -n 1)
           {
             ls -l obs/build_x64/rundir
-            "$dumpbin" -nologo -exports obs/build_x64/rundir/obs-dstreamy.dll
-            "$dumpbin" -nologo -dependents obs/build_x64/rundir/obs-dstreamy.dll
+            "$DUMPBIN" -nologo -exports obs/build_x64/rundir/obs-dstreamy.dll
+            "$DUMPBIN" -nologo -dependents obs/build_x64/rundir/obs-dstreamy.dll
           } | tee "$OBS_LOGS/plugin-dll.log"
           grep -qw obs_module_load "$OBS_LOGS/plugin-dll.log"
 
