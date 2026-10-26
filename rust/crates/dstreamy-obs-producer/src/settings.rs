@@ -272,22 +272,20 @@ fn x264_b_frames(s: &EncoderSettings) -> i64 {
     b
 }
 
-/// x264_param_apply_profile gives up before zeroing B-frames for 4:4:4 input and for lossless CRF (x264 base.c:761-770),
-/// and obs-x264 only warns (obs-x264.c:293-299); obs-x264 feeds x264 4:4:4 only from I444 (:482-489).
+/// x264 skips baseline's B-frame zeroing for 4:4:4 or lossless input (base.c:761-770; obs-x264.c:293-299,378-386,482-489).
 fn x264_baseline_applies(s: &EncoderSettings) -> bool {
-    let crf_mode = ["VBR", "CRF"]
-        .iter()
-        .any(|m| s.string("rate_control").eq_ignore_ascii_case(m));
+    let crf_mode = !s.bool("cbr")
+        && ["VBR", "CRF"]
+            .iter()
+            .any(|m| s.string("rate_control").eq_ignore_ascii_case(m));
     let lossless = crf_mode && s.int("crf") <= 0;
     !lossless && s.format.as_deref() != Some("I444")
 }
 
 /// NVENC's Ultra High Quality tuning forces at least 4 B-frames, except in lossless mode (nvenc.c:201-202,241,259-260,294-298).
 fn nvenc_b_frames(s: &EncoderSettings) -> i64 {
-    // ffmpeg_nvenc at the pin is obs-ffmpeg's FFmpeg NVENC, which passes the tune to FFmpeg without forcing B-frames.
-    let uhq = s.id != "ffmpeg_nvenc"
-        && s.string("tune").eq_ignore_ascii_case("uhq")
-        && s.string("rate_control") != "lossless";
+    let uhq =
+        s.string("tune").eq_ignore_ascii_case("uhq") && s.string("rate_control") != "lossless";
     if uhq { s.int("bf").max(4) } else { s.int("bf") }
 }
 
@@ -331,13 +329,9 @@ pub fn check_video_encoder(s: &EncoderSettings) -> Vec<Problem> {
     problems
 }
 
-/// 4:4:4, 4:2:2 and high-bit-depth formats give profiles most H.264 decoders lack (obs-x264.c:482-489 emits 4:4:4).
+/// Only 8-bit 4:2:0 input keeps every encoder at 4:2:0; NVENC turns RGB into 4:4:4 (nvenc.c:761-775).
 pub fn check_format(format: &str) -> Vec<Problem> {
-    const REFUSED: [&str; 14] = [
-        "I444", "I422", "I412", "I210", "I010", "P010", "P216", "P416", "YUVA", "I42A", "AYUV",
-        "YA2L", "V210", "R10L",
-    ];
-    if REFUSED.contains(&format) {
+    if !["NV12", "I420"].contains(&format) {
         vec![Problem::ColorFormat {
             format: format.to_owned(),
         }]
@@ -558,11 +552,30 @@ mod tests {
     }
 
     #[test]
-    fn color_formats_other_than_8_bit_4_2_0_fail() {
-        for format in ["NV12", "I420", "BGRA"] {
+    fn x264_deprecated_cbr_switch_is_not_lossless() {
+        let defaults = json!({"preset": "veryfast", "tune": "", "profile": "baseline", "keyint_sec": 2, "x264opts": "", "rate_control": "CRF", "crf": 0});
+        let b = |user: Value| {
+            !check_video_encoder(&settings("obs_x264", defaults.clone(), user)).is_empty()
+        };
+        assert!(
+            b(json!({})),
+            "CRF 0 is lossless, so baseline is refused and B-frames stay"
+        );
+        assert!(
+            !b(json!({"cbr": true})),
+            "the deprecated cbr switch forces CBR (obs-x264.c:378-386)"
+        );
+    }
+
+    #[test]
+    fn only_nv12_and_i420_pass_the_color_format_check() {
+        for format in ["NV12", "I420"] {
             assert!(check_format(format).is_empty(), "{format}");
         }
-        for format in ["I444", "P010", "I010", "P216", "P416", "I422"] {
+        for format in [
+            "I444", "P010", "I010", "P216", "P416", "I422", "BGRA", "RGBA", "BGRX", "YUY2", "I40A",
+            "Y800", "NONE",
+        ] {
             assert_eq!(
                 check_format(format),
                 [Problem::ColorFormat {
@@ -581,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn nvenc_uhq_with_capitalised_lossless_still_has_b_frames_and_ffmpeg_nvenc_never_forces() {
+    fn nvenc_uhq_with_capitalised_lossless_still_has_b_frames_also_through_ffmpeg_nvenc() {
         let defaults = json!({"bf": 0, "keyint_sec": 2, "tune": "uhq", "rate_control": "Lossless", "opts": ""});
         let p = check_video_encoder(&settings("obs_nvenc_h264_tex", defaults.clone(), json!({})));
         assert_eq!(
@@ -591,7 +604,13 @@ mod tests {
             }],
             "lossless is matched exactly"
         );
-        assert!(check_video_encoder(&settings("ffmpeg_nvenc", defaults, json!({}))).is_empty());
+        assert_eq!(
+            check_video_encoder(&settings("ffmpeg_nvenc", defaults, json!({}))),
+            [Problem::BFrames {
+                family: Family::Nvenc
+            }],
+            "ffmpeg_nvenc is obs-nvenc's compat id, rerouted to the encoder that forces them"
+        );
     }
 
     #[test]
