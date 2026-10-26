@@ -3,27 +3,34 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::mem;
 use std::ptr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use dstreamy_obs_sys as sys;
 
 use crate::guard::{self, guard};
+use crate::log;
 
 const OUTPUT_ID: &CStr = c"dstreamy_output";
+const OUTPUT_NAME: &CStr = c"D-Streamy";
 const STATS_DECL: &CStr =
     c"void get_stats(out int video_packets, out int audio_packets, out int panics)";
 
 struct OutputHandle(*mut sys::obs_output_t);
 
-// SAFETY: libobs output functions synchronise internally; the stop thread mirrors null-output.c.
+// SAFETY: obs_output_end_data_capture may be called from any thread (null-output.c:66-80 does).
 unsafe impl Send for OutputHandle {}
+
+#[derive(Default)]
+struct Stats {
+    video: AtomicI64,
+    audio: AtomicI64,
+}
 
 struct Output {
     output: *mut sys::obs_output_t,
-    video: AtomicI64,
-    audio: AtomicI64,
+    stats: Arc<Stats>,
     panic_at: i64,
     stop_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -41,17 +48,17 @@ impl Output {
     }
 
     fn count(&self, packet: &sys::encoder_packet) {
+        let stats = &self.stats;
         let counter = if packet.type_ == sys::OBS_ENCODER_VIDEO {
-            &self.video
+            &stats.video
         } else {
-            &self.audio
+            &stats.audio
         };
-        let seen = self.video.load(Ordering::Relaxed) + self.audio.load(Ordering::Relaxed) + 1;
+        let seen = stats.video.load(Ordering::Relaxed) + stats.audio.load(Ordering::Relaxed) + 1;
+        counter.fetch_add(1, Ordering::Relaxed);
         if self.panic_at > 0 && seen == self.panic_at {
-            counter.fetch_add(1, Ordering::Relaxed);
             panic!("test panic at packet {seen}");
         }
-        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -63,7 +70,7 @@ unsafe fn state<'a>(data: *mut c_void) -> &'a Output {
 }
 
 extern "C" fn output_get_name(_type_data: *mut c_void) -> *const c_char {
-    guard("get_name", ptr::null(), || c"D-Streamy".as_ptr())
+    guard("get_name", OUTPUT_NAME.as_ptr(), || OUTPUT_NAME.as_ptr())
 }
 
 extern "C" fn output_create(
@@ -73,19 +80,26 @@ extern "C" fn output_create(
     guard("create", ptr::null_mut(), || {
         // SAFETY: libobs passes the output's live settings object.
         let panic_at = unsafe { sys::obs_data_get_int(settings, c"panic_at_packet".as_ptr()) };
-        let state = Box::into_raw(Box::new(Output {
-            output,
-            video: AtomicI64::new(0),
-            audio: AtomicI64::new(0),
-            panic_at,
-            stop_thread: Mutex::new(None),
-        }));
-        // SAFETY: `state` lives until output_destroy, which libobs calls before freeing the proc handler.
+        let stats = Arc::new(Stats::default());
+        // The proc handler outlives destroy (obs.c:2669), so it holds its own reference, never released.
+        let proc_data = Arc::into_raw(Arc::clone(&stats));
+        // SAFETY: `proc_data` stays valid for the process lifetime; libobs copies the declaration.
         unsafe {
             let ph = sys::obs_output_get_proc_handler(output);
-            sys::proc_handler_add(ph, STATS_DECL.as_ptr(), Some(get_stats), state.cast());
+            sys::proc_handler_add(
+                ph,
+                STATS_DECL.as_ptr(),
+                Some(get_stats),
+                proc_data.cast_mut().cast(),
+            );
         }
-        state.cast()
+        Box::into_raw(Box::new(Output {
+            output,
+            stats,
+            panic_at,
+            stop_thread: Mutex::new(None),
+        }))
+        .cast()
     })
 }
 
@@ -101,17 +115,13 @@ extern "C" fn output_start(data: *mut c_void) -> bool {
     guard("start", false, || {
         // SAFETY: libobs passes the pointer create returned.
         let state = unsafe { state(data) };
+        state.join_stop_thread();
         // SAFETY: `state.output` is the live output this state belongs to.
         unsafe {
-            if !sys::obs_output_can_begin_data_capture(state.output, 0)
-                || !sys::obs_output_initialize_encoders(state.output, 0)
-            {
-                return false;
-            }
+            sys::obs_output_can_begin_data_capture(state.output, 0)
+                && sys::obs_output_initialize_encoders(state.output, 0)
+                && sys::obs_output_begin_data_capture(state.output, 0)
         }
-        state.join_stop_thread();
-        // SAFETY: as above.
-        unsafe { sys::obs_output_begin_data_capture(state.output, 0) }
     })
 }
 
@@ -120,19 +130,32 @@ extern "C" fn output_stop(data: *mut c_void, _ts: u64) {
         // SAFETY: libobs passes the pointer create returned.
         let state = unsafe { state(data) };
         let output = OutputHandle(state.output);
-        // libobs joins its own end-capture thread, so ending capture on the caller's thread can deadlock.
-        let handle = std::thread::spawn(move || {
-            let output = output;
-            // SAFETY: destroy joins this thread before the output is freed.
-            unsafe { sys::obs_output_end_data_capture(output.0) };
-        });
-        let previous = state
-            .stop_thread
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replace(handle);
-        if let Some(previous) = previous {
-            let _ = previous.join();
+        // Ends capture off the caller's thread, following null_output (null-output.c:66-80).
+        let spawned = std::thread::Builder::new()
+            .name("dstreamy stop".into())
+            .spawn(move || {
+                let output = output;
+                // SAFETY: destroy joins this thread before the output is freed.
+                unsafe { sys::obs_output_end_data_capture(output.0) };
+            });
+        match spawned {
+            Ok(handle) => {
+                let previous = state
+                    .stop_thread
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .replace(handle);
+                if let Some(previous) = previous {
+                    let _ = previous.join();
+                }
+            }
+            Err(e) => {
+                log::error(&format!(
+                    "cannot start the stop thread ({e}); ending capture inline"
+                ));
+                // SAFETY: `state.output` is live for the duration of this callback.
+                unsafe { sys::obs_output_end_data_capture(state.output) };
+            }
         }
     });
 }
@@ -144,26 +167,24 @@ extern "C" fn output_encoded_packet(data: *mut c_void, packet: *mut sys::encoder
         // SAFETY: a non-null packet is valid for the duration of the call.
         match unsafe { packet.as_ref() } {
             Some(packet) => state.count(packet),
-            // SAFETY: a NULL packet signals an encoder error (`obs-encoder.c:1380-1382`).
-            None => unsafe {
-                sys::obs_output_signal_stop(state.output, sys::OBS_OUTPUT_ENCODE_ERROR)
-            },
+            // full_stop already force-stopped this output before passing NULL (obs-encoder.c:1372-1384).
+            None => log::error("encoder error: the output is being stopped"),
         }
     });
 }
 
 extern "C" fn get_stats(data: *mut c_void, cd: *mut sys::calldata_t) {
     guard("get_stats", (), || {
-        // SAFETY: registered in create with the state pointer, which outlives the proc handler call.
-        let state = unsafe { state(data) };
+        // SAFETY: `data` is the Arc<Stats> leaked in output_create, valid for the process lifetime.
+        let stats = unsafe { &*data.cast_const().cast::<Stats>() };
         let values = [
-            (c"video_packets", state.video.load(Ordering::Relaxed)),
-            (c"audio_packets", state.audio.load(Ordering::Relaxed)),
+            (c"video_packets", stats.video.load(Ordering::Relaxed)),
+            (c"audio_packets", stats.audio.load(Ordering::Relaxed)),
             (c"panics", guard::panics()),
         ];
         for (name, value) in values {
             let value: i64 = value;
-            // SAFETY: the declaration types each out parameter as `int`, which calldata stores as a long long.
+            // SAFETY: calldata stores an `int` out parameter as a long long (calldata.h:165-168).
             unsafe {
                 sys::calldata_set_data(
                     cd,
