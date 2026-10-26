@@ -3,7 +3,7 @@ mod common;
 use async_trait::async_trait;
 use common::{annexb, answer_like_discord, loopback_settings};
 use discord_stream_rs::dave::DaveHandler;
-use discord_stream_rs::voice::webrtc::WebRtcWrapper;
+use discord_stream_rs::voice::webrtc::{MAX_VIDEO_FRAME_BYTES, WebRtcWrapper};
 use discord_stream_rs::voice::{WebRtcParams, codec_payload};
 use dstreamy_mock_discord::dave::DaveServer;
 use std::collections::HashMap;
@@ -217,9 +217,10 @@ async fn frames_complete_on_the_wire_in_dave_nonce_order() {
     .expect("peer connection did not connect");
     client.set_packetizer(&params, "H264").unwrap();
 
-    const FRAMES: usize = 6;
+    const FRAMES: usize = 3;
+    // About a second on the wire, so each audio frame is sent while its keyframe is still being paced.
     let mut idr = vec![0x65, 0x88];
-    idr.extend((0..60_000u32).map(|i| (i % 251) as u8 + 1));
+    idr.extend((0..MAX_VIDEO_FRAME_BYTES as u32 - 1024).map(|i| (i % 251) as u8 + 1));
     let au = annexb(&[&[0x09, 0xF0], &idr]);
     let opus = [0xFC, 0xFF, 0xFE, 0x01];
     let mut order: Vec<WireKey> = Vec::new();
@@ -248,7 +249,7 @@ async fn frames_complete_on_the_wire_in_dave_nonce_order() {
     }
 
     let mut packets: HashMap<(u32, u16), Packet> = HashMap::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while order.iter().filter(|&&(_, _, m, _)| m).count() < 2 * FRAMES
             || packets.len() < order.len()
         {

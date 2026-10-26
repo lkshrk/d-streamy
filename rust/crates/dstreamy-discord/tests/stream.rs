@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use discord_stream_rs::voice::webrtc::PACER_QUEUE_BYTES;
 use discord_stream_rs::{rewrite_sps_vui, split_nalu};
 use dstreamy_discord::{
     DiscordClient, GatewayEvent, GatewayOptions, StreamError, StreamOptions, StreamStats,
@@ -477,6 +478,9 @@ struct FloodSource {
     keyframe_requests: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
     fail_start: bool,
+    flood_every: Duration,
+    /// Until set, frames are 2 KB at 30 fps instead of `size` bytes every `flood_every`.
+    flooding: Arc<AtomicBool>,
 }
 
 impl FloodSource {
@@ -487,7 +491,16 @@ impl FloodSource {
             keyframe_requests: Arc::default(),
             stopped: Arc::default(),
             fail_start: false,
+            flood_every: Duration::from_millis(1),
+            flooding: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    fn held(size: usize, every: Duration) -> Self {
+        let mut source = Self::new(size);
+        source.flood_every = every;
+        source.flooding.store(false, Ordering::Relaxed);
+        source
     }
 }
 
@@ -505,6 +518,7 @@ impl CaptureSource for FloodSource {
         let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
         let size = self.size;
         let requests = self.keyframe_requests.clone();
+        let (flooding, flood_every) = (self.flooding.clone(), self.flood_every);
         self.task = Some(tokio::spawn(async move {
             let mut served = 0;
             for index in 0u64.. {
@@ -513,9 +527,13 @@ impl CaptureSource for FloodSource {
                 let keyframe = index % 300 == 0 || requested;
                 served = wanted;
                 let mut data = vec![0, 0, 0, 1, if keyframe { 0x65 } else { 0x41 }];
-                data.extend(index.to_be_bytes().map(|b| b | 0x80));
-                data.extend((wanted as u64).to_be_bytes().map(|b| b | 0x80));
-                data.resize(size, if requested { REQUESTED_FILL } else { 0x55 });
+                data.extend(flood_field(index));
+                data.extend(flood_field(wanted as u64));
+                let flood = flooding.load(Ordering::Relaxed);
+                data.resize(
+                    if flood { size } else { 2_000 },
+                    if requested { REQUESTED_FILL } else { 0x55 },
+                );
                 let frame = MediaFrame::Video(EncodedVideoFrame {
                     codec: VideoCodec::H264,
                     data,
@@ -525,7 +543,12 @@ impl CaptureSource for FloodSource {
                 if tx.send(frame).await.is_err() {
                     return;
                 }
-                sleep(Duration::from_millis(1)).await;
+                sleep(if flood {
+                    flood_every
+                } else {
+                    Duration::from_millis(33)
+                })
+                .await;
             }
         }));
         Ok(rx)
@@ -549,6 +572,19 @@ async fn start(
     client: &Arc<DiscordClient>,
     source: impl CaptureSource + 'static,
 ) -> dstreamy_discord::StreamHandle {
+    start_with(
+        client,
+        source,
+        StreamOptions::new(capture(VideoCodec::H264, 320, 180)),
+    )
+    .await
+}
+
+async fn start_with(
+    client: &Arc<DiscordClient>,
+    source: impl CaptureSource + 'static,
+    options: StreamOptions,
+) -> dstreamy_discord::StreamHandle {
     timeout(
         T,
         start_stream(
@@ -556,7 +592,7 @@ async fn start(
             Some(MOCK_GUILD_ID.into()),
             MOCK_VOICE_CHANNEL_ID.into(),
             Box::new(source),
-            StreamOptions::new(capture(VideoCodec::H264, 320, 180)),
+            options,
         ),
     )
     .await
@@ -585,69 +621,111 @@ async fn left_voice_times(mock: &MockDiscord, n: usize) {
 
 /// Filler of a FloodSource keyframe produced because a keyframe was requested.
 const REQUESTED_FILL: u8 = 0x5A;
+const FLOOD_FRAME_BYTES: usize = 100_000;
+/// The pump's `KEYFRAME_RETRY`.
+const KEYFRAME_RETRY: Duration = Duration::from_secs(1);
 
-/// A FloodSource frame's index and the keyframe requests seen when it was made; bytes carry a high bit so no start code forms.
+/// Seven bits per byte with the high bit set, so no start code or emulation prevention can form.
+fn flood_field(value: u64) -> [u8; 8] {
+    std::array::from_fn(|i| ((value >> (7 * i)) & 0x7F) as u8 | 0x80)
+}
+
+/// A FloodSource frame's index and the keyframe requests seen when it was made.
 fn flood_tag(f: &RecordedVideoFrame) -> Option<(u64, u64)> {
     let unit = *nal_units(&f.data).first()?;
     let field = |at: usize| -> Option<u64> {
-        let bytes: [u8; 8] = unit.get(at..at + 8)?.try_into().ok()?;
-        Some(u64::from_be_bytes(bytes.map(|b| b & 0x7F)))
+        let bytes = unit.get(at..at + 8)?;
+        Some(
+            bytes
+                .iter()
+                .enumerate()
+                .fold(0, |v, (i, b)| v | u64::from(b & 0x7F) << (7 * i)),
+        )
     };
     Some((field(1)?, field(9)?))
+}
+
+#[test]
+fn flood_tags_round_trip() {
+    for value in [0, 1, 0x7F, 0x80, 159, 204, 1 << 40] {
+        let mut data = vec![0, 0, 0, 1, 0x41];
+        data.extend(flood_field(value));
+        data.extend(flood_field(value + 1));
+        let frame = RecordedVideoFrame {
+            kind: VoiceKind::Stream,
+            server_id: String::new(),
+            ssrc: 0,
+            payload_type: 0,
+            codec: MockCodec::H264,
+            rtp_timestamp: 0,
+            data,
+            e2ee: false,
+            playout_delay: None,
+            received_at: std::time::Instant::now(),
+        };
+        assert_eq!(flood_tag(&frame), Some((value, value + 1)), "{value}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn transport_lag_drops_video_until_a_requested_keyframe() {
     let mock = MockDiscord::start().await.unwrap();
     let client = client(&mock).await;
-    let source = FloodSource::new(100_000);
-    let requests = source.keyframe_requests.clone();
-    let handle = start(&client, source).await;
+    // Eight times the pacer rate, yet slow enough that the pump's own queue never overflows.
+    let source = FloodSource::held(FLOOD_FRAME_BYTES, Duration::from_millis(4));
+    let (requests, flooding) = (source.keyframe_requests.clone(), source.flooding.clone());
+    let mut options = StreamOptions::new(capture(VideoCodec::H264, 320, 180));
+    options.max_queued_video = 64;
+    let handle = start_with(&client, source, options).await;
     let pacer_full = |s: &StreamStats| {
         s.last_error
             .as_deref()
             .is_some_and(|e| e.contains("pacer queue is full"))
     };
+    // The attach and DAVE requests are over and the retry interval passed, so the lag's own request is not held back.
     timeout(T, async {
-        while !pacer_full(&handle.stats()) || requests.load(Ordering::Relaxed) == 0 {
+        while handle.stats().dave_keyframe_requests == 0 {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("DAVE never asked for a keyframe: {:?}", handle.stats()));
+    sleep(KEYFRAME_RETRY + Duration::from_millis(100)).await;
+    let asked_before_lag = requests.load(Ordering::Relaxed) as u64;
+    flooding.store(true, Ordering::Relaxed);
+    timeout(T, async {
+        while !pacer_full(&handle.stats()) {
             sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .unwrap_or_else(|_| panic!("the pacer never filled: {:?}", handle.stats()));
-    // Taken after the loss, so it can only count stale frames that already arrived as acceptable.
-    let at_loss = mock.recorded().video.len();
     let lagged = handle.stats();
-    assert!(lagged.video_frames_dropped > 0, "{lagged:?}");
-    assert!(requests.load(Ordering::Relaxed) > 0);
-    let requested_idr = |f: &RecordedVideoFrame| {
+    let recovery = |f: &RecordedVideoFrame| {
         nal_units(&f.data)
             .first()
             .is_some_and(|n| n[0] & 0x1F == 5 && n.last() == Some(&REQUESTED_FILL))
+            && flood_tag(f).is_some_and(|(_, served)| served > asked_before_lag)
     };
-    // Only a hang guard: what is under test is the order below, not how fast it arrives.
     let recorded = mock
-        .wait_for(T, |r| {
-            r.video[at_loss.min(r.video.len())..]
-                .iter()
-                .any(requested_idr)
-                .then(|| r.clone())
-        })
+        .wait_for(T, |r| r.video.iter().any(recovery).then(|| r.clone()))
         .await
-        .unwrap_or_else(|| panic!("the requested keyframe never arrived: {:?}", handle.stats()));
-    let keyframe_at = at_loss
-        + recorded.video[at_loss..]
-            .iter()
-            .position(requested_idr)
-            .unwrap();
-    let stale: Vec<_> = recorded.video[at_loss..keyframe_at]
+        .unwrap_or_else(|| panic!("no keyframe answered the lag: {:?}", handle.stats()));
+    let at = recorded.video.iter().position(recovery).unwrap();
+    // Flood P-frames made before the lag's request: the pacer's backlog, plus the few it sent while filling.
+    let backlog_sent: Vec<u64> = recorded.video[..at]
         .iter()
+        .filter(|f| f.data.len() == FLOOD_FRAME_BYTES)
         .filter(|f| nal_units(&f.data).first().is_some_and(|n| n[0] & 0x1F != 5))
-        .map(flood_tag)
+        .filter_map(flood_tag)
+        .filter(|&(_, served)| served <= asked_before_lag)
+        .map(|(index, _)| index)
         .collect();
+    let backlog = PACER_QUEUE_BYTES / FLOOD_FRAME_BYTES;
     assert!(
-        stale.len() <= 1,
-        "video queued before the loss went out ahead of the requested keyframe (only the frame in flight may): {stale:?}"
+        backlog_sent.len() < backlog / 2,
+        "{} of the pacer's {backlog} queued frames went out before the requested keyframe: {backlog_sent:?}",
+        backlog_sent.len()
     );
 
     let stats = timeout(T, handle.stop()).await.unwrap().unwrap();
