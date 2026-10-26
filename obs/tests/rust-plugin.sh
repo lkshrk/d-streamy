@@ -9,14 +9,15 @@ logs=$4
 shift 4
 mkdir -p "$logs"
 modules="image-source,obs-x264,obs-ffmpeg,obs-outputs,obs-dstreamy"
-seconds=${RUST_PLUGIN_SECONDS:-3}
+timeout=60
+until_video=60
 
 run() {
   local name=$1
   shift
   echo "=== $name"
   local rc=0
-  "$harness" --seconds "$seconds" --output dstreamy_output --video-encoder obs_x264 --audio-encoder ffmpeg_opus \
+  "$harness" --seconds "$timeout" --until-video "$until_video" --output dstreamy_output --video-encoder obs_x264 --audio-encoder ffmpeg_opus \
     --plugin-bin "$bin" --plugin-data "$data" --modules "$modules" --trace-dir "$logs/$name-trace" "$@" \
     >"$logs/$name.log" 2>&1 || rc=$?
   cat "$logs/$name.log"

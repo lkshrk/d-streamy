@@ -62,6 +62,7 @@ struct harness_args {
 	int bf;
 	int keyint_sec;
 	int expect_panics;
+	int until_video;
 	bool bf_set;
 	bool keyint_set;
 	int argc;
@@ -462,6 +463,7 @@ static void usage(void)
 	fprintf(stderr,
 		"usage: obs-harness [--trace-dir DIR] [--seconds N] [--fps N] [--width N] [--height N]\n"
 		"  [--video-encoder ID] [--audio-encoder ID] [--output ID] [--output-settings JSON] [--expect-panics N]\n"
+		"  [--until-video N (plugin output: run until it counted N video packets; --seconds is the timeout)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
 		"  [--modules a,b,c] [--plugin-bin DIR --plugin-data DIR] [--note TEXT] [--x264opts OPTS] [--verbose]\n");
@@ -527,6 +529,8 @@ static int parse_args(int argc, char **argv)
 			args.output_settings = v;
 		else if (strcmp(a, "--expect-panics") == 0)
 			ok = parse_int(a, v, 0, &args.expect_panics);
+		else if (strcmp(a, "--until-video") == 0)
+			ok = parse_int(a, v, 1, &args.until_video);
 		else if (strcmp(a, "--trace-dir") == 0)
 			args.trace_dir = v;
 		else if (strcmp(a, "--plugin-bin") == 0)
@@ -587,14 +591,50 @@ static struct frame_counts frame_counts(void)
 
 static struct frame_counts frame_delta;
 
-static bool check_output_stats(obs_output_t *output, obs_encoder_t *aenc)
+struct output_stats {
+	long long video;
+	long long audio;
+	long long panics;
+};
+
+static bool output_stats(obs_output_t *output, struct output_stats *out)
 {
 	calldata_t cd = {0};
 	bool ok = proc_handler_call(obs_output_get_proc_handler(output), "get_stats", &cd);
-	long long video = calldata_int(&cd, "video_packets");
-	long long audio = calldata_int(&cd, "audio_packets");
-	long long panics = calldata_int(&cd, "panics");
+	out->video = calldata_int(&cd, "video_packets");
+	out->audio = calldata_int(&cd, "audio_packets");
+	out->panics = calldata_int(&cd, "panics");
 	calldata_free(&cd);
+	return ok;
+}
+
+static bool wait_for_plugin_video(obs_output_t *output)
+{
+	uint64_t start = os_gettime_ns();
+	uint64_t deadline = start + (uint64_t)args.seconds * 1000000000ULL;
+	struct output_stats st = {0};
+	while (os_gettime_ns() < deadline) {
+		if (!output_stats(output, &st))
+			return false;
+		if (st.video >= args.until_video && st.panics >= args.expect_panics) {
+			printf("HARNESS reached video=%lld after %llu ms\n", st.video,
+			       (unsigned long long)((os_gettime_ns() - start) / 1000000));
+			return true;
+		}
+		if (os_event_timedwait(full_event, 100) == 0)
+			break;
+	}
+	harness_error("plugin counted %lld of %d video packets within %d s", st.video, args.until_video, args.seconds);
+	return false;
+}
+
+static bool check_output_stats(obs_output_t *output, obs_encoder_t *aenc)
+{
+	struct output_stats st;
+	bool ok = output_stats(output, &st);
+	long long video = st.video;
+	long long audio = st.audio;
+	long long panics = st.panics;
 	if (!ok) {
 		harness_error("output %s has no get_stats proc", args.output_id);
 		return false;
@@ -920,9 +960,12 @@ int main(int argc, char **argv)
 	struct frame_counts at_start = frame_counts();
 
 	unsigned long budget_ms = (unsigned long)args.seconds * 1000 + 30000;
-	if (!recording)
-		os_event_timedwait(full_event, (unsigned long)args.seconds * 1000);
-	else if (os_event_timedwait(full_event, budget_ms) != 0)
+	if (!recording) {
+		if (!args.until_video)
+			FAIL("--output %s needs --until-video", args.output_id);
+		if (!wait_for_plugin_video(output))
+			rc = 1;
+	} else if (os_event_timedwait(full_event, budget_ms) != 0)
 		FAIL("no %d s of video within %lu ms", args.seconds, budget_ms);
 
 	struct frame_counts at_end = frame_counts();
