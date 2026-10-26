@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Line tables keep file:line in backtraces at a fraction of full debuginfo's size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true

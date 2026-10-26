@@ -34,6 +34,8 @@ env:
   OBS_TAG: "32.2.2"
   OBS_COMMIT: ba2f32bdf791005443988a4955e963663e16b1ed
   OBS_BUILD_REV: "1"
+  # Line tables keep file:line in backtraces at a fraction of full debuginfo's size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   obs-linux:
