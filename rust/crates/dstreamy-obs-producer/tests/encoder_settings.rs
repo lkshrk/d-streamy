@@ -203,3 +203,39 @@ fn d_streamys_own_settings_pass_on_every_encoder() {
         assert!(problems.is_empty(), "{}: {problems:?}", f.id);
     }
 }
+
+/// Share mode with the frontend's x264, whose sheet has no B-frames property (obs-x264.c:179-219).
+#[test]
+fn x264_share_mode_cases() {
+    let f = fixtures().into_iter().find(|f| f.id == "obs_x264").unwrap();
+    let base = json!({"keyint_sec": 2});
+    let default = check(&f, base.clone());
+    assert_eq!(
+        default,
+        [Problem::BFrames {
+            family: Family::X264
+        }],
+        "veryfast with bf unset has 3 B-frames"
+    );
+    assert!(
+        default[0]
+            .message()
+            .ends_with("› Tune: zerolatency, or Profile: baseline")
+    );
+    for user in [
+        json!({"tune": "zerolatency"}),
+        json!({"profile": "baseline"}),
+        json!({"preset": "ultrafast"}),
+        json!({"bf": 0}),
+    ] {
+        let problems = check(&f, merged(base.clone(), user.clone()));
+        assert!(problems.is_empty(), "{user}: {problems:?}");
+    }
+    for opts in ["bframes=0", "bframes=2", "keyint=60"] {
+        let problems = check(&f, merged(base.clone(), json!({"bf": 0, "x264opts": opts})));
+        assert!(
+            matches!(problems[..], [Problem::CustomOptions { .. }]),
+            "x264opts {opts}: {problems:?}"
+        );
+    }
+}

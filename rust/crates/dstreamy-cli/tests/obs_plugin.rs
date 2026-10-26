@@ -748,3 +748,28 @@ fn the_own_encoder_runs_at_60_fps_on_a_60_fps_canvas() {
         "RTP steps at 90 kHz: {steps:?}"
     );
 }
+
+/// PRD decision 9: audio is always D-Streamy's own Opus, even when the stream's AAC encoder is attached.
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn share_mode_replaces_an_attached_aac_encoder_with_opus() {
+    let (lines, _) = stream(
+        json!({"mode": "share"}),
+        &[
+            "--bf",
+            "0",
+            "--keyint-sec",
+            "2",
+            "--audio-encoder",
+            "ffmpeg_aac",
+        ],
+        90,
+    );
+    assert!(
+        has_plugin_line(
+            &lines,
+            "replacing the attached audio encoder ffmpeg_aac with D-Streamy's own Opus encoder"
+        ),
+        "{lines:#?}"
+    );
+}
