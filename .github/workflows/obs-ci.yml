@@ -62,39 +62,44 @@ jobs:
       - name: OBS pin matches obs/buildspec.json
         run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
 
-      - name: Runner image
-        id: image
-        run: echo "version=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
       - name: Restore apt archives
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: apt-restore
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/apt-archives
-          key: apt-obs-linux-${{ steps.image.outputs.version }}-${{ hashFiles('.github/workflows/obs-ci.yml') }}
-          restore-keys: apt-obs-linux-${{ steps.image.outputs.version }}-
-      - name: Install build and runtime dependencies
+          key: apt-obs-linux-ubuntu-24.04-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: apt-obs-linux-ubuntu-24.04-
+      - name: Install system dependencies
         timeout-minutes: 30
         run: |
-          retry() { for i in 1 2 3; do "$@" && return; echo "attempt $i failed: $*"; sleep 15; done; return 1; }
-          mkdir -p ~/apt-archives/partial
-          apt=(-o "Dir::Cache::archives=$HOME/apt-archives/" -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120)
-          args=(-y --no-install-recommends \
-            build-essential cmake ninja-build pkg-config git curl jq \
-            libglib2.0-dev extra-cmake-modules libcurl4-openssl-dev \
-            libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev libavutil-dev \
-            libswresample-dev libswscale-dev libjansson-dev libx11-xcb-dev libgles2-mesa-dev \
-            libwayland-dev libpipewire-0.3-dev libpulse-dev libx264-dev libmbedtls-dev libgl1-mesa-dev \
-            uthash-dev libsimde-dev libx11-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-xinerama0-dev \
-            libxcb-composite0-dev libxinerama-dev libxcb1-dev libxcb-xfixes0-dev libxss-dev libglvnd-dev \
-            libxkbcommon-dev libxcomposite-dev libxdamage-dev libasound2-dev libfontconfig-dev \
-            libfreetype6-dev libspeexdsp-dev libudev-dev libv4l-dev libva-dev libpci-dev libdrm-dev \
-            nlohmann-json3-dev libwebsocketpp-dev libasio-dev libqrcodegencpp-dev \
-            qt6-base-dev libqt6svg6-dev qt6-base-private-dev \
-            xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils libclang-dev)
-          retry sudo apt-get "${apt[@]}" update
-          # Only fetches are retried: killing an install mid-unpack leaves dpkg broken.
-          retry sudo apt-get "${apt[@]}" install --download-only "${args[@]}"
-          sudo apt-get "${apt[@]}" install --no-download "${args[@]}"
-          sudo chown -R "$USER" ~/apt-archives
+          "$GITHUB_WORKSPACE/.github/scripts/apt-install.sh" \
+            build-essential cmake ninja-build pkg-config git curl jq libglib2.0-dev \
+            extra-cmake-modules libcurl4-openssl-dev libavcodec-dev libavdevice-dev libavfilter-dev \
+            libavformat-dev libavutil-dev libswresample-dev libswscale-dev libjansson-dev \
+            libx11-xcb-dev libgles2-mesa-dev libwayland-dev libpipewire-0.3-dev libpulse-dev \
+            libx264-dev libmbedtls-dev libgl1-mesa-dev uthash-dev libsimde-dev libx11-dev \
+            libxcb-randr0-dev libxcb-shm0-dev libxcb-xinerama0-dev libxcb-composite0-dev \
+            libxinerama-dev libxcb1-dev libxcb-xfixes0-dev libxss-dev libglvnd-dev libxkbcommon-dev \
+            libxcomposite-dev libxdamage-dev libasound2-dev libfontconfig-dev libfreetype6-dev \
+            libspeexdsp-dev libudev-dev libv4l-dev libva-dev libpci-dev libdrm-dev \
+            nlohmann-json3-dev libwebsocketpp-dev libasio-dev libqrcodegencpp-dev qt6-base-dev \
+            libqt6svg6-dev qt6-base-private-dev xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils \
+            libclang-dev
+      - name: Check apt archives
+        id: apt-check
+        if: always()
+        run: |
+          sudo chown -R "$USER" ~/apt-archives ~/apt-archives.manifest 2>/dev/null || true
+          if [ -f ~/apt-archives.manifest ] &&
+            ! find ~/apt-archives -type f ! -name lock -printf '%P %s\n' | sort | cmp -s - ~/apt-archives.manifest; then
+            echo changed=true >>"$GITHUB_OUTPUT"
+          fi
+      - name: Save apt archives
+        if: always() && steps.apt-check.outputs.changed == 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/apt-archives
+          key: ${{ steps.apt-restore.outputs.cache-primary-key }}
 
       - name: Restore OBS build
         id: obs-cache

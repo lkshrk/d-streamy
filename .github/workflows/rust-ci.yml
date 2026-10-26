@@ -50,30 +50,35 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - name: Runner image
-        id: image
-        run: echo "version=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
       - name: Restore apt archives
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: apt-restore
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/apt-archives
-          key: apt-rust-linux-${{ steps.image.outputs.version }}-${{ hashFiles('.github/workflows/rust-ci.yml') }}
-          restore-keys: apt-rust-linux-${{ steps.image.outputs.version }}-
+          key: apt-rust-linux-ubuntu-24.04-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: apt-rust-linux-ubuntu-24.04-
       - name: Install system dependencies
         timeout-minutes: 30
         run: |
-          retry() { for i in 1 2 3; do "$@" && return; echo "attempt $i failed: $*"; sleep 15; done; return 1; }
-          mkdir -p ~/apt-archives/partial
-          apt=(-o "Dir::Cache::archives=$HOME/apt-archives/" -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120)
-          args=(-y --no-install-recommends clang libclang-dev \
-            libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
-            libopus-dev)
-          retry sudo apt-get "${apt[@]}" update
-          # Only fetches are retried: killing an install mid-unpack leaves dpkg broken.
-          retry sudo apt-get "${apt[@]}" install --download-only "${args[@]}"
-          sudo apt-get "${apt[@]}" install --no-download "${args[@]}"
-          sudo chown -R "$USER" ~/apt-archives
+          "$GITHUB_WORKSPACE/.github/scripts/apt-install.sh" \
+            clang libclang-dev libpipewire-0.3-dev libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly libopus-dev
+      - name: Check apt archives
+        id: apt-check
+        if: always()
+        run: |
+          sudo chown -R "$USER" ~/apt-archives ~/apt-archives.manifest 2>/dev/null || true
+          if [ -f ~/apt-archives.manifest ] &&
+            ! find ~/apt-archives -type f ! -name lock -printf '%P %s\n' | sort | cmp -s - ~/apt-archives.manifest; then
+            echo changed=true >>"$GITHUB_OUTPUT"
+          fi
+      - name: Save apt archives
+        if: always() && steps.apt-check.outputs.changed == 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/apt-archives
+          key: ${{ steps.apt-restore.outputs.cache-primary-key }}
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -117,29 +122,34 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - name: Runner image
-        id: image
-        run: echo "version=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
       - name: Restore apt archives
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: apt-restore
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/apt-archives
-          key: apt-service-linux-${{ steps.image.outputs.version }}-${{ hashFiles('.github/workflows/rust-ci.yml') }}
-          restore-keys: apt-service-linux-${{ steps.image.outputs.version }}-
+          key: apt-service-linux-ubuntu-24.04-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: apt-service-linux-ubuntu-24.04-
       - name: Install system dependencies
         timeout-minutes: 30
         run: |
-          retry() { for i in 1 2 3; do "$@" && return; echo "attempt $i failed: $*"; sleep 15; done; return 1; }
-          mkdir -p ~/apt-archives/partial
-          apt=(-o "Dir::Cache::archives=$HOME/apt-archives/" -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120)
-          args=(-y --no-install-recommends clang libclang-dev \
-            libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libopus-dev)
-          retry sudo apt-get "${apt[@]}" update
-          # Only fetches are retried: killing an install mid-unpack leaves dpkg broken.
-          retry sudo apt-get "${apt[@]}" install --download-only "${args[@]}"
-          sudo apt-get "${apt[@]}" install --no-download "${args[@]}"
-          sudo chown -R "$USER" ~/apt-archives
+          "$GITHUB_WORKSPACE/.github/scripts/apt-install.sh" \
+            clang libclang-dev libpipewire-0.3-dev libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev libopus-dev
+      - name: Check apt archives
+        id: apt-check
+        if: always()
+        run: |
+          sudo chown -R "$USER" ~/apt-archives ~/apt-archives.manifest 2>/dev/null || true
+          if [ -f ~/apt-archives.manifest ] &&
+            ! find ~/apt-archives -type f ! -name lock -printf '%P %s\n' | sort | cmp -s - ~/apt-archives.manifest; then
+            echo changed=true >>"$GITHUB_OUTPUT"
+          fi
+      - name: Save apt archives
+        if: always() && steps.apt-check.outputs.changed == 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/apt-archives
+          key: ${{ steps.apt-restore.outputs.cache-primary-key }}
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
