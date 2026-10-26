@@ -1,0 +1,12 @@
+[test-groups]
+trace-replay-macos = { max-threads = 1 }
+
+# exclusive_on_macos() in tests/trace_replay.rs only serialises tests within one process.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "macos")'
+filter = 'binary_id(dstreamy-cli::trace_replay)'
+test-group = 'trace-replay-macos'
+
+[profile.ci]
+fail-fast = false
+slow-timeout = { period = "60s" }
