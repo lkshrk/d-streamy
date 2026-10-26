@@ -62,11 +62,21 @@ jobs:
       - name: OBS pin matches obs/buildspec.json
         run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
 
+      - name: Runner image
+        id: image
+        run: echo "version=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Restore apt archives
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/apt-archives
+          key: apt-obs-linux-${{ steps.image.outputs.version }}-${{ hashFiles('.github/workflows/obs-ci.yml') }}
+          restore-keys: apt-obs-linux-${{ steps.image.outputs.version }}-
       - name: Install build and runtime dependencies
         timeout-minutes: 30
         run: |
           retry() { for i in 1 2 3; do "$@" && return; echo "attempt $i failed: $*"; sleep 15; done; return 1; }
-          apt=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120)
+          mkdir -p ~/apt-archives/partial
+          apt=(-o "Dir::Cache::archives=$HOME/apt-archives/" -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120)
           args=(-y --no-install-recommends \
             build-essential cmake ninja-build pkg-config git curl jq \
             libglib2.0-dev extra-cmake-modules libcurl4-openssl-dev \
@@ -84,6 +94,7 @@ jobs:
           # Only fetches are retried: killing an install mid-unpack leaves dpkg broken.
           retry sudo apt-get "${apt[@]}" install --download-only "${args[@]}"
           sudo apt-get "${apt[@]}" install --no-download "${args[@]}"
+          sudo chown -R "$USER" ~/apt-archives
 
       - name: Restore OBS build
         id: obs-cache
