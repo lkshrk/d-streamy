@@ -599,7 +599,7 @@ static bool check_output_stats(obs_output_t *output, obs_encoder_t *aenc)
 		harness_error("output %s has no get_stats proc", args.output_id);
 		return false;
 	}
-	// libobs counts each video packet it hands encoded_packet (obs-output.c:2318-2321).
+	// libobs counts each interleaved video packet it hands encoded_packet (obs-output.c:1689-1690, 1756).
 	long long obs_video = obs_output_get_total_frames(output);
 	double video_s = (double)video / args.fps;
 	double audio_s = (double)audio * (double)obs_encoder_get_frame_size(aenc) / SAMPLE_RATE;
