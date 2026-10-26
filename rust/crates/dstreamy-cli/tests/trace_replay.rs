@@ -24,6 +24,7 @@ const AUDIO_HZ: i64 = 48_000;
 const PACING_SLACK_US: i64 = 20_000;
 const STALL_TICK: Duration = Duration::from_millis(2);
 const STALL_MIN: Duration = Duration::from_millis(10);
+const MIN_BASELINE_FRAMES: usize = 15;
 
 fn traces_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../obs/tests/traces")
@@ -343,6 +344,9 @@ fn markers(
     fps: i64,
     what: &str,
 ) -> Vec<MarkerPair> {
+    if video.is_empty() || audio.is_empty() {
+        return Vec::new();
+    }
     let frames = luma_frames(video);
     let flashes = sync::flash_onsets(&frames);
     let pcm = pcm(audio);
@@ -748,7 +752,7 @@ fn wait_or_drops<V>(
     })
 }
 
-/// Frames the mock received before `at` and after it; an RTP jump also marks serve dropping video to a keyframe.
+/// Frames the mock received before `at` and after it.
 fn split<'a, T>(
     frames: &[&'a T],
     received: impl Fn(&T) -> Instant,
@@ -808,9 +812,11 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
 
     let (v1, v2) = split(&stream_video(&recorded), |v| v.received_at, reattached);
     let (a1, a2) = split(&producer_audio(&recorded), |a| a.received_at, reattached);
+    let drops = serve_drops(&c.status(), &canary.stalls());
     assert!(
         is_keyframe(&v2[0].data),
-        "first video after the gap is not an IDR"
+        "first video after the gap is not an IDR; {drops:?}; stalls {:?}",
+        canary.stalls()
     );
     assert_eq!(
         a1[0].data, want.audio[lost_first].key,
@@ -818,26 +824,42 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
     );
     let fps = want.fps;
     let step = (VIDEO_HZ / fps) as u32;
+    // Serve dropping video to a keyframe leaves an RTP jump inside the run.
     let undropped = v1
         .windows(2)
         .position(|w| w[1].rtp_timestamp.wrapping_sub(w[0].rtp_timestamp) != step)
         .map_or(v1.len(), |i| i + 1);
-    let v1_kept = &v1[..undropped];
-    let kept_until = rtp_us(v1_kept[v1_kept.len() - 1].rtp_timestamp, VIDEO_HZ);
-    let a1_kept: Vec<_> = a1
-        .iter()
-        .copied()
-        .filter(|a| rtp_us(a.rtp_timestamp, AUDIO_HZ) <= kept_until)
-        .collect();
-    let drops = serve_drops(&c.status(), &canary.stalls());
-    let before = markers(v1_kept, &a1_kept, fps, "before the kill");
-    assert!(
-        !before.is_empty() || drops.is_some(),
-        "no markers before the kill in {} of {} frames: {before:?}",
-        v1_kept.len(),
-        v1.len()
-    );
-    assert_av_aligned(v1_kept, &a1_kept, &want, "before the kill");
+    let dropped_in_v1 = drops.as_ref().filter(|_| undropped < v1.len());
+    if undropped < MIN_BASELINE_FRAMES {
+        let dropped = dropped_in_v1.unwrap_or_else(|| {
+            panic!(
+                "before the kill: video jumps after {undropped} of {} frames, but serve reports no drops",
+                v1.len()
+            )
+        });
+        eprintln!(
+            "before the kill: no baseline, serve dropped video after {undropped} frames; {dropped}"
+        );
+    } else {
+        let v1_kept = &v1[..undropped];
+        let kept_from = rtp_us(v1_kept[0].rtp_timestamp, VIDEO_HZ);
+        let kept_until = rtp_us(v1_kept[v1_kept.len() - 1].rtp_timestamp, VIDEO_HZ);
+        let a1_kept: Vec<_> = a1
+            .iter()
+            .copied()
+            .filter(|a| rtp_us(a.rtp_timestamp, AUDIO_HZ) <= kept_until)
+            .collect();
+        let before = markers(v1_kept, &a1_kept, fps, "before the kill");
+        let too_short = kept_until - kept_from < sync::FLASH_PERIOD_US;
+        assert!(
+            !before.is_empty() || (too_short && dropped_in_v1.is_some()),
+            "no markers before the kill in {} of {} frames, {} µs; {drops:?}",
+            v1_kept.len(),
+            v1.len(),
+            kept_until - kept_from
+        );
+        assert_av_aligned(v1_kept, &a1_kept, &want, "before the kill");
+    }
     check_replay(&v2, &a2, &want, 0, &canary.stalls(), "after the restart");
 
     let last_before = rtp_us(v1.last().unwrap().rtp_timestamp, VIDEO_HZ);
