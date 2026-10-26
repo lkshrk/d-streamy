@@ -621,8 +621,11 @@ static bool wait_for_plugin_video(obs_output_t *output)
 			       (unsigned long long)((os_gettime_ns() - start) / 1000000));
 			return true;
 		}
-		if (os_event_timedwait(full_event, 100) == 0)
-			break;
+		if (os_event_timedwait(full_event, 100) == 0) {
+			output_stats(output, &st);
+			harness_error("output stopped after %lld of %d video packets", st.video, args.until_video);
+			return false;
+		}
 	}
 	harness_error("plugin counted %lld of %d video packets within %d s", st.video, args.until_video, args.seconds);
 	return false;

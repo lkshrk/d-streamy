@@ -3,8 +3,8 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::mem;
 use std::ptr;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -31,7 +31,7 @@ struct Stats {
 
 struct Output {
     output: *mut sys::obs_output_t,
-    stats: Arc<Stats>,
+    stats: Stats,
     panic_at: i64,
     started: Mutex<Option<Instant>>,
     stop_thread: Mutex<Option<JoinHandle<()>>>,
@@ -91,27 +91,19 @@ extern "C" fn output_create(
     guard("create", ptr::null_mut(), || {
         // SAFETY: libobs passes the output's live settings object.
         let panic_at = unsafe { sys::obs_data_get_int(settings, c"panic_at_packet".as_ptr()) };
-        let stats = Arc::new(Stats::default());
-        // The proc handler outlives destroy (obs.c:2669), so it holds its own reference, never released.
-        let proc_data = Arc::into_raw(Arc::clone(&stats));
-        // SAFETY: `proc_data` stays valid for the process lifetime; libobs copies the declaration.
-        unsafe {
-            let ph = sys::obs_output_get_proc_handler(output);
-            sys::proc_handler_add(
-                ph,
-                STATS_DECL.as_ptr(),
-                Some(get_stats),
-                proc_data.cast_mut().cast(),
-            );
-        }
-        Box::into_raw(Box::new(Output {
+        let state = Box::into_raw(Box::new(Output {
             output,
-            stats,
+            stats: Stats::default(),
             panic_at,
             started: Mutex::new(None),
             stop_thread: Mutex::new(None),
-        }))
-        .cast()
+        }));
+        // SAFETY: the handler dies with `state` in obs_output_destroy (obs-output.c:308,344); libobs copies the decl.
+        unsafe {
+            let ph = sys::obs_output_get_proc_handler(output);
+            sys::proc_handler_add(ph, STATS_DECL.as_ptr(), Some(get_stats), state.cast());
+        }
+        state.cast()
     })
 }
 
@@ -169,7 +161,7 @@ extern "C" fn output_stop(data: *mut c_void, _ts: u64) {
             }
             Err(e) => {
                 log::error(&format!(
-                    "cannot start the stop thread ({e}); ending capture inline"
+                    "cannot start the stop thread ({e}); ending capture inline, which can block if called from full_stop"
                 ));
                 // SAFETY: `state.output` is live for the duration of this callback.
                 unsafe { sys::obs_output_end_data_capture(state.output) };
@@ -185,7 +177,7 @@ extern "C" fn output_encoded_packet(data: *mut c_void, packet: *mut sys::encoder
         // SAFETY: a non-null packet is valid for the duration of the call.
         match unsafe { packet.as_ref() } {
             Some(packet) => state.count(packet),
-            // Never end capture here: this thread holds video input_mutex, which end-capture's join can need.
+            // Unlike rtmp and ffmpeg-mux, never signal here: this thread holds video input_mutex.
             None => log::error("encoder error: the output is being stopped"),
         }
     });
@@ -193,8 +185,8 @@ extern "C" fn output_encoded_packet(data: *mut c_void, packet: *mut sys::encoder
 
 extern "C" fn get_stats(data: *mut c_void, cd: *mut sys::calldata_t) {
     guard("get_stats", (), || {
-        // SAFETY: `data` is the Arc<Stats> leaked in output_create, valid for the process lifetime.
-        let stats = unsafe { &*data.cast_const().cast::<Stats>() };
+        // SAFETY: registered in create with the state pointer; callers only call it on a live output.
+        let stats = unsafe { &state(data).stats };
         let values = [
             (c"video_packets", stats.video.load(Ordering::Relaxed)),
             (c"audio_packets", stats.audio.load(Ordering::Relaxed)),
