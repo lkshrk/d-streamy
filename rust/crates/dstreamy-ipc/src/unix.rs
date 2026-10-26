@@ -271,7 +271,16 @@ impl Listener {
 }
 
 /// Held from the stale check until bind returns, so two services starting together can't both unlink.
-fn lock_dir(dir: &Path, socket: &Path) -> Result<File, IpcError> {
+struct DirLock(File);
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        // Closing alone leaves it held while a child forked before its exec still has the descriptor.
+        let _ = self.0.unlock();
+    }
+}
+
+fn lock_dir(dir: &Path, socket: &Path) -> Result<DirLock, IpcError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -281,7 +290,7 @@ fn lock_dir(dir: &Path, socket: &Path) -> Result<File, IpcError> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(dir.join(LOCK_NAME))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(DirLock(file)),
         Err(TryLockError::WouldBlock) => Err(IpcError::AlreadyRunning(socket.to_owned())),
         Err(TryLockError::Error(e)) => Err(e.into()),
     }
@@ -477,6 +486,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, IpcError::NoHomeDirectory), "{err}");
+    }
+
+    #[test]
+    fn a_dropped_dir_lock_is_free_while_a_copy_of_its_descriptor_lives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("serve.sock");
+        let held = lock_dir(tmp.path(), &socket).unwrap();
+        let forked_copy = held.0.try_clone().unwrap();
+        drop(held);
+        lock_dir(tmp.path(), &socket).unwrap();
+        drop(forked_copy);
     }
 
     #[test]
