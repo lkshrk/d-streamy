@@ -9,7 +9,7 @@ use dstreamy_discord::{
 };
 use dstreamy_media::{
     CaptureConfig, CaptureSource, EXTERNAL_TARGET_ID, ExternalHandle, ExternalOptions,
-    ExternalSource, IdleMode, InterruptReason, OptionsError, ProducerInfo, SourceState,
+    ExternalSource, IdleMode, InterruptReason, MAX_GRACE, OptionsError, ProducerInfo, SourceState,
     SourceStats,
 };
 use serde::{Deserialize, Serialize};
@@ -137,12 +137,13 @@ impl From<&SourceState> for SourceView {
     }
 }
 
-/// Where the session that `start` began streams; omitted before a start and once the session stops.
+/// Where the session streams, as of its `start` or its last channel move; omitted before a start and once it stops.
 #[derive(Debug, Clone, Serialize)]
 pub struct Place {
     pub guild_id: String,
     pub channel_id: String,
-    pub channel_name: String,
+    /// `None` after a move to a channel the gateway's guild cache does not list.
+    pub channel_name: Option<String>,
     pub target: String,
 }
 
@@ -284,7 +285,7 @@ impl Conn {
 }
 
 struct Running {
-    place: Place,
+    target: String,
     stream: StreamConfig,
     crop: Option<CropRect>,
     external: bool,
@@ -300,12 +301,12 @@ impl Running {
         };
         stream.validate().map_err(invalid_params)?;
         let next = Self {
-            place: self.place.clone(),
+            target: self.target.clone(),
             stream,
             crop: p.crop.or(self.crop),
             external: self.external,
         };
-        let capture = stream::capture_config(&next.place.target, &next.stream, next.crop);
+        let capture = stream::capture_config(&next.target, &next.stream, next.crop);
         Ok((next, capture))
     }
 }
@@ -322,6 +323,8 @@ pub struct Engine {
     updating: tokio::sync::Mutex<()>,
     last_stats: Mutex<Option<StreamStats>>,
     running: Mutex<Option<Running>>,
+    /// Set before the session starts, so a session that stops at once never leaves it behind.
+    place: Mutex<Option<Place>>,
     started_by: Mutex<Option<u64>>,
     external: Mutex<Option<External>>,
     portal: Mutex<Option<PortalBook>>,
@@ -387,6 +390,7 @@ impl Engine {
             updating: tokio::sync::Mutex::new(()),
             last_stats: Mutex::new(None),
             running: Mutex::new(None),
+            place: Mutex::new(None),
             started_by: Mutex::new(None),
             external: Mutex::new(None),
             portal: Mutex::new(None),
@@ -469,10 +473,9 @@ impl Engine {
     pub fn status(&self) -> Status {
         let session = self.current().map(|c| {
             let state = c.session.state().borrow().clone();
-            let place = lock(&self.running)
-                .as_ref()
-                .filter(|_| !matches!(state, SessionState::Stopped { .. }))
-                .map(|r| r.place.clone());
+            let place = lock(&self.place)
+                .clone()
+                .filter(|_| !matches!(state, SessionState::Stopped { .. }));
             SessionView { state, place }
         });
         let source = lock(&self.external).as_ref().map(|e| SourceView {
@@ -581,6 +584,10 @@ impl Engine {
                             self.remember_portal_token();
                             self.release_if_stopped();
                         }
+                        SessionEvent::ChannelMoved {
+                            guild_id,
+                            channel_id,
+                        } => self.moved(guild_id.as_deref(), channel_id),
                         _ => {}
                     }
                     self.publish(EngineEvent::Session(event));
@@ -594,6 +601,22 @@ impl Engine {
         }
     }
 
+    fn moved(&self, guild_id: Option<&str>, channel_id: &str) {
+        let Some(conn) = self.current() else { return };
+        let mut place = lock(&self.place);
+        let Some(place) = place.as_mut() else { return };
+        if let Some(guild_id) = guild_id {
+            place.guild_id = guild_id.to_owned();
+        }
+        place.channel_id = channel_id.to_owned();
+        place.channel_name = conn
+            .client
+            .voice_channels(&place.guild_id)
+            .into_iter()
+            .find(|c| c.id == channel_id)
+            .map(|c| c.name);
+    }
+
     fn release_if_stopped(&self) {
         let mut hold = lock(&self.session_lock);
         let stopped = self
@@ -603,6 +626,7 @@ impl Engine {
         if stopped && !hold.starting {
             *lock(&self.started_by) = None;
             *lock(&self.external) = None;
+            *lock(&self.place) = None;
         }
     }
 
@@ -650,7 +674,9 @@ impl Engine {
             .then(|| external_options(&config.serve))
             .transpose()
             .map_err(CliError::from)?;
-        match (p.grace_secs, external_options.as_mut()) {
+        // Protocol 1 never had grace_secs and ignores fields it does not know.
+        let grace_secs = p.grace_secs.filter(|_| self.opts.allow_external);
+        match (grace_secs, external_options.as_mut()) {
             (None, _) => {}
             (Some(_), None) => {
                 return Err(invalid_params(
@@ -658,10 +684,13 @@ impl Engine {
                 ));
             }
             (Some(secs), Some(options)) => {
+                if Duration::from_secs(secs) > MAX_GRACE {
+                    return Err(invalid_params(format!(
+                        "grace_secs {secs} is longer than {} s",
+                        MAX_GRACE.as_secs()
+                    )));
+                }
                 options.grace = Duration::from_secs(secs);
-                options
-                    .validate()
-                    .map_err(|e| invalid_params(format!("invalid grace_secs {secs}: {e}")))?;
             }
         }
         let settings = StreamConfig {
@@ -691,7 +720,7 @@ impl Engine {
         let place = Place {
             guild_id: p.guild_id.clone(),
             channel_id: p.channel_id.clone(),
-            channel_name: channel.name,
+            channel_name: Some(channel.name),
             target: p.target.clone(),
         };
         let restore_token = capture::restore_token(&config);
@@ -715,6 +744,7 @@ impl Engine {
             }
             hold.starting = true;
         }
+        *lock(&self.place) = Some(place);
         #[cfg(test)]
         drop(self.start_gate.lock().await);
         let started = stream::start(&conn.session, p.guild_id, p.channel_id, source, capture).await;
@@ -722,6 +752,9 @@ impl Engine {
             let mut hold = lock(&self.session_lock);
             hold.starting = false;
             hold.release_if(started.is_err() || stream::has_stopped(&conn.session));
+        }
+        if started.is_err() {
+            *lock(&self.place) = None;
         }
         started?;
         *lock(&self.last_stats) = None;
@@ -735,7 +768,7 @@ impl Engine {
         *lock(&self.external) = handle.map(|handle| self.watch_source(handle, announced));
         self.release_if_stopped();
         *lock(&self.running) = Some(Running {
-            place,
+            target: p.target,
             stream: settings,
             crop: p.crop,
             external,
@@ -813,6 +846,7 @@ impl Engine {
             return Err(not_running());
         }
         *lock(&self.running) = None;
+        *lock(&self.place) = None;
         *lock(&self.started_by) = None;
         *lock(&self.external) = None;
         self.release_if_stopped();
@@ -853,6 +887,7 @@ impl Engine {
             }
         }
         *lock(&self.running) = None;
+        *lock(&self.place) = None;
         *lock(&self.started_by) = None;
         *lock(&self.external) = None;
         *lock(&self.session_lock) = Hold::default();
@@ -940,12 +975,7 @@ mod tests {
     #[test]
     fn an_update_carries_the_crop_and_keeps_the_rest() {
         let running = Running {
-            place: Place {
-                guild_id: "g".into(),
-                channel_id: "c".into(),
-                channel_name: "General".into(),
-                target: "display:1".into(),
-            },
+            target: "display:1".into(),
             stream: StreamConfig::default(),
             crop: None,
             external: false,
@@ -996,7 +1026,8 @@ mod tests {
 
         use dstreamy_core::ConfigPaths;
         use dstreamy_mock_discord::{
-            MOCK_GUILD_ID, MOCK_TOKEN, MOCK_VOICE_CHANNEL_ID, MockDiscord,
+            MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID, MOCK_TOKEN, MOCK_VOICE_CHANNEL_ID,
+            MockDiscord,
         };
         use tempfile::TempDir;
         use tokio::time::timeout;
@@ -1013,6 +1044,10 @@ mod tests {
 
         impl Fixture {
             async fn new() -> Self {
+                Self::with_external(true).await
+            }
+
+            async fn with_external(allow_external: bool) -> Self {
                 let mock = MockDiscord::start().await.unwrap();
                 let dir = tempfile::tempdir().unwrap();
                 let paths = ConfigPaths::in_dir(dir.path());
@@ -1023,7 +1058,7 @@ mod tests {
                 };
                 let opts = Options {
                     include_platform: false,
-                    allow_external: true,
+                    allow_external,
                     ..Options::default()
                 };
                 let engine = Engine::new(&ctx, opts);
@@ -1150,6 +1185,91 @@ mod tests {
             assert_eq!(captured.code, "invalid_params", "{}", captured.message);
             assert!(f.engine.current().is_none_or(|c| !c.live()));
             f.engine.start(external(Some(3600)), None).await.unwrap();
+            f.engine.shutdown().await;
+        }
+
+        fn status_place(f: &Fixture) -> [Value; 4] {
+            let status = serde_json::to_value(f.engine.status()).unwrap();
+            ["guild_id", "channel_id", "channel_name", "target"]
+                .map(|k| status["session"][k].clone())
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_grace_secs_of_zero_is_accepted() {
+            let f = Fixture::new().await;
+            f.engine.start(external(Some(0)), None).await.unwrap();
+            f.engine.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn protocol_1_ignores_grace_secs() {
+            let f = Fixture::with_external(false).await;
+            let p = StartParams {
+                grace_secs: Some(5),
+                ..params()
+            };
+            f.engine.start(p, None).await.unwrap();
+            f.engine.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn status_follows_a_move_to_another_channel() {
+            let f = Fixture::new().await;
+            f.engine.start(params(), None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            assert!(
+                f.mock
+                    .move_to_channel(MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID)
+            );
+            timeout(T, async {
+                while status_place(&f)[1] != json!(MOCK_OTHER_VOICE_CHANNEL_ID) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("status still names {:?}", status_place(&f)));
+            assert_eq!(
+                status_place(&f),
+                [
+                    json!(MOCK_GUILD_ID),
+                    json!(MOCK_OTHER_VOICE_CHANNEL_ID),
+                    json!("Gaming"),
+                    json!("test-pattern")
+                ]
+            );
+            f.engine.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_session_that_stops_itself_leaves_no_place_behind() {
+            let f = Fixture::new().await;
+            streams_without_a_producer_for(&f, external(Some(1))).await;
+            timeout(T, async {
+                while !f.lock_is_free() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the stopped session kept the lock");
+            assert!(lock(&f.engine.place).is_none());
+            assert!(status_place(&f).iter().all(Value::is_null));
+            f.engine.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_stopped_session_hides_its_place_before_the_stop_is_handled() {
+            let f = Fixture::new().await;
+            f.engine.start(external(Some(1)), None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            f.engine.current().unwrap().forwarder.abort();
+            f.wait_state(|s| matches!(s, SessionState::Stopped { .. }))
+                .await;
+            assert!(lock(&f.engine.place).is_some());
+            assert!(
+                status_place(&f).iter().all(Value::is_null),
+                "{:?}",
+                status_place(&f)
+            );
             f.engine.shutdown().await;
         }
 

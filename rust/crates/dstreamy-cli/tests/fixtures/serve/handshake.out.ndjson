@@ -7,4 +7,4 @@
 {"code":"malformed","id":null,"message":"malformed line: missing string field \"id\"","type":"error"}
 {"code":"invalid_params","id":"8","message":"missing object field \"video\"","type":"error"}
 {"code":"unsupported_protocol","id":"9","message":"protocol 0 is not supported; this service speaks 1 to 2","type":"error"}
-{"data":{"connection":"<connection>","platform":"<platform>","protocol":2,"status":{"session":null,"source":null,"started_by":null,"stats":null},"version":"<version>"},"id":"10","type":"result"}
+{"data":{"connection":"<connection>","features":["start_grace_secs","status_place"],"platform":"<platform>","protocol":2,"status":{"session":null,"source":null,"started_by":null,"stats":null},"version":"<version>"},"id":"10","type":"result"}

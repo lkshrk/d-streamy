@@ -245,12 +245,16 @@ enum Role {
     Producer(ProducerInfo),
 }
 
+/// What this serve supports beyond protocol 2 as first released; every build reports the same `version`.
+const FEATURES: [&str; 2] = ["start_grace_secs", "status_place"];
+
 fn hello_data(engine: &Engine, connection: u64) -> Value {
     json!({
         "protocol": PROTOCOL,
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
         "connection": connection,
+        "features": FEATURES,
         "status": engine.status(),
     })
 }
