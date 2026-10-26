@@ -5,6 +5,7 @@ mod support;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use dstreamy_media::annexb;
@@ -20,6 +21,8 @@ use support::*;
 const VIDEO_HZ: i64 = 90_000;
 const AUDIO_HZ: i64 = 48_000;
 const PACING_SLACK_US: i64 = 20_000;
+const STALL_TICK: Duration = Duration::from_millis(2);
+const STALL_MIN: Duration = Duration::from_millis(10);
 
 fn traces_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../obs/tests/traces")
@@ -166,7 +169,26 @@ fn assert_av_aligned(
     );
 }
 
-/// Arrival at the mock follows the trace's libobs dts, so the producer paces in real time.
+/// Spans in which this process got no CPU, seen by a thread that sleeps `STALL_TICK` at a time.
+fn stalls() -> Vec<(Instant, Instant)> {
+    static SPANS: Mutex<Vec<(Instant, Instant)>> = Mutex::new(Vec::new());
+    static CANARY: Once = Once::new();
+    CANARY.call_once(|| {
+        std::thread::spawn(|| {
+            loop {
+                let before = Instant::now();
+                std::thread::sleep(STALL_TICK);
+                let after = Instant::now();
+                if after - before > STALL_TICK + STALL_MIN {
+                    SPANS.lock().unwrap().push((before, after));
+                }
+            }
+        });
+    });
+    SPANS.lock().unwrap().clone()
+}
+
+/// Arrival at the mock follows the trace's libobs dts, except during or just after a stall of this process, which measures the runner.
 fn assert_paced<F>(
     recorded: &[&F],
     key: impl Fn(&F) -> Vec<u8>,
@@ -178,22 +200,38 @@ fn assert_paced<F>(
     let pairs = matched(recorded, key, sent);
     let (f0, s0) = pairs[0];
     let slack = PACING_SLACK_US.max(frame_us);
-    let mut lags: Vec<i64> = pairs
-        .iter()
-        .map(|(f, s)| {
-            let arrived = at(f).duration_since(at(f0)).as_micros() as i64;
-            arrived - (s.dts_usec - s0.dts_usec)
+    let stalls = stalls();
+    let after_stall = |t: Instant| {
+        stalls.iter().any(|&(from, to)| {
+            t >= from && t <= to + (to - from) + Duration::from_micros(slack as u64)
         })
-        .collect();
-    let mid = median(lags.clone());
-    // The reference frame's lag is 0 by construction, so a late reference would count as its own outlier.
-    lags.remove(0);
-    lags.retain(|l| (l - mid).abs() > slack);
+    };
+    let lag = |(f, s): &(&F, &Sent)| {
+        let arrived = at(f).duration_since(at(f0)).as_micros() as i64;
+        arrived - (s.dts_usec - s0.dts_usec)
+    };
+    let checked: Vec<_> = pairs.iter().filter(|(f, _)| !after_stall(at(f))).collect();
     assert!(
-        lags.len() * 50 <= pairs.len(),
-        "{what}: {} of {} frames off the trace's dts pace by more than {slack} µs: {lags:?}",
-        lags.len(),
+        checked.len() * 2 >= pairs.len(),
+        "{what}: only {} of {} frames arrived outside a stall of this process: {stalls:?}",
+        checked.len(),
         pairs.len()
+    );
+    let mid = median(checked.iter().map(|p| lag(p)).collect());
+    let off: Vec<i64> = checked
+        .iter()
+        // The reference frame's lag is 0 by construction, so a late reference would count as its own outlier.
+        .filter(|(f, _)| !std::ptr::eq(*f, f0))
+        .map(|p| lag(p))
+        .filter(|l| (l - mid).abs() > slack)
+        .collect();
+    assert!(
+        off.len() * 50 <= checked.len(),
+        "{what}: {} of {} frames off the trace's dts pace by more than {slack} µs: {off:?}; {} frames left out after {} stalls",
+        off.len(),
+        checked.len(),
+        pairs.len() - checked.len(),
+        stalls.len()
     );
 }
 
@@ -371,6 +409,7 @@ fn monotonic(recorded: &Recorded) {
 
 fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
     let want = expected(trace);
+    stalls();
     let h = Harness::new("");
     let _s = h.serve();
     let mut c = h.external_session();
@@ -538,6 +577,7 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
         .find(|(n, _, _)| n == "linux-x264-main-bf0-keyint2-30fps")
         .unwrap();
     let want = expected(&trace);
+    stalls();
     let h = Harness::new(&format!("[serve]\ngrace_secs = {}\n", grace.as_secs()));
     let _s = h.serve();
     let mut c = h.external_session();
