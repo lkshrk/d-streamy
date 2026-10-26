@@ -167,7 +167,7 @@ extern "C" fn output_encoded_packet(data: *mut c_void, packet: *mut sys::encoder
         // SAFETY: a non-null packet is valid for the duration of the call.
         match unsafe { packet.as_ref() } {
             Some(packet) => state.count(packet),
-            // full_stop already force-stopped this output before passing NULL (obs-encoder.c:1372-1384).
+            // Never end capture here: this thread holds video input_mutex, which end-capture's join can need.
             None => log::error("encoder error: the output is being stopped"),
         }
     });
