@@ -24,6 +24,7 @@ const AUDIO_HZ: i64 = 48_000;
 const PACING_SLACK_US: i64 = 20_000;
 const STALL_TICK: Duration = Duration::from_millis(2);
 const STALL_MIN: Duration = Duration::from_millis(10);
+// The A/V median needs 10 unique payloads; the restart trace repeats frames 9 and 11 later, so 15 frames leave 13.
 const MIN_BASELINE_FRAMES: usize = 15;
 
 fn traces_dir() -> PathBuf {
@@ -829,6 +830,13 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
         .windows(2)
         .position(|w| w[1].rtp_timestamp.wrapping_sub(w[0].rtp_timestamp) != step)
         .map_or(v1.len(), |i| i + 1);
+    if undropped < v1.len() {
+        assert!(
+            is_keyframe(&v1[undropped].data),
+            "before the kill: video jumps after {undropped} of {} frames to a frame that is not an IDR; {drops:?}",
+            v1.len()
+        );
+    }
     let dropped_in_v1 = drops.as_ref().filter(|_| undropped < v1.len());
     if undropped < MIN_BASELINE_FRAMES {
         let dropped = dropped_in_v1.unwrap_or_else(|| {
