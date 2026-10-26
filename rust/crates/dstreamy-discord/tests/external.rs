@@ -288,15 +288,15 @@ async fn a_producer_swap_keeps_streaming_with_continuous_decodable_media() {
         &recorded.dropped_frames[before.dropped_frames.len()..]
     );
     let drops = &before.dropped_frames;
-    // A receiver that demuxes tracks can still lose the first video frame to audio decrypted ahead of it.
-    let tolerated = format!("{FIRST_FRAME_DAVE_DROP}video");
+    // A receiver that demuxes tracks can lose either track's first frame to the other track decrypted ahead of it.
     assert!(
-        drops.len() <= 1 && drops.iter().all(|d| d.starts_with(&tolerated)),
+        drops.len() <= 1 && drops.iter().all(|d| d.starts_with(FIRST_FRAME_DAVE_DROP)),
         "drops before the reattach: {drops:?}"
     );
+    let lost_video = format!("{FIRST_FRAME_DAVE_DROP}video");
     let start = video.iter().position(|v| is_keyframe(&v.data)).unwrap();
     assert!(
-        start == 0 || drops.len() == 1,
+        start == 0 || drops.iter().any(|d| d.starts_with(&lost_video)),
         "video before the first keyframe without a lost one; drops: {drops:?}"
     );
     assert!(split > start);
