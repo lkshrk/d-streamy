@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Usage: apt-install.sh PACKAGE...
-# Installs Ubuntu packages through $APT_ARCHIVES (default ~/apt-archives), a directory
-# that actions/cache may have restored, and records its contents in $APT_ARCHIVES.manifest.
+# Usage: APT_ARCHIVES=dir apt-install.sh PACKAGE...
 set -euo pipefail
 
 cache=${APT_ARCHIVES:-$HOME/apt-archives}
@@ -18,20 +16,27 @@ retry() {
   return 1
 }
 
+if [ -L "$cache" ] || { [ -e "$cache" ] && [ ! -d "$cache" ]; }; then sudo rm -rf "$cache"; fi
+if [ -L "$cache/partial" ] || { [ -e "$cache/partial" ] && [ ! -d "$cache/partial" ]; }; then
+  sudo rm -rf "$cache/partial"
+fi
+if [ -d "$cache" ]; then
+  sudo find "$cache" -mindepth 1 -maxdepth 1 ! -name partial ! -name lock \
+    \( ! -type f -o ! -name '*.deb' \) -exec rm -rf {} +
+fi
 sudo mkdir -p "$cache/partial"
 retry sudo apt-get "${apt[@]}" update
 
 # apt trusts any archive of the right size in its cache; only the signed index's SHA256 makes a restored one safe.
 for deb in "$cache"/*.deb; do
-  [ -e "$deb" ] || continue
+  [ -f "$deb" ] || continue
   IFS=_ read -r pkg ver arch <<<"$(basename "$deb" .deb)"
   want=$(apt-cache show "$pkg=${ver//%3a/:}" 2>/dev/null |
-    awk -v a="$arch" '/^Architecture:/ { m = ($2 == a) } /^SHA256:/ && m { print $2; exit }')
+    awk -v a="$arch" '/^Architecture:/ { m = ($2 == a) } /^SHA256:/ && m { print $2; exit }') || want=
   if [ -z "$want" ] || [ "$(sha256sum "$deb" | cut -d' ' -f1)" != "$want" ]; then
     sudo rm -f "$deb"
   fi
 done
-sudo find "$cache" -maxdepth 1 ! -type d ! -name '*.deb' ! -name lock -delete
 sudo find "$cache" -type f ! -name lock -printf '%P %s\n' | sort >"$cache.manifest"
 
 retry sudo apt-get "${apt[@]}" install --download-only "${args[@]}"
