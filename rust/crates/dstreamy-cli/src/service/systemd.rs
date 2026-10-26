@@ -3,27 +3,22 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use super::{Backend, ServiceError, Step, Supervision, output, shell_words};
+use super::{Backend, Previous, QUERY_TIMEOUT, ServiceError, Step, Supervision, checked_output};
 
 pub const UNIT_NAME: &str = "dstreamy.service";
 
 pub struct Systemd {
     systemctl: PathBuf,
+    exe: PathBuf,
     unit_path: PathBuf,
-    unit: String,
 }
 
 impl Systemd {
-    /// Places the unit where the user manager looks first for user configuration.
     pub fn new(systemctl: PathBuf, exe: &Path) -> Result<Self, ServiceError> {
-        Self::with_unit_dir(systemctl, exe, &user_unit_dir()?)
-    }
-
-    pub fn with_unit_dir(systemctl: PathBuf, exe: &Path, dir: &Path) -> Result<Self, ServiceError> {
         Ok(Self {
             systemctl,
-            unit_path: dir.join(UNIT_NAME),
-            unit: unit(exe)?,
+            exe: exe.to_owned(),
+            unit_path: user_unit_dir()?.join(UNIT_NAME),
         })
     }
 
@@ -31,6 +26,15 @@ impl Systemd {
         let mut argv = vec![self.systemctl.clone().into_os_string(), "--user".into()];
         argv.extend(args.iter().map(OsString::from));
         argv
+    }
+
+    fn read(&self, args: &[&str]) -> Result<(String, String), ServiceError> {
+        let argv = self.systemctl(args);
+        let output = checked_output(&argv, Some(QUERY_TIMEOUT))?;
+        Ok((
+            super::shell_words(&argv),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        ))
     }
 }
 
@@ -43,17 +47,21 @@ impl Backend for Systemd {
         &self.unit_path
     }
 
-    fn definition(&self) -> &str {
-        &self.unit
+    fn definition(&self) -> Result<String, ServiceError> {
+        unit(&self.exe)
     }
 
-    fn install(&self) -> Vec<Step> {
+    fn install(&self, definition: &str, previous: Previous) -> Vec<Step> {
+        if previous == Previous::Same {
+            return vec![Step::Run(self.systemctl(&["enable", "--now", UNIT_NAME]))];
+        }
         vec![
             Step::Write {
                 path: self.unit_path.clone(),
-                contents: self.unit.clone(),
+                contents: definition.to_owned(),
             },
             Step::Run(self.systemctl(&["daemon-reload"])),
+            Step::Run(self.systemctl(&["try-restart", UNIT_NAME])),
             Step::Run(self.systemctl(&["enable", "--now", UNIT_NAME])),
         ]
     }
@@ -67,34 +75,72 @@ impl Backend for Systemd {
     }
 
     fn query(&self) -> Result<Supervision, ServiceError> {
-        let argv = self.systemctl(&[
+        let (_, show) = self.read(&[
             "show",
             "--property=LoadState,ActiveState,SubState,UnitFileState,MainPID",
             UNIT_NAME,
-        ]);
-        let output = output(&argv)?;
-        if !output.status.success() {
-            return Err(ServiceError::Failed {
-                command: shell_words(&argv),
-                status: output.status,
-            });
+        ])?;
+        Ok(supervision(&show))
+    }
+
+    fn check_location(&self) -> Result<(), ServiceError> {
+        let (command, show) = self.read(&["show", "--property=UnitPath"])?;
+        let search_path = property(&show, "UnitPath").ok_or(ServiceError::Unexpected {
+            command,
+            what: "UnitPath".to_owned(),
+        })?;
+        let dir = self.unit_path.parent().unwrap_or(Path::new("/"));
+        if searched(search_path, dir) {
+            Ok(())
+        } else {
+            Err(ServiceError::NotSearched {
+                dir: dir.to_owned(),
+                search_path: search_path.to_owned(),
+            })
         }
-        Ok(supervision(&String::from_utf8_lossy(&output.stdout)))
+    }
+
+    fn service_runtime_dir(&self) -> Result<Option<OsString>, ServiceError> {
+        let (command, env) = self.read(&["show-environment"])?;
+        match property(&env, "XDG_RUNTIME_DIR") {
+            None => Ok(None),
+            Some(value) if value.starts_with("$'") => Err(ServiceError::Unexpected {
+                command,
+                what: "unescaped XDG_RUNTIME_DIR".to_owned(),
+            }),
+            Some(value) => Ok(Some(value.into())),
+        }
     }
 }
 
-fn supervision(show: &str) -> Supervision {
-    let property = |name: &str| {
-        show.lines()
-            .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
-            .unwrap_or("")
+fn property<'a>(show: &'a str, name: &str) -> Option<&'a str> {
+    show.lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+}
+
+/// Whether `dir` is an entry of the manager's space-separated `UnitPath`.
+fn searched(search_path: &str, dir: &Path) -> bool {
+    let dir_text = dir.to_string_lossy();
+    if format!(" {search_path} ").contains(&format!(" {dir_text} ")) {
+        return true;
+    }
+    let Ok(dir) = std::fs::canonicalize(dir) else {
+        return false;
     };
+    search_path
+        .split(' ')
+        .filter_map(|entry| std::fs::canonicalize(entry).ok())
+        .any(|entry| entry == dir)
+}
+
+fn supervision(show: &str) -> Supervision {
+    let get = |name| property(show, name).unwrap_or("");
     let (load, active, sub, file, pid) = (
-        property("LoadState"),
-        property("ActiveState"),
-        property("SubState"),
-        property("UnitFileState"),
-        property("MainPID"),
+        get("LoadState"),
+        get("ActiveState"),
+        get("SubState"),
+        get("UnitFileState"),
+        get("MainPID"),
     );
     let running = active == "active" && sub == "running";
     let mut detail = format!("{load}, {active} ({sub})");
@@ -105,14 +151,16 @@ fn supervision(show: &str) -> Supervision {
         detail.push_str(&format!(", pid {pid}"));
     }
     Supervision {
+        loaded: !load.is_empty() && load != "not-found",
         enabled: file == "enabled",
+        active: !active.is_empty() && active != "inactive" && active != "failed",
         running,
         detail,
     }
 }
 
 /// `$XDG_CONFIG_HOME/systemd/user`, else `$HOME/.config/systemd/user`, as the user manager resolves it.
-fn user_unit_dir() -> Result<PathBuf, ServiceError> {
+pub fn user_unit_dir() -> Result<PathBuf, ServiceError> {
     let config = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) => PathBuf::from(dir),
         None => std::env::home_dir()
@@ -142,13 +190,13 @@ pub fn unit(exe: &Path) -> Result<String, ServiceError> {
 }
 
 /// `exe` as the first word of `ExecStart=`, which systemd unquotes, then resolves `%` specifiers in.
-fn exec_path(exe: &Path) -> Result<String, ServiceError> {
+pub fn exec_path(exe: &Path) -> Result<String, ServiceError> {
     let text = exe
         .to_str()
         .ok_or_else(|| ServiceError::NotUtf8(exe.to_owned()))?;
     if let Some(found) = text
         .chars()
-        .find(|&c| c.is_control() || matches!(c, '"' | '\'' | '\\'))
+        .find(|&c| c < ' ' || matches!(c, '\u{7f}' | '"' | '\'' | '\\'))
     {
         return Err(ServiceError::UnsupportedPath {
             path: exe.to_owned(),
@@ -186,6 +234,7 @@ mod tests {
             ("/opt/$HOME/dstreamy", ":/opt/$HOME/dstreamy"),
             ("/opt/a $b/dstreamy", "\":/opt/a $b/dstreamy\""),
             ("/opt/ünï/dstreamy", "/opt/ünï/dstreamy"),
+            ("/opt/a\u{85}b/dstreamy", "/opt/a\u{85}b/dstreamy"),
         ];
         for (path, word) in cases {
             assert_eq!(exec_path(Path::new(path)).unwrap(), word, "{path}");
@@ -200,6 +249,7 @@ mod tests {
             ("/opt/a\\b/dstreamy", '\\'),
             ("/opt/a\tb/dstreamy", '\t'),
             ("/opt/a\nb/dstreamy", '\n'),
+            ("/opt/a\u{1f}b/dstreamy", '\u{1f}'),
             ("/opt/a\u{7f}b/dstreamy", '\u{7f}'),
         ] {
             match exec_path(Path::new(path)) {
@@ -216,13 +266,13 @@ mod tests {
         let up = supervision(
             "MainPID=4242\nLoadState=loaded\nActiveState=active\nSubState=running\nUnitFileState=enabled\n",
         );
-        assert!(up.running && up.enabled);
+        assert!(up.loaded && up.active && up.running && up.enabled);
         assert_eq!(up.detail, "loaded, active (running), enabled, pid 4242");
 
         let restarting = supervision(
             "MainPID=0\nLoadState=loaded\nActiveState=activating\nSubState=auto-restart\nUnitFileState=enabled\n",
         );
-        assert!(!restarting.running && restarting.enabled);
+        assert!(restarting.active && !restarting.running && restarting.enabled);
         assert_eq!(
             restarting.detail,
             "loaded, activating (auto-restart), enabled"
@@ -231,7 +281,29 @@ mod tests {
         let missing = supervision(
             "MainPID=0\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nUnitFileState=\n",
         );
-        assert!(!missing.running && !missing.enabled);
+        assert!(!missing.loaded && !missing.active && !missing.running && !missing.enabled);
         assert_eq!(missing.detail, "not-found, inactive (dead)");
+    }
+
+    #[test]
+    fn the_unit_directory_must_be_on_the_managers_search_path() {
+        let search = "/home/u/.config/systemd/user.control /run/user/1/systemd/transient /home/u/.config/systemd/user /etc/systemd/user";
+        assert!(searched(search, Path::new("/home/u/.config/systemd/user")));
+        assert!(!searched(search, Path::new("/home/u/.config/systemd")));
+        assert!(!searched(search, Path::new("/elsewhere/systemd/user")));
+        assert!(searched(
+            "/a /home/my user/.config/systemd/user /b",
+            Path::new("/home/my user/.config/systemd/user")
+        ));
+    }
+
+    #[test]
+    fn a_search_path_entry_reached_through_a_symlink_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real/systemd/user");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        let via_link = dir.path().join("link/systemd/user");
+        assert!(searched(&format!("/x {}", real.display()), &via_link));
     }
 }

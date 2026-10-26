@@ -189,6 +189,7 @@ impl From<CliError> for Failure {
                 );
             }
             CliError::Media(_) => "capture",
+            CliError::Service(e) => e.code(),
             CliError::AlreadyStreaming | CliError::Lock(LockError::Held { .. }) => {
                 "already_running"
             }
@@ -197,7 +198,6 @@ impl From<CliError> for Failure {
             | CliError::Stopped(_)
             | CliError::NoTerminal
             | CliError::Terminal(_)
-            | CliError::Service(_)
             | CliError::Ipc(_)
             | CliError::Lock(LockError::Io { .. }) => "internal",
         };
@@ -865,6 +865,21 @@ fn session_failure(e: SessionError) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_errors_keep_their_own_codes() {
+        use crate::service::ServiceError;
+        let code = |e| Failure::from(CliError::Service(e)).code;
+        assert_eq!(code(ServiceError::Unsupported), "unsupported_platform");
+        assert_eq!(code(ServiceError::NoHome), "config");
+        assert_eq!(
+            code(ServiceError::Timeout {
+                command: "systemctl".into(),
+                after: std::time::Duration::from_secs(5),
+            }),
+            "service_manager"
+        );
+    }
 
     #[test]
     fn an_update_carries_the_crop_and_keeps_the_rest() {

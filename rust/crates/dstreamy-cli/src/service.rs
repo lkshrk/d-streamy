@@ -4,10 +4,13 @@
 pub mod systemd;
 
 use std::ffi::{OsStr, OsString};
-use std::io;
+use std::fs::{self, File, OpenOptions, Permissions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, ExitStatus, Output};
-use std::time::Duration;
+use std::process::{Command, ExitCode, ExitStatus, Output, Stdio};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dstreamy_ipc::{ControlCodec, Endpoint};
 use futures_util::{SinkExt, StreamExt};
@@ -18,6 +21,8 @@ use crate::CliError;
 use crate::output::{Out, table};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
+pub const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFINITION_MODE: u32 = 0o644;
 
 #[derive(Debug, clap::Args)]
 pub struct ServiceArgs {
@@ -36,6 +41,9 @@ pub struct ServiceArgs {
 #[derive(Debug, clap::Subcommand)]
 pub enum Action {
     /// Write the service definition, then enable and start the service
+    ///
+    /// A running service is restarted only when its definition changed, which ends its
+    /// Discord session.
     Install {
         /// Print the file and the commands instead of running them
         #[arg(long)]
@@ -49,7 +57,7 @@ pub enum Action {
     },
     /// Report whether the service is installed and running, and whether its socket answers
     Status {
-        /// Socket path; defaults to the one `dstreamy serve` uses
+        /// Socket path; defaults to the one the service's `dstreamy serve` uses
         #[arg(long, value_name = "PATH")]
         endpoint: Option<PathBuf>,
     },
@@ -69,12 +77,26 @@ pub enum ServiceError {
         "the dstreamy path {path} contains {found:?}, which a service definition cannot express"
     )]
     UnsupportedPath { path: PathBuf, found: char },
+    #[error(
+        "the running dstreamy binary was replaced or removed ({0}); run the installed dstreamy instead"
+    )]
+    ExeDeleted(PathBuf),
+    #[error("the dstreamy executable {0} does not exist")]
+    ExeMissing(PathBuf),
     #[error("no home directory to place the service definition in")]
     NoHome,
     #[error(
         "the user configuration directory {0:?} is not absolute; set XDG_CONFIG_HOME or HOME to an absolute path"
     )]
     RelativeConfigDir(PathBuf),
+    #[error(
+        "the user service manager does not load units from {dir}; it searches {search_path}. Its XDG_CONFIG_HOME or HOME differs from this shell's: run dstreamy with the same values"
+    )]
+    NotSearched { dir: PathBuf, search_path: String },
+    #[error(
+        "{0} is a symbolic link; dstreamy does not replace a link it did not create. Remove it, or install the service by hand"
+    )]
+    DefinitionIsSymlink(PathBuf),
     #[error("{action} {path}: {source}")]
     File {
         action: &'static str,
@@ -83,8 +105,54 @@ pub enum ServiceError {
     },
     #[error("running {command}: {source}")]
     Spawn { command: String, source: io::Error },
-    #[error("{command} failed ({status})")]
-    Failed { command: String, status: ExitStatus },
+    #[error("{command} failed ({status}){}", stderr_suffix(.stderr))]
+    Failed {
+        command: String,
+        status: ExitStatus,
+        stderr: String,
+    },
+    #[error("{command} did not finish within {after:?}")]
+    Timeout { command: String, after: Duration },
+    #[error("{command} printed no {what}")]
+    Unexpected { command: String, what: String },
+    #[error(
+        "{source}\n{path} is written, but enabling or starting the service did not finish; running `dstreamy service install` again is safe"
+    )]
+    NotEnabled {
+        path: PathBuf,
+        source: Box<ServiceError>,
+    },
+}
+
+fn stderr_suffix(stderr: &str) -> String {
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
+    }
+}
+
+impl ServiceError {
+    /// The protocol error code this failure maps to.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported_platform",
+            Self::NotUtf8(_)
+            | Self::UnsupportedPath { .. }
+            | Self::ExeDeleted(_)
+            | Self::ExeMissing(_)
+            | Self::NoHome
+            | Self::RelativeConfigDir(_)
+            | Self::NotSearched { .. }
+            | Self::DefinitionIsSymlink(_) => "config",
+            Self::Failed { .. }
+            | Self::Timeout { .. }
+            | Self::Unexpected { .. }
+            | Self::NotEnabled { .. } => "service_manager",
+            Self::CurrentExe(_) | Self::File { .. } | Self::Spawn { .. } => "internal",
+        }
+    }
 }
 
 pub enum Step {
@@ -93,105 +161,227 @@ pub enum Step {
     Run(Vec<OsString>),
 }
 
+/// The definition already on disk, compared with the one `install` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Previous {
+    Absent,
+    Same,
+    Different,
+}
+
 /// What the service manager says about the service.
 pub struct Supervision {
+    pub loaded: bool,
     pub enabled: bool,
+    pub active: bool,
     pub running: bool,
     pub detail: String,
 }
 
-pub trait Backend {
+pub trait Backend: Send + Sync {
     /// The service's name in the manager.
     fn name(&self) -> &str;
     fn definition_path(&self) -> &Path;
-    fn definition(&self) -> &str;
-    fn install(&self) -> Vec<Step>;
+    fn definition(&self) -> Result<String, ServiceError>;
+    /// Writes `definition` unless it is unchanged; a running service is restarted only if it changed.
+    fn install(&self, definition: &str, previous: Previous) -> Vec<Step>;
     fn uninstall(&self) -> Vec<Step>;
     fn query(&self) -> Result<Supervision, ServiceError>;
+    /// Fails when the manager would not load a definition from [`Backend::definition_path`].
+    fn check_location(&self) -> Result<(), ServiceError>;
+    /// The runtime directory the manager gives the service, which places its default socket.
+    fn service_runtime_dir(&self) -> Result<Option<OsString>, ServiceError>;
 }
 
 pub async fn run(out: &Out, args: ServiceArgs) -> Result<ExitCode, CliError> {
-    let backend = backend(args.systemctl)?;
-    let backend = backend.as_ref();
+    let (backend, exe) = backend(args.systemctl)?;
     match args.action {
         Action::Print => {
-            out.raw(backend.definition());
-            Ok(ExitCode::SUCCESS)
-        }
-        Action::Install { dry_run } => {
-            let steps = backend.install();
-            if dry_run {
-                print_plan(out, &steps);
+            warn_about_exe(out, &exe)?;
+            let definition = backend.definition()?;
+            if out.json {
+                out.json_line(&json!({
+                    "path": backend.definition_path(),
+                    "contents": definition,
+                }));
             } else {
-                apply(&steps)?;
-                out.line(format_args!(
-                    "installed {}; {} is enabled and started",
-                    backend.definition_path().display(),
-                    backend.name()
-                ));
+                out.raw(&definition);
             }
             Ok(ExitCode::SUCCESS)
         }
-        Action::Uninstall { dry_run } => {
-            if !dry_run && !backend.definition_path().exists() {
-                out.line(format_args!(
-                    "{} is not installed ({} does not exist)",
-                    backend.name(),
-                    backend.definition_path().display()
-                ));
-                return Ok(ExitCode::SUCCESS);
-            }
-            let steps = backend.uninstall();
-            if dry_run {
-                print_plan(out, &steps);
-            } else {
-                apply(&steps)?;
-                out.line(format_args!(
-                    "uninstalled {}; removed {}",
-                    backend.name(),
-                    backend.definition_path().display()
-                ));
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Action::Status { endpoint } => {
-            let endpoint = match endpoint {
-                Some(path) => Endpoint::new(path),
-                None => Endpoint::default_for_user()?,
-            };
-            status(out, backend, &endpoint).await
-        }
+        Action::Install { dry_run } => install(out, backend.as_ref(), &exe, dry_run),
+        Action::Uninstall { dry_run } => uninstall(out, backend.as_ref(), dry_run),
+        Action::Status { endpoint } => status(out, backend, endpoint).await,
     }
 }
 
 #[cfg(target_os = "linux")]
-fn backend(systemctl: PathBuf) -> Result<Box<dyn Backend>, ServiceError> {
+fn backend(systemctl: PathBuf) -> Result<(Arc<dyn Backend>, PathBuf), ServiceError> {
     let exe = std::env::current_exe().map_err(ServiceError::CurrentExe)?;
-    Ok(Box::new(systemd::Systemd::new(systemctl, &exe)?))
+    let backend = systemd::Systemd::new(systemctl, &exe)?;
+    Ok((Arc::new(backend), exe))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn backend(_systemctl: PathBuf) -> Result<Box<dyn Backend>, ServiceError> {
+fn backend(_systemctl: PathBuf) -> Result<(Arc<dyn Backend>, PathBuf), ServiceError> {
     Err(ServiceError::Unsupported)
 }
 
+fn warn_about_exe(out: &Out, exe: &Path) -> Result<(), ServiceError> {
+    if let Some(place) = check_exe(exe)? {
+        out.warn(format_args!(
+            "{} is in {place}; the service stops working when it is removed",
+            exe.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses an executable the definition cannot point at; names a place that will likely vanish.
+pub fn check_exe(exe: &Path) -> Result<Option<&'static str>, ServiceError> {
+    if exe.to_string_lossy().ends_with(" (deleted)") {
+        return Err(ServiceError::ExeDeleted(exe.to_owned()));
+    }
+    if !exe.is_file() {
+        return Err(ServiceError::ExeMissing(exe.to_owned()));
+    }
+    let temp = [std::env::temp_dir(), "/tmp".into(), "/var/tmp".into()];
+    Ok(vanishing_place(exe, &temp))
+}
+
+fn vanishing_place(exe: &Path, temp: &[PathBuf]) -> Option<&'static str> {
+    if temp.iter().any(|dir| exe.starts_with(dir)) {
+        return Some("a temporary directory");
+    }
+    let in_target = exe.ancestors().any(|dir| {
+        dir.file_name() == Some(OsStr::new("target")) && dir.join("CACHEDIR.TAG").is_file()
+    });
+    in_target.then_some("a Cargo target directory")
+}
+
+pub fn previous(path: &Path, definition: &str) -> Result<Previous, ServiceError> {
+    let file_err = |source| ServiceError::File {
+        action: "reading",
+        path: path.to_owned(),
+        source,
+    };
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Previous::Absent),
+        Err(e) => Err(file_err(e)),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(ServiceError::DefinitionIsSymlink(path.to_owned()))
+        }
+        Ok(_) => {
+            let current = fs::read(path).map_err(file_err)?;
+            Ok(if current == definition.as_bytes() {
+                Previous::Same
+            } else {
+                Previous::Different
+            })
+        }
+    }
+}
+
+fn install(
+    out: &Out,
+    backend: &dyn Backend,
+    exe: &Path,
+    dry_run: bool,
+) -> Result<ExitCode, CliError> {
+    warn_about_exe(out, exe)?;
+    let definition = backend.definition()?;
+    let path = backend.definition_path();
+    let previous = previous(path, &definition)?;
+    let steps = backend.install(&definition, previous);
+    if dry_run {
+        print_plan(out, &steps);
+        return Ok(ExitCode::SUCCESS);
+    }
+    backend.check_location()?;
+    let was_running = backend.query()?.running;
+    apply(&steps)?;
+    let outcome = match (previous, was_running) {
+        (Previous::Same, true) => "unchanged",
+        (_, true) => "restarted",
+        (_, false) => "started",
+    };
+    if out.json {
+        out.json_line(&json!({
+            "action": outcome,
+            "name": backend.name(),
+            "definition": path,
+        }));
+    } else {
+        let name = backend.name();
+        let path = path.display();
+        match outcome {
+            "unchanged" => out.line(format_args!(
+                "{path} is unchanged; {name} is enabled and was already running"
+            )),
+            "restarted" => out.line(format_args!(
+                "updated {path}; {name} is enabled and was restarted, which ended any Discord session it had"
+            )),
+            _ => out.line(format_args!(
+                "installed {path}; {name} is enabled and started"
+            )),
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn uninstall(out: &Out, backend: &dyn Backend, dry_run: bool) -> Result<ExitCode, CliError> {
+    let steps = backend.uninstall();
+    if dry_run {
+        print_plan(out, &steps);
+        return Ok(ExitCode::SUCCESS);
+    }
+    backend.check_location()?;
+    let path = backend.definition_path();
+    if fs::symlink_metadata(path).is_err() {
+        let state = backend.query()?;
+        if !(state.loaded || state.enabled || state.active) {
+            if out.json {
+                out.json_line(&json!({
+                    "action": "absent",
+                    "name": backend.name(),
+                    "definition": path,
+                }));
+            } else {
+                out.line(format_args!(
+                    "{} is not installed ({} does not exist)",
+                    backend.name(),
+                    path.display()
+                ));
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    apply(&steps)?;
+    if out.json {
+        out.json_line(&json!({
+            "action": "uninstalled",
+            "name": backend.name(),
+            "definition": path,
+        }));
+    } else {
+        out.line(format_args!(
+            "uninstalled {}; removed {}",
+            backend.name(),
+            path.display()
+        ));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn apply(steps: &[Step]) -> Result<(), ServiceError> {
+    let mut written = None;
     for step in steps {
         match step {
             Step::Write { path, contents } => {
-                let file_err = |action| {
-                    move |source| ServiceError::File {
-                        action,
-                        path: path.clone(),
-                        source,
-                    }
-                };
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir).map_err(file_err("creating the directory of"))?;
-                }
-                std::fs::write(path, contents).map_err(file_err("writing"))?;
+                write_atomically(path, contents)?;
+                written = Some(path.clone());
             }
-            Step::Remove(path) => match std::fs::remove_file(path) {
+            Step::Remove(path) => match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(source) => {
@@ -203,12 +393,13 @@ pub fn apply(steps: &[Step]) -> Result<(), ServiceError> {
                 }
             },
             Step::Run(argv) => {
-                let output = output(argv)?;
-                if !output.status.success() {
-                    out_stderr(&output);
-                    return Err(ServiceError::Failed {
-                        command: shell_words(argv),
-                        status: output.status,
+                if let Err(e) = checked_output(argv, None) {
+                    return Err(match written {
+                        Some(path) => ServiceError::NotEnabled {
+                            path,
+                            source: Box::new(e),
+                        },
+                        None => e,
                     });
                 }
             }
@@ -217,23 +408,102 @@ pub fn apply(steps: &[Step]) -> Result<(), ServiceError> {
     Ok(())
 }
 
-fn out_stderr(output: &Output) {
-    let text = String::from_utf8_lossy(&output.stderr);
-    if !text.trim().is_empty() {
-        Out::new(false).err_raw(&text);
+/// Replaces `path` by rename, so a reader never sees half a file and a symlink there is replaced, not followed.
+fn write_atomically(path: &Path, contents: &str) -> Result<(), ServiceError> {
+    let file_err = |action| {
+        move |source| ServiceError::File {
+            action,
+            path: path.to_owned(),
+            source,
+        }
+    };
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir).map_err(file_err("creating the directory of"))?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let written = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(DEFINITION_MODE)
+            .open(&temp)?;
+        file.set_permissions(Permissions::from_mode(DEFINITION_MODE))?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        File::open(dir)?.sync_all()
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
     }
+    written.map_err(file_err("writing"))
 }
 
-/// Runs `argv` to completion, capturing its output.
-pub fn output(argv: &[OsString]) -> Result<Output, ServiceError> {
+/// Runs `argv`, capturing its output; with a `timeout` it is killed once that passes.
+pub fn output(argv: &[OsString], timeout: Option<Duration>) -> Result<Output, ServiceError> {
     let (program, args) = argv.split_first().expect("a command has a program");
-    Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|source| ServiceError::Spawn {
-            command: shell_words(argv),
-            source,
+    let spawn_err = |source| ServiceError::Spawn {
+        command: shell_words(argv),
+        source,
+    };
+    let mut command = Command::new(program);
+    command.args(args).stdin(Stdio::null());
+    let Some(timeout) = timeout else {
+        return command.output().map_err(spawn_err);
+    };
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(spawn_err)?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
         })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(spawn_err)? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ServiceError::Timeout {
+                command: shell_words(argv),
+                after: timeout,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// [`output`] that fails, with the command's stderr, on a non-zero exit.
+pub fn checked_output(
+    argv: &[OsString],
+    timeout: Option<Duration>,
+) -> Result<Output, ServiceError> {
+    let output = output(argv, timeout)?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(ServiceError::Failed {
+            command: shell_words(argv),
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
 }
 
 fn print_plan(out: &Out, steps: &[Step]) {
@@ -286,19 +556,87 @@ fn shell_word(arg: &OsStr) -> String {
     }
 }
 
+/// The manager's answers, gathered off the async runtime; after a timeout the rest are skipped.
+struct ManagerView {
+    location: Result<(), String>,
+    supervision: Result<Supervision, String>,
+    runtime_dir: Result<Option<OsString>, String>,
+}
+
+fn manager_view(backend: &dyn Backend) -> ManagerView {
+    let timed_out = |e: &ServiceError| matches!(e, ServiceError::Timeout { .. });
+    let location = backend.check_location();
+    if let Err(e) = &location
+        && timed_out(e)
+    {
+        let e = e.to_string();
+        return ManagerView {
+            location: Err(e.clone()),
+            supervision: Err(e.clone()),
+            runtime_dir: Err(e),
+        };
+    }
+    let supervision = backend.query();
+    if let Err(e) = &supervision
+        && timed_out(e)
+    {
+        let e = e.to_string();
+        return ManagerView {
+            location: location.map_err(|e| e.to_string()),
+            supervision: Err(e.clone()),
+            runtime_dir: Err(e),
+        };
+    }
+    ManagerView {
+        location: location.map_err(|e| e.to_string()),
+        supervision: supervision.map_err(|e| e.to_string()),
+        runtime_dir: backend.service_runtime_dir().map_err(|e| e.to_string()),
+    }
+}
+
 async fn status(
     out: &Out,
-    backend: &dyn Backend,
-    endpoint: &Endpoint,
+    backend: Arc<dyn Backend>,
+    endpoint: Option<PathBuf>,
 ) -> Result<ExitCode, CliError> {
-    let installed = backend.definition_path().exists();
-    let manager = backend.query().unwrap_or_else(|e| Supervision {
-        enabled: false,
-        running: false,
-        detail: e.to_string(),
-    });
-    let hello = hello(endpoint).await;
-    let healthy = installed && manager.running && hello.is_ok();
+    let installed = fs::symlink_metadata(backend.definition_path()).is_ok();
+    let view = {
+        let backend = backend.clone();
+        tokio::task::spawn_blocking(move || manager_view(backend.as_ref()))
+            .await
+            .map_err(|e| CliError::Session(format!("querying the service manager: {e}")))?
+    };
+    let own_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
+    let mut runtime_note = None;
+    let endpoint = match endpoint {
+        Some(path) => Ok(Endpoint::new(path)),
+        None => match &view.runtime_dir {
+            Ok(Some(dir)) => {
+                if own_runtime_dir.as_deref() != Some(dir.as_os_str()) {
+                    runtime_note = Some(format!(
+                        "the service's XDG_RUNTIME_DIR is {}, this shell's is {}",
+                        dir.to_string_lossy(),
+                        own_runtime_dir
+                            .as_deref()
+                            .map_or("unset".into(), OsStr::to_string_lossy)
+                    ));
+                }
+                Endpoint::default_for_runtime_dir(Some(dir))
+            }
+            _ => Endpoint::default_for_user(),
+        },
+    }
+    .map_err(|e| format!("finding the socket: {e}"));
+    let hello = match &endpoint {
+        Ok(endpoint) => hello(endpoint).await,
+        Err(e) => Err(e.clone()),
+    };
+    let (running, enabled, manager) = match &view.supervision {
+        Ok(s) => (s.running, s.enabled, s.detail.clone()),
+        Err(e) => (false, false, e.clone()),
+    };
+    let healthy = installed && view.location.is_ok() && running && hello.is_ok();
+    let endpoint_path = endpoint.as_ref().ok().map(|e| e.as_path().to_owned());
     if out.json {
         let (version, error) = match &hello {
             Ok(data) => (data.get("version").cloned(), None),
@@ -308,16 +646,18 @@ async fn status(
             "name": backend.name(),
             "definition": backend.definition_path(),
             "installed": installed,
-            "enabled": manager.enabled,
-            "running": manager.running,
-            "manager": manager.detail,
-            "endpoint": endpoint.as_path(),
+            "location_error": view.location.as_ref().err(),
+            "enabled": enabled,
+            "running": running,
+            "manager": manager,
+            "endpoint": endpoint_path,
+            "runtime_dir_note": runtime_note,
             "hello": hello.is_ok(),
             "version": version,
             "error": error,
         }));
     } else {
-        let definition = format!(
+        let mut definition = format!(
             "{} ({})",
             backend.definition_path().display(),
             if installed {
@@ -326,16 +666,25 @@ async fn status(
                 "not installed"
             }
         );
-        let socket = match &hello {
+        if let Err(e) = &view.location {
+            definition.push_str(&format!("; {e}"));
+        }
+        let place = endpoint_path
+            .as_ref()
+            .map_or("the socket".to_owned(), |p| p.display().to_string());
+        let mut socket = match &hello {
             Ok(data) => format!(
-                "{endpoint} answers hello (dstreamy {})",
+                "{place} answers hello (dstreamy {})",
                 data["version"].as_str().unwrap_or("?")
             ),
-            Err(e) => format!("{endpoint} does not answer: {e}"),
+            Err(e) => format!("{place} does not answer: {e}"),
         };
+        if let Some(note) = &runtime_note {
+            socket.push_str(&format!(" ({note})"));
+        }
         out.raw(&table(&[
             vec!["definition".to_owned(), definition],
-            vec![backend.name().to_owned(), manager.detail],
+            vec![backend.name().to_owned(), manager],
             vec!["socket".to_owned(), socket],
         ]));
     }
@@ -384,5 +733,80 @@ mod tests {
             shell_words(&argv),
             r"/usr/bin/systemctl --user 'a b' 'it'\''s' ''"
         );
+    }
+
+    #[test]
+    fn a_replaced_or_missing_executable_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("dstreamy (deleted)");
+        std::fs::write(&gone, "").unwrap();
+        assert!(matches!(check_exe(&gone), Err(ServiceError::ExeDeleted(_))));
+        assert!(matches!(
+            check_exe(&dir.path().join("dstreamy")),
+            Err(ServiceError::ExeMissing(_))
+        ));
+    }
+
+    #[test]
+    fn an_executable_in_a_temporary_or_cargo_target_directory_is_flagged() {
+        let tmp = tempfile::tempdir_in("/tmp").unwrap();
+        let exe = tmp.path().join("dstreamy");
+        std::fs::write(&exe, "").unwrap();
+        assert_eq!(check_exe(&exe).unwrap(), Some("a temporary directory"));
+
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let exe = target.join("debug/dstreamy");
+        assert_eq!(vanishing_place(&exe, &[]), None);
+        std::fs::write(target.join("CACHEDIR.TAG"), "").unwrap();
+        assert_eq!(vanishing_place(&exe, &[]), Some("a Cargo target directory"));
+    }
+
+    #[test]
+    fn a_write_replaces_a_symlink_instead_of_following_it_and_sets_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "theirs").unwrap();
+        let path = dir.path().join("unit/dstreamy.service");
+        std::fs::create_dir(dir.path().join("unit")).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        write_atomically(&path, "ours").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "theirs");
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o7777, DEFINITION_MODE);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ours");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("unit")).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn previous_refuses_a_symlink_and_compares_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dstreamy.service");
+        assert_eq!(previous(&path, "a").unwrap(), Previous::Absent);
+        std::fs::write(&path, "a").unwrap();
+        assert_eq!(previous(&path, "a").unwrap(), Previous::Same);
+        assert_eq!(previous(&path, "b").unwrap(), Previous::Different);
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("x"), &path).unwrap();
+        assert!(matches!(
+            previous(&path, "a"),
+            Err(ServiceError::DefinitionIsSymlink(_))
+        ));
+    }
+
+    #[test]
+    fn a_query_is_killed_at_its_timeout() {
+        let argv: Vec<OsString> = ["sh", "-c", "exec sleep 30"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let started = Instant::now();
+        let e = output(&argv, Some(Duration::from_millis(200))).unwrap_err();
+        assert!(matches!(e, ServiceError::Timeout { .. }), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
