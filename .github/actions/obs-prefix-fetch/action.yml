@@ -1,0 +1,80 @@
+name: Fetch the OBS prefix
+description: >-
+  Restore a pinned OBS install prefix from the newest successful rust-rewrite push or dispatch run of obs-ci,
+  else from the Actions cache.
+inputs:
+  key:
+    description: Cache key of the prefix; the artifact is <key>.tar.gz.
+    required: true
+  path:
+    description: Directory to restore the prefix into.
+    required: true
+outputs:
+  hit:
+    description: '"true" when the prefix was restored from either source.'
+    value: ${{ steps.unpack.outputs.hit == 'true' || steps.cache.outputs.cache-hit == 'true' }}
+runs:
+  using: composite
+  steps:
+    - name: Find the prefix in a rust-rewrite run
+      id: find
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        ARTIFACT: ${{ inputs.key }}.tar.gz
+      run: |
+        set -euo pipefail
+        # Only rust-rewrite's own runs: a pull_request run can come from a fork branch of any name.
+        runs=$(gh api "repos/$REPO/actions/workflows/obs-ci.yml/runs?branch=rust-rewrite&status=success&per_page=30" \
+          --jq '.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")
+            | select(.head_repository.full_name == $ENV.REPO) | .id') || runs=
+        for id in $runs; do
+          found=$(gh api "repos/$REPO/actions/runs/$id/artifacts?name=$ARTIFACT" \
+            --jq '[.artifacts[] | select(.expired | not)] | length') || found=0
+          if [ "$found" -gt 0 ]; then
+            echo "$ARTIFACT from run $id"
+            echo "run-id=$id" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+        done
+        echo "No unexpired $ARTIFACT in a successful rust-rewrite run; trying the cache"
+
+    - name: Download the prefix
+      id: download
+      if: steps.find.outputs.run-id != ''
+      continue-on-error: true
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: ${{ inputs.key }}.tar.gz
+        path: ${{ runner.temp }}/obs-prefix-download
+        run-id: ${{ steps.find.outputs.run-id }}
+        github-token: ${{ github.token }}
+
+    - name: Unpack the prefix
+      id: unpack
+      if: steps.download.outcome == 'success'
+      shell: bash
+      env:
+        ARTIFACT: ${{ inputs.key }}.tar.gz
+        DOWNLOAD: ${{ runner.temp }}/obs-prefix-download
+        PREFIX: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        unix() { if command -v cygpath >/dev/null; then cygpath -u "$1"; else printf '%s\n' "$1"; fi; }
+        download=$(unix "$DOWNLOAD")
+        prefix=$(unix "$PREFIX")
+        archive=$(find "$download" -type f -name "$ARTIFACT" | head -n 1)
+        test -n "$archive"
+        mkdir -p "$prefix"
+        tar -xzf "$archive" -C "$prefix"
+        rm -rf "$download"
+        echo hit=true >> "$GITHUB_OUTPUT"
+
+    - name: Restore the prefix from the cache
+      id: cache
+      if: steps.unpack.outputs.hit != 'true'
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ inputs.path }}
+        key: ${{ inputs.key }}

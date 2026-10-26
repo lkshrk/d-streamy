@@ -11,6 +11,7 @@ on:
       - "rust/Cargo.lock"
       - "rust/rust-toolchain.toml"
       - ".github/workflows/obs-ci.yml"
+      - ".github/actions/obs-prefix-*/**"
   pull_request:
     branches: [main, rust-rewrite]
     paths:
@@ -21,10 +22,13 @@ on:
       - "rust/Cargo.lock"
       - "rust/rust-toolchain.toml"
       - ".github/workflows/obs-ci.yml"
+      - ".github/actions/obs-prefix-*/**"
+  # On rust-rewrite this also re-publishes the OBS prefix artifacts before they expire.
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: obs-ci-${{ github.ref }}
@@ -36,6 +40,7 @@ env:
   OBS_BUILD_REV: "1"
   # Line tables keep file:line in backtraces at a fraction of full debuginfo's size.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  PUBLISH_OBS_PREFIX: ${{ github.ref == 'refs/heads/rust-rewrite' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
 
 jobs:
   obs-linux:
@@ -98,14 +103,14 @@ jobs:
           key: ${{ steps.apt-restore.outputs.cache-primary-key }}
 
       - name: Restore OBS build
-        id: obs-cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: obs
+        uses: ./.github/actions/obs-prefix-fetch
         with:
-          path: ${{ runner.temp }}/obs-prefix
           key: obs-${{ env.OBS_TAG }}-ubuntu-24.04-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix
 
       - name: Build OBS ${{ env.OBS_TAG }} with the frontend and obs-websocket
-        if: steps.obs-cache.outputs.cache-hit != 'true'
+        if: steps.obs.outputs.hit != 'true'
         run: |
           start=$(date +%s)
           git clone --depth 1 --branch "$OBS_TAG" --recurse-submodules --shallow-submodules \
@@ -124,11 +129,18 @@ jobs:
           echo "OBS build took $(( $(date +%s) - start )) s" | tee "$OBS_PREFIX/build-time.txt"
 
       - name: Save OBS build
-        if: steps.obs-cache.outputs.cache-hit != 'true'
+        if: steps.obs.outputs.hit != 'true'
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/obs-prefix
           key: obs-${{ env.OBS_TAG }}-ubuntu-24.04-r${{ env.OBS_BUILD_REV }}
+
+      - name: Publish OBS build
+        if: env.PUBLISH_OBS_PREFIX == 'true'
+        uses: ./.github/actions/obs-prefix-publish
+        with:
+          key: obs-${{ env.OBS_TAG }}-ubuntu-24.04-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix
 
       - name: Check the OBS install
         run: |
@@ -299,14 +311,14 @@ jobs:
           mkdir -p "$RUNNER_TEMP/obs-logs"
 
       - name: Restore OBS build
-        id: obs-cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: obs
+        uses: ./.github/actions/obs-prefix-fetch
         with:
-          path: ${{ runner.temp }}/obs-prefix
           key: obs-${{ env.OBS_TAG }}-xcode-27.1-${{ matrix.arch }}-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix
 
       - name: Build OBS ${{ env.OBS_TAG }}
-        if: steps.obs-cache.outputs.cache-hit != 'true'
+        if: steps.obs.outputs.hit != 'true'
         run: |
           set -o pipefail
           start=$(date +%s)
@@ -326,11 +338,18 @@ jobs:
           echo "OBS build took $(( $(date +%s) - start )) s" | tee "$OBS_PREFIX/build-time.txt"
 
       - name: Save OBS build
-        if: steps.obs-cache.outputs.cache-hit != 'true'
+        if: steps.obs.outputs.hit != 'true'
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/obs-prefix
           key: obs-${{ env.OBS_TAG }}-xcode-27.1-${{ matrix.arch }}-r${{ env.OBS_BUILD_REV }}
+
+      - name: Publish OBS build
+        if: env.PUBLISH_OBS_PREFIX == 'true'
+        uses: ./.github/actions/obs-prefix-publish
+        with:
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-${{ matrix.arch }}-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix
 
       - name: Install Rust toolchain from rust-toolchain.toml
         working-directory: rust
@@ -435,14 +454,14 @@ jobs:
           New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\obs-logs" | Out-Null
 
       - name: Restore OBS build
-        id: obs-cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: obs
+        uses: ./.github/actions/obs-prefix-fetch
         with:
-          path: ${{ runner.temp }}\obs-prefix
           key: obs-${{ env.OBS_TAG }}-windows-2025-x64-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}\obs-prefix
 
       - name: Build OBS ${{ env.OBS_TAG }}
-        if: steps.obs-cache.outputs.cache-hit != 'true'
+        if: steps.obs.outputs.hit != 'true'
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
@@ -460,11 +479,18 @@ jobs:
           "OBS build took $secs s" | Tee-Object -FilePath "$env:OBS_PREFIX\build-time.txt"
 
       - name: Save OBS build
-        if: steps.obs-cache.outputs.cache-hit != 'true'
+        if: steps.obs.outputs.hit != 'true'
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}\obs-prefix
           key: obs-${{ env.OBS_TAG }}-windows-2025-x64-r${{ env.OBS_BUILD_REV }}
+
+      - name: Publish OBS build
+        if: env.PUBLISH_OBS_PREFIX == 'true'
+        uses: ./.github/actions/obs-prefix-publish
+        with:
+          key: obs-${{ env.OBS_TAG }}-windows-2025-x64-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}\obs-prefix
 
       - name: Install Rust toolchain from rust-toolchain.toml
         working-directory: rust
