@@ -974,10 +974,10 @@ cleanup:
 		harness_error("plugin logged %ld caught panic(s), expected %d", panics, args.expect_panics);
 		rc = 1;
 	}
-	long leaks = bnum_allocs();
-	printf("HARNESS shutdown leaks=%ld\n", leaks);
-	if (initialized && leaks) {
-		harness_error("%ld allocation(s) leaked after obs_shutdown", leaks);
+	long libobs_leaks = bnum_allocs();
+	printf("HARNESS shutdown libobs_leaks=%ld\n", libobs_leaks);
+	if (initialized && libobs_leaks) {
+		harness_error("%ld libobs allocation(s) leaked after obs_shutdown", libobs_leaks);
 		rc = 1;
 	}
 	printf("HARNESS result=%s\n", rc == 0 ? "PASS" : "FAIL");
