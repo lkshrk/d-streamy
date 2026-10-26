@@ -13,6 +13,7 @@ use dstreamy_obs_producer::{Hello, Packet, Ring, Track};
 use dstreamy_obs_sys as sys;
 use tokio::sync::mpsc;
 
+use crate::encoders::{self, Owned};
 use crate::guard::{self, guard, guard_with};
 use crate::hooks::Hooks;
 use crate::log;
@@ -68,6 +69,8 @@ struct Output {
     shared: Arc<Shared>,
     worker: Mutex<Option<JoinHandle<()>>>,
     hooks: Hooks,
+    /// Released when the output is destroyed, after the worker has stopped.
+    encoders: Mutex<Owned>,
 }
 
 impl Output {
@@ -123,7 +126,7 @@ pub fn set_last_error(output: OutputPtr, message: &str) {
 
 /// # Safety
 /// `ptr` is NULL or a NUL-terminated string valid for the call.
-unsafe fn text(ptr: *const c_char) -> String {
+pub(crate) unsafe fn text(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }
@@ -215,6 +218,7 @@ extern "C" fn output_create(
             shared,
             worker: Mutex::new(Some(worker)),
             hooks,
+            encoders: Mutex::new(Owned::default()),
         }));
         // SAFETY: the handler dies with `state` in obs_output_destroy (obs-output.c:308,344); libobs copies the decl.
         unsafe {
@@ -276,10 +280,15 @@ extern "C" fn output_start(data: *mut c_void) -> bool {
     )
 }
 
-/// Initializes the encoders on the caller's thread, then hands the connect to the worker and returns.
+/// Picks, checks and initializes the encoders on the caller's thread, then hands the connect to the worker.
 fn start(state: &Output) -> bool {
     let shared = &state.shared;
     let output = shared.output;
+    if let Err(message) = encoders::prepare(output, &state.encoders) {
+        log::warn(&message);
+        set_last_error(output, &message);
+        return false;
+    }
     // SAFETY: `output` is the live output being started; the encoders it returns are owned by it.
     let encoders = unsafe {
         if !sys::obs_output_can_begin_data_capture(output.0, 0)
@@ -289,6 +298,12 @@ fn start(state: &Output) -> bool {
         }
         let venc = sys::obs_output_get_video_encoder(output.0);
         let aenc = sys::obs_output_get_audio_encoder(output.0, 0);
+        if !aenc.is_null()
+            && let Err(message) = encoders::check_audio(aenc)
+        {
+            set_last_error(output, &message);
+            return false;
+        }
         (!venc.is_null() && !aenc.is_null()).then(|| hello(venc, aenc))
     };
     let hello = match encoders {
@@ -403,6 +418,8 @@ pub fn register() {
         start: Some(output_start),
         stop: Some(output_stop),
         encoded_packet: Some(output_encoded_packet),
+        get_defaults: Some(encoders::get_defaults),
+        get_properties: Some(encoders::get_properties),
         encoded_video_codecs: c"h264".as_ptr(),
         encoded_audio_codecs: c"opus".as_ptr(),
         ..Default::default()

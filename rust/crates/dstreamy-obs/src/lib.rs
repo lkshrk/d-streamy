@@ -1,5 +1,6 @@
 //! D-Streamy OBS plugin module: the entry points libobs looks up (`libobs/obs-module.c:40-50`).
 
+mod encoders;
 mod guard;
 mod hooks;
 mod log;
