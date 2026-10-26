@@ -872,6 +872,15 @@ mod tests {
         let code = |e| Failure::from(CliError::Service(e)).code;
         assert_eq!(code(ServiceError::Unsupported), "unsupported_platform");
         assert_eq!(code(ServiceError::NoHome), "config");
+        let spawn = |kind| ServiceError::Spawn {
+            command: "systemctl".into(),
+            source: std::io::Error::from(kind),
+        };
+        assert_eq!(code(spawn(std::io::ErrorKind::NotFound)), "service_manager");
+        assert_eq!(
+            code(spawn(std::io::ErrorKind::PermissionDenied)),
+            "internal"
+        );
         assert_eq!(
             code(ServiceError::Timeout {
                 command: "systemctl".into(),

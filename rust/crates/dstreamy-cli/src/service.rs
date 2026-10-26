@@ -150,6 +150,9 @@ impl ServiceError {
             | Self::Timeout { .. }
             | Self::Unexpected { .. }
             | Self::NotEnabled { .. } => "service_manager",
+            Self::Spawn { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+                "service_manager"
+            }
             Self::CurrentExe(_) | Self::File { .. } | Self::Spawn { .. } => "internal",
         }
     }
@@ -175,6 +178,8 @@ pub struct Supervision {
     pub enabled: bool,
     pub active: bool,
     pub running: bool,
+    /// The running process predates the loaded definition or its binary was replaced.
+    pub stale: bool,
     pub detail: String,
 }
 
@@ -183,9 +188,12 @@ pub trait Backend: Send + Sync {
     fn name(&self) -> &str;
     fn definition_path(&self) -> &Path;
     fn definition(&self) -> Result<String, ServiceError>;
-    /// Writes `definition` unless it is unchanged; a running service is restarted only if it changed.
-    fn install(&self, definition: &str, previous: Previous) -> Vec<Step>;
-    fn uninstall(&self) -> Vec<Step>;
+    /// With `write`, writes `definition` and restarts a running service; otherwise only enables and starts.
+    fn install(&self, definition: &str, write: bool) -> Vec<Step>;
+    /// `known`: the manager has the service loaded or active.
+    fn uninstall(&self, definition_present: bool, known: bool) -> Vec<Step>;
+    /// Whether enablement links are left without a definition.
+    fn enablement_left(&self) -> bool;
     fn query(&self) -> Result<Supervision, ServiceError>;
     /// Fails when the manager would not load a definition from [`Backend::definition_path`].
     fn check_location(&self) -> Result<(), ServiceError>;
@@ -292,69 +300,100 @@ fn install(
     let definition = backend.definition()?;
     let path = backend.definition_path();
     let previous = previous(path, &definition)?;
-    let steps = backend.install(&definition, previous);
+    let state = manager_state(out, backend, dry_run)?;
+    let running = state.as_ref().is_some_and(|s| s.running);
+    let stale = running && state.as_ref().is_some_and(|s| s.stale);
+    let write = previous != Previous::Same || stale;
+    let steps = backend.install(&definition, write);
     if dry_run {
         print_plan(out, &steps);
         return Ok(ExitCode::SUCCESS);
     }
-    backend.check_location()?;
-    let was_running = backend.query()?.running;
     apply(&steps)?;
-    let outcome = match (previous, was_running) {
-        (Previous::Same, true) => "unchanged",
-        (_, true) => "restarted",
-        (_, false) => "started",
+    let outcome = match (running, write) {
+        (true, true) => "restarted",
+        (true, false) => "unchanged",
+        (false, _) => "started",
     };
     if out.json {
         out.json_line(&json!({
             "action": outcome,
+            "written": write,
             "name": backend.name(),
             "definition": path,
         }));
     } else {
         let name = backend.name();
         let path = path.display();
-        match outcome {
-            "unchanged" => out.line(format_args!(
-                "{path} is unchanged; {name} is enabled and was already running"
-            )),
-            "restarted" => out.line(format_args!(
-                "updated {path}; {name} is enabled and was restarted, which ended any Discord session it had"
-            )),
-            _ => out.line(format_args!(
-                "installed {path}; {name} is enabled and started"
-            )),
-        }
+        let file = match previous {
+            Previous::Absent => format!("installed {path}"),
+            Previous::Different => format!("updated {path}"),
+            Previous::Same => format!("{path} is unchanged"),
+        };
+        let service = match outcome {
+            "unchanged" => format!("{name} is enabled and was already running"),
+            "restarted" if previous == Previous::Same => format!(
+                "{name} was restarted because it ran an outdated definition or binary, which ended any Discord session it had"
+            ),
+            "restarted" => format!(
+                "{name} is enabled and was restarted, which ended any Discord session it had"
+            ),
+            _ => format!("{name} is enabled and started"),
+        };
+        out.line(format_args!("{file}; {service}"));
     }
     Ok(ExitCode::SUCCESS)
 }
 
+/// Checks the location and queries the service; a dry run only warns when either fails.
+fn manager_state(
+    out: &Out,
+    backend: &dyn Backend,
+    dry_run: bool,
+) -> Result<Option<Supervision>, ServiceError> {
+    let checked = backend.check_location();
+    let state = backend.query();
+    if !dry_run {
+        checked?;
+        return state.map(Some);
+    }
+    if let Err(e) = &checked {
+        out.warn(format_args!("a real run would fail: {e}"));
+    }
+    Ok(match state {
+        Ok(state) => Some(state),
+        Err(e) => {
+            out.warn(format_args!("querying the service manager: {e}"));
+            None
+        }
+    })
+}
+
 fn uninstall(out: &Out, backend: &dyn Backend, dry_run: bool) -> Result<ExitCode, CliError> {
-    let steps = backend.uninstall();
+    let path = backend.definition_path();
+    let present = fs::symlink_metadata(path).is_ok();
+    let state = manager_state(out, backend, dry_run)?;
+    let known = state.as_ref().is_none_or(|s| s.loaded || s.active);
+    if !present && !known && !backend.enablement_left() {
+        if out.json {
+            out.json_line(&json!({
+                "action": "absent",
+                "name": backend.name(),
+                "definition": path,
+            }));
+        } else {
+            out.line(format_args!(
+                "{} is not installed ({} does not exist)",
+                backend.name(),
+                path.display()
+            ));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let steps = backend.uninstall(present, known);
     if dry_run {
         print_plan(out, &steps);
         return Ok(ExitCode::SUCCESS);
-    }
-    backend.check_location()?;
-    let path = backend.definition_path();
-    if fs::symlink_metadata(path).is_err() {
-        let state = backend.query()?;
-        if !(state.loaded || state.enabled || state.active) {
-            if out.json {
-                out.json_line(&json!({
-                    "action": "absent",
-                    "name": backend.name(),
-                    "definition": path,
-                }));
-            } else {
-                out.line(format_args!(
-                    "{} is not installed ({} does not exist)",
-                    backend.name(),
-                    path.display()
-                ));
-            }
-            return Ok(ExitCode::SUCCESS);
-        }
     }
     apply(&steps)?;
     if out.json {
@@ -363,9 +402,15 @@ fn uninstall(out: &Out, backend: &dyn Backend, dry_run: bool) -> Result<ExitCode
             "name": backend.name(),
             "definition": path,
         }));
-    } else {
+    } else if present {
         out.line(format_args!(
             "uninstalled {}; removed {}",
+            backend.name(),
+            path.display()
+        ));
+    } else {
+        out.line(format_args!(
+            "uninstalled {}; {} was already gone, so the service was stopped and its links removed",
             backend.name(),
             path.display()
         ));
@@ -378,7 +423,16 @@ pub fn apply(steps: &[Step]) -> Result<(), ServiceError> {
     for step in steps {
         match step {
             Step::Write { path, contents } => {
-                write_atomically(path, contents)?;
+                write_atomically(path, contents).map_err(|(renamed, e)| {
+                    if renamed {
+                        ServiceError::NotEnabled {
+                            path: path.clone(),
+                            source: Box::new(e),
+                        }
+                    } else {
+                        e
+                    }
+                })?;
                 written = Some(path.clone());
             }
             Step::Remove(path) => match fs::remove_file(path) {
@@ -409,7 +463,8 @@ pub fn apply(steps: &[Step]) -> Result<(), ServiceError> {
 }
 
 /// Replaces `path` by rename, so a reader never sees half a file and a symlink there is replaced, not followed.
-fn write_atomically(path: &Path, contents: &str) -> Result<(), ServiceError> {
+/// An error says whether the rename already happened.
+fn write_atomically(path: &Path, contents: &str) -> Result<(), (bool, ServiceError)> {
     let file_err = |action| {
         move |source| ServiceError::File {
             action,
@@ -418,7 +473,7 @@ fn write_atomically(path: &Path, contents: &str) -> Result<(), ServiceError> {
         }
     };
     let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir).map_err(file_err("creating the directory of"))?;
+    fs::create_dir_all(dir).map_err(|e| (false, file_err("creating the directory of")(e)))?;
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let temp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let written = (|| {
@@ -430,13 +485,15 @@ fn write_atomically(path: &Path, contents: &str) -> Result<(), ServiceError> {
         file.set_permissions(Permissions::from_mode(DEFINITION_MODE))?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
-        fs::rename(&temp, path)?;
-        File::open(dir)?.sync_all()
+        fs::rename(&temp, path)
     })();
-    if written.is_err() {
+    if let Err(e) = written {
         let _ = fs::remove_file(&temp);
+        return Err((false, file_err("writing")(e)));
     }
-    written.map_err(file_err("writing"))
+    File::open(dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| (true, file_err("syncing the directory of")(e)))
 }
 
 /// Runs `argv`, capturing its output; with a `timeout` it is killed once that passes.
@@ -623,7 +680,13 @@ async fn status(
                 }
                 Endpoint::default_for_runtime_dir(Some(dir))
             }
-            _ => Endpoint::default_for_user(),
+            Ok(None) => Endpoint::default_for_runtime_dir(None),
+            Err(e) => {
+                runtime_note = Some(format!(
+                    "could not read the service's XDG_RUNTIME_DIR ({e}); used this shell's"
+                ));
+                Endpoint::default_for_user()
+            }
         },
     }
     .map_err(|e| format!("finding the socket: {e}"));

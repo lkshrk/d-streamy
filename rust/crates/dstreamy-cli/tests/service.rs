@@ -11,14 +11,34 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const GOLDEN: &str = include_str!("fixtures/service/dstreamy.service");
-const RUNNING: &str =
-    "LoadState=loaded\nActiveState=active\nSubState=running\nUnitFileState=enabled\nMainPID=77\n";
 const NOT_FOUND: &str =
     "LoadState=not-found\nActiveState=inactive\nSubState=dead\nUnitFileState=\nMainPID=0\n";
+
+/// A running unit whose main process is `pid`, started long after any file the test writes.
+fn running(pid: u32) -> String {
+    running_since(pid, "@9999999999", "no")
+}
+
+fn running_since(pid: u32, started: &str, need_reload: &str) -> String {
+    format!(
+        "LoadState=loaded\nActiveState=active\nSubState=running\nUnitFileState=enabled\nMainPID={pid}\n\
+         NeedDaemonReload={need_reload}\nExecMainStartTimestamp={started}\n"
+    )
+}
 
 fn dstreamy() -> PathBuf {
     assert_cmd::cargo::cargo_bin("dstreamy")
 }
+
+const DEFAULT_SCRIPT: &str = "case \"$2\" in\n\
+               disable) [ -f \"$XDG_CONFIG_HOME/systemd/user/dstreamy.service\" ] || \
+                 { echo 'Failed to disable unit: Unit file dstreamy.service does not exist.' >&2; exit 1; } ;;\n\
+               show-environment) cat \"$d/environment\" 2>/dev/null ;;\n\
+               show) case \"$3\" in\n\
+                 --property=UnitPath) cat \"$d/unitpath\" ;;\n\
+                 *) cat \"$d/show\" 2>/dev/null ;;\n\
+               esac ;;\n\
+             esac\n";
 
 /// A temp home whose `systemctl` records its arguments and answers queries from files.
 struct Fake {
@@ -29,18 +49,14 @@ impl Fake {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let fake = Self { dir };
-        fake.script(
-            "case \"$2\" in\n\
-               show-environment) cat \"$d/environment\" 2>/dev/null ;;\n\
-               show) case \"$3\" in\n\
-                 --property=UnitPath) cat \"$d/unitpath\" ;;\n\
-                 *) cat \"$d/show\" 2>/dev/null ;;\n\
-               esac ;;\n\
-             esac\n",
-        );
+        fake.default_script();
         fake.set_unit_path(&[&fake.unit_dir()]);
         fake.answer_show(NOT_FOUND);
         fake
+    }
+
+    fn default_script(&self) {
+        self.script(DEFAULT_SCRIPT);
     }
 
     fn script(&self, body: &str) {
@@ -142,7 +158,7 @@ fn print_shows_the_unit_for_this_executable_as_text_or_json() {
         v,
         json!({"path": fake.unit_path(), "contents": golden_for(&dstreamy())})
     );
-    assert_eq!(fake.calls(), "");
+    assert_eq!(fake.actions(), "");
 }
 
 #[test]
@@ -160,7 +176,7 @@ fn install_dry_run_prints_the_file_and_the_exact_commands_and_runs_nothing() {
         stdout(&fake.run(&["service", "install", "--dry-run"])),
         expected
     );
-    assert_eq!(fake.calls(), "");
+    assert_eq!(fake.actions(), "");
     assert!(!fake.unit_path().exists());
 }
 
@@ -184,12 +200,21 @@ fn install_dry_run_as_json_lists_the_steps() {
             {"run": [s, "--user", "enable", "--now", "dstreamy.service"]},
         ]})
     );
-    assert_eq!(fake.calls(), "");
+    assert_eq!(fake.actions(), "");
 }
 
 #[test]
 fn uninstall_dry_run_prints_the_exact_commands_and_runs_nothing() {
     let fake = Fake::new();
+    assert_eq!(
+        stdout(&fake.run(&["service", "uninstall", "--dry-run"])),
+        format!(
+            "dstreamy.service is not installed ({} does not exist)\n",
+            fake.unit_path().display()
+        )
+    );
+    fs::create_dir_all(fake.unit_dir()).unwrap();
+    fs::write(fake.unit_path(), GOLDEN).unwrap();
     let expected = format!(
         "would run: {s} --user disable --now dstreamy.service\nwould remove {}\nwould run: {s} --user daemon-reload\n",
         fake.unit_path().display(),
@@ -199,7 +224,7 @@ fn uninstall_dry_run_prints_the_exact_commands_and_runs_nothing() {
         stdout(&fake.run(&["service", "uninstall", "--dry-run"])),
         expected
     );
-    assert_eq!(fake.calls(), "");
+    assert_eq!(fake.actions(), "");
 }
 
 #[test]
@@ -225,7 +250,7 @@ fn install_writes_the_unit_then_reloads_and_enables_it_and_uninstall_reverses_it
         "--user daemon-reload\n--user try-restart dstreamy.service\n--user enable --now dstreamy.service\n"
     );
 
-    fake.answer_show(RUNNING);
+    fake.answer_show(&running(std::process::id()));
     let v: Value =
         serde_json::from_str(&stdout(&fake.run(&["--json", "service", "uninstall"]))).unwrap();
     assert_eq!(v["action"], "uninstalled", "{v}");
@@ -241,7 +266,7 @@ fn install_writes_the_unit_then_reloads_and_enables_it_and_uninstall_reverses_it
 fn an_unchanged_reinstall_over_a_running_service_does_not_restart_it() {
     let fake = Fake::new();
     stdout(&fake.run(&["service", "install"]));
-    fake.answer_show(RUNNING);
+    fake.answer_show(&running(std::process::id()));
     fs::remove_file(fake.dir.path().join("calls")).unwrap();
     let v: Value =
         serde_json::from_str(&stdout(&fake.run(&["--json", "service", "install"]))).unwrap();
@@ -260,7 +285,7 @@ fn a_changed_reinstall_over_a_running_service_restarts_it() {
         "[Service]\nExecStart=/old/dstreamy serve\n",
     )
     .unwrap();
-    fake.answer_show(RUNNING);
+    fake.answer_show(&running(std::process::id()));
     let v: Value =
         serde_json::from_str(&stdout(&fake.run(&["--json", "service", "install"]))).unwrap();
     assert_eq!(v["action"], "restarted", "{v}");
@@ -305,25 +330,114 @@ fn install_refuses_a_unit_directory_the_manager_does_not_search() {
     );
     assert!(!fake.unit_path().exists());
     assert_eq!(fake.actions(), "");
+    let dry = fake.run(&["service", "install", "--dry-run"]);
+    stdout(&dry);
+    let stderr = String::from_utf8_lossy(&dry.stderr);
+    assert!(
+        stderr.contains("a real run would fail") && stderr.contains("does not load units from"),
+        "{stderr}"
+    );
     let stderr = failure(&fake.run(&["service", "uninstall"]));
     assert!(stderr.contains("does not load units from"), "{stderr}");
 }
 
 #[test]
-fn uninstall_without_the_file_still_disables_a_unit_the_manager_knows() {
+fn uninstall_without_the_file_stops_a_unit_the_manager_knows_and_removes_its_link() {
     let fake = Fake::new();
     let v: Value =
         serde_json::from_str(&stdout(&fake.run(&["--json", "service", "uninstall"]))).unwrap();
     assert_eq!(v["action"], "absent", "{v}");
     assert_eq!(fake.actions(), "");
 
-    fake.answer_show(RUNNING);
+    let wants = fake.unit_dir().join("default.target.wants");
+    fs::create_dir_all(&wants).unwrap();
+    std::os::unix::fs::symlink(fake.unit_path(), wants.join("dstreamy.service")).unwrap();
+    fake.answer_show(&running(std::process::id()));
+    let plan = stdout(&fake.run(&["service", "uninstall", "--dry-run"]));
+    assert_eq!(
+        plan,
+        format!(
+            "would run: {s} --user stop dstreamy.service\nwould run: {s} --user reset-failed dstreamy.service\n\
+             would remove {}\nwould run: {s} --user daemon-reload\n",
+            wants.join("dstreamy.service").display(),
+            s = fake.systemctl().display()
+        )
+    );
+    assert_eq!(fake.actions(), "");
     let out = stdout(&fake.run(&["service", "uninstall"]));
-    assert!(out.contains("uninstalled"), "{out}");
+    assert!(out.contains("was already gone"), "{out}");
     assert_eq!(
         fake.actions(),
-        "--user disable --now dstreamy.service\n--user daemon-reload\n"
+        "--user stop dstreamy.service\n--user reset-failed dstreamy.service\n--user daemon-reload\n"
     );
+    assert!(fs::symlink_metadata(wants.join("dstreamy.service")).is_err());
+}
+
+#[test]
+fn uninstall_removes_a_dangling_enablement_link_left_without_a_loaded_unit() {
+    let fake = Fake::new();
+    let wants = fake.unit_dir().join("default.target.wants");
+    fs::create_dir_all(&wants).unwrap();
+    std::os::unix::fs::symlink(fake.unit_path(), wants.join("dstreamy.service")).unwrap();
+    stdout(&fake.run(&["service", "uninstall"]));
+    assert_eq!(fake.actions(), "--user daemon-reload\n");
+    assert!(fs::symlink_metadata(wants.join("dstreamy.service")).is_err());
+}
+
+fn reinstall_over(fake: &Fake, show: &str) -> Value {
+    stdout(&fake.run(&["service", "install"]));
+    fake.answer_show(show);
+    fs::remove_file(fake.dir.path().join("calls")).unwrap();
+    serde_json::from_str(&stdout(&fake.run(&["--json", "service", "install"]))).unwrap()
+}
+
+const RESTART: &str = "--user daemon-reload\n--user try-restart dstreamy.service\n--user enable --now dstreamy.service\n";
+
+#[test]
+fn a_rerun_after_a_failed_reload_restarts_the_service_that_needs_one() {
+    let fake = Fake::new();
+    fake.script("case \"$2\" in daemon-reload) exit 1 ;; show) cat \"$d/unitpath\" ;; esac\n");
+    failure(&fake.run(&["service", "install"]));
+    fake.default_script();
+    fake.answer_show(&running_since(std::process::id(), "@9999999999", "yes"));
+    fs::remove_file(fake.dir.path().join("calls")).unwrap();
+    let v: Value =
+        serde_json::from_str(&stdout(&fake.run(&["--json", "service", "install"]))).unwrap();
+    assert_eq!(v["action"], "restarted", "{v}");
+    assert_eq!(v["written"], true, "{v}");
+    assert_eq!(fake.actions(), RESTART);
+    let text = stdout(&fake.run(&["service", "install"]));
+    assert!(
+        text.contains("is unchanged") && text.contains("outdated definition"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_service_started_before_its_unit_file_was_written_is_restarted() {
+    let fake = Fake::new();
+    let v = reinstall_over(&fake, &running_since(std::process::id(), "@1", "no"));
+    assert_eq!(v["action"], "restarted", "{v}");
+    assert_eq!(fake.actions(), RESTART);
+}
+
+#[test]
+fn a_service_whose_binary_was_replaced_is_restarted() {
+    let fake = Fake::new();
+    let bin = fake.dir.path().join("old-dstreamy");
+    fs::copy("/bin/sleep", &bin).unwrap();
+    let old = loop {
+        // A concurrent test's fork can briefly hold the copy open for writing (ETXTBSY).
+        match Command::new(&bin).arg("30").spawn() {
+            Ok(child) => break KillOnDrop(child),
+            Err(e) if e.raw_os_error() == Some(26) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => panic!("{e}"),
+        }
+    };
+    fs::remove_file(&bin).unwrap();
+    let v = reinstall_over(&fake, &running(old.0.id()));
+    assert_eq!(v["action"], "restarted", "{v}");
+    assert_eq!(fake.actions(), RESTART);
 }
 
 #[test]
@@ -409,7 +523,7 @@ impl Drop for KillOnDrop {
 #[test]
 fn status_finds_the_socket_under_the_services_runtime_directory() {
     let fake = Fake::new();
-    fake.answer_show(RUNNING);
+    fake.answer_show(&running(std::process::id()));
     let runtime = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     fs::write(
         fake.dir.path().join("environment"),
@@ -463,7 +577,11 @@ fn status_finds_the_socket_under_the_services_runtime_directory() {
     assert_eq!(v["endpoint"], json!(endpoint), "{v}");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"), "{v}");
     assert_eq!(
-        v["manager"], "loaded, active (running), enabled, pid 77",
+        v["manager"],
+        format!(
+            "loaded, active (running), enabled, pid {}",
+            std::process::id()
+        ),
         "{v}"
     );
     let note = v["runtime_dir_note"].as_str().unwrap();
@@ -471,7 +589,7 @@ fn status_finds_the_socket_under_the_services_runtime_directory() {
     assert!(
         fake.calls().ends_with(
             "--user show --property=UnitPath\n\
-             --user show --property=LoadState,ActiveState,SubState,UnitFileState,MainPID dstreamy.service\n\
+             --user show --timestamp=unix --property=LoadState,ActiveState,SubState,UnitFileState,MainPID,NeedDaemonReload,ExecMainStartTimestamp dstreamy.service\n\
              --user show-environment\n"
         ),
         "{}",
@@ -480,12 +598,44 @@ fn status_finds_the_socket_under_the_services_runtime_directory() {
 }
 
 #[test]
+fn status_reports_an_unreadable_service_runtime_dir_and_uses_the_home_fallback_without_one() {
+    let fake = Fake::new();
+    let shell_runtime = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let status = |fake: &Fake| -> Value {
+        let output = fake
+            .command(&dstreamy(), &["--json", "service", "status"])
+            .env("XDG_RUNTIME_DIR", shell_runtime.path())
+            .output()
+            .unwrap();
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let environment = fake.dir.path().join("environment");
+
+    fs::write(&environment, "XDG_RUNTIME_DIR=$'/run/user/1\\x20x'\n").unwrap();
+    let v = status(&fake);
+    let note = v["runtime_dir_note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("could not read the service's XDG_RUNTIME_DIR"),
+        "{v}"
+    );
+    assert!(note.contains("it can decode"), "{v}");
+
+    fs::write(&environment, "HOME=/x\n").unwrap();
+    let v = status(&fake);
+    let endpoint = v["endpoint"].as_str().unwrap();
+    assert!(
+        !endpoint.starts_with(&shell_runtime.path().display().to_string()),
+        "{v}"
+    );
+    assert!(endpoint.ends_with("/dstreamy/serve.sock"), "{v}");
+}
+
+#[test]
 fn a_relative_config_directory_is_refused() {
     let fake = Fake::new();
-    let output = Command::new(dstreamy())
-        .env("HOME", fake.dir.path())
+    let output = fake
+        .command(&dstreamy(), &["service", "install", "--dry-run"])
         .env("XDG_CONFIG_HOME", "")
-        .args(["service", "install", "--dry-run"])
         .output()
         .unwrap();
     let stderr = failure(&output);
