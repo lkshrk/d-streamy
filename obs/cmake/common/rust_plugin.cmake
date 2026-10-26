@@ -2,7 +2,7 @@ include_guard(GLOBAL)
 
 find_program(CARGO_EXECUTABLE cargo HINTS "$ENV{CARGO_HOME}/bin" "$ENV{HOME}/.cargo/bin" REQUIRED)
 
-# add_rust_plugin: Build the cdylib crate in CRATE_DIR with cargo and lay it out as the OBS module <target>
+# add_rust_plugin(<target> CRATE_DIR <dir> LIB_NAME <name>): cargo-built cdylib laid out as OBS module <target>
 function(add_rust_plugin target)
   cmake_parse_arguments(PARSE_ARGV 1 _ARP "" "CRATE_DIR;LIB_NAME" "")
 
@@ -77,7 +77,8 @@ link=$<TARGET_LINKER_FILE:OBS::libobs>
       ALL
       ${build_commands}
       COMMAND "${CMAKE_COMMAND}" -E make_directory "${contents}/MacOS" "${contents}/Resources"
-      COMMAND lipo -create ${slices} -output "${module}"
+      COMMAND lipo -create ${slices} -output "${cargo_target_dir}/${target}.universal"
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${cargo_target_dir}/${target}.universal" "${module}"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${contents}/Info.plist"
       WORKING_DIRECTORY "${_ARP_CRATE_DIR}"
       BYPRODUCTS "${module}"

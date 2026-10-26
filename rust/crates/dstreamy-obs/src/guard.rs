@@ -6,8 +6,7 @@ use crate::log;
 
 static PANICS: AtomicI64 = AtomicI64::new(0);
 
-/// Runs `body` for a callback from libobs; a panic is logged and turned into `fallback`
-/// because unwinding into C is undefined behaviour.
+/// Runs a libobs callback body; a panic is logged and returns `fallback` instead of unwinding into C.
 pub fn guard<R>(callback: &str, fallback: R, body: impl FnOnce() -> R) -> R {
     match panic::catch_unwind(AssertUnwindSafe(body)) {
         Ok(value) => value,
