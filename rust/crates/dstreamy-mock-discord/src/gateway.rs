@@ -253,7 +253,12 @@ fn resume(state: &mut State, id: u64, d: &Value) {
     let _ = tx.send(Control::Send(resumed));
 }
 
-fn voice_state_update(shared: &Shared, state: &mut State, d: &Value) {
+pub(crate) fn voice_state_update(shared: &Shared, state: &mut State, d: &Value) {
+    if state.defer_join && d["channel_id"].is_string() {
+        state.defer_join = false;
+        state.deferred_join = Some(d.clone());
+        return;
+    }
     let user_id = shared.config.user.id.clone();
     let session_id = state.session.clone().unwrap_or_default();
     let (Some(guild_id), Some(channel_id)) = (d["guild_id"].as_str(), d["channel_id"].as_str())
@@ -352,6 +357,20 @@ fn stream_key(guild_id: &str, channel_id: &str, user_id: &str) -> String {
 }
 
 fn stream_create(shared: &Shared, state: &mut State, d: &Value) {
+    if state.close_voice_on_stream_create {
+        for (kind, conn) in state.voice_sockets.values() {
+            if *kind == VoiceKind::Voice {
+                let _ = conn.tx.send(Control::Close(Some(
+                    crate::voice::CLOSE_SESSION_NO_LONGER_VALID,
+                )));
+            }
+        }
+        return;
+    }
+    if state.ignore_stream_creates > 0 {
+        state.ignore_stream_creates -= 1;
+        return;
+    }
     let (Some(guild_id), Some(channel_id)) = (d["guild_id"].as_str(), d["channel_id"].as_str())
     else {
         return;

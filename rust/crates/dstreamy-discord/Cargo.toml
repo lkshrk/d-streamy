@@ -28,10 +28,12 @@ async-trait = "0.1"
 openh264 = "0.9"
 unsafe-libopus = "0.2"
 dstreamy-mock-discord = { path = "../dstreamy-mock-discord" }
+dstreamy-discord = { path = ".", features = ["test-hooks"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [features]
 test-rtp-start = ["discord-stream-rs/test-rtp-start"]
+test-hooks = []
 
 [lints]
 workspace = true

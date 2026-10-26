@@ -189,6 +189,10 @@ pub(crate) struct State {
     pub before_join_answer: Vec<Value>,
     /// Applied between the next join's VOICE_STATE_UPDATE and its VOICE_SERVER_UPDATE.
     pub move_during_join: Option<(String, String)>,
+    pub defer_join: bool,
+    pub deferred_join: Option<Value>,
+    pub close_voice_on_stream_create: bool,
+    pub ignore_stream_creates: usize,
 }
 
 pub(crate) struct Shared {

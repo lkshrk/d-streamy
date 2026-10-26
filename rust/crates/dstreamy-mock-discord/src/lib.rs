@@ -245,6 +245,33 @@ impl MockDiscord {
         self.shared.state().move_during_join = Some((guild_id.to_owned(), channel_id.to_owned()));
     }
 
+    /// Holds the next op 4 that joins a channel unanswered until [`MockDiscord::answer_deferred_join`].
+    pub fn defer_next_join(&self) {
+        self.shared.state().defer_join = true;
+    }
+
+    /// Answers the held op 4; false when none is held.
+    pub fn answer_deferred_join(&self) -> bool {
+        let mut state = self.shared.state();
+        let Some(d) = state.deferred_join.take() else {
+            return false;
+        };
+        gateway::voice_state_update(&self.shared, &mut state, &d);
+        drop(state);
+        self.shared.notify();
+        true
+    }
+
+    /// From now on every STREAM_CREATE closes the voice connection (4006) instead of being answered.
+    pub fn close_voice_on_stream_create(&self) {
+        self.shared.state().close_voice_on_stream_create = true;
+    }
+
+    /// Leaves the next `n` STREAM_CREATEs unanswered.
+    pub fn ignore_stream_creates(&self, n: usize) {
+        self.shared.state().ignore_stream_creates = n;
+    }
+
     /// Close the voice WebSocket of `kind`; `None` drops TCP without a close frame. The connection stays resumable.
     pub fn drop_voice(&self, kind: VoiceKind, close_code: Option<u16>) -> bool {
         let state = self.shared.state();

@@ -456,15 +456,141 @@ async fn restart_in(f: &mut Fixture, channel_id: &str, arm: impl FnOnce(&MockDis
     f.video_flowing().await;
 }
 
-fn moves_seen(f: &mut Fixture) -> Vec<String> {
-    let mut moves = Vec::new();
+fn events_seen(f: &mut Fixture) -> Vec<SessionEvent> {
+    let mut events = Vec::new();
     loop {
         match f.events.try_recv() {
-            Ok(SessionEvent::ChannelMoved { channel_id, .. }) => moves.push(channel_id),
-            Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-            Err(_) => return moves,
+            Ok(event) => events.push(event),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(_) => return events,
         }
     }
+}
+
+fn moves_seen(f: &mut Fixture) -> Vec<String> {
+    events_seen(f)
+        .into_iter()
+        .filter_map(|e| match e {
+            SessionEvent::ChannelMoved { channel_id, .. } => Some(channel_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Stops `f`'s session, arms the mock with `arm`, and starts again in `channel_id` without waiting.
+async fn stop_and_start(
+    f: &mut Fixture,
+    channel_id: &str,
+    options: SessionOptions,
+    arm: impl FnOnce(&MockDiscord),
+) {
+    let source = timeout(T, f.session.stop())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("source handed back");
+    arm(&f.mock);
+    f.states_seen();
+    f.session
+        .start(
+            Some(MOCK_GUILD_ID.into()),
+            channel_id.into(),
+            source,
+            options,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("restart: {e}"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn voice_states_queued_when_the_join_completes_never_move_the_run() {
+    let mut f = Fixture::streaming().await;
+    stop_and_start(&mut f, MOCK_OTHER_VOICE_CHANNEL_ID, options(), |mock| {
+        mock.defer_next_join();
+        mock.late_voice_state_before_next_join(MOCK_GUILD_ID, Some(MOCK_VOICE_CHANNEL_ID));
+    })
+    .await;
+    f.mock
+        .wait_for_op(None, gw::OP_VOICE_STATE_UPDATE, 2, T)
+        .await
+        .expect("the restart's op 4");
+    let release = f.session.park_for_tests().await;
+    assert!(f.mock.answer_deferred_join());
+    timeout(T, async {
+        loop {
+            let voice = f.client.streamer().voice_connection().cloned();
+            if let Some(voice) = voice
+                && voice.is_ready().await
+            {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the join never completed");
+    drop(release);
+    f.wait_state_explained(|s| *s == SessionState::Streaming)
+        .await;
+    f.video_flowing().await;
+    assert_eq!(moves_seen(&mut f), Vec::<String>::new());
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn voice_closing_during_every_stream_create_gives_up() {
+    let mut f = Fixture::streaming().await;
+    let max_attempts = options().backoff.max_attempts;
+    stop_and_start(&mut f, MOCK_VOICE_CHANNEL_ID, options(), |mock| {
+        mock.close_voice_on_stream_create();
+    })
+    .await;
+    wait_state(&mut f.state, |s| {
+        matches!(
+            s,
+            SessionState::Stopped {
+                reason: StopReason::GaveUp { .. }
+            }
+        )
+    })
+    .await;
+    assert_eq!(
+        *f.state.borrow(),
+        SessionState::Stopped {
+            reason: StopReason::GaveUp {
+                attempts: max_attempts
+            }
+        }
+    );
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_stream_create_rejoins_once_without_a_stale_voice_close() {
+    let mut f = Fixture::streaming().await;
+    let mut options = options();
+    options.stream.step_timeout = Duration::from_secs(2);
+    stop_and_start(&mut f, MOCK_VOICE_CHANNEL_ID, options, |mock| {
+        mock.ignore_stream_creates(1);
+    })
+    .await;
+    f.wait_state_explained(|s| *s == SessionState::Streaming)
+        .await;
+    f.video_flowing().await;
+    let closes: Vec<_> = events_seen(&mut f)
+        .into_iter()
+        .filter(|e| matches!(e, SessionEvent::Error { message, .. } if message.contains("connection closed")))
+        .collect();
+    assert!(closes.is_empty(), "{closes:?}");
+    assert_eq!(
+        f.voice_joins(),
+        [
+            MOCK_VOICE_CHANNEL_ID,
+            MOCK_VOICE_CHANNEL_ID,
+            MOCK_VOICE_CHANNEL_ID
+        ]
+    );
+    f.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

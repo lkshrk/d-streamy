@@ -1195,6 +1195,7 @@ dependencies = [
  "async-trait",
  "discord-stream-rs",
  "dstreamy-core",
+ "dstreamy-discord",
  "dstreamy-media",
  "dstreamy-mock-discord",
  "flate2",

@@ -212,6 +212,11 @@ enum Command {
         reply: Reply<Result<(), SessionError>>,
     },
     RequestKeyframe,
+    #[cfg(feature = "test-hooks")]
+    Park {
+        parked: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
 }
 
 /// Supervises one Go Live stream; the client's `Streamer` holds one stream, so one `Session` per client.
@@ -286,6 +291,20 @@ impl Session {
                 error: SessionError::Gone,
             }),
         }
+    }
+
+    /// Parks the session task until the returned sender is dropped; events queue meanwhile.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub async fn park_for_tests(&self) -> oneshot::Sender<()> {
+        let (parked, is_parked) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let _ = self.commands.send(Command::Park {
+            parked,
+            release: released,
+        });
+        let _ = is_parked.await;
+        release
     }
 
     /// Ends Go Live, leaves voice and hands the stopped source back; `None` when there is none.
@@ -385,6 +404,11 @@ impl Actor {
                     let _ = reply.send(Err(SessionError::NotRunning));
                 }
                 Command::RequestKeyframe => {}
+                #[cfg(feature = "test-hooks")]
+                Command::Park { parked, release } => {
+                    let _ = parked.send(());
+                    let _ = release.await;
+                }
             }
         }
     }
@@ -438,6 +462,12 @@ enum Phase {
         until: tokio::time::Instant,
     },
     Streaming,
+}
+
+enum Gateway {
+    Handled,
+    Phase(Phase),
+    Stop(StopReason),
 }
 
 struct Ended {
@@ -502,7 +532,7 @@ impl Run {
         health.set_missed_tick_behavior(MissedTickBehavior::Delay);
         health.reset();
 
-        let (reason, stop_reply, exit) = loop {
+        let (reason, stop_reply, exit) = 'run: loop {
             tokio::select! {
                 biased;
                 command = actor.commands.recv() => match command {
@@ -518,6 +548,11 @@ impl Run {
                         if let Some(pump) = &self.pump {
                             pump.request_keyframe();
                         }
+                    }
+                    #[cfg(feature = "test-hooks")]
+                    Some(Command::Park { parked, release }) => {
+                        let _ = parked.send(());
+                        let _ = release.await;
                     }
                     Some(Command::Reconfigure { capture, reply }) => {
                         if capture.codec != self.options.stream.capture.codec {
@@ -559,9 +594,21 @@ impl Run {
                                 self.voice = Some(voice);
                             }
                             let Some(stream) = connected.stream else {
+                                // Voice states queued while the join was in flight still go behind the fence.
+                                while let Ok(event) = self.gateway.try_recv() {
+                                    match self.on_gateway(actor, &phase, Some(event)) {
+                                        Gateway::Handled => {}
+                                        Gateway::Phase(next) => {
+                                            phase = next;
+                                            continue 'run;
+                                        }
+                                        Gateway::Stop(reason) => break 'run (reason, None, false),
+                                    }
+                                }
                                 self.joined = true;
                                 phase = Phase::Connecting { redo: Redo::Stream, attempt, fut: self.connect(Redo::Stream) };
-                                if let Some(next) = self.unacked.take().and_then(|state| self.on_voice_state(actor, &phase, state)) {
+                                let unacked = self.unacked.take().filter(|state| !self.is_stale_session(state));
+                                if let Some(next) = unacked.and_then(|state| self.on_voice_state(actor, &phase, state)) {
                                     phase = next;
                                 }
                                 continue;
@@ -618,54 +665,31 @@ impl Run {
                         }
                         Err(e) => {
                             actor.error(format!("connecting failed: {e}"), false);
-                            let attempt = attempt + 1;
-                            if attempt > self.options.backoff.max_attempts {
-                                actor.error("giving up after repeated reconnect failures", true);
-                                break (StopReason::GaveUp { attempts: attempt - 1 }, None, false);
+                            match self.retry(actor, attempt) {
+                                Ok(next) => phase = next,
+                                Err(reason) => break (reason, None, false),
                             }
-                            // A failed stream-only retry may mean voice is gone too; the reference always rejoins.
-                            phase = self.wait(actor, Redo::Voice, attempt);
                         }
                     },
                 },
                 event = next_event(&mut self.voice) => {
-                    if let Some(next) = self.on_connection_event(actor, &phase, Redo::Voice, event) {
-                        phase = next;
+                    match self.on_connection_event(actor, &phase, Redo::Voice, event) {
+                        Ok(Some(next)) => phase = next,
+                        Ok(None) => {}
+                        Err(reason) => break (reason, None, false),
                     }
                 }
                 event = next_event(&mut self.stream) => {
-                    if let Some(next) = self.on_connection_event(actor, &phase, Redo::Stream, event) {
-                        phase = next;
+                    match self.on_connection_event(actor, &phase, Redo::Stream, event) {
+                        Ok(Some(next)) => phase = next,
+                        Ok(None) => {}
+                        Err(reason) => break (reason, None, false),
                     }
                 }
-                event = self.gateway.recv() => match event {
-                    Some(GatewayEvent::Closed(e)) => {
-                        actor.error(format!("gateway closed: {e}"), true);
-                        break (StopReason::GatewayClosed, None, false);
-                    }
-                    Some(GatewayEvent::Ready { .. }) => {
-                        debug!("new gateway session; joining voice again");
-                        phase = self.reconnect(actor, &phase, Redo::Voice);
-                    }
-                    Some(GatewayEvent::VoiceStateUpdate(state)) => {
-                        if self.is_other_session(&state) {
-                            if state.channel_id.is_some() {
-                                actor.error("another device of this account joined voice", true);
-                                break (StopReason::VoiceTakenOver, None, false);
-                            }
-                        } else if self.is_stale_session(&state) {
-                            debug!("voice state of an earlier gateway session ignored");
-                        } else if !self.joined {
-                            self.unacked = Some(state);
-                        } else if let Some(next) = self.on_voice_state(actor, &phase, state) {
-                            phase = next;
-                        }
-                    }
-                    Some(_) => {}
-                    None => {
-                        actor.error("gateway closed", true);
-                        break (StopReason::GatewayClosed, None, false);
-                    }
+                event = self.gateway.recv() => match self.on_gateway(actor, &phase, event) {
+                    Gateway::Handled => {}
+                    Gateway::Phase(next) => phase = next,
+                    Gateway::Stop(reason) => break (reason, None, false),
                 },
                 _ = health.tick() => {
                     if self.pump.as_ref().is_some_and(MediaPump::capture_ended) {
@@ -768,14 +792,14 @@ impl Run {
         phase: &Phase,
         kind: Redo,
         event: Option<VoiceEvent>,
-    ) -> Option<Phase> {
+    ) -> Result<Option<Phase>, StopReason> {
         match event {
             Some(VoiceEvent::Resumed) => {
                 if let Some(pump) = &self.pump {
                     pump.update_stats(|s| s.resumes += 1);
                 }
                 actor.emit(SessionEvent::Resumed);
-                None
+                return Ok(None);
             }
             Some(VoiceEvent::Closed { code }) => {
                 let name = if kind == Redo::Voice {
@@ -784,10 +808,65 @@ impl Run {
                     "stream"
                 };
                 actor.error(format!("{name} connection closed (code {code:?})"), false);
-                Some(self.reconnect(actor, phase, kind))
             }
-            Some(_) => None,
-            None => Some(self.reconnect(actor, phase, kind)),
+            Some(_) => return Ok(None),
+            None => {}
+        }
+        match phase {
+            Phase::Connecting { attempt, .. } => self.retry(actor, *attempt).map(Some),
+            _ => Ok(Some(self.reconnect(actor, phase, kind))),
+        }
+    }
+
+    /// A failed connect attempt: tears everything down and waits to rejoin, or gives up past `max_attempts`.
+    fn retry(&mut self, actor: &Actor, attempt: u32) -> Result<Phase, StopReason> {
+        let attempt = attempt + 1;
+        if attempt > self.options.backoff.max_attempts {
+            actor.error("giving up after repeated reconnect failures", true);
+            return Err(StopReason::GaveUp {
+                attempts: attempt - 1,
+            });
+        }
+        if let Some(pump) = &self.pump {
+            pump.detach();
+        }
+        self.stream = None;
+        self.client.stop_stream();
+        // A failed stream-only retry may mean voice is gone too; the reference always rejoins.
+        self.voice = None;
+        Ok(self.wait(actor, Redo::Voice, attempt))
+    }
+
+    fn on_gateway(&mut self, actor: &Actor, phase: &Phase, event: Option<GatewayEvent>) -> Gateway {
+        match event {
+            Some(GatewayEvent::Closed(e)) => {
+                actor.error(format!("gateway closed: {e}"), true);
+                Gateway::Stop(StopReason::GatewayClosed)
+            }
+            Some(GatewayEvent::Ready { .. }) => {
+                debug!("new gateway session; joining voice again");
+                Gateway::Phase(self.reconnect(actor, phase, Redo::Voice))
+            }
+            Some(GatewayEvent::VoiceStateUpdate(state)) => {
+                if self.is_other_session(&state) {
+                    if state.channel_id.is_some() {
+                        actor.error("another device of this account joined voice", true);
+                        return Gateway::Stop(StopReason::VoiceTakenOver);
+                    }
+                } else if self.is_stale_session(&state) {
+                    debug!("voice state of an earlier gateway session ignored");
+                } else if !self.joined {
+                    self.unacked = Some(state);
+                } else if let Some(next) = self.on_voice_state(actor, phase, state) {
+                    return Gateway::Phase(next);
+                }
+                Gateway::Handled
+            }
+            Some(_) => Gateway::Handled,
+            None => {
+                actor.error("gateway closed", true);
+                Gateway::Stop(StopReason::GatewayClosed)
+            }
         }
     }
 
