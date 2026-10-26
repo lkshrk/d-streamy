@@ -328,8 +328,6 @@ jobs:
           cargo clippy --workspace --all-targets --locked --target x86_64-apple-darwin -- -D warnings
 
       - name: Load and panic tests (${{ matrix.arch }} slice)
-        env:
-          RUST_PLUGIN_SECONDS: ${{ matrix.arch == 'x86_64' && '15' || '3' }}
         run: |
           set -o pipefail
           app="$OBS_PREFIX/OBS.app/Contents"
