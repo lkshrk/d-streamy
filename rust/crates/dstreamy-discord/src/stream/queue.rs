@@ -432,6 +432,49 @@ mod tests {
     }
 
     #[test]
+    fn a_keyframe_arriving_clears_a_pending_early_request() {
+        let now = Instant::now();
+        let ms = |n| now + Duration::from_millis(n);
+        let mut q = FrameQueue::new(8, 8);
+        q.push(video(0, true), now);
+        q.pop();
+        q.push(video(33, false), now);
+        assert!(q.video_lost(now, false).request_keyframe);
+        assert!(
+            !q.video_lost(ms(100), true).request_keyframe,
+            "pending, before the floor"
+        );
+        q.push(video(150, true), ms(150));
+        q.pop();
+        assert!(
+            !q.video_lost(ms(250), false).request_keyframe,
+            "an ordinary loss waits the full retry"
+        );
+        assert!(q.video_lost(ms(1000), false).request_keyframe);
+    }
+
+    #[test]
+    fn an_attach_clears_a_pending_early_request() {
+        let now = Instant::now();
+        let ms = |n| now + Duration::from_millis(n);
+        let mut q = FrameQueue::new(8, 8);
+        q.push(video(0, true), now);
+        q.pop();
+        q.push(video(33, false), now);
+        assert!(q.video_lost(now, false).request_keyframe);
+        assert!(
+            !q.video_lost(ms(100), true).request_keyframe,
+            "pending, before the floor"
+        );
+        assert!(q.require_keyframe(ms(150)).request_keyframe);
+        assert!(
+            !q.video_lost(ms(400), false).request_keyframe,
+            "the attach request answers it"
+        );
+        assert!(q.video_lost(ms(1150), false).request_keyframe);
+    }
+
+    #[test]
     fn a_stale_keyframe_asks_again_only_while_waiting_for_one() {
         let now = Instant::now();
         let soon = now + KEYFRAME_RETRY_SOON;
