@@ -1278,6 +1278,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dstreamy-obs-producer"
+version = "0.1.0"
+dependencies = [
+ "dstreamy-core",
+ "dstreamy-ipc",
+ "dstreamy-mock-discord",
+ "dstreamy-obs-packet",
+ "dstreamy-test-producer",
+ "futures-util",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "dstreamy-test-producer"
 version = "0.1.0"
 dependencies = [
