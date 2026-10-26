@@ -272,22 +272,22 @@ fn assert_paced<F>(
     };
     let unexcused: Vec<_> = pairs.iter().filter(|(f, _)| !after_stall(at(f))).collect();
     let mid = median(unexcused.iter().map(|p| lag(p)).collect());
-    // A backlog can take longer than the stall to drain, so a draining tail within the stall's length after its window goes with it.
+    // A backlog can outlast the stall, so late frames within the stall's length after its window, none later than the first, go with it.
     let mut checked = Vec::new();
-    let mut tail: Option<(Instant, Duration, i64)> = None;
+    let mut tail: Option<(Instant, Duration, Option<i64>)> = None;
     let mut previous = first;
     for p in &pairs {
         let t = at(p.0);
         let deviation = lag(p) - mid;
         if let Some((end, len)) = stall_at(t) {
-            tail = Some((end, len, len.as_micros() as i64 - JITTER_MARGIN_US));
-        } else if let Some((end, len, before)) = tail
+            tail = Some((end, len, None));
+        } else if let Some((end, len, ceiling)) = tail
             && deviation > slack
-            && deviation <= before + JITTER_MARGIN_US
+            && deviation <= ceiling.unwrap_or(len.as_micros() as i64)
             && t <= end + len
         {
             excused += t.saturating_duration_since(previous);
-            tail = Some((end, len, deviation));
+            tail = Some((end, len, ceiling.or(Some(deviation + JITTER_MARGIN_US))));
         } else {
             tail = None;
             checked.push(p);
@@ -751,6 +751,12 @@ fn ms(ms: u64) -> Duration {
 #[should_panic(expected = "checked frames off")]
 fn drift_right_after_a_stall_still_fails() {
     catch_up_after_a_stall(&[(4, ms(30)), (5, ms(40)), (6, ms(50)), (7, ms(60))]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn a_staircase_of_late_frames_inside_the_stall_still_fails() {
+    catch_up_after_a_stall(&[(4, ms(30)), (5, ms(40)), (6, ms(50))]);
 }
 
 #[test]
