@@ -45,6 +45,13 @@ impl Endpoint {
         sys::default_location().map(Self::new)
     }
 
+    /// Where `serve` listens by default in a process whose runtime directory is `runtime_dir`.
+    pub fn default_for_runtime_dir(
+        runtime_dir: Option<&std::ffi::OsStr>,
+    ) -> Result<Self, IpcError> {
+        sys::default_location_in(runtime_dir).map(Self::new)
+    }
+
     pub fn as_path(&self) -> &Path {
         &self.location
     }

@@ -46,9 +46,13 @@ pub(crate) fn own_principal() -> Principal {
 }
 
 pub(crate) fn default_location() -> Result<PathBuf, IpcError> {
+    default_location_in(std::env::var_os(RUNTIME_DIR_VAR).as_deref())
+}
+
+pub(crate) fn default_location_in(runtime_dir: Option<&OsStr>) -> Result<PathBuf, IpcError> {
     let uid = own_principal();
     resolve_location(
-        std::env::var_os(RUNTIME_DIR_VAR).as_deref(),
+        runtime_dir,
         passwd_home(uid).as_deref(),
         |base| check_base(base, uid),
         Path::is_dir,
