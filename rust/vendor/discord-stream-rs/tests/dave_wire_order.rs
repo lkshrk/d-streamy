@@ -225,12 +225,14 @@ async fn frames_complete_on_the_wire_in_dave_nonce_order() {
     let opus = [0xFC, 0xFF, 0xFE, 0x01];
     let mut order: Vec<WireKey> = Vec::new();
     let mut previous_ts = None;
+    // Each keyframe is DAVE-encrypted whole when the pacer starts it, about 0.5 s of CPU in a debug build.
+    const FIRST_PACKET: Duration = Duration::from_secs(30);
     for i in 0..FRAMES as u64 {
         client
             .send_video_frame_at(&au, Duration::from_millis(33 * i))
             .await
             .unwrap();
-        let ts = tokio::time::timeout(Duration::from_secs(5), async {
+        let ts = tokio::time::timeout(FIRST_PACKET, async {
             loop {
                 let key = wire.recv().await.unwrap();
                 order.push(key);
@@ -240,7 +242,7 @@ async fn frames_complete_on_the_wire_in_dave_nonce_order() {
             }
         })
         .await
-        .expect("keyframe did not reach the wire");
+        .unwrap_or_else(|_| panic!("keyframe {i} did not reach the wire within {FIRST_PACKET:?}"));
         previous_ts = Some(ts);
         client
             .send_audio_frame_at(&opus, Duration::from_millis(20 * i))
