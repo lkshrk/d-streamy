@@ -54,7 +54,7 @@ pub const VIDEO_PACING_BITS_PER_SECOND: f64 = 25_000_000.0;
 /// What the pacer may send at once after waiting for a frame, as the reference's one-millisecond bucket.
 const PACING_IDLE_BURST: Duration = Duration::from_millis(1);
 /// Send time lost while backlogged (oversleeping, a slow encrypt, a stall) is made up only this far, so a long stall cannot become a long burst.
-pub const PACING_MAX_DEBT: Duration = Duration::from_millis(20);
+const PACING_MAX_DEBT: Duration = Duration::from_millis(20);
 
 const AUDIO_PLAYOUT_DELAY: (u16, u16) = (0, 1);
 const VIDEO_PLAYOUT_DELAY: (u16, u16) = (0, 10);
@@ -455,9 +455,6 @@ async fn run_pacer(shared: Arc<PacerShared>, bytes_per_second: f64) {
     let mut pacing = Pacing::new(bytes_per_second, Instant::now());
     loop {
         let (frame, waited) = shared.queue.next().await;
-        if waited {
-            pacing.idle(Instant::now());
-        }
         let order = shared.send_order.lock().await;
         if frame.generation < shared.gate.generation() {
             drop(order);
@@ -490,6 +487,10 @@ async fn run_pacer(shared: Arc<PacerShared>, bytes_per_second: f64) {
                 continue;
             }
         };
+        // After the lock wait and encrypt, so neither adds to the burst allowed after idle.
+        if waited {
+            pacing.idle(Instant::now());
+        }
         let mut write_error = None;
         for packet in &packets {
             let at = pacing.reserve(packet.payload.len() + 12, Instant::now());
@@ -1428,6 +1429,35 @@ mod tests {
         assert!(
             burst as f64 <= BYTES_PER_SECOND / 1000.0 + 1300.0,
             "{burst} bytes at once after idle"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn time_spent_before_sending_does_not_widen_the_burst_after_idle() {
+        let writes = Arc::new(StdMutex::new(Vec::new()));
+        let (pacer, mut rx) = pacer(TestWriter::Timed(writes.clone(), |_| Duration::ZERO)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let audio = pacer.shared.send_order.clone().lock_owned().await;
+        pacer.enqueue(sized(0, 100_000)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pacer.shared.queue.lock().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("frame popped");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(audio);
+        tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|p| p.sent_frames >= 1))
+            .await
+            .unwrap()
+            .unwrap();
+        let writes = writes.lock().unwrap().clone();
+        let first = writes[0].0;
+        let burst: usize = writes.iter().filter(|w| w.0 == first).map(|w| w.1).sum();
+        assert!(
+            burst as f64 <= BYTES_PER_SECOND / 1000.0 + 1300.0,
+            "{burst} bytes at once after a 10 ms wait for the send order"
         );
     }
 

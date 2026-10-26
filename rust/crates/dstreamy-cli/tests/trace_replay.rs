@@ -398,15 +398,19 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
             break r;
         }
         if Instant::now() >= deadline {
-            let status = c.status();
-            panic!(
-                "{name}: {} of {frames} video and {} of {packets} audio frames arrived, dropped {:?}; session {}; source {}",
+            let counts = format!(
+                "{name}: {} of {frames} video and {} of {packets} audio frames arrived, dropped {:?}",
                 stream_video(&r).len(),
                 producer_audio(&r).len(),
-                r.dropped_frames,
-                status["stats"],
-                status["source"]["stats"]
+                r.dropped_frames
             );
+            match c.try_status() {
+                Ok(s) => panic!(
+                    "{counts}; session {}; source {}",
+                    s["stats"], s["source"]["stats"]
+                ),
+                Err(e) => panic!("{counts}; {e}"),
+            }
         }
         std::thread::sleep(Duration::from_millis(if plis { 50 } else { 100 }));
     };

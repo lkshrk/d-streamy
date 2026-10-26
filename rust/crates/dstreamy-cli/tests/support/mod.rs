@@ -394,6 +394,16 @@ impl Client {
         self.reply("st")["data"].clone()
     }
 
+    /// Like `status`, for failure messages: an error instead of a panic when serve is gone or hung.
+    pub fn try_status(&mut self) -> Result<Value, String> {
+        self.stream
+            .write_all(format!("{}\n", json!({"id": "st", "cmd": "status"})).as_bytes())
+            .map_err(|e| format!("status unavailable: {e}"))?;
+        self.try_until(|m| m["type"] != "event" && m["id"] == "st")
+            .map(|m| m["data"].clone())
+            .ok_or_else(|| "status unavailable: no reply".to_owned())
+    }
+
     pub fn drain(&mut self) {
         while let Ok(m) = self.lines.try_recv() {
             self.seen.push(m);
