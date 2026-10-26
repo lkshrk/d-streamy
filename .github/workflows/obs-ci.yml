@@ -65,7 +65,7 @@ jobs:
       - name: Install build and runtime dependencies
         timeout-minutes: 30
         run: |
-          retry() { for i in 1 2 3; do timeout 180 "$@" && return; echo "attempt $i failed: $*"; sleep 15; done; return 1; }
+          retry() { for i in 1 2 3; do "$@" && return; echo "attempt $i failed: $*"; sleep 15; done; return 1; }
           apt=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120)
           args=(-y --no-install-recommends \
             build-essential cmake ninja-build pkg-config git curl jq \

@@ -53,7 +53,7 @@ jobs:
       - name: Install system dependencies
         timeout-minutes: 30
         run: |
-          retry() { for i in 1 2 3; do timeout 180 "$@" && return; echo "attempt $i failed: $*"; sleep 15; done; return 1; }
+          retry() { for i in 1 2 3; do "$@" && return; echo "attempt $i failed: $*"; sleep 15; done; return 1; }
           apt=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120)
           args=(-y --no-install-recommends clang libclang-dev \
             libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
@@ -109,7 +109,7 @@ jobs:
       - name: Install system dependencies
         timeout-minutes: 30
         run: |
-          retry() { for i in 1 2 3; do timeout 180 "$@" && return; echo "attempt $i failed: $*"; sleep 15; done; return 1; }
+          retry() { for i in 1 2 3; do "$@" && return; echo "attempt $i failed: $*"; sleep 15; done; return 1; }
           apt=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120)
           args=(-y --no-install-recommends clang libclang-dev \
             libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
