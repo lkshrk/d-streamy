@@ -270,6 +270,11 @@ impl Fixture {
                 Err(_) => break,
             }
         }
+        panic!("state stuck: {}", self.context(&events));
+    }
+
+    /// The state, `events` and the last 40 non-heartbeat ops the mock received, for failure messages.
+    fn context(&self, events: &[String]) -> String {
         let ops: Vec<String> = self
             .mock
             .received_ops()
@@ -277,25 +282,27 @@ impl Fixture {
             .filter(|o| !o.is(None, gw::OP_HEARTBEAT))
             .map(|o| format!("{:?} op {}", o.socket, o.op))
             .collect();
-        panic!(
-            "state stuck at {:?}; session events {events:?}; the last ops the mock received {:?}",
+        format!(
+            "state {:?}; session events {events:?}; the last ops the mock received {:?}",
             *self.state.borrow(),
             &ops[ops.len().saturating_sub(40)..]
-        );
+        )
     }
 
     async fn wait_event(&mut self, f: impl Fn(&SessionEvent) -> bool) -> SessionEvent {
-        timeout(T, async {
+        let mut skipped = Vec::new();
+        let found = timeout(T, async {
             loop {
                 match self.events.recv().await {
                     Ok(event) if f(&event) => return event,
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(SessionEvent::Health(_)) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(event) => skipped.push(format!("{event:?}")),
                     Err(e) => panic!("session events: {e}"),
                 }
             }
         })
-        .await
-        .expect("session event")
+        .await;
+        found.unwrap_or_else(|_| panic!("no such session event: {}", self.context(&skipped)))
     }
 
     async fn finish(self) {
@@ -442,6 +449,7 @@ async fn gateway_drop_resumes_and_leaves_the_stream_alone() {
 #[tokio::test(flavor = "multi_thread")]
 async fn invalid_session_rejoins_and_recovers() {
     let mut f = Fixture::streaming().await;
+    f.states_seen();
     assert!(f.mock.invalidate_session(false));
     f.mock
         .wait_for_op(None, gw::OP_IDENTIFY, 1, T)
