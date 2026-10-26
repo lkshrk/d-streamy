@@ -447,8 +447,16 @@ async fn invalid_session_rejoins_and_recovers() {
         .wait_for_op(None, gw::OP_IDENTIFY, 1, T)
         .await
         .expect("second IDENTIFY");
-    f.wait_state_explained(|s| matches!(s, SessionState::Reconnecting { .. }))
-        .await;
+    // The event, unlike the state, is still there if this task only runs once the session is streaming again.
+    f.wait_event(|e| {
+        matches!(
+            e,
+            SessionEvent::State {
+                state: SessionState::Reconnecting { attempt: 1 }
+            }
+        )
+    })
+    .await;
     f.wait_state_explained(|s| *s == SessionState::Streaming)
         .await;
     f.video_flowing().await;
