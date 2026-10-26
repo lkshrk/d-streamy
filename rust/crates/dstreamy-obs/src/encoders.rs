@@ -169,6 +169,11 @@ fn create_video(config: &Config) -> Result<EncoderRef, String> {
     let (fps, divisor) = settings::target_fps(ovi.fps_num, ovi.fps_den).map_err(|p| p.message())?;
     let (width, height) = settings::fit_1080p(ovi.output_width, ovi.output_height);
     let id = CString::new(config.video_encoder.as_str()).map_err(|e| e.to_string())?;
+    // SAFETY: a NUL-terminated id; libobs only looks it up.
+    let codec = unsafe { text(sys::obs_get_encoder_codec(id.as_ptr())) };
+    if registered(&id) && codec != "h264" {
+        return Err(Problem::NotH264 { codec }.message());
+    }
     if !registered(&id) {
         return Err(format!(
             "D-Streamy's video encoder {} isn't available in this OBS: choose another in its settings",

@@ -570,6 +570,19 @@ mod tests {
         ] {
             assert_eq!(Family::of(id), Some(Family::VideoToolbox), "{id}");
         }
+        let hevc = EncoderSettings::new(
+            "com.apple.videotoolbox.videoencoder.ave.hevc",
+            "hevc",
+            Map::new(),
+            Map::new(),
+        );
+        assert_eq!(
+            check_video_encoder(&hevc),
+            [Problem::NotH264 {
+                codec: "hevc".into()
+            }],
+            "the codec decides before the family"
+        );
     }
 
     #[test]
