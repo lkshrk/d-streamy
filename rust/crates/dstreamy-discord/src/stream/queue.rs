@@ -25,6 +25,8 @@ pub struct FrameQueue {
     max_audio: usize,
     awaiting_keyframe: bool,
     last_request: Option<Instant>,
+    /// A keyframe was lost before the floor allowed asking again; the next chance uses the floor, not the full retry.
+    lost_keyframe: bool,
     closed: bool,
 }
 
@@ -38,6 +40,7 @@ impl FrameQueue {
             max_audio: max_audio.max(1),
             awaiting_keyframe: true,
             last_request: None,
+            lost_keyframe: false,
             closed: false,
         }
     }
@@ -58,6 +61,7 @@ impl FrameQueue {
             }
             MediaFrame::Video(ref v) if v.keyframe => {
                 self.awaiting_keyframe = false;
+                self.lost_keyframe = false;
                 if self.video_len >= self.max_video {
                     effects.dropped_video = self.drop_video_before(self.frames.len());
                 }
@@ -95,7 +99,7 @@ impl FrameQueue {
         Some(frame)
     }
 
-    /// Skips queued video to the next keyframe; one the transport just flushed is asked for again at once.
+    /// Skips queued video to the next keyframe; one the transport just flushed is asked for again as soon as the floor allows.
     pub fn video_lost(&mut self, now: Instant, keyframe_flushed: bool) -> Effects {
         let next_key = self
             .frames
@@ -122,6 +126,7 @@ impl FrameQueue {
         let dropped_video = self.drop_video_before(self.frames.len());
         self.awaiting_keyframe = true;
         self.last_request = Some(now);
+        self.lost_keyframe = false;
         Effects {
             dropped_video,
             dropped_audio: 0,
@@ -156,7 +161,8 @@ impl FrameQueue {
 
     /// `soon` when the keyframe being waited for was lost, not merely late.
     fn request(&mut self, now: Instant, soon: bool) -> bool {
-        let interval = if soon {
+        self.lost_keyframe |= soon;
+        let interval = if self.lost_keyframe {
             KEYFRAME_RETRY_SOON
         } else {
             KEYFRAME_RETRY
@@ -166,6 +172,7 @@ impl FrameQueue {
             .is_none_or(|t| now.duration_since(t) >= interval);
         if due {
             self.last_request = Some(now);
+            self.lost_keyframe = false;
         }
         due
     }
@@ -397,6 +404,31 @@ mod tests {
         }
         assert!(requests >= 2, "the cycle still asks: {requests}");
         assert!(requests <= 9, "{requests} requests in 2 s");
+    }
+
+    #[test]
+    fn a_keyframe_lost_before_the_floor_is_asked_for_once_the_floor_allows() {
+        let now = Instant::now();
+        let ms = |n| now + Duration::from_millis(n);
+        let mut q = FrameQueue::new(8, 8);
+        q.push(video(0, true), now);
+        q.pop();
+        q.push(video(33, false), now);
+        assert!(q.video_lost(now, false).request_keyframe);
+        assert!(
+            !q.video_lost(ms(100), true).request_keyframe,
+            "the floor has not passed"
+        );
+        assert!(!q.push(video(200, false), ms(200)).request_keyframe);
+        assert!(
+            q.push(video(250, false), ms(250)).request_keyframe,
+            "asked again at the floor, not at the full retry"
+        );
+        assert!(
+            !q.push(video(600, false), ms(600)).request_keyframe,
+            "then the full retry"
+        );
+        assert!(q.push(video(1250, false), ms(1250)).request_keyframe);
     }
 
     #[test]
