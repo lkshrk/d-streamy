@@ -259,7 +259,30 @@ fn assert_paced<F>(
         let arrived = at(f).duration_since(at(f0)).as_micros() as i64;
         arrived - (s.dts_usec - s0.dts_usec)
     };
-    let checked: Vec<_> = pairs.iter().filter(|(f, _)| !after_stall(at(f))).collect();
+    let in_window: Vec<_> = pairs.iter().filter(|(f, _)| !after_stall(at(f))).collect();
+    assert!(
+        in_window.len() * 2 >= pairs.len(),
+        "{what}: only {} of {} frames arrived outside a stall of the mock's runtime: {stalls:?}",
+        in_window.len(),
+        pairs.len()
+    );
+    let mid = median(in_window.iter().map(|p| lag(p)).collect());
+    // A backlog can take longer than the stall to drain, so the late frames right after a window go with it.
+    let mut checked = Vec::new();
+    let mut catching_up = false;
+    let mut previous = first;
+    for p in &pairs {
+        let t = at(p.0);
+        if after_stall(t) {
+            catching_up = true;
+        } else if catching_up && lag(p) - mid > slack {
+            excused += t.saturating_duration_since(previous);
+        } else {
+            catching_up = false;
+            checked.push(p);
+        }
+        previous = t;
+    }
     let span = last - first;
     eprintln!(
         "{what}: pace checked on {} of {} frames, {} left out after {} stalls of {stalled:?} in all, longest {longest:?}, excusing {excused:?} of {span:?}",
@@ -275,11 +298,10 @@ fn assert_paced<F>(
     );
     assert!(
         checked.len() * 2 >= pairs.len(),
-        "{what}: only {} of {} frames arrived outside a stall of the mock's runtime: {stalls:?}",
+        "{what}: only {} of {} frames arrived outside a stall of the mock's runtime or its catch-up: {stalls:?}",
         checked.len(),
         pairs.len()
     );
-    let mid = median(checked.iter().map(|p| lag(p)).collect());
     let off: Vec<i64> = checked
         .iter()
         // The reference frame's lag is 0 by construction, so a late reference would count as its own outlier.
@@ -656,8 +678,12 @@ fn a_few_stalls_excuse_the_frames_they_delay() {
 
 /// 40 unique frames at 60 fps, as many as a short 60 fps trace yields; `late` frames arrive that much behind their dts.
 fn check_sixty_fps(late: &[(i64, Duration)]) {
-    let start = Instant::now();
-    let sent: Vec<Sent> = (0..40i64)
+    check_sixty_fps_with(Instant::now(), 40, late, &[]);
+}
+
+/// `frames` frames at 60 fps from `start`, with `late` frames behind their dts and the mock's runtime stalled in `stalls`.
+fn check_sixty_fps_with(start: Instant, frames: i64, late: &[(i64, Duration)], stalls: &[Stall]) {
+    let sent: Vec<Sent> = (0..frames)
         .map(|i| Sent {
             key: i.to_le_bytes().to_vec(),
             pts_us: i * 16_667,
@@ -683,9 +709,50 @@ fn check_sixty_fps(late: &[(i64, Duration)]) {
         |a| a.1,
         &sent,
         16_667,
-        &[],
+        stalls,
         "synthetic 60 fps",
     );
+}
+
+/// As on CI: a 122.7 ms stall ends 112.9 ms before the first frame, whose catch-up outlasts the stall's window.
+fn catch_up_after_a_stall(tail: &[(i64, Duration)]) {
+    let start = Instant::now() + Duration::from_secs(1);
+    let stall_end = start + Duration::from_micros(22_900) - Duration::from_micros(112_900);
+    let stalls = [(stall_end - Duration::from_micros(122_700), stall_end)];
+    let mut late = vec![
+        (0, Duration::from_micros(22_900)),
+        (1, Duration::from_micros(13_300)),
+        (2, Duration::from_micros(6_700)),
+    ];
+    late.extend_from_slice(tail);
+    check_sixty_fps_with(start, 41, &late, &stalls);
+}
+
+#[test]
+fn the_catch_up_right_after_a_stall_is_excused_with_it() {
+    catch_up_after_a_stall(&[
+        (4, Duration::from_micros(41_700)),
+        (5, Duration::from_micros(25_200)),
+    ]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn late_frames_after_the_catch_up_has_ended_still_fail() {
+    catch_up_after_a_stall(&[
+        (4, Duration::from_micros(41_700)),
+        (20, Duration::from_micros(41_700)),
+        (30, Duration::from_micros(41_700)),
+    ]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn late_frames_without_a_stall_still_fail() {
+    check_sixty_fps(&[
+        (4, Duration::from_micros(41_700)),
+        (5, Duration::from_micros(25_200)),
+    ]);
 }
 
 #[test]
