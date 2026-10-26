@@ -254,6 +254,36 @@ impl Fixture {
         states
     }
 
+    /// `wait_state` that on a timeout also names what the session reported and what the mock received.
+    async fn wait_state_explained(&mut self, f: impl Fn(&SessionState) -> bool) {
+        let waited = timeout(T, self.state.wait_for(|s| f(s)))
+            .await
+            .map(|r| r.is_ok());
+        if waited == Ok(true) {
+            return;
+        }
+        let mut events = Vec::new();
+        loop {
+            match self.events.try_recv() {
+                Ok(SessionEvent::Health(_)) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Ok(event) => events.push(format!("{event:?}")),
+                Err(_) => break,
+            }
+        }
+        let ops: Vec<String> = self
+            .mock
+            .received_ops()
+            .iter()
+            .filter(|o| !o.is(None, gw::OP_HEARTBEAT))
+            .map(|o| format!("{:?} op {}", o.socket, o.op))
+            .collect();
+        panic!(
+            "state stuck at {:?}; session events {events:?}; the last ops the mock received {:?}",
+            *self.state.borrow(),
+            &ops[ops.len().saturating_sub(40)..]
+        );
+    }
+
     async fn wait_event(&mut self, f: impl Fn(&SessionEvent) -> bool) -> SessionEvent {
         timeout(T, async {
             loop {
@@ -417,11 +447,10 @@ async fn invalid_session_rejoins_and_recovers() {
         .wait_for_op(None, gw::OP_IDENTIFY, 1, T)
         .await
         .expect("second IDENTIFY");
-    wait_state(&mut f.state, |s| {
-        matches!(s, SessionState::Reconnecting { .. })
-    })
-    .await;
-    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    f.wait_state_explained(|s| matches!(s, SessionState::Reconnecting { .. }))
+        .await;
+    f.wait_state_explained(|s| *s == SessionState::Streaming)
+        .await;
     f.video_flowing().await;
 
     assert_eq!(
