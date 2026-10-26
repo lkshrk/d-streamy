@@ -210,25 +210,45 @@ fn assert_paced<F>(
     let (f0, s0) = pairs[0];
     let slack = PACING_SLACK_US.max(frame_us);
     let (first, last) = (at(f0), at(pairs[pairs.len() - 1].0));
+    let clipped = |(from, to): Stall| (from.max(first), to.min(last));
     let stalls: Vec<Stall> = stalls
         .iter()
         .copied()
         .filter(|&(from, to)| to >= first && from <= last)
         .collect();
-    let stalled: Duration = stalls.iter().map(|&(from, to)| to - from).sum();
-    let longest = stalls.iter().map(|&(from, to)| to - from).max();
-    let after_stall = |t: Instant| {
-        stalls.iter().any(|&(from, to)| {
-            t >= from && t <= to + (to - from) + Duration::from_micros(slack as u64)
+    let stalled: Duration = stalls
+        .iter()
+        .map(|&s| {
+            let (from, to) = clipped(s);
+            to.saturating_duration_since(from)
         })
-    };
+        .sum();
+    let longest = stalls
+        .iter()
+        .map(|&(from, to)| to - from)
+        .max()
+        .unwrap_or_default();
+    let mut windows: Vec<Stall> = stalls
+        .iter()
+        .map(|&(from, to)| (from, to + (to - from) + Duration::from_micros(slack as u64)))
+        .collect();
+    windows.sort();
+    let mut excused = Duration::ZERO;
+    let mut covered_to = first;
+    for &w in &windows {
+        let (from, to) = clipped(w);
+        excused += to.saturating_duration_since(from.max(covered_to));
+        covered_to = covered_to.max(to);
+    }
+    let after_stall = |t: Instant| windows.iter().any(|&(from, to)| t >= from && t <= to);
     let lag = |(f, s): &(&F, &Sent)| {
         let arrived = at(f).duration_since(at(f0)).as_micros() as i64;
         arrived - (s.dts_usec - s0.dts_usec)
     };
     let checked: Vec<_> = pairs.iter().filter(|(f, _)| !after_stall(at(f))).collect();
+    let span = last - first;
     eprintln!(
-        "{what}: pace checked on {} of {} frames, {} left out after {} stalls of {stalled:?} in all, longest {longest:?}",
+        "{what}: pace checked on {} of {} frames, {} left out after {} stalls of {stalled:?} in all, longest {longest:?}, excusing {excused:?} of {span:?}",
         checked.len(),
         pairs.len(),
         pairs.len() - checked.len(),
@@ -236,9 +256,8 @@ fn assert_paced<F>(
     );
     // A hot loop in serve or the producer also starves the runtime, so it may not hide behind its own stalls.
     assert!(
-        stalled * 10 <= last - first,
-        "{what}: the mock's runtime stalled for {stalled:?} of {:?}: {stalls:?}",
-        last - first
+        excused * 4 <= span,
+        "{what}: stalls of the mock's runtime would excuse {excused:?} of the {span:?} trace, over a quarter: {stalls:?}"
     );
     assert!(
         checked.len() * 2 >= pairs.len(),
@@ -530,6 +549,73 @@ fn control_events_during_a_replay_lose_no_packet() {
         .find(|(n, _, _)| n == "linux-x264-main-bf0-keyint2-30fps")
         .unwrap();
     replay_through_serve(&name, &dir, &trace, true);
+}
+
+/// 150 frames sent at 30 fps; frames due inside `late_within` arrive `late` behind their dts.
+fn paced_arrivals(
+    start: Instant,
+    late_within: &[Stall],
+    late: Duration,
+) -> (Vec<Sent>, Vec<(Vec<u8>, Instant)>) {
+    let sent: Vec<Sent> = (0..150i64)
+        .map(|i| Sent {
+            key: i.to_le_bytes().to_vec(),
+            pts_us: i * 33_333,
+            dts_usec: i * 33_333,
+        })
+        .collect();
+    let arrived = sent
+        .iter()
+        .map(|s| {
+            let due = start + Duration::from_micros(s.dts_usec as u64);
+            let delayed = late_within
+                .iter()
+                .any(|&(from, to)| due >= from && due <= to);
+            (s.key.clone(), if delayed { due + late } else { due })
+        })
+        .collect();
+    (sent, arrived)
+}
+
+fn check_arrivals(sent: &[Sent], arrived: &[(Vec<u8>, Instant)], stalls: &[Stall]) {
+    let recorded: Vec<&(Vec<u8>, Instant)> = arrived.iter().collect();
+    assert_paced(
+        &recorded,
+        |a| a.0.clone(),
+        |a| a.1,
+        sent,
+        33_333,
+        stalls,
+        "synthetic",
+    );
+}
+
+#[test]
+fn a_few_stalls_excuse_the_frames_they_delay() {
+    let start = Instant::now();
+    let stalls: Vec<Stall> = [1_000u64, 3_000]
+        .iter()
+        .map(|&ms| {
+            let from = start + Duration::from_millis(ms);
+            (from, from + Duration::from_millis(80))
+        })
+        .collect();
+    let (sent, arrived) = paced_arrivals(start, &stalls, Duration::from_millis(70));
+    check_arrivals(&sent, &arrived, &stalls);
+}
+
+#[test]
+#[should_panic(expected = "over a quarter")]
+fn many_short_stalls_cannot_excuse_half_a_trace() {
+    let start = Instant::now();
+    let stalls: Vec<Stall> = (0..40u64)
+        .map(|i| {
+            let from = start + Duration::from_millis(60 + i * 125);
+            (from, from + Duration::from_millis(12))
+        })
+        .collect();
+    let (sent, arrived) = paced_arrivals(start, &[], Duration::ZERO);
+    check_arrivals(&sent, &arrived, &stalls);
 }
 
 #[test]
