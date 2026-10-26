@@ -218,14 +218,14 @@ fn shell_words_unquoted(value: &str) -> Result<Vec<PathBuf>, String> {
                     Some(b'v') => 0x0b,
                     Some(d @ b'0'..=b'3') => {
                         let digits = [Some(d), bytes.next(), bytes.next()];
-                        let mut value = 0u8;
+                        let mut byte = 0u8;
                         for digit in digits {
                             match digit {
-                                Some(o @ b'0'..=b'7') => value = value * 8 + (o - b'0'),
+                                Some(o @ b'0'..=b'7') => byte = byte * 8 + (o - b'0'),
                                 _ => return Err(format!("a bad octal escape in {value:?}")),
                             }
                         }
-                        value
+                        byte
                     }
                     Some(c @ (b'\\' | b'"' | b'\'' | b'`' | b'$')) => c,
                     Some(c) => {
@@ -475,9 +475,9 @@ mod tests {
     #[test]
     fn c_escapes_in_quoted_entries_are_decoded_and_only_spaces_separate() {
         assert_eq!(
-            shell_words_unquoted(r#""/a\tb/\n\001\303\274" /c\td"#).unwrap(),
+            shell_words_unquoted(r#""/a\tb/\n\001\303\274\377" /c\td"#).unwrap(),
             [
-                PathBuf::from(OsString::from_vec(b"/a\tb/\n\x01\xc3\xbc".to_vec())),
+                PathBuf::from(OsString::from_vec(b"/a\tb/\n\x01\xc3\xbc\xff".to_vec())),
                 PathBuf::from("/c\td"),
             ]
         );
@@ -487,7 +487,8 @@ mod tests {
         );
         assert!(shell_words_unquoted(r#""/a\q""#).is_err());
         assert!(shell_words_unquoted(r#""/a"#).is_err());
-        assert!(shell_words_unquoted(r#""/a\9""#).is_err());
+        let bad_octal = shell_words_unquoted(r#""/a\19""#).unwrap_err();
+        assert!(bad_octal.contains(r#"\"/a\\19\""#), "{bad_octal}");
     }
 
     #[test]
