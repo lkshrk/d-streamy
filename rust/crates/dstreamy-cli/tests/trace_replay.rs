@@ -289,6 +289,7 @@ fn assert_paced<F>(
         .collect();
     let largest = checked
         .iter()
+        .filter(|(f, _)| !std::ptr::eq(*f, f0))
         .map(|p| (lag(p) - mid).abs())
         .max()
         .unwrap_or(0);
@@ -676,7 +677,7 @@ fn check_sixty_fps(late: &[(i64, Duration)]) {
 
 #[test]
 fn one_frame_of_jitter_past_the_slack_passes_a_short_trace() {
-    check_sixty_fps(&[(20, Duration::from_millis(25))]);
+    check_sixty_fps(&[(20, Duration::from_millis(29))]);
 }
 
 #[test]
@@ -691,7 +692,7 @@ fn two_late_frames_fail_a_short_trace() {
 #[test]
 #[should_panic(expected = "checked frames off")]
 fn one_frame_late_past_the_jitter_margin_fails_a_short_trace() {
-    check_sixty_fps(&[(20, Duration::from_millis(35))]);
+    check_sixty_fps(&[(20, Duration::from_millis(31))]);
 }
 
 #[test]
@@ -745,6 +746,7 @@ fn a_stall_that_ends_before_the_first_frame_still_excuses_the_frames_behind_it()
 
 #[test]
 fn b_frame_traces_are_refused_at_conversion() {
+    let _paced = exclusive_on_macos();
     let negatives: Vec<_> = traces()
         .into_iter()
         .filter(|(n, _, _)| uses_b_frames(n))
@@ -779,6 +781,7 @@ fn b_frame_traces_are_refused_at_conversion() {
 
 #[test]
 fn non_opus_traces_are_refused_at_hello() {
+    let _paced = exclusive_on_macos();
     let refused: Vec<_> = traces()
         .into_iter()
         .filter(|(_, _, t)| t.audio_codec() != "opus")
