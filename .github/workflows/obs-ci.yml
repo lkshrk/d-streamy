@@ -63,9 +63,11 @@ jobs:
         run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
 
       - name: Install build and runtime dependencies
+        timeout-minutes: 20
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          retry() { for i in 1 2 3; do timeout 300 "$@" && return; echo "attempt $i failed: $*"; done; return 1; }
+          apt=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120)
+          args=(-y --no-install-recommends \
             build-essential cmake ninja-build pkg-config git curl jq \
             libglib2.0-dev extra-cmake-modules libcurl4-openssl-dev \
             libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev libavutil-dev \
@@ -77,7 +79,11 @@ jobs:
             libfreetype6-dev libspeexdsp-dev libudev-dev libv4l-dev libva-dev libpci-dev libdrm-dev \
             nlohmann-json3-dev libwebsocketpp-dev libasio-dev libqrcodegencpp-dev \
             qt6-base-dev libqt6svg6-dev qt6-base-private-dev \
-            xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils libclang-dev
+            xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils libclang-dev)
+          retry sudo apt-get "${apt[@]}" update
+          # Only fetches are retried: killing an install mid-unpack leaves dpkg broken.
+          retry sudo apt-get "${apt[@]}" install --download-only "${args[@]}"
+          sudo apt-get "${apt[@]}" install "${args[@]}"
 
       - name: Restore OBS build
         id: obs-cache
