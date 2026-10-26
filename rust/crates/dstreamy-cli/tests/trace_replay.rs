@@ -255,30 +255,41 @@ fn assert_paced<F>(
         covered_to = covered_to.max(to);
     }
     let after_stall = |t: Instant| windows.iter().any(|&(from, to)| t >= from && t <= to);
+    // The latest window end and the longest stall among the windows `t` falls in.
+    let stall_at = |t: Instant| {
+        stalls
+            .iter()
+            .filter(|&&s| {
+                let (from, to) = window(s);
+                t >= from && t <= to
+            })
+            .map(|&(from, to)| (window((from, to)).1, to - from))
+            .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)))
+    };
     let lag = |(f, s): &(&F, &Sent)| {
         let arrived = at(f).duration_since(at(f0)).as_micros() as i64;
         arrived - (s.dts_usec - s0.dts_usec)
     };
-    let in_window: Vec<_> = pairs.iter().filter(|(f, _)| !after_stall(at(f))).collect();
-    assert!(
-        in_window.len() * 2 >= pairs.len(),
-        "{what}: only {} of {} frames arrived outside a stall of the mock's runtime: {stalls:?}",
-        in_window.len(),
-        pairs.len()
-    );
-    let mid = median(in_window.iter().map(|p| lag(p)).collect());
-    // A backlog can take longer than the stall to drain, so the late frames right after a window go with it.
+    let unexcused: Vec<_> = pairs.iter().filter(|(f, _)| !after_stall(at(f))).collect();
+    let mid = median(unexcused.iter().map(|p| lag(p)).collect());
+    // A backlog can take longer than the stall to drain, so a draining tail within the stall's length after its window goes with it.
     let mut checked = Vec::new();
-    let mut catching_up = false;
+    let mut tail: Option<(Instant, Duration, i64)> = None;
     let mut previous = first;
     for p in &pairs {
         let t = at(p.0);
-        if after_stall(t) {
-            catching_up = true;
-        } else if catching_up && lag(p) - mid > slack {
+        let deviation = lag(p) - mid;
+        if let Some((end, len)) = stall_at(t) {
+            tail = Some((end, len, len.as_micros() as i64 - JITTER_MARGIN_US));
+        } else if let Some((end, len, before)) = tail
+            && deviation > slack
+            && deviation <= before + JITTER_MARGIN_US
+            && t <= end + len
+        {
             excused += t.saturating_duration_since(previous);
+            tail = Some((end, len, deviation));
         } else {
-            catching_up = false;
+            tail = None;
             checked.push(p);
         }
         previous = t;
@@ -716,6 +727,10 @@ fn check_sixty_fps_with(start: Instant, frames: i64, late: &[(i64, Duration)], s
 
 /// As on CI: a 122.7 ms stall ends 112.9 ms before the first frame, whose catch-up outlasts the stall's window.
 fn catch_up_after_a_stall(tail: &[(i64, Duration)]) {
+    catch_up_after_a_stall_in(41, tail);
+}
+
+fn catch_up_after_a_stall_in(frames: i64, tail: &[(i64, Duration)]) {
     let start = Instant::now() + Duration::from_secs(1);
     let stall_end = start + Duration::from_micros(22_900) - Duration::from_micros(112_900);
     let stalls = [(stall_end - Duration::from_micros(122_700), stall_end)];
@@ -725,7 +740,46 @@ fn catch_up_after_a_stall(tail: &[(i64, Duration)]) {
         (2, Duration::from_micros(6_700)),
     ];
     late.extend_from_slice(tail);
-    check_sixty_fps_with(start, 41, &late, &stalls);
+    check_sixty_fps_with(start, frames, &late, &stalls);
+}
+
+fn ms(ms: u64) -> Duration {
+    Duration::from_millis(ms)
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn drift_right_after_a_stall_still_fails() {
+    catch_up_after_a_stall(&[(4, ms(30)), (5, ms(40)), (6, ms(50)), (7, ms(60))]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn a_tail_growing_faster_than_jitter_inside_the_stall_still_fails() {
+    catch_up_after_a_stall(&[(4, ms(30)), (5, ms(45)), (6, ms(60))]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn a_plateau_after_a_stall_shorter_than_it_still_fails() {
+    let start = Instant::now() + Duration::from_secs(1);
+    let stall_end = start + ms(50) - ms(5);
+    let stalls = [(stall_end - ms(12), stall_end)];
+    check_sixty_fps_with(
+        start,
+        41,
+        &[(5, ms(40)), (6, ms(40)), (7, ms(40)), (8, ms(40))],
+        &stalls,
+    );
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn a_tail_longer_than_the_stall_still_fails() {
+    let draining: Vec<(i64, Duration)> = (4..14)
+        .map(|i| (i, Duration::from_micros(41_700 - 1_500 * (i as u64 - 4))))
+        .collect();
+    catch_up_after_a_stall_in(121, &draining);
 }
 
 #[test]
