@@ -197,22 +197,6 @@ jobs:
             cargo test --locked -p dstreamy-cli --test obs_plugin -- --ignored --test-threads 1 \
             2>&1 | tee "$OBS_LOGS/obs-plugin.log"
 
-      - name: H.264 encoder settings match obs/tests/encoder-settings
-        run: |
-          set -o pipefail
-          export LIBGL_ALWAYS_SOFTWARE=1
-          xvfb-run -a -s "-screen 0 1280x720x24" "$HARNESS" --modules image-source,obs-x264,obs-ffmpeg \
-            --dump-encoder-settings "$RUNNER_TEMP/encoder-settings" | tee "$OBS_LOGS/encoder-settings.log"
-          python3 obs/tests/check-encoder-settings.py "$RUNNER_TEMP/encoder-settings" obs/tests/encoder-settings \
-            "the obs-encoder-settings-linux artifact of this run"
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: obs-encoder-settings-linux
-          path: ${{ runner.temp }}/encoder-settings
-          if-no-files-found: ignore
-
       - name: Harness 5 s trace with A/V marker check
         run: |
           set -o pipefail
@@ -245,6 +229,22 @@ jobs:
           xvfb-run -a -s "-screen 0 1920x1080x24" bash obs/tests/frontend/frontend-smoke.sh \
             "$XDG_CONFIG_HOME/obs-studio" "$OBS_LOGS/frontend-stdout.log" "$OBS_PREFIX/bin/obs" \
             | tee "$OBS_LOGS/frontend.log"
+
+      - name: H.264 encoder settings match obs/tests/encoder-settings
+        run: |
+          set -o pipefail
+          export LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a -s "-screen 0 1280x720x24" "$HARNESS" --modules image-source,obs-x264,obs-ffmpeg \
+            --dump-encoder-settings "$RUNNER_TEMP/encoder-settings" | tee "$OBS_LOGS/encoder-settings.log"
+          python3 obs/tests/check-encoder-settings.py "$RUNNER_TEMP/encoder-settings" obs/tests/encoder-settings \
+            "the obs-encoder-settings-linux artifact of this run" obs_x264
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-encoder-settings-linux
+          path: ${{ runner.temp }}/encoder-settings
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
@@ -396,7 +396,7 @@ jobs:
             --modules image-source,obs-x264,obs-ffmpeg,mac-videotoolbox \
             --dump-encoder-settings "$RUNNER_TEMP/encoder-settings" | tee "$OBS_LOGS/encoder-settings.log"
           python3 obs/tests/check-encoder-settings.py "$RUNNER_TEMP/encoder-settings" obs/tests/encoder-settings \
-            "the obs-encoder-settings-macos-${{ matrix.arch }} artifact of this run"
+            "the obs-encoder-settings-macos-${{ matrix.arch }} artifact of this run" obs_x264
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()

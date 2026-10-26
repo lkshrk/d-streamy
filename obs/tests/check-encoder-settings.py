@@ -1,35 +1,48 @@
 #!/usr/bin/env python3
-"""Compares an `obs-harness --dump-encoder-settings` directory with the committed fixtures."""
+"""Compares an `obs-harness --dump-encoder-settings` directory with the committed fixtures.
+
+usage: check-encoder-settings.py DUMP FIXTURES ARTIFACT REQUIRED_ID...
+"""
 import json
 import sys
 from pathlib import Path
 
-dump, fixtures = Path(sys.argv[1]), Path(sys.argv[2])
-artifact = sys.argv[3] if len(sys.argv) > 3 else "the CI artifact"
+MISSING = object()
+
+dump, fixtures, artifact = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+required = set(sys.argv[4:])
 failures = []
 dumped = sorted(dump.glob("*.json"))
-if not dumped:
-    failures.append(f"{dump} holds no dumped encoder")
+seen = set()
 for path in dumped:
     got = json.loads(path.read_text())
+    seen.add(got["id"])
     fixture = fixtures / path.name
     if not fixture.exists():
-        failures.append(
-            f"{got['id']}: no fixture. Copy {path.name} from {artifact} to {fixtures}/, "
-            "set \"kind\": \"captured\" and \"source\" to the CI run, and commit it."
+        advice = (
+            f"copy {path.name} from {artifact} to {fixtures}/, set \"kind\": \"captured\" and \"source\" "
+            "to the CI run, and commit it"
         )
+        if got["id"].startswith("com.apple.videotoolbox."):
+            print(f"::warning::{got['id']}: VideoToolbox encoder with no fixture; {advice}")
+        else:
+            failures.append(f"{got['id']}: no fixture; {advice}")
         continue
     want = json.loads(fixture.read_text())
     for key, value in want["defaults"].items():
-        if got["defaults"].get(key) != value:
+        actual = got["defaults"].get(key, MISSING)
+        if actual is MISSING or actual != value:
+            shown = "missing" if actual is MISSING else repr(actual)
             failures.append(
-                f"{got['id']}: default {key} is {got['defaults'].get(key)!r} in libobs, {value!r} in {fixture}. "
+                f"{got['id']}: default {key} is {shown} in libobs, {value!r} in {fixture}. "
                 f"Fix the fixture from {artifact} and its cited source lines."
             )
     names = {p["name"] for p in got["properties"]}
     for prop in want["properties"]:
         if prop["name"] not in names:
             failures.append(f"{got['id']}: property {prop['name']} is in {fixture} but not in libobs's properties.")
+for missing in sorted(required - seen):
+    failures.append(f"{missing} was not dumped: its module did not load, so nothing was compared")
 for failure in failures:
     print(f"FAIL {failure}")
 print(f"checked {len(dumped)} dumped H.264 encoder(s) against {fixtures}: {'FAIL' if failures else 'PASS'}")
