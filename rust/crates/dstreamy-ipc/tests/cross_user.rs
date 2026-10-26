@@ -90,7 +90,17 @@ impl Sandbox {
         let bin = root.path().join("bin");
         mkdir(&bin, 0o755);
         let helper = bin.join("helper");
-        fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+        // Copied by a child process, so no concurrent fork here holds a write descriptor that makes the exec fail with ETXTBSY.
+        let copied = Command::new("cp")
+            .arg(std::env::current_exe().unwrap())
+            .arg(&helper)
+            .status()
+            .unwrap();
+        assert!(
+            copied.success(),
+            "copying the helper to {}",
+            helper.display()
+        );
         fs::set_permissions(&helper, Permissions::from_mode(0o755)).unwrap();
         Self { root, helper }
     }

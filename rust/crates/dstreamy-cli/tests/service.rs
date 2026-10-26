@@ -582,7 +582,7 @@ fn write_executable(path: &Path, body: &str) {
         .take()
         .unwrap()
         .write_all(body.as_bytes())
-        .unwrap();
+        .unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
     assert!(
         child.wait().unwrap().success(),
         "writing {}",
