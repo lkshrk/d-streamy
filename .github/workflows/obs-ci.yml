@@ -45,7 +45,7 @@ env:
   PUBLISH_OBS_PREFIX: ${{ github.ref == 'refs/heads/rust-rewrite' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
 
 jobs:
-  obs-linux:
+  obs-linux-plugin:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -58,7 +58,6 @@ jobs:
           {
             echo "OBS_PREFIX=$RUNNER_TEMP/obs-prefix"
             echo "OBS_LOGS=$RUNNER_TEMP/obs-logs"
-            echo "OBS_TRACES=$RUNNER_TEMP/traces"
           } >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/obs-logs"
 
@@ -113,22 +112,7 @@ jobs:
 
       - name: Build OBS ${{ env.OBS_TAG }} with the frontend and obs-websocket
         if: steps.obs.outputs.hit != 'true'
-        run: |
-          start=$(date +%s)
-          git clone --depth 1 --branch "$OBS_TAG" --recurse-submodules --shallow-submodules \
-            https://github.com/obsproject/obs-studio.git "$RUNNER_TEMP/obs-src"
-          cd "$RUNNER_TEMP/obs-src"
-          test "$(git rev-parse HEAD)" = "$OBS_COMMIT"
-          cmake --preset ubuntu \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_INSTALL_PREFIX="$OBS_PREFIX" \
-            -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF \
-            -DENABLE_BROWSER=OFF -DENABLE_SCRIPTING=OFF -DENABLE_VLC=OFF \
-            -DENABLE_NVENC=OFF -DENABLE_QSV11=OFF -DENABLE_NEW_MPEGTS_OUTPUT=OFF \
-            -DENABLE_WEBRTC=OFF -DENABLE_AJA=OFF
-          cmake --build build_ubuntu --parallel
-          cmake --install build_ubuntu
-          echo "OBS build took $(( $(date +%s) - start )) s" | tee "$OBS_PREFIX/build-time.txt"
+        run: bash .github/scripts/obs-linux-build.sh
 
       - name: Save OBS build
         if: steps.obs.outputs.hit != 'true'
@@ -145,14 +129,7 @@ jobs:
           path: ${{ runner.temp }}/obs-prefix
 
       - name: Check the OBS install
-        run: |
-          cat "$OBS_PREFIX/build-time.txt" || true
-          libdir=$(dirname "$(find "$OBS_PREFIX" -name 'libobs.so.*' | head -n 1)")
-          echo "LD_LIBRARY_PATH=$libdir" >> "$GITHUB_ENV"
-          for m in obs-x264 obs-ffmpeg obs-outputs image-source obs-websocket frontend-tools; do
-            test -f "$libdir/obs-plugins/$m.so" || { echo "missing module $m"; exit 1; }
-          done
-          test -x "$OBS_PREFIX/bin/obs"
+        run: bash .github/scripts/obs-linux-check-install.sh
 
       - name: Install Rust toolchain from rust-toolchain.toml
         working-directory: rust
@@ -161,7 +138,97 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: rust
-          key: obs-linux
+
+      - name: Configure and build obs/
+        working-directory: obs
+        run: |
+          cmake --preset ubuntu-ci-x86_64 -DCMAKE_PREFIX_PATH="$OBS_PREFIX" -DDSTREAMY_PLUGIN_TEST_HOOKS=ON
+          cmake --build --preset ubuntu-ci-x86_64
+
+      - name: OBS through the plugin to serve and mock Discord
+        working-directory: rust
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          DSTREAMY_OBS_HARNESS: ${{ github.workspace }}/obs/build_x86_64/harness/obs-harness
+          DSTREAMY_OBS_PLUGIN_BIN: ${{ github.workspace }}/obs/build_x86_64/rundir
+          DSTREAMY_OBS_PLUGIN_DATA: ${{ github.workspace }}/obs/build_x86_64/harness/plugin-data
+        run: |
+          set -o pipefail
+          xvfb-run -a -s "-screen 0 1280x720x24" \
+            cargo test --locked -p dstreamy-cli --test obs_plugin -- --ignored --test-threads 1 \
+            2>&1 | tee "$OBS_LOGS/obs-plugin.log"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-logs-linux-plugin
+          path: ${{ runner.temp }}/obs-logs
+
+  obs-linux-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set paths
+        run: |
+          {
+            echo "OBS_PREFIX=$RUNNER_TEMP/obs-prefix"
+            echo "OBS_LOGS=$RUNNER_TEMP/obs-logs"
+            echo "OBS_TRACES=$RUNNER_TEMP/traces"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/obs-logs"
+
+      - name: OBS pin matches obs/buildspec.json
+        run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
+
+      # obs-linux-plugin installs the same packages and saves the archives for both jobs.
+      - name: Restore apt archives
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/apt-archives
+          key: apt-obs-linux-ubuntu-24.04-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: apt-obs-linux-ubuntu-24.04-
+      - name: Install system dependencies
+        timeout-minutes: 30
+        run: |
+          "$GITHUB_WORKSPACE/.github/scripts/apt-install.sh" \
+            build-essential cmake ninja-build pkg-config git curl jq libglib2.0-dev \
+            extra-cmake-modules libcurl4-openssl-dev libavcodec-dev libavdevice-dev libavfilter-dev \
+            libavformat-dev libavutil-dev libswresample-dev libswscale-dev libjansson-dev \
+            libx11-xcb-dev libgles2-mesa-dev libwayland-dev libpipewire-0.3-dev libpulse-dev \
+            libx264-dev libmbedtls-dev libgl1-mesa-dev uthash-dev libsimde-dev libx11-dev \
+            libxcb-randr0-dev libxcb-shm0-dev libxcb-xinerama0-dev libxcb-composite0-dev \
+            libxinerama-dev libxcb1-dev libxcb-xfixes0-dev libxss-dev libglvnd-dev libxkbcommon-dev \
+            libxcomposite-dev libxdamage-dev libasound2-dev libfontconfig-dev libfreetype6-dev \
+            libspeexdsp-dev libudev-dev libv4l-dev libva-dev libpci-dev libdrm-dev \
+            nlohmann-json3-dev libwebsocketpp-dev libasio-dev libqrcodegencpp-dev qt6-base-dev \
+            libqt6svg6-dev qt6-base-private-dev xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils \
+            libclang-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libopus-dev
+
+      - name: Restore OBS build
+        id: obs
+        uses: ./.github/actions/obs-prefix-fetch
+        with:
+          key: obs-${{ env.OBS_TAG }}-ubuntu-24.04-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix
+
+      - name: Build OBS ${{ env.OBS_TAG }} with the frontend and obs-websocket
+        if: steps.obs.outputs.hit != 'true'
+        run: bash .github/scripts/obs-linux-build.sh
+
+      - name: Check the OBS install
+        run: bash .github/scripts/obs-linux-check-install.sh
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: rust
 
       - name: Build the trace checker
         working-directory: rust
@@ -199,19 +266,6 @@ jobs:
           cargo build --release --locked --target-dir "$RUNNER_TEMP/plugin-without-hooks"
           cmake -DTEST_HOOKS=OFF -DLIBRARY="$RUNNER_TEMP/plugin-without-hooks/release/libdstreamy_obs.so" \
             -P "$GITHUB_WORKSPACE/obs/cmake/common/check_test_hooks.cmake"
-
-      - name: OBS through the plugin to serve and mock Discord
-        working-directory: rust
-        env:
-          LIBGL_ALWAYS_SOFTWARE: "1"
-          DSTREAMY_OBS_HARNESS: ${{ github.workspace }}/obs/build_x86_64/harness/obs-harness
-          DSTREAMY_OBS_PLUGIN_BIN: ${{ github.workspace }}/obs/build_x86_64/rundir
-          DSTREAMY_OBS_PLUGIN_DATA: ${{ github.workspace }}/obs/build_x86_64/harness/plugin-data
-        run: |
-          set -o pipefail
-          xvfb-run -a -s "-screen 0 1280x720x24" \
-            cargo test --locked -p dstreamy-cli --test obs_plugin -- --ignored --test-threads 1 \
-            2>&1 | tee "$OBS_LOGS/obs-plugin.log"
 
       - name: Harness 5 s trace with A/V marker check
         run: |
