@@ -14,7 +14,7 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio_util::bytes::Bytes;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use crate::ring::{Oversized, Packet, Ring, Track};
+use crate::ring::{MAX_PACKET, Oversized, Packet, Ring, Track};
 use crate::types::{End, Hello, Level, Log};
 
 /// Above serve's 5 s wait for the session to announce the producer's video.
@@ -380,7 +380,7 @@ fn oversized_message(Oversized { track, len }: Oversized) -> String {
         Track::Video => "video",
         Track::Audio => "audio",
     };
-    format!("a {track} packet of {len} bytes is over the {MAX_FRAME_LEN}-byte frame limit")
+    format!("a {track} packet of {len} bytes is over the {MAX_PACKET}-byte packet limit")
 }
 
 /// One OBS packet to a producer frame; the video extra data is read once the first video packet exists.
@@ -475,7 +475,7 @@ mod tests {
         };
         let refused = frame_for(packet, &mut converter, &mut || None).unwrap_err();
         assert!(
-            refused.contains("over the 8388608-byte frame limit"),
+            refused.contains("bytes is over the 8388598-byte packet limit"),
             "{refused}"
         );
         let fits = Packet {
