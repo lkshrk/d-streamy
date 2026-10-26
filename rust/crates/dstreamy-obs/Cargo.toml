@@ -10,7 +10,10 @@ publish.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+dstreamy-obs-producer = { path = "../dstreamy-obs-producer" }
 dstreamy-obs-sys = { path = "../dstreamy-obs-sys" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
 
 [lints]
 workspace = true

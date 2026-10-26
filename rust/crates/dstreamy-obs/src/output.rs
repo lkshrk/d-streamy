@@ -1,75 +1,115 @@
-//! `dstreamy_output`: an encoded A/V output that counts packets.
+//! `dstreamy_output`: an encoded A/V output that hands its packets to `dstreamy serve`.
 
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem;
+use std::path::PathBuf;
 use std::ptr;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use dstreamy_obs_producer::{Hello, Packet, Ring, Track};
 use dstreamy_obs_sys as sys;
+use tokio::sync::mpsc;
 
-use crate::guard::{self, guard};
+use crate::guard::{self, guard, guard_with};
 use crate::log;
+use crate::worker::{self, Command};
 
 const OUTPUT_ID: &CStr = c"dstreamy_output";
 const OUTPUT_NAME: &CStr = c"D-Streamy";
-const STATS_DECL: &CStr =
-    c"void get_stats(out int video_packets, out int audio_packets, out int panics)";
+const STATS_DECL: &CStr = c"void get_stats(out int video_packets, out int audio_packets, out int panics, out int dropped_video, out int dropped_audio)";
 
-struct OutputHandle(*mut sys::obs_output_t);
+#[derive(Clone, Copy)]
+pub struct OutputPtr(pub *mut sys::obs_output_t);
 
-// SAFETY: obs_output_end_data_capture may be called from any thread (null-output.c:66-80 does).
-unsafe impl Send for OutputHandle {}
+// SAFETY: plugin threads may call the output API (rtmp-stream.c's connect and send threads); destroy joins the worker.
+unsafe impl Send for OutputPtr {}
+// SAFETY: as above.
+unsafe impl Sync for OutputPtr {}
 
-#[derive(Default)]
-struct Stats {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanicIn {
+    Nowhere,
+    Start,
+    Stop,
+}
+
+/// What the libobs callbacks and the worker thread share.
+pub struct Shared {
+    pub output: OutputPtr,
+    pub ring: Ring,
+    pub commands: mpsc::UnboundedSender<Command>,
+    pub encode_error: AtomicBool,
+    /// Set by `start`, cleared by the worker once it signalled the stop.
+    pub busy: AtomicBool,
     video: AtomicI64,
     audio: AtomicI64,
 }
 
+impl Shared {
+    pub fn send(&self, command: Command) {
+        if self.commands.send(command).is_err() {
+            log::warn("the D-Streamy worker thread is gone");
+        }
+    }
+
+    fn fail(&self, message: &str) {
+        self.send(Command::Fail(format!("D-Streamy plugin error ({message})")));
+    }
+}
+
 struct Output {
-    output: *mut sys::obs_output_t,
-    stats: Stats,
+    shared: Arc<Shared>,
+    worker: Mutex<Option<JoinHandle<()>>>,
     panic_at: i64,
-    started: Mutex<Option<Instant>>,
-    stop_thread: Mutex<Option<JoinHandle<()>>>,
+    panic_in: PanicIn,
 }
 
 impl Output {
-    fn join_stop_thread(&self) {
-        let handle = self
-            .stop_thread
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(handle) = handle {
-            let _ = handle.join();
+    fn maybe_panic(&self, at: PanicIn) {
+        if self.panic_in == at {
+            panic!("test panic in {at:?}");
         }
     }
 
     fn count(&self, packet: &sys::encoder_packet) {
-        let stats = &self.stats;
+        let shared = &self.shared;
         let counter = if packet.type_ == sys::OBS_ENCODER_VIDEO {
-            &stats.video
+            &shared.video
         } else {
-            &stats.audio
+            &shared.audio
         };
-        let seen = stats.video.load(Ordering::Relaxed) + stats.audio.load(Ordering::Relaxed) + 1;
-        if counter.fetch_add(1, Ordering::Relaxed) == 0 {
-            let started = *self.started.lock().unwrap_or_else(|e| e.into_inner());
-            let kind = if packet.type_ == sys::OBS_ENCODER_VIDEO {
-                "video"
-            } else {
-                "audio"
-            };
-            let ms = started.map_or(-1, |t| t.elapsed().as_millis() as i64);
-            log::info(&format!("first {kind} packet {ms} ms after start"));
-        }
+        counter.fetch_add(1, Ordering::Relaxed);
+        let seen = shared.video.load(Ordering::Relaxed) + shared.audio.load(Ordering::Relaxed);
         if self.panic_at > 0 && seen == self.panic_at {
             panic!("test panic at packet {seen}");
         }
+    }
+
+    /// The only work done on the encoder thread: one copy into the ring.
+    fn enqueue(&self, packet: &sys::encoder_packet) {
+        let data = if packet.data.is_null() || packet.size == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: libobs hands a packet whose `data` holds `size` bytes for the duration of the call.
+            unsafe { std::slice::from_raw_parts(packet.data, packet.size) }.to_vec()
+        };
+        let track = if packet.type_ == sys::OBS_ENCODER_VIDEO {
+            Track::Video
+        } else {
+            Track::Audio
+        };
+        self.shared.ring.push(Packet {
+            track,
+            keyframe: packet.keyframe,
+            pts: packet.pts,
+            dts: packet.dts,
+            timebase: (packet.timebase_num, packet.timebase_den),
+            data,
+            arrived: Instant::now(),
+        });
     }
 }
 
@@ -78,6 +118,72 @@ impl Output {
 unsafe fn state<'a>(data: *mut c_void) -> &'a Output {
     // SAFETY: the caller's contract.
     unsafe { &*data.cast::<Output>() }
+}
+
+pub fn set_last_error(output: OutputPtr, message: &str) {
+    let text = CString::new(message.replace('\0', " ")).expect("NUL bytes were replaced");
+    // SAFETY: libobs copies the message (obs-output.c:3231-3242).
+    unsafe { sys::obs_output_set_last_error(output.0, text.as_ptr()) };
+}
+
+/// # Safety
+/// `ptr` is NULL or a NUL-terminated string valid for the call.
+unsafe fn text(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    // SAFETY: the caller's contract.
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// # Safety
+/// Both encoders belong to the output being started and are initialized.
+unsafe fn hello(
+    venc: *mut sys::obs_encoder_t,
+    aenc: *mut sys::obs_encoder_t,
+) -> Result<Hello, String> {
+    // SAFETY: valid encoders; libobs returns static strings or NULL, and video info owned by the encoder's video.
+    unsafe {
+        let info = sys::video_output_get_info(sys::obs_encoder_video(venc));
+        let info = info.as_ref().ok_or("the video encoder has no video")?;
+        if info.fps_den == 0 || info.fps_num % info.fps_den != 0 {
+            return Err(format!(
+                "D-Streamy needs a whole frame rate (15, 30 or 60 fps), not {}/{}",
+                info.fps_num, info.fps_den
+            ));
+        }
+        let sample_rate = sys::obs_encoder_get_sample_rate(aenc);
+        if sample_rate == 0 {
+            return Err("the audio encoder has no sample rate".into());
+        }
+        let frame_size = sys::obs_encoder_get_frame_size(aenc) as u64;
+        Ok(Hello {
+            video_codec: text(sys::obs_encoder_get_codec(venc)),
+            width: sys::obs_encoder_get_width(venc),
+            height: sys::obs_encoder_get_height(venc),
+            fps: info.fps_num / info.fps_den,
+            audio_codec: text(sys::obs_encoder_get_codec(aenc)),
+            sample_rate,
+            channels: u32::try_from(sys::audio_output_get_channels(sys::obs_encoder_audio(aenc)))
+                .unwrap_or(0),
+            frame_ms: u32::try_from(frame_size * 1000 / u64::from(sample_rate)).unwrap_or(0),
+            client_name: "obs-dstreamy".into(),
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            obs_version: text(sys::obs_get_version_string()),
+        })
+    }
+}
+
+fn endpoint_setting(output: OutputPtr) -> Option<PathBuf> {
+    // SAFETY: obs_output_get_settings adds a reference, released below.
+    unsafe {
+        let settings = sys::obs_output_get_settings(output.0);
+        let endpoint = text(sys::obs_data_get_string(settings, c"endpoint".as_ptr()));
+        sys::obs_data_release(settings);
+        (!endpoint.is_empty()).then(|| PathBuf::from(endpoint))
+    }
 }
 
 extern "C" fn output_get_name(_type_data: *mut c_void) -> *const c_char {
@@ -90,13 +196,39 @@ extern "C" fn output_create(
 ) -> *mut c_void {
     guard("create", ptr::null_mut(), || {
         // SAFETY: libobs passes the output's live settings object.
-        let panic_at = unsafe { sys::obs_data_get_int(settings, c"panic_at_packet".as_ptr()) };
+        let (panic_at, panic_in) = unsafe {
+            (
+                sys::obs_data_get_int(settings, c"panic_at_packet".as_ptr()),
+                text(sys::obs_data_get_string(settings, c"panic_in".as_ptr())),
+            )
+        };
+        let panic_in = match panic_in.as_str() {
+            "start" => PanicIn::Start,
+            "stop" => PanicIn::Stop,
+            _ => PanicIn::Nowhere,
+        };
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            output: OutputPtr(output),
+            ring: Ring::default(),
+            commands,
+            encode_error: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
+            video: AtomicI64::new(0),
+            audio: AtomicI64::new(0),
+        });
+        let worker = match worker::spawn(shared.clone(), receiver) {
+            Ok(handle) => handle,
+            Err(e) => {
+                log::error(&format!("cannot start the D-Streamy worker thread: {e}"));
+                return ptr::null_mut();
+            }
+        };
         let state = Box::into_raw(Box::new(Output {
-            output,
-            stats: Stats::default(),
+            shared,
+            worker: Mutex::new(Some(worker)),
             panic_at,
-            started: Mutex::new(None),
-            stop_thread: Mutex::new(None),
+            panic_in,
         }));
         // SAFETY: the handler dies with `state` in obs_output_destroy (obs-output.c:308,344); libobs copies the decl.
         unsafe {
@@ -111,89 +243,146 @@ extern "C" fn output_destroy(data: *mut c_void) {
     guard("destroy", (), || {
         // SAFETY: libobs calls destroy once, with the pointer create returned.
         let state = unsafe { Box::from_raw(data.cast::<Output>()) };
-        state.join_stop_thread();
+        state.shared.send(Command::Shutdown);
+        let worker = state
+            .worker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(worker) = worker
+            && worker.join().is_err()
+        {
+            log::warn("the D-Streamy worker thread panicked");
+        }
     });
 }
 
 extern "C" fn output_start(data: *mut c_void) -> bool {
-    guard("start", false, || {
-        // SAFETY: libobs passes the pointer create returned.
-        let state = unsafe { state(data) };
-        state.join_stop_thread();
-        *state.started.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-        // SAFETY: `state.output` is the live output this state belongs to.
-        let (can_begin, initialized, began) = unsafe {
-            let can_begin = sys::obs_output_can_begin_data_capture(state.output, 0);
-            let initialized = can_begin && sys::obs_output_initialize_encoders(state.output, 0);
-            let began = initialized && sys::obs_output_begin_data_capture(state.output, 0);
-            (can_begin, initialized, began)
-        };
-        log::info(&format!(
-            "start: can_begin_data_capture={can_begin} initialize_encoders={initialized} begin_data_capture={began}"
-        ));
-        began
-    })
+    // SAFETY: libobs passes the pointer create returned.
+    let state = unsafe { state(data) };
+    let output = state.shared.output;
+    guard_with(
+        "start",
+        false,
+        || {
+            state.maybe_panic(PanicIn::Start);
+            let shared = &state.shared;
+            if shared.busy.swap(true, Ordering::AcqRel) {
+                set_last_error(output, "D-Streamy is already starting");
+                return false;
+            }
+            let started = start(state);
+            if !started {
+                shared.busy.store(false, Ordering::Release);
+            }
+            started
+        },
+        |message| {
+            state.shared.busy.store(false, Ordering::Release);
+            set_last_error(output, &format!("D-Streamy plugin error ({message})"));
+        },
+    )
+}
+
+/// Initializes the encoders on the caller's thread, then hands the connect to the worker and returns.
+fn start(state: &Output) -> bool {
+    let shared = &state.shared;
+    let output = shared.output;
+    // SAFETY: `output` is the live output being started; the encoders it returns are owned by it.
+    let encoders = unsafe {
+        if !sys::obs_output_can_begin_data_capture(output.0, 0)
+            || !sys::obs_output_initialize_encoders(output.0, 0)
+        {
+            return false;
+        }
+        let venc = sys::obs_output_get_video_encoder(output.0);
+        let aenc = sys::obs_output_get_audio_encoder(output.0, 0);
+        (!venc.is_null() && !aenc.is_null()).then(|| hello(venc, aenc))
+    };
+    let hello = match encoders {
+        Some(Ok(hello)) => hello,
+        Some(Err(message)) => {
+            set_last_error(output, &message);
+            return false;
+        }
+        None => {
+            set_last_error(output, "D-Streamy needs a video and an audio encoder");
+            return false;
+        }
+    };
+    shared.ring.reopen();
+    shared.encode_error.store(false, Ordering::Release);
+    shared.video.store(0, Ordering::Relaxed);
+    shared.audio.store(0, Ordering::Relaxed);
+    let endpoint = endpoint_setting(output);
+    if shared
+        .commands
+        .send(Command::Start { hello, endpoint })
+        .is_err()
+    {
+        set_last_error(output, "the D-Streamy worker thread is gone");
+        return false;
+    }
+    true
 }
 
 extern "C" fn output_stop(data: *mut c_void, _ts: u64) {
-    guard("stop", (), || {
-        // SAFETY: libobs passes the pointer create returned.
-        let state = unsafe { state(data) };
-        let output = OutputHandle(state.output);
-        // Ends capture off the caller's thread, following null_output (null-output.c:66-80).
-        let spawned = std::thread::Builder::new()
-            .name("dstreamy stop".into())
-            .spawn(move || {
-                let output = output;
-                // SAFETY: destroy joins this thread before the output is freed.
-                unsafe { sys::obs_output_end_data_capture(output.0) };
-            });
-        match spawned {
-            Ok(handle) => {
-                let previous = state
-                    .stop_thread
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .replace(handle);
-                if let Some(previous) = previous {
-                    let _ = previous.join();
-                }
-            }
-            Err(e) => {
-                log::error(&format!(
-                    "cannot start the stop thread ({e}); ending capture inline, which can block if called from full_stop"
-                ));
-                // SAFETY: `state.output` is live for the duration of this callback.
-                unsafe { sys::obs_output_end_data_capture(state.output) };
-            }
-        }
-    });
+    // SAFETY: libobs passes the pointer create returned.
+    let state = unsafe { state(data) };
+    guard_with(
+        "stop",
+        (),
+        || {
+            state.maybe_panic(PanicIn::Stop);
+            state.shared.send(Command::Stop);
+        },
+        |message| state.shared.fail(message),
+    );
 }
 
 extern "C" fn output_encoded_packet(data: *mut c_void, packet: *mut sys::encoder_packet) {
-    guard("encoded_packet", (), || {
-        // SAFETY: libobs passes the pointer create returned.
-        let state = unsafe { state(data) };
-        // SAFETY: a non-null packet is valid for the duration of the call.
-        match unsafe { packet.as_ref() } {
-            Some(packet) => state.count(packet),
-            // Unlike rtmp and ffmpeg-mux, never signal here: this thread holds video input_mutex.
-            None => log::error("encoder error: the output is being stopped"),
-        }
-    });
+    // SAFETY: libobs passes the pointer create returned.
+    let state = unsafe { state(data) };
+    guard_with(
+        "encoded_packet",
+        (),
+        || {
+            // SAFETY: a non-null packet is valid for the duration of the call.
+            match unsafe { packet.as_ref() } {
+                Some(packet) => {
+                    state.count(packet);
+                    state.enqueue(packet);
+                }
+                // Never signal here: this thread can hold video input_mutex. The worker reports it.
+                None => {
+                    state.shared.encode_error.store(true, Ordering::Release);
+                    state.shared.send(Command::EncodeError);
+                }
+            }
+        },
+        |message| state.shared.fail(message),
+    );
 }
 
 extern "C" fn get_stats(data: *mut c_void, cd: *mut sys::calldata_t) {
     guard("get_stats", (), || {
         // SAFETY: registered in create with the state pointer; callers only call it on a live output.
-        let stats = unsafe { &state(data).stats };
+        let shared = unsafe { &state(data).shared };
+        let ring = shared.ring.stats();
         let values = [
-            (c"video_packets", stats.video.load(Ordering::Relaxed)),
-            (c"audio_packets", stats.audio.load(Ordering::Relaxed)),
+            (c"video_packets", shared.video.load(Ordering::Relaxed)),
+            (c"audio_packets", shared.audio.load(Ordering::Relaxed)),
             (c"panics", guard::panics()),
+            (
+                c"dropped_video",
+                i64::try_from(ring.dropped_video).unwrap_or(i64::MAX),
+            ),
+            (
+                c"dropped_audio",
+                i64::try_from(ring.dropped_audio).unwrap_or(i64::MAX),
+            ),
         ];
         for (name, value) in values {
-            let value: i64 = value;
             // SAFETY: calldata stores an `int` out parameter as a long long (calldata.h:165-168).
             unsafe {
                 sys::calldata_set_data(

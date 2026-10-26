@@ -3,6 +3,7 @@
 mod guard;
 mod log;
 mod output;
+mod worker;
 
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
