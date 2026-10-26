@@ -121,7 +121,7 @@ unsafe fn encoder_settings(encoder: *mut sys::obs_encoder_t) -> Result<EncoderSe
     }
 }
 
-/// The format libobs feeds the encoder: its preferred format, else the canvas's (obs-encoder.c:194-206,257).
+/// Preferred format if set (a GPU mix uses it, obs-encoder.c:257; x264/QSV/VAAPI/NVENC read it), else the canvas's.
 ///
 /// # Safety
 /// `encoder` is a live video encoder with its video set.
@@ -285,8 +285,7 @@ fn create_video(config: &Config) -> Result<EncoderRef, String> {
     }
     let encoder = EncoderRef(encoder);
     // SAFETY: a new, inactive encoder; init-only settings are allowed before it initializes (obs-encoder.c:995-1040).
-    let mut path = "the canvas's video";
-    unsafe {
+    let path = unsafe {
         let resize = (width, height) != (ovi.output_width, ovi.output_height);
         let convert =
             ![sys::VIDEO_FORMAT_NV12, sys::VIDEO_FORMAT_I420].contains(&ovi.output_format);
@@ -294,16 +293,14 @@ fn create_video(config: &Config) -> Result<EncoderRef, String> {
             sys::obs_encoder_set_scaled_size(encoder.get(), width, height);
         }
         if resize || convert {
-            path = "a GPU-scaled or converted video";
-            // The canvas's filter, so a resize-free conversion can reuse a matching mix (obs-encoder.c:248-280).
+            // The canvas's filter: the mix scales from the canvas's base size like the canvas output (obs-encoder.c:296-304).
             let scale = if ovi.scale_type == sys::OBS_SCALE_DISABLE {
                 sys::OBS_SCALE_BICUBIC
             } else {
                 ovi.scale_type
             };
             sys::obs_encoder_set_gpu_scale_type(encoder.get(), scale);
-        }
-        if convert {
+            // A GPU mix keeps the canvas format unless told (obs-encoder.c:257); texture encoders need NV12 (obs.c:150).
             sys::obs_encoder_set_preferred_video_format(encoder.get(), sys::VIDEO_FORMAT_NV12);
         }
         if divisor > 1 && !sys::obs_encoder_set_frame_rate_divisor(encoder.get(), divisor) {
@@ -320,7 +317,15 @@ fn create_video(config: &Config) -> Result<EncoderRef, String> {
                 messages(&problems)
             ));
         }
-    }
+        if sys::obs_encoder_gpu_scaling_enabled(encoder.get()) {
+            format!(
+                "a GPU mix in {}",
+                format_name(sys::obs_encoder_get_preferred_video_format(encoder.get()))
+            )
+        } else {
+            "the canvas's video".to_owned()
+        }
+    };
     log::info(&format!(
         "own video encoder {} at {width}×{height}, {fps} FPS, {} kbps, from {path}",
         config.video_encoder, config.bitrate_kbps

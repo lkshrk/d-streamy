@@ -715,7 +715,8 @@ fn share_mode_falls_back_to_the_own_encoder_when_b_frames_are_on() {
 fn the_own_encoder_scales_a_1440p_canvas_to_1080p() {
     let (lines, recorded) = stream(json!({}), &["--width", "2560", "--height", "1440"], 60);
     assert!(
-        has_plugin_line(&lines, "own video encoder obs_x264 at 1920×1080"),
+        has_plugin_line(&lines, "own video encoder obs_x264 at 1920×1080")
+            && has_plugin_line(&lines, "from a GPU mix in NV12"),
         "{lines:#?}"
     );
     assert_eq!(first_picture_size(&stream_video(&recorded)), (1920, 1080));
@@ -864,7 +865,7 @@ fn sps_profile(video: &[&RecordedVideoFrame]) -> u8 {
 fn the_own_encoder_sends_4_2_0_from_an_i444_canvas() {
     let (lines, recorded) = stream(json!({}), &["--format", "I444"], 90);
     assert!(
-        has_plugin_line(&lines, "from a GPU-scaled or converted video"),
+        has_plugin_line(&lines, "from a GPU mix in NV12"),
         "{lines:#?}"
     );
     let profile = sps_profile(&stream_video(&recorded));
@@ -890,4 +891,21 @@ fn share_mode_falls_back_from_an_i444_stream_encoder() {
         ),
         "{lines:#?}"
     );
+}
+
+/// A resize from an I420 canvas must still feed NV12, which texture encoders need to stay on the GPU.
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn the_own_encoder_resizes_an_i420_canvas_in_nv12() {
+    let (lines, recorded) = stream(
+        json!({}),
+        &["--format", "I420", "--width", "2560", "--height", "1440"],
+        60,
+    );
+    assert!(
+        has_plugin_line(&lines, "at 1920×1080")
+            && has_plugin_line(&lines, "from a GPU mix in NV12"),
+        "{lines:#?}"
+    );
+    assert_eq!(first_picture_size(&stream_video(&recorded)), (1920, 1080));
 }
