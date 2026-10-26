@@ -417,9 +417,10 @@ enum Redo {
     Voice,
 }
 
+/// `Redo::Voice` connects voice only; the stream follows as `Redo::Stream`.
 struct Connected {
     voice: Option<(MediaConnection, Events)>,
-    stream: (MediaConnection, Events),
+    stream: Option<(MediaConnection, Events)>,
     attrs: VideoAttributes,
 }
 
@@ -459,6 +460,9 @@ struct Run {
     reconfigure_pending: bool,
     sampler: MetricsSampler,
     history: Vec<StreamMetrics>,
+    /// Until the first join completes, voice states may answer the previous run's ops; only the latest is kept.
+    joined: bool,
+    unacked: Option<VoiceState>,
 }
 
 impl Run {
@@ -481,6 +485,8 @@ impl Run {
             reconfigure_pending: false,
             sampler: MetricsSampler::new(),
             history: Vec::new(),
+            joined: false,
+            unacked: None,
         }
     }
 
@@ -552,8 +558,16 @@ impl Run {
                             if let Some(voice) = connected.voice {
                                 self.voice = Some(voice);
                             }
-                            let conn = connected.stream.0.clone();
-                            self.stream = Some(connected.stream);
+                            let Some(stream) = connected.stream else {
+                                self.joined = true;
+                                phase = Phase::Connecting { redo: Redo::Stream, attempt, fut: self.connect(Redo::Stream) };
+                                if let Some(next) = self.unacked.take().and_then(|state| self.on_voice_state(actor, &phase, state)) {
+                                    phase = next;
+                                }
+                                continue;
+                            };
+                            let conn = stream.0.clone();
+                            self.stream = Some(stream);
                             if connected.attrs != self.attrs
                                 && !self.reconfigure_pending
                                 && let Err(e) = conn.set_video_attributes(Some(self.attrs))
@@ -641,6 +655,8 @@ impl Run {
                             }
                         } else if self.is_stale_session(&state) {
                             debug!("voice state of an earlier gateway session ignored");
+                        } else if !self.joined {
+                            self.unacked = Some(state);
                         } else if let Some(next) = self.on_voice_state(actor, &phase, state) {
                             phase = next;
                         }
@@ -696,17 +712,19 @@ impl Run {
         let options = self.options.stream.clone();
         let attrs = self.attrs;
         Box::pin(async move {
-            let voice = match redo {
-                Redo::Voice => {
-                    Some(join_voice(&client, guild_id, channel_id, options.step_timeout).await?)
-                }
-                Redo::Stream => None,
-            };
-            let stream = open_stream(&client, &options, attrs).await?;
-            Ok(Connected {
-                voice,
-                stream,
-                attrs,
+            Ok(match redo {
+                Redo::Voice => Connected {
+                    voice: Some(
+                        join_voice(&client, guild_id, channel_id, options.step_timeout).await?,
+                    ),
+                    stream: None,
+                    attrs,
+                },
+                Redo::Stream => Connected {
+                    voice: None,
+                    stream: Some(open_stream(&client, &options, attrs).await?),
+                    attrs,
+                },
             })
         })
     }

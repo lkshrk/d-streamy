@@ -185,6 +185,10 @@ pub(crate) struct State {
     pub voice_sockets: HashMap<String, (VoiceKind, Connection)>,
     pub recorded: Recorded,
     pub next_id: u64,
+    /// Dispatched before the answer to the next op 4 that joins a channel.
+    pub before_join_answer: Vec<Value>,
+    /// Applied between the next join's VOICE_STATE_UPDATE and its VOICE_SERVER_UPDATE.
+    pub move_during_join: Option<(String, String)>,
 }
 
 pub(crate) struct Shared {

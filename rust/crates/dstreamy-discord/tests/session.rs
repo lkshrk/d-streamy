@@ -433,6 +433,86 @@ async fn channel_move_recreates_go_live_without_rejoining() {
     f.finish().await;
 }
 
+/// Stops `f`'s session, arms the mock with `arm`, and streams again in `channel_id`.
+async fn restart_in(f: &mut Fixture, channel_id: &str, arm: impl FnOnce(&MockDiscord)) {
+    let source = timeout(T, f.session.stop())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("source handed back");
+    arm(&f.mock);
+    f.states_seen();
+    f.session
+        .start(
+            Some(MOCK_GUILD_ID.into()),
+            channel_id.into(),
+            source,
+            options(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("restart: {e}"));
+    f.wait_state_explained(|s| *s == SessionState::Streaming)
+        .await;
+    f.video_flowing().await;
+}
+
+fn moves_seen(f: &mut Fixture) -> Vec<String> {
+    let mut moves = Vec::new();
+    loop {
+        match f.events.try_recv() {
+            Ok(SessionEvent::ChannelMoved { channel_id, .. }) => moves.push(channel_id),
+            Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(_) => return moves,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_voice_states_of_the_last_run_never_move_the_next_one() {
+    let mut f = Fixture::streaming().await;
+    restart_in(&mut f, MOCK_OTHER_VOICE_CHANNEL_ID, |mock| {
+        mock.late_voice_state_before_next_join(MOCK_GUILD_ID, Some(MOCK_VOICE_CHANNEL_ID));
+        mock.late_voice_state_before_next_join(MOCK_GUILD_ID, None);
+    })
+    .await;
+    assert_eq!(moves_seen(&mut f), Vec::<String>::new());
+    assert_eq!(
+        f.voice_joins(),
+        [MOCK_VOICE_CHANNEL_ID, MOCK_OTHER_VOICE_CHANNEL_ID]
+    );
+    let streams = f.mock.streams();
+    assert!(
+        streams
+            .iter()
+            .all(|s| s.stream_key.contains(MOCK_OTHER_VOICE_CHANNEL_ID)),
+        "{streams:?}"
+    );
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_while_joining_is_followed() {
+    let mut f = Fixture::streaming().await;
+    restart_in(&mut f, MOCK_VOICE_CHANNEL_ID, |mock| {
+        mock.move_during_next_join(MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID);
+    })
+    .await;
+    assert_eq!(moves_seen(&mut f), [MOCK_OTHER_VOICE_CHANNEL_ID]);
+    assert_eq!(
+        f.voice_joins(),
+        [MOCK_VOICE_CHANNEL_ID, MOCK_VOICE_CHANNEL_ID]
+    );
+    let streams = f.mock.streams();
+    assert!(
+        !streams.is_empty()
+            && streams
+                .iter()
+                .all(|s| s.stream_key.contains(MOCK_OTHER_VOICE_CHANNEL_ID)),
+        "{streams:?}"
+    );
+    f.finish().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn gateway_drop_resumes_and_leaves_the_stream_alone() {
     let mut f = Fixture::streaming().await;

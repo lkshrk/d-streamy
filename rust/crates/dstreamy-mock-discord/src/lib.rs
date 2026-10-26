@@ -221,6 +221,30 @@ impl MockDiscord {
         true
     }
 
+    /// Before it answers the next join, a late VOICE_STATE_UPDATE of the user's own session, as if answering an earlier op.
+    pub fn late_voice_state_before_next_join(&self, guild_id: &str, channel_id: Option<&str>) {
+        let mut state = self.shared.state();
+        let late = VoiceStateSnapshot {
+            guild_id: guild_id.to_owned(),
+            channel_id: channel_id.unwrap_or_default().to_owned(),
+            session_id: state.session.clone().unwrap_or_default(),
+            self_mute: false,
+            self_deaf: false,
+            self_video: false,
+            self_stream: false,
+        };
+        let mut payload = late.dispatch(&self.shared.config.user.id);
+        if channel_id.is_none() {
+            payload["channel_id"] = serde_json::Value::Null;
+        }
+        state.before_join_answer.push(payload);
+    }
+
+    /// Moves the user to `channel_id` after the next join's VOICE_STATE_UPDATE and before its VOICE_SERVER_UPDATE.
+    pub fn move_during_next_join(&self, guild_id: &str, channel_id: &str) {
+        self.shared.state().move_during_join = Some((guild_id.to_owned(), channel_id.to_owned()));
+    }
+
     /// Close the voice WebSocket of `kind`; `None` drops TCP without a close frame. The connection stays resumable.
     pub fn drop_voice(&self, kind: VoiceKind, close_code: Option<u16>) -> bool {
         let state = self.shared.state();

@@ -265,6 +265,9 @@ fn voice_state_update(shared: &Shared, state: &mut State, d: &Value) {
         debug!("mock gateway: op 4 for unknown voice channel {guild_id}/{channel_id}");
         return;
     }
+    for payload in std::mem::take(&mut state.before_join_answer) {
+        shared.dispatch(state, "VOICE_STATE_UPDATE", payload);
+    }
     let self_stream = state
         .voice
         .as_ref()
@@ -281,6 +284,9 @@ fn voice_state_update(shared: &Shared, state: &mut State, d: &Value) {
     let payload = voice.dispatch(&user_id);
     state.voice = Some(voice);
     shared.dispatch(state, "VOICE_STATE_UPDATE", payload);
+    if let Some((guild_id, channel_id)) = state.move_during_join.take() {
+        move_to_channel(shared, state, &guild_id, &channel_id);
+    }
 
     let token = random_hex(8);
     state.voice_auth.insert(
