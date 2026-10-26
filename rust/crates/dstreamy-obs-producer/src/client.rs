@@ -20,6 +20,8 @@ use crate::types::{End, Hello, Level, Log};
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to read pending events after a failed write, so a `detached` already sent is not missed.
 pub const PENDING_EVENTS: Duration = Duration::from_secs(1);
+/// After a stop, the queued packets and end of stream get this long before the connection is dropped.
+pub const STOP_DEADLINE: Duration = Duration::from_millis(1500);
 
 type Lines = FramedRead<ReadHalf<dstreamy_ipc::Stream>, ControlCodec>;
 type Sink = FramedWrite<WriteHalf<dstreamy_ipc::Stream>, ProducerCodec>;
@@ -203,7 +205,12 @@ async fn write_packets<T>(
             last_pts_us = frame.pts_us;
         }
         let keyframe_pts_us = frame.keyframe.then_some(frame.pts_us);
-        if let Err(e) = sink.send(frame).await {
+        let sent = tokio::select! {
+            biased;
+            t = &mut stop => break t,
+            sent = sink.send(frame) => sent,
+        };
+        if let Err(e) = sent {
             return WriterEnd::Failed(format!("writing to the service: {e}"));
         }
         if let Some(pts_us) = keyframe_pts_us {
@@ -217,24 +224,32 @@ async fn write_packets<T>(
         }
     };
     ring.close();
-    while let Some(packet) = ring.pop() {
-        let frame = match convert(packet, &mut converter, &mut video_extra_data) {
-            Ok(frame) => frame,
-            Err(e) => {
-                log.log(Level::Warn, &format!("not sending a queued packet: {e}"));
-                break;
+    let finish = async {
+        while let Some(packet) = ring.pop() {
+            let frame = match convert(packet, &mut converter, &mut video_extra_data) {
+                Ok(frame) => frame,
+                Err(e) => {
+                    log.log(Level::Warn, &format!("not sending a queued packet: {e}"));
+                    break;
+                }
+            };
+            if frame.kind == Kind::Video {
+                last_pts_us = frame.pts_us;
             }
-        };
-        if frame.kind == Kind::Video {
-            last_pts_us = frame.pts_us;
+            sink.feed(frame).await?;
         }
-        if let Err(e) = sink.feed(frame).await {
-            log.log(Level::Warn, &format!("writing queued packets: {e}"));
-            return WriterEnd::Stopped(stopped);
-        }
-    }
-    if let Err(e) = sink.send(Frame::end_of_stream(last_pts_us)).await {
-        log.log(Level::Warn, &format!("sending end of stream: {e}"));
+        sink.send(Frame::end_of_stream(last_pts_us)).await
+    };
+    match tokio::time::timeout(STOP_DEADLINE, finish).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log.log(Level::Warn, &format!("finishing the stream: {e}")),
+        Err(_) => log.log(
+            Level::Warn,
+            &format!(
+                "the service read nothing for {} ms after the stop; dropping the connection",
+                STOP_DEADLINE.as_millis()
+            ),
+        ),
     }
     WriterEnd::Stopped(stopped)
 }
