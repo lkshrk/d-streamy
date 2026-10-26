@@ -39,6 +39,7 @@ pub struct ReceivedOp {
     pub socket: Socket,
     pub op: u8,
     pub payload: OpPayload,
+    pub received_at: Instant,
 }
 
 impl ReceivedOp {

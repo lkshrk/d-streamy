@@ -208,6 +208,7 @@ async fn open(shared: &Arc<Shared>, ws: &mut Ws) -> Result<SharedConn, u16> {
                 socket,
                 op,
                 payload: OpPayload::Json(d.clone()),
+                received_at: std::time::Instant::now(),
             })
         });
     }
@@ -309,6 +310,7 @@ async fn run(
                         socket: socket.clone(),
                         op,
                         payload: OpPayload::Json(d.clone()),
+                        received_at: std::time::Instant::now(),
                     }));
                     if op == OP_HEARTBEAT {
                         heartbeat_deadline = tokio::time::Instant::now() + heartbeat_timeout;
@@ -326,6 +328,7 @@ async fn run(
                         socket: socket.clone(),
                         op,
                         payload: OpPayload::Binary(payload.to_vec()),
+                        received_at: std::time::Instant::now(),
                     }));
                     on_binary(conn, &mut ws, op, payload).await;
                 }

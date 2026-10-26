@@ -167,6 +167,7 @@ fn on_text(shared: &Shared, id: u64, text: &str) -> Result<(), u16> {
         socket: Socket::Gateway,
         op,
         payload: OpPayload::Json(d.clone()),
+        received_at: std::time::Instant::now(),
     });
     shared.notify();
     match op {

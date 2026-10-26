@@ -189,7 +189,7 @@ impl Fixture {
         let client = client(&mock).await;
         let session = Session::new(client.clone());
         let events = session.subscribe();
-        let mut state = session.state();
+        let state = session.state();
         let (source, counters) = Counted::with(behaviour);
         session
             .start(
@@ -200,8 +200,7 @@ impl Fixture {
             )
             .await
             .unwrap_or_else(|e| panic!("start: {e}"));
-        wait_state(&mut state, |s| *s == SessionState::Streaming).await;
-        let fixture = Self {
+        let mut fixture = Self {
             mock,
             client,
             session,
@@ -209,6 +208,9 @@ impl Fixture {
             events,
             counters,
         };
+        fixture
+            .wait_state_explained(|s| *s == SessionState::Streaming)
+            .await;
         fixture.video_flowing().await;
         fixture
     }
@@ -275,12 +277,15 @@ impl Fixture {
 
     /// The state, `events` and the last 40 non-heartbeat ops the mock received, for failure messages.
     fn context(&self, events: &[String]) -> String {
-        let ops: Vec<String> = self
-            .mock
-            .received_ops()
+        let received = self.mock.received_ops();
+        let start = received.first().map(|o| o.received_at);
+        let ops: Vec<String> = received
             .iter()
             .filter(|o| !o.is(None, gw::OP_HEARTBEAT))
-            .map(|o| format!("{:?} op {}", o.socket, o.op))
+            .map(|o| {
+                let at = start.map_or(0, |t| o.received_at.duration_since(t).as_millis());
+                format!("{at} ms {:?} op {}", o.socket, o.op)
+            })
             .collect();
         format!(
             "state {:?}; session events {events:?}; the last ops the mock received {:?}",
