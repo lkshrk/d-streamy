@@ -10,6 +10,8 @@ use tokio::sync::Notify;
 pub const CAPACITY: usize = 256;
 /// Four maximum-size producer frames.
 pub const MAX_BYTES: usize = 32 << 20;
+/// A producer frame's largest payload; bigger packets still go to the writer, which refuses them with their size.
+pub const MAX_PACKET: usize = (8 << 20) - 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Track {
@@ -79,6 +81,11 @@ impl Inner {
 
     fn admit(&mut self, packet: Packet, capacity: usize, max_bytes: usize) {
         let len = packet.data.len();
+        if len > MAX_PACKET {
+            self.bytes += len;
+            self.queue.push_back(packet);
+            return;
+        }
         if len > max_bytes {
             match packet.track {
                 Track::Video => {
@@ -345,6 +352,16 @@ mod tests {
             "an oversized packet is dropped alone, and video waits for a keyframe"
         );
         assert_eq!(ring.stats().queued_bytes, 0);
+    }
+
+    #[test]
+    fn a_packet_over_the_frame_limit_still_reaches_the_writer() {
+        let ring = Ring::default();
+        let mut big = audio(0);
+        big.data = vec![0; MAX_PACKET + 1];
+        ring.push(big);
+        assert_eq!(ring.pop().map(|p| p.data.len()), Some(MAX_PACKET + 1));
+        assert_eq!(ring.stats().dropped_audio, 0);
     }
 
     #[test]

@@ -202,13 +202,22 @@ async fn read_events<T>(mut lines: Lines, log: &dyn Log) -> End<T> {
 
 /// Service text as OBS may show it: no control or bidi-override characters, at most `MAX_SERVICE_TEXT` characters.
 fn service_text(text: &str) -> String {
-    let bidi = |c: char| matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    let hidden = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    };
+    let long = text.chars().nth(MAX_SERVICE_TEXT).is_some();
+    let keep = if long {
+        MAX_SERVICE_TEXT - 1
+    } else {
+        MAX_SERVICE_TEXT
+    };
     let mut out: String = text
         .chars()
-        .take(MAX_SERVICE_TEXT)
-        .map(|c| if c.is_control() || bidi(c) { ' ' } else { c })
+        .take(keep)
+        .map(|c| if hidden(c) { ' ' } else { c })
         .collect();
-    if text.chars().nth(MAX_SERVICE_TEXT).is_some() {
+    if long {
         out.push('…');
     }
     out
@@ -460,12 +469,24 @@ mod tests {
 
     #[test]
     fn service_text_drops_controls_and_bidi_overrides_and_is_capped() {
-        assert_eq!(service_text("a\nb\u{1b}[31mc\u{202E}d"), "a b [31mc d");
-        let long = "x".repeat(MAX_SERVICE_TEXT + 5);
-        let cut = service_text(&long);
-        assert_eq!(cut.chars().count(), MAX_SERVICE_TEXT + 1);
+        assert_eq!(
+            service_text("a\nb\u{1b}[31mc\u{202E}d\u{2028}e\u{2029}f"),
+            "a b [31mc d e f"
+        );
+        let cut = service_text(&"x".repeat(MAX_SERVICE_TEXT + 5));
+        assert_eq!(cut.chars().count(), MAX_SERVICE_TEXT);
         assert!(cut.ends_with('…'));
+        let exact = "y".repeat(MAX_SERVICE_TEXT);
+        assert_eq!(service_text(&exact), exact);
         assert_eq!(service_text("ok"), "ok");
+    }
+
+    #[test]
+    fn the_ring_packet_limit_is_the_frame_limit() {
+        assert_eq!(
+            crate::ring::MAX_PACKET,
+            (MAX_FRAME_LEN - HEADER_LEN) as usize
+        );
     }
 
     #[test]
