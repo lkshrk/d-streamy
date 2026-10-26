@@ -41,7 +41,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
@@ -61,13 +61,13 @@ jobs:
   release:
     needs: gate
     if: needs.gate.outputs.tag != ''
-    runs-on: macos-15
+    runs-on: macos-26
     env:
       DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
       SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
       TAG: ${{ needs.gate.outputs.tag }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.gate.outputs.tag }}
           fetch-depth: 0

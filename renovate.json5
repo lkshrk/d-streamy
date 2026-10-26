@@ -1,0 +1,5 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: ["github>lkshrk/gh-ops//renovate/presets/github-actions.json5"],
+  enabledManagers: ["github-actions", "custom.regex"],
+}
