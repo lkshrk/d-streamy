@@ -6,7 +6,7 @@ pub mod ring;
 mod types;
 
 #[cfg(unix)]
-pub use client::{Connection, StartError, attach, run};
+pub use client::{Connection, StartError, attach, block_sigpipe_on_this_thread, run};
 #[cfg(unix)]
 pub use dstreamy_ipc::Endpoint;
 pub use ring::{Packet, Ring, RingStats, Track};

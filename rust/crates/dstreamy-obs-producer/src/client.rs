@@ -254,6 +254,21 @@ async fn write_packets<T>(
     WriterEnd::Stopped(stopped)
 }
 
+/// Blocks SIGPIPE for this thread only (POSIX sends it to the writing thread), so a dead service gives EPIPE.
+pub fn block_sigpipe_on_this_thread() -> std::io::Result<()> {
+    // SAFETY: sigemptyset/sigaddset initialise a local set; pthread_sigmask reads it and changes only this thread.
+    let rc = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGPIPE);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut())
+    };
+    match rc {
+        0 => Ok(()),
+        e => Err(std::io::Error::from_raw_os_error(e)),
+    }
+}
+
 /// CLOCK_MONOTONIC in ns at `at`, comparable across processes (std `Instant` uses it on Linux).
 fn monotonic_ns(at: Instant) -> i64 {
     let mut ts = libc::timespec {
