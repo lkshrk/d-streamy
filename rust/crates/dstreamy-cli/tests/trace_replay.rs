@@ -5,7 +5,7 @@ mod support;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dstreamy_media::annexb;
@@ -169,38 +169,54 @@ fn assert_av_aligned(
     );
 }
 
-/// Spans in which this process got no CPU, seen by a thread that sleeps `STALL_TICK` at a time.
-fn stalls() -> Vec<(Instant, Instant)> {
-    static SPANS: Mutex<Vec<(Instant, Instant)>> = Mutex::new(Vec::new());
-    static CANARY: Once = Once::new();
-    CANARY.call_once(|| {
-        std::thread::spawn(|| {
+type Stall = (Instant, Instant);
+
+/// Spans in which a `STALL_TICK` timer task on the mock's runtime, whose workers stamp `received_at`, woke over `STALL_MIN` late.
+struct StallCanary(Arc<Mutex<Vec<Stall>>>);
+
+impl StallCanary {
+    fn start(rt: &tokio::runtime::Runtime) -> Self {
+        let spans = Arc::new(Mutex::new(Vec::new()));
+        let sink = spans.clone();
+        rt.spawn(async move {
             loop {
                 let before = Instant::now();
-                std::thread::sleep(STALL_TICK);
+                tokio::time::sleep(STALL_TICK).await;
                 let after = Instant::now();
                 if after - before > STALL_TICK + STALL_MIN {
-                    SPANS.lock().unwrap().push((before, after));
+                    sink.lock().unwrap().push((before, after));
                 }
             }
         });
-    });
-    SPANS.lock().unwrap().clone()
+        Self(spans)
+    }
+
+    fn stalls(&self) -> Vec<Stall> {
+        self.0.lock().unwrap().clone()
+    }
 }
 
-/// Arrival at the mock follows the trace's libobs dts, except during or just after a stall of this process, which measures the runner.
+/// Arrival at the mock follows the trace's libobs dts, except during or just after a stall of the mock's runtime.
 fn assert_paced<F>(
     recorded: &[&F],
     key: impl Fn(&F) -> Vec<u8>,
     at: impl Fn(&F) -> Instant,
     sent: &[Sent],
     frame_us: i64,
+    stalls: &[Stall],
     what: &str,
 ) {
     let pairs = matched(recorded, key, sent);
     let (f0, s0) = pairs[0];
     let slack = PACING_SLACK_US.max(frame_us);
-    let stalls = stalls();
+    let (first, last) = (at(f0), at(pairs[pairs.len() - 1].0));
+    let stalls: Vec<Stall> = stalls
+        .iter()
+        .copied()
+        .filter(|&(from, to)| to >= first && from <= last)
+        .collect();
+    let stalled: Duration = stalls.iter().map(|&(from, to)| to - from).sum();
+    let longest = stalls.iter().map(|&(from, to)| to - from).max();
     let after_stall = |t: Instant| {
         stalls.iter().any(|&(from, to)| {
             t >= from && t <= to + (to - from) + Duration::from_micros(slack as u64)
@@ -211,9 +227,22 @@ fn assert_paced<F>(
         arrived - (s.dts_usec - s0.dts_usec)
     };
     let checked: Vec<_> = pairs.iter().filter(|(f, _)| !after_stall(at(f))).collect();
+    eprintln!(
+        "{what}: pace checked on {} of {} frames, {} left out after {} stalls of {stalled:?} in all, longest {longest:?}",
+        checked.len(),
+        pairs.len(),
+        pairs.len() - checked.len(),
+        stalls.len()
+    );
+    // A hot loop in serve or the producer also starves the runtime, so it may not hide behind its own stalls.
+    assert!(
+        stalled * 10 <= last - first,
+        "{what}: the mock's runtime stalled for {stalled:?} of {:?}: {stalls:?}",
+        last - first
+    );
     assert!(
         checked.len() * 2 >= pairs.len(),
-        "{what}: only {} of {} frames arrived outside a stall of this process: {stalls:?}",
+        "{what}: only {} of {} frames arrived outside a stall of the mock's runtime: {stalls:?}",
         checked.len(),
         pairs.len()
     );
@@ -227,11 +256,9 @@ fn assert_paced<F>(
         .collect();
     assert!(
         off.len() * 50 <= checked.len(),
-        "{what}: {} of {} frames off the trace's dts pace by more than {slack} µs: {off:?}; {} frames left out after {} stalls",
+        "{what}: {} of {} checked frames off the trace's dts pace by more than {slack} µs from the median lag {mid} µs: {off:?}",
         off.len(),
-        checked.len(),
-        pairs.len() - checked.len(),
-        stalls.len()
+        checked.len()
     );
 }
 
@@ -334,6 +361,7 @@ fn check_replay(
     audio: &[&RecordedAudioFrame],
     want: &Expected,
     lost_audio: usize,
+    stalls: &[Stall],
     what: &str,
 ) -> Vec<MarkerPair> {
     assert_eq!(
@@ -370,6 +398,7 @@ fn check_replay(
         |f| f.received_at,
         &want.video,
         frame_us,
+        stalls,
         &format!("{what} video"),
     );
     assert_paced(
@@ -378,6 +407,7 @@ fn check_replay(
         |f| f.received_at,
         &want.audio,
         frame_us,
+        stalls,
         &format!("{what} audio"),
     );
     assert_av_aligned(video, audio, want, what);
@@ -409,8 +439,8 @@ fn monotonic(recorded: &Recorded) {
 
 fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
     let want = expected(trace);
-    stalls();
     let h = Harness::new("");
+    let canary = StallCanary::start(&h.rt);
     let _s = h.serve();
     let mut c = h.external_session();
     let p = h.replay(dir, &[]);
@@ -474,6 +504,7 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
         &producer_audio(&recorded),
         &want,
         lost_audio,
+        &canary.stalls(),
         name,
     );
 }
@@ -578,8 +609,8 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
         .find(|(n, _, _)| n == "linux-x264-main-bf0-keyint2-30fps")
         .unwrap();
     let want = expected(&trace);
-    stalls();
     let h = Harness::new(&format!("[serve]\ngrace_secs = {}\n", grace.as_secs()));
+    let canary = StallCanary::start(&h.rt);
     let _s = h.serve();
     let mut c = h.external_session();
 
@@ -631,7 +662,7 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
     let before = markers(&v1, &a1, fps, "before the kill");
     assert!(!before.is_empty(), "{before:?}");
     assert_av_aligned(&v1, &a1, &want, "before the kill");
-    check_replay(&v2, &a2, &want, 0, "after the restart");
+    check_replay(&v2, &a2, &want, 0, &canary.stalls(), "after the restart");
 
     let last_before = rtp_us(v1.last().unwrap().rtp_timestamp, VIDEO_HZ);
     let resumed = rtp_us(v2[0].rtp_timestamp, VIDEO_HZ) - last_before;
