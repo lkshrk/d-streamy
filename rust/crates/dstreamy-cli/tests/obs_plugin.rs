@@ -251,6 +251,10 @@ fn obs_streams_through_the_plugin_in_sync_and_within_a_second() {
     );
     let (status, lines) = run.finish();
     passed(status, &lines);
+    assert!(
+        has_plugin_line(&lines, "from the canvas's video"),
+        "an NV12 canvas needs no extra GPU mix: {lines:#?}"
+    );
     c.source("the attachment ending at end of stream", |e| {
         e["reason"] == "detached"
     });
@@ -854,10 +858,15 @@ fn sps_profile(video: &[&RecordedVideoFrame]) -> u8 {
         .expect("an SPS reached the mock")
 }
 
+/// 90 frames like the share runs: at 60, one loaded run missed the 90% floor by a frame.
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn the_own_encoder_sends_4_2_0_from_an_i444_canvas() {
-    let (_, recorded) = stream(json!({}), &["--format", "I444"], 90);
+    let (lines, recorded) = stream(json!({}), &["--format", "I444"], 90);
+    assert!(
+        has_plugin_line(&lines, "from a GPU-scaled or converted video"),
+        "{lines:#?}"
+    );
     let profile = sps_profile(&stream_video(&recorded));
     assert!(
         [66, 77, 100].contains(&profile),
@@ -865,6 +874,7 @@ fn the_own_encoder_sends_4_2_0_from_an_i444_canvas() {
     );
 }
 
+/// Plugin logic only: the frontend itself prefers NV12 for its encoder on an I444 canvas.
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn share_mode_falls_back_from_an_i444_stream_encoder() {

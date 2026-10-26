@@ -285,13 +285,27 @@ fn create_video(config: &Config) -> Result<EncoderRef, String> {
     }
     let encoder = EncoderRef(encoder);
     // SAFETY: a new, inactive encoder; init-only settings are allowed before it initializes (obs-encoder.c:995-1040).
+    let mut path = "the canvas's video";
     unsafe {
-        if (width, height) != (ovi.output_width, ovi.output_height) {
+        let resize = (width, height) != (ovi.output_width, ovi.output_height);
+        let convert =
+            ![sys::VIDEO_FORMAT_NV12, sys::VIDEO_FORMAT_I420].contains(&ovi.output_format);
+        if resize {
             sys::obs_encoder_set_scaled_size(encoder.get(), width, height);
         }
-        // NV12 whatever the canvas format; libobs converts it on the GPU (obs-encoder.c:245-262).
-        sys::obs_encoder_set_gpu_scale_type(encoder.get(), sys::OBS_SCALE_BICUBIC);
-        sys::obs_encoder_set_preferred_video_format(encoder.get(), sys::VIDEO_FORMAT_NV12);
+        if resize || convert {
+            path = "a GPU-scaled or converted video";
+            // The canvas's filter, so a resize-free conversion can reuse a matching mix (obs-encoder.c:248-280).
+            let scale = if ovi.scale_type == sys::OBS_SCALE_DISABLE {
+                sys::OBS_SCALE_BICUBIC
+            } else {
+                ovi.scale_type
+            };
+            sys::obs_encoder_set_gpu_scale_type(encoder.get(), scale);
+        }
+        if convert {
+            sys::obs_encoder_set_preferred_video_format(encoder.get(), sys::VIDEO_FORMAT_NV12);
+        }
         if divisor > 1 && !sys::obs_encoder_set_frame_rate_divisor(encoder.get(), divisor) {
             return Err(format!(
                 "D-Streamy can't divide the frame rate down to {fps} FPS"
@@ -308,7 +322,7 @@ fn create_video(config: &Config) -> Result<EncoderRef, String> {
         }
     }
     log::info(&format!(
-        "own video encoder {} at {width}×{height}, {fps} FPS, {} kbps",
+        "own video encoder {} at {width}×{height}, {fps} FPS, {} kbps, from {path}",
         config.video_encoder, config.bitrate_kbps
     ));
     Ok(encoder)
