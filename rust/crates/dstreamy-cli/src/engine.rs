@@ -15,7 +15,7 @@ use dstreamy_media::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -273,15 +273,15 @@ struct Conn {
     client: Arc<DiscordClient>,
     session: Session,
     forwarder: JoinHandle<()>,
+    catch_up: mpsc::UnboundedSender<oneshot::Sender<()>>,
     /// Tells this connection's forwarder from one an older connection left running.
     seq: u64,
 }
 
-/// A start's `Place`, and which forwarder may move it: the connection's, once it has seen this start's `Connecting`.
+/// A start's `Place`, and the connection whose forwarder may move it.
 struct Placed {
     place: Place,
     conn: u64,
-    announced: bool,
 }
 
 impl Conn {
@@ -343,6 +343,11 @@ pub struct Engine {
     start_gate: tokio::sync::Mutex<()>,
     #[cfg(test)]
     stop_gate: tokio::sync::Mutex<()>,
+    /// Holding it parks every forwarder before it handles its next event, as a forwarder far behind would be.
+    #[cfg(test)]
+    forward_gate: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    moves_applied: Mutex<Vec<Place>>,
     #[cfg(test)]
     stop_entered: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -410,6 +415,10 @@ impl Engine {
             start_gate: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             stop_gate: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            forward_gate: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            moves_applied: Mutex::new(Vec::new()),
             #[cfg(test)]
             stop_entered: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -580,30 +589,48 @@ impl Engine {
             .conn_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        let forwarder = tokio::spawn(engine.forward(session.subscribe(), seq));
+        let (catch_up, catch_ups) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(engine.forward(session.subscribe(), catch_ups, seq));
         let conn = Arc::new(Conn {
             client,
             session,
             forwarder,
+            catch_up,
             seq,
         });
         *lock(&self.conn) = Some(conn.clone());
         Ok(conn)
     }
 
-    async fn forward(self: Arc<Self>, mut events: broadcast::Receiver<SessionEvent>, conn: u64) {
+    /// Answers each catch-up request once it has handled every event the session sent before it.
+    async fn forward(
+        self: Arc<Self>,
+        mut events: broadcast::Receiver<SessionEvent>,
+        mut catch_ups: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+        conn: u64,
+    ) {
+        let mut waiting: Vec<oneshot::Sender<()>> = Vec::new();
         loop {
-            match events.recv().await {
+            if events.is_empty() {
+                for caught_up in waiting.drain(..) {
+                    let _ = caught_up.send(());
+                }
+            }
+            let received = tokio::select! {
+                biased;
+                received = events.recv() => received,
+                Some(caught_up) = catch_ups.recv() => {
+                    waiting.push(caught_up);
+                    continue;
+                }
+            };
+            #[cfg(test)]
+            drop(self.forward_gate.lock().await);
+            match received {
                 Ok(event) => {
                     match &event {
                         SessionEvent::Health(h) => *lock(&self.last_stats) = Some(h.stats.clone()),
-                        SessionEvent::State { state } => {
-                            if *state == SessionState::Connecting
-                                && let Some(placed) = lock(&self.place).as_mut()
-                                && placed.conn == conn
-                            {
-                                placed.announced = true;
-                            }
+                        SessionEvent::State { .. } => {
                             self.remember_portal_token();
                             self.release_if_stopped();
                         }
@@ -627,8 +654,7 @@ impl Engine {
     fn moved(&self, from: u64, guild_id: Option<&str>, channel_id: &str) {
         let Some(conn) = self.current() else { return };
         let mut placed = lock(&self.place);
-        let Some(Placed { place, .. }) = placed.as_mut().filter(|p| p.conn == from && p.announced)
-        else {
+        let Some(Placed { place, .. }) = placed.as_mut().filter(|p| p.conn == from) else {
             return;
         };
         if let Some(guild_id) = guild_id {
@@ -641,6 +667,22 @@ impl Engine {
             .into_iter()
             .find(|c| c.id == channel_id)
             .map(|c| c.name);
+        #[cfg(test)]
+        lock(&self.moves_applied).push(place.clone());
+    }
+
+    /// Waits, bounded, until `conn`'s forwarder has handled every event its session sent so far.
+    async fn catch_up(&self, conn: &Conn) -> bool {
+        let (caught_up, handled) = oneshot::channel();
+        if conn.catch_up.send(caught_up).is_err() {
+            return true;
+        }
+        // A forwarder that is gone has nothing left to handle.
+        let behind = timeout(FORWARDER_DRAIN, handled).await.is_err();
+        if behind {
+            tracing::warn!("session events are still queued after {FORWARDER_DRAIN:?}");
+        }
+        !behind
     }
 
     fn release_if_stopped(&self) {
@@ -735,6 +777,8 @@ impl Engine {
         if conn.live() {
             return Err(CliError::AlreadyStreaming.into());
         }
+        // The last run may have stopped itself; its queued events must not touch this start's place.
+        let caught_up = self.catch_up(&conn).await;
         let channels = discord::voice_channels(&conn.client, &p.guild_id).await?;
         let Some(channel) = channels.into_iter().find(|c| c.id == p.channel_id) else {
             return Err(CliError::UnknownChannel {
@@ -770,10 +814,9 @@ impl Engine {
             }
             hold.starting = true;
         }
-        *lock(&self.place) = Some(Placed {
+        *lock(&self.place) = caught_up.then(|| Placed {
             place,
             conn: conn.seq,
-            announced: false,
         });
         #[cfg(test)]
         drop(self.start_gate.lock().await);
@@ -871,6 +914,7 @@ impl Engine {
         #[cfg(test)]
         drop(self.stop_gate.lock().await);
         let stopped = conn.session.stop().await.map_err(session_failure)?;
+        self.catch_up(&conn).await;
         self.release_if_stopped();
         if stopped.is_none() {
             return Err(not_running());
@@ -1271,14 +1315,15 @@ mod tests {
             f.engine.shutdown().await;
         }
 
-        /// Runs `events` through a forwarder of connection `conn`, as a lagging or leftover one would.
+        /// Runs `events` through a forwarder of connection `conn`, as a leftover one would.
         async fn forward_events(f: &Fixture, conn: u64, events: &[SessionEvent]) {
             let (tx, rx) = broadcast::channel(16);
             for e in events {
                 tx.send(e.clone()).unwrap();
             }
             drop(tx);
-            timeout(T, f.engine.clone().forward(rx, conn))
+            let (_catch_up, catch_ups) = mpsc::unbounded_channel();
+            timeout(T, f.engine.clone().forward(rx, catch_ups, conn))
                 .await
                 .unwrap();
         }
@@ -1291,23 +1336,12 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_move_from_before_this_start_or_another_connection_leaves_the_place_alone() {
+        async fn a_move_from_another_connection_leaves_the_place_alone() {
             let f = Fixture::new().await;
             f.engine.start(params(), None).await.unwrap();
             f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
             let conn = f.engine.current().unwrap().seq;
             f.engine.current().unwrap().forwarder.abort();
-            lock(&f.engine.place).as_mut().unwrap().announced = false;
-            forward_events(&f, conn, &[moved_to_gaming()]).await;
-            assert_eq!(
-                status_place(&f)[1],
-                json!(MOCK_VOICE_CHANNEL_ID),
-                "a queued move from before the start"
-            );
-            let connecting = SessionEvent::State {
-                state: SessionState::Connecting,
-            };
-            forward_events(&f, conn, &[connecting]).await;
             forward_events(&f, conn + 1, &[moved_to_gaming()]).await;
             assert_eq!(
                 status_place(&f)[1],
@@ -1316,6 +1350,101 @@ mod tests {
             );
             forward_events(&f, conn, &[moved_to_gaming()]).await;
             assert_eq!(status_place(&f)[1], json!(MOCK_OTHER_VOICE_CHANNEL_ID));
+            f.engine.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_lagged_forwarder_catches_up_without_waiting_out_the_bound() {
+            let f = Fixture::new().await;
+            let (tx, rx) = broadcast::channel(4);
+            for _ in 0..20 {
+                tx.send(moved_to_gaming()).unwrap();
+            }
+            let (catch_up, catch_ups) = mpsc::unbounded_channel();
+            let forwarder = tokio::spawn(f.engine.clone().forward(rx, catch_ups, u64::MAX));
+            let (caught_up, handled) = oneshot::channel();
+            catch_up.send(caught_up).unwrap();
+            timeout(FORWARDER_DRAIN / 4, handled)
+                .await
+                .expect("the lagged forwarder never caught up")
+                .unwrap();
+            drop(tx);
+            timeout(T, forwarder).await.unwrap().unwrap();
+        }
+
+        fn gaming(p: StartParams) -> StartParams {
+            StartParams {
+                channel_id: MOCK_OTHER_VOICE_CHANNEL_ID.into(),
+                ..p
+            }
+        }
+
+        /// Runs `first` in Gaming with the forwarder parked behind its whole run, moves it to General, then starts `second`.
+        /// Returns the moves applied to `second`'s place.
+        async fn moves_after_a_move_queued_behind(
+            f: &Fixture,
+            first: StartParams,
+            second: StartParams,
+        ) -> Vec<Place> {
+            let conn = f.engine.conn().await.unwrap();
+            let mut probe = conn.session.subscribe();
+            assert!(f.engine.catch_up(&conn).await);
+            let gate = f.engine.forward_gate.lock().await;
+            let self_stops = first.target == EXTERNAL_TARGET_ID;
+            let second_target = second.target.clone();
+            f.engine.start(first, None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            assert!(f.mock.move_to_channel(MOCK_GUILD_ID, MOCK_VOICE_CHANNEL_ID));
+            timeout(T, async {
+                while !matches!(probe.recv().await, Ok(SessionEvent::ChannelMoved { .. })) {}
+            })
+            .await
+            .expect("the first run never moved");
+            if self_stops {
+                f.wait_state(|s| matches!(s, SessionState::Stopped { .. }))
+                    .await;
+            }
+            let engine = f.engine.clone();
+            let restart = tokio::spawn(async move {
+                if !self_stops {
+                    engine.stop().await.unwrap();
+                }
+                engine.start(second, None).await.unwrap();
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let waited = !restart.is_finished();
+            drop(gate);
+            timeout(T, restart).await.unwrap().unwrap();
+            assert!(
+                waited,
+                "the restart went ahead of the first run's queued events"
+            );
+            assert!(f.engine.catch_up(&f.engine.current().unwrap()).await);
+            assert_eq!(status_place(f)[1], json!(MOCK_OTHER_VOICE_CHANNEL_ID));
+            lock(&f.engine.moves_applied)
+                .iter()
+                .filter(|p| p.target == second_target)
+                .cloned()
+                .collect()
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_stopped_runs_queued_move_never_moves_the_next_start() {
+            let f = Fixture::new().await;
+            let moves =
+                moves_after_a_move_queued_behind(&f, gaming(params()), gaming(external(None)))
+                    .await;
+            assert!(moves.is_empty(), "{moves:?}");
+            f.engine.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_self_stopped_runs_queued_move_never_moves_the_next_start() {
+            let f = Fixture::new().await;
+            let moves =
+                moves_after_a_move_queued_behind(&f, gaming(external(Some(1))), gaming(params()))
+                    .await;
+            assert!(moves.is_empty(), "{moves:?}");
             f.engine.shutdown().await;
         }
 
@@ -1462,7 +1591,14 @@ mod tests {
             }
             drop(tx);
             let seq = f.engine.current().unwrap().seq;
-            timeout(T, f.engine.clone().forward(rx, seq)).await.unwrap();
+            timeout(
+                T,
+                f.engine
+                    .clone()
+                    .forward(rx, mpsc::unbounded_channel().1, seq),
+            )
+            .await
+            .unwrap();
             assert!(f.lock_is_free(), "a lagged forwarder kept the lock");
             f.engine.shutdown().await;
         }
@@ -1688,7 +1824,10 @@ mod tests {
             tx.send(SessionEvent::Resumed).unwrap();
         }
         drop(tx);
-        engine.clone().forward(rx, 0).await;
+        engine
+            .clone()
+            .forward(rx, mpsc::unbounded_channel().1, 0)
+            .await;
         let mut n = 0;
         while let Ok(EngineEvent::Session(SessionEvent::Resumed)) = lossless.try_recv() {
             n += 1;
