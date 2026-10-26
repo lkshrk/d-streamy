@@ -137,9 +137,27 @@ impl From<&SourceState> for SourceView {
     }
 }
 
+/// Where the session that `start` began streams; omitted before a start and once the session stops.
+#[derive(Debug, Clone, Serialize)]
+pub struct Place {
+    pub guild_id: String,
+    pub channel_id: String,
+    pub channel_name: String,
+    pub target: String,
+}
+
+/// A session on the wire: its `SessionState` fields, plus its `Place` while it has one.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionView {
+    #[serde(flatten)]
+    pub state: SessionState,
+    #[serde(flatten)]
+    pub place: Option<Place>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Status {
-    pub session: Option<SessionState>,
+    pub session: Option<SessionView>,
     pub source: Option<SourceView>,
     pub stats: Option<StreamStats>,
     pub started_by: Option<u64>,
@@ -238,6 +256,8 @@ pub struct StartParams {
     pub resolution: Option<Resolution>,
     pub bitrate_kbps: Option<u32>,
     pub gain: Option<f32>,
+    /// Replaces `[serve] grace_secs` for this external session only.
+    pub grace_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -264,7 +284,7 @@ impl Conn {
 }
 
 struct Running {
-    target: String,
+    place: Place,
     stream: StreamConfig,
     crop: Option<CropRect>,
     external: bool,
@@ -280,12 +300,12 @@ impl Running {
         };
         stream.validate().map_err(invalid_params)?;
         let next = Self {
-            target: self.target.clone(),
+            place: self.place.clone(),
             stream,
             crop: p.crop.or(self.crop),
             external: self.external,
         };
-        let capture = stream::capture_config(&next.target, &next.stream, next.crop);
+        let capture = stream::capture_config(&next.place.target, &next.stream, next.crop);
         Ok((next, capture))
     }
 }
@@ -447,7 +467,14 @@ impl Engine {
     }
 
     pub fn status(&self) -> Status {
-        let session = self.current().map(|c| c.session.state().borrow().clone());
+        let session = self.current().map(|c| {
+            let state = c.session.state().borrow().clone();
+            let place = lock(&self.running)
+                .as_ref()
+                .filter(|_| !matches!(state, SessionState::Stopped { .. }))
+                .map(|r| r.place.clone());
+            SessionView { state, place }
+        });
         let source = lock(&self.external).as_ref().map(|e| SourceView {
             stats: e.handle.stats().map(SourceCounters::from),
             ..SourceView::from(&*e.handle.state().borrow())
@@ -619,10 +646,24 @@ impl Engine {
         if external && codec != Codec::H264 {
             return Err(invalid_params("an external session always streams h264"));
         }
-        let external_options = external
+        let mut external_options = external
             .then(|| external_options(&config.serve))
             .transpose()
             .map_err(CliError::from)?;
+        match (p.grace_secs, external_options.as_mut()) {
+            (None, _) => {}
+            (Some(_), None) => {
+                return Err(invalid_params(
+                    "grace_secs applies only to an external session",
+                ));
+            }
+            (Some(secs), Some(options)) => {
+                options.grace = Duration::from_secs(secs);
+                options
+                    .validate()
+                    .map_err(|e| invalid_params(format!("invalid grace_secs {secs}: {e}")))?;
+            }
+        }
         let settings = StreamConfig {
             resolution: p.resolution.unwrap_or(config.stream.resolution),
             fps: p.fps.unwrap_or(config.stream.fps),
@@ -640,13 +681,19 @@ impl Engine {
             return Err(CliError::AlreadyStreaming.into());
         }
         let channels = discord::voice_channels(&conn.client, &p.guild_id).await?;
-        if !channels.iter().any(|c| c.id == p.channel_id) {
+        let Some(channel) = channels.into_iter().find(|c| c.id == p.channel_id) else {
             return Err(CliError::UnknownChannel {
                 guild: p.guild_id,
                 channel: p.channel_id,
             }
             .into());
-        }
+        };
+        let place = Place {
+            guild_id: p.guild_id.clone(),
+            channel_id: p.channel_id.clone(),
+            channel_name: channel.name,
+            target: p.target.clone(),
+        };
         let restore_token = capture::restore_token(&config);
         let (source, portal_token, handle): (Box<dyn CaptureSource>, _, _) = match external_options
         {
@@ -688,7 +735,7 @@ impl Engine {
         *lock(&self.external) = handle.map(|handle| self.watch_source(handle, announced));
         self.release_if_stopped();
         *lock(&self.running) = Some(Running {
-            target: p.target,
+            place,
             stream: settings,
             crop: p.crop,
             external,
@@ -893,7 +940,12 @@ mod tests {
     #[test]
     fn an_update_carries_the_crop_and_keeps_the_rest() {
         let running = Running {
-            target: "display:1".into(),
+            place: Place {
+                guild_id: "g".into(),
+                channel_id: "c".into(),
+                channel_name: "General".into(),
+                target: "display:1".into(),
+            },
             stream: StreamConfig::default(),
             crop: None,
             external: false,
@@ -1030,7 +1082,107 @@ mod tests {
                 resolution: Some(Resolution::new(320, 180).unwrap()),
                 bitrate_kbps: Some(1000),
                 gain: None,
+                grace_secs: None,
             }
+        }
+
+        fn external(grace_secs: Option<u64>) -> StartParams {
+            StartParams {
+                target: EXTERNAL_TARGET_ID.into(),
+                grace_secs,
+                ..params()
+            }
+        }
+
+        /// How long an external session with no producer streams before its grace period ends it.
+        async fn streams_without_a_producer_for(f: &Fixture, p: StartParams) -> Duration {
+            f.engine.start(p, None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            let streaming = std::time::Instant::now();
+            f.wait_state(|s| matches!(s, SessionState::Stopped { .. }))
+                .await;
+            streaming.elapsed()
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_start_grace_secs_replaces_the_configured_grace_for_that_session() {
+            let f = Fixture::new().await;
+            std::fs::write(
+                f.dir.path().join("config.toml"),
+                "[serve]\ngrace_secs = 30\n",
+            )
+            .unwrap();
+            let lasted = streams_without_a_producer_for(&f, external(Some(1))).await;
+            assert!(lasted < Duration::from_secs(10), "{lasted:?}");
+            f.engine.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_start_without_grace_secs_keeps_the_configured_grace() {
+            let f = Fixture::new().await;
+            std::fs::write(
+                f.dir.path().join("config.toml"),
+                "[serve]\ngrace_secs = 2\n",
+            )
+            .unwrap();
+            let lasted = streams_without_a_producer_for(&f, external(None)).await;
+            assert!(
+                lasted >= Duration::from_millis(1_500) && lasted < Duration::from_secs(10),
+                "{lasted:?}"
+            );
+            f.engine.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_grace_secs_over_the_limit_or_for_a_captured_target_is_invalid() {
+            let f = Fixture::new().await;
+            let over = f
+                .engine
+                .start(external(Some(3601)), None)
+                .await
+                .unwrap_err();
+            assert_eq!(over.code, "invalid_params", "{}", over.message);
+            let captured = StartParams {
+                grace_secs: Some(5),
+                ..params()
+            };
+            let captured = f.engine.start(captured, None).await.unwrap_err();
+            assert_eq!(captured.code, "invalid_params", "{}", captured.message);
+            assert!(f.engine.current().is_none_or(|c| !c.live()));
+            f.engine.start(external(Some(3600)), None).await.unwrap();
+            f.engine.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn status_names_the_guild_channel_and_target_of_the_live_session() {
+            let f = Fixture::new().await;
+            let place = |f: &Fixture| {
+                let status = serde_json::to_value(f.engine.status()).unwrap();
+                ["guild_id", "channel_id", "channel_name", "target"]
+                    .map(|k| status["session"][k].clone())
+            };
+            f.engine.start(params(), None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            assert_eq!(
+                place(&f),
+                [
+                    json!(MOCK_GUILD_ID),
+                    json!(MOCK_VOICE_CHANNEL_ID),
+                    json!("General"),
+                    json!("test-pattern")
+                ]
+            );
+            assert_eq!(
+                serde_json::to_value(f.engine.status()).unwrap()["session"]["state"],
+                "streaming"
+            );
+            f.engine.stop().await.unwrap();
+            let gone = serde_json::to_value(f.engine.status()).unwrap();
+            assert!(
+                place(&f).iter().all(Value::is_null),
+                "a stopped session still names its place: {gone}"
+            );
+            f.engine.shutdown().await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

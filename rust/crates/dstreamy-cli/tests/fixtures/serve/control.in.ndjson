@@ -12,7 +12,9 @@
 {"id":"12","cmd":"start","guild_id":"200000000000000001","channel_id":"300000000000000001","target":"test-pattern"}
 {"id":"13","cmd":"stop"}
 {"id":"14","cmd":"start","guild_id":"200000000000000001","channel_id":"300000000000000001","target":"external","codec":"h265"}
-{"id":"15","cmd":"start","guild_id":"200000000000000001","channel_id":"300000000000000001","target":"external","fps":15,"resolution":"320x180","bitrate_kbps":1000}
+{"id":"14b","cmd":"start","guild_id":"200000000000000001","channel_id":"300000000000000001","target":"external","grace_secs":3601}
+{"id":"14c","cmd":"start","guild_id":"200000000000000001","channel_id":"300000000000000001","target":"test-pattern","grace_secs":5}
+{"id":"15","cmd":"start","guild_id":"200000000000000001","channel_id":"300000000000000001","target":"external","fps":15,"resolution":"320x180","bitrate_kbps":1000,"grace_secs":60}
 {"id":"16","cmd":"status"}
 {"id":"17","cmd":"update","fps":30}
 {"id":"18","cmd":"stop"}

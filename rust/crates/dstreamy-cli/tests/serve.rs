@@ -460,7 +460,12 @@ fn two_controls_share_one_session_and_a_disconnect_keeps_it() {
     let (mut a, _) = h.control();
     let status = a.request(&json!({"id": "st", "cmd": "status"}));
     let data = &status["data"];
-    assert_eq!(data["session"], json!({"state": "streaming"}), "{status}");
+    assert_eq!(
+        data["session"],
+        json!({"state": "streaming", "guild_id": MOCK_GUILD_ID, "channel_id": MOCK_VOICE_CHANNEL_ID,
+            "channel_name": "General", "target": "test-pattern"}),
+        "{status}"
+    );
     assert_eq!(data["started_by"], a_id, "{status}");
     assert_eq!(data["source"], Value::Null);
     assert!(data["stats"].is_object(), "{status}");
