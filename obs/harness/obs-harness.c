@@ -54,6 +54,8 @@ struct harness_args {
 	const char *note;
 	const char *x264opts;
 	const char *expect_error;
+	const char *dump_encoder_settings;
+	bool no_encoders;
 	int seconds;
 	int fps;
 	int width;
@@ -489,6 +491,8 @@ static void usage(void)
 		"  [--expect-error TEXT (pass only if the output fails to start or stops with an error containing TEXT;\n"
 		"   after a stop OBS keeps running until --seconds)]\n"
 		"  [--release-after-start MS (release the output MS after a successful start, without stopping it)]\n"
+		"  [--no-encoders (the output brings its own encoders)]\n"
+		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
 		"  [--modules a,b,c] [--plugin-bin DIR --plugin-data DIR] [--note TEXT] [--x264opts OPTS] [--verbose]\n");
@@ -532,6 +536,10 @@ static int parse_args(int argc, char **argv)
 			usage();
 			return 0;
 		}
+		if (strcmp(a, "--no-encoders") == 0) {
+			args.no_encoders = true;
+			continue;
+		}
 		if (strcmp(a, "--verbose") == 0) {
 			log_max_level = LOG_DEBUG;
 			continue;
@@ -556,6 +564,8 @@ static int parse_args(int argc, char **argv)
 			ok = parse_int(a, v, 0, &args.expect_panics);
 		else if (strcmp(a, "--until-video") == 0)
 			ok = parse_int(a, v, 1, &args.until_video);
+		else if (strcmp(a, "--dump-encoder-settings") == 0)
+			args.dump_encoder_settings = v;
 		else if (strcmp(a, "--release-after-start") == 0)
 			ok = parse_int(a, v, 0, &args.release_after_start_ms);
 		else if (strcmp(a, "--expect-error") == 0)
@@ -695,6 +705,63 @@ static bool stay_alive_until(uint64_t start_ns)
 		return false;
 	}
 	return true;
+}
+
+static void add_property_names(obs_properties_t *props, obs_data_array_t *names)
+{
+	for (obs_property_t *p = obs_properties_first(props); p; obs_property_next(&p)) {
+		if (obs_property_get_type(p) == OBS_PROPERTY_GROUP) {
+			add_property_names(obs_property_group_content(p), names);
+			continue;
+		}
+		obs_data_t *entry = obs_data_create();
+		obs_data_set_string(entry, "name", obs_property_name(p));
+		obs_data_set_int(entry, "type", obs_property_get_type(p));
+		obs_data_array_push_back(names, entry);
+		obs_data_release(entry);
+	}
+}
+
+/* Fixture source for the settings table test: what libobs reports for each registered H.264 encoder. */
+static int dump_encoder_settings(const char *dir)
+{
+	if (os_mkdirs(dir) == MKDIR_ERROR) {
+		harness_error("cannot create %s", dir);
+		return 1;
+	}
+	int written = 0;
+	const char *id;
+	for (size_t i = 0; obs_enum_encoder_types(i, &id); i++) {
+		const char *codec = obs_get_encoder_codec(id);
+		if (obs_get_encoder_type(id) != OBS_ENCODER_VIDEO || !codec || strcmp(codec, "h264") != 0)
+			continue;
+		obs_data_t *defaults = obs_encoder_defaults(id);
+		obs_data_t *values = obs_data_create_from_json(obs_data_get_json_with_defaults(defaults));
+		obs_data_array_t *names = obs_data_array_create();
+		obs_properties_t *props = obs_get_encoder_properties(id);
+		if (props)
+			add_property_names(props, names);
+		obs_data_t *d = obs_data_create();
+		obs_data_set_string(d, "id", id);
+		obs_data_set_string(d, "codec", codec);
+		obs_data_set_string(d, "source", "captured");
+		obs_data_set_obj(d, "defaults", values);
+		obs_data_set_array(d, "properties", names);
+		struct dstr path = {0};
+		dstr_printf(&path, "%s/%s.json", dir, id);
+		bool ok = obs_data_save_json_pretty_safe(d, path.array, "tmp", NULL);
+		printf("HARNESS encoder settings %s: %s\n", id, ok ? path.array : "write failed");
+		written += ok;
+		dstr_free(&path);
+		obs_data_release(d);
+		obs_properties_destroy(props);
+		obs_data_array_release(names);
+		obs_data_release(values);
+		obs_data_release(defaults);
+	}
+	if (!written)
+		harness_error("no H.264 encoder is registered");
+	return written ? 0 : 1;
 }
 
 static bool check_output_stats(obs_output_t *output, obs_encoder_t *aenc)
@@ -955,6 +1022,11 @@ int main(int argc, char **argv)
 	obs_post_load_modules();
 	obs_log_loaded_modules();
 
+	if (args.dump_encoder_settings) {
+		rc = dump_encoder_settings(args.dump_encoder_settings);
+		goto cleanup;
+	}
+
 	obs_register_source(&audio_source_info);
 	obs_register_output(&trace_output_info);
 	uint64_t interval_ns = obs_get_frame_interval_ns();
@@ -988,23 +1060,27 @@ int main(int argc, char **argv)
 	obs_add_tick_callback(flash_tick, &flash);
 	tick_added = true;
 
-	obs_data_t *vs = video_settings();
-	venc = obs_video_encoder_create(args.video_encoder, "harness video", vs, NULL);
-	obs_data_release(vs);
-	if (!venc)
-		FAIL("video encoder %s create failed", args.video_encoder);
-	obs_encoder_set_video(venc, obs_get_video());
+	if (!args.no_encoders) {
+		obs_data_t *vs = video_settings();
+		venc = obs_video_encoder_create(args.video_encoder, "harness video", vs, NULL);
+		obs_data_release(vs);
+		if (!venc)
+			FAIL("video encoder %s create failed", args.video_encoder);
+		obs_encoder_set_video(venc, obs_get_video());
 
-	obs_data_t *as = obs_data_create();
-	if (args.audio_bitrate)
-		obs_data_set_int(as, "bitrate", args.audio_bitrate);
-	aenc = obs_audio_encoder_create(args.audio_encoder, "harness audio", as, 0, NULL);
-	obs_data_release(as);
-	if (!aenc)
-		FAIL("audio encoder %s create failed", args.audio_encoder);
-	obs_encoder_set_audio(aenc, obs_get_audio());
+		obs_data_t *as = obs_data_create();
+		if (args.audio_bitrate)
+			obs_data_set_int(as, "bitrate", args.audio_bitrate);
+		aenc = obs_audio_encoder_create(args.audio_encoder, "harness audio", as, 0, NULL);
+		obs_data_release(as);
+		if (!aenc)
+			FAIL("audio encoder %s create failed", args.audio_encoder);
+		obs_encoder_set_audio(aenc, obs_get_audio());
+	}
 
 	bool recording = strcmp(args.output_id, TRACE_OUTPUT_ID) == 0;
+	if (recording && args.no_encoders)
+		FAIL("the trace recorder needs the harness's encoders; drop --no-encoders");
 	obs_data_t *os = args.output_settings ? obs_data_create_from_json(args.output_settings) : obs_data_create();
 	if (!os)
 		FAIL("--output-settings is not a JSON object");
@@ -1014,8 +1090,10 @@ int main(int argc, char **argv)
 	obs_data_release(os);
 	if (!output)
 		FAIL("output %s create failed", args.output_id);
-	obs_output_set_video_encoder(output, venc);
-	obs_output_set_audio_encoder(output, aenc, 0);
+	if (venc)
+		obs_output_set_video_encoder(output, venc);
+	if (aenc)
+		obs_output_set_audio_encoder(output, aenc, 0);
 	signal_handler_connect(obs_output_get_signal_handler(output), "stop", on_output_stop, NULL);
 	signal_handler_connect(obs_output_get_signal_handler(output), "start", on_output_start, NULL);
 
@@ -1025,8 +1103,8 @@ int main(int argc, char **argv)
 			printf("HARNESS expected_error start: %s\n", err);
 			goto cleanup;
 		}
-		const char *verr = obs_encoder_get_last_error(venc);
-		const char *aerr = obs_encoder_get_last_error(aenc);
+		const char *verr = venc ? obs_encoder_get_last_error(venc) : NULL;
+		const char *aerr = aenc ? obs_encoder_get_last_error(aenc) : NULL;
 		FAIL("obs_output_start: %s (video encoder: %s, audio encoder: %s)", err ? err : "(no error)",
 		     verr ? verr : "-", aerr ? aerr : "-");
 	}
@@ -1083,7 +1161,7 @@ int main(int argc, char **argv)
 	}
 
 	if (!recording) {
-		if (!check_output_stats(output, aenc))
+		if (!check_output_stats(output, obs_output_get_audio_encoder(output, 0)))
 			rc = 1;
 		goto cleanup;
 	}

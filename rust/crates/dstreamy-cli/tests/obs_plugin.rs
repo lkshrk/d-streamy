@@ -56,10 +56,19 @@ impl HarnessRun {
             settings["endpoint"] = json!(h.endpoint());
         }
         let trace_dir = h.dir.path().join("harness-trace");
+        let encoders: &[&str] = if settings["mode"] == "share" {
+            &[
+                "--video-encoder",
+                "obs_x264",
+                "--audio-encoder",
+                "ffmpeg_opus",
+            ]
+        } else {
+            &["--no-encoders"]
+        };
         let mut child = Command::new(&env.harness)
-            .args(["--output", "dstreamy_output", "--video-encoder", "obs_x264"])
-            .args(["--audio-encoder", "ffmpeg_opus", "--modules", MODULES])
-            .args(["--bf", "0", "--keyint-sec", "2", "--profile", "main"])
+            .args(["--output", "dstreamy_output", "--modules", MODULES])
+            .args(encoders)
             .arg("--plugin-bin")
             .arg(&env.plugin_bin)
             .arg("--plugin-data")
@@ -590,5 +599,152 @@ fn a_late_capture_whose_shutdown_is_lost_still_lets_destroy_return() {
     assert!(
         stop < detached,
         "the Shutdown was not taken before the detached: {lines:#?}"
+    );
+}
+
+fn has_plugin_line(lines: &[String], text: &str) -> bool {
+    lines
+        .iter()
+        .any(|l| l.contains("[obs-dstreamy] ") && l.contains(text))
+}
+
+/// The width and height of the first picture openh264 decodes from the stream.
+fn first_picture_size(video: &[&RecordedVideoFrame]) -> (usize, usize) {
+    use openh264::formats::YUVSource;
+    let mut decoder = openh264::decoder::Decoder::new().unwrap();
+    video
+        .iter()
+        .find_map(|v| {
+            decoder
+                .decode(&v.data)
+                .ok()
+                .flatten()
+                .map(|yuv| yuv.dimensions())
+        })
+        .expect("a picture decodes")
+}
+
+fn rtp_steps(video: &[&RecordedVideoFrame]) -> Vec<u32> {
+    video
+        .windows(2)
+        .map(|w| w[1].rtp_timestamp.wrapping_sub(w[0].rtp_timestamp))
+        .collect()
+}
+
+/// Streams `video` frames from the harness started with `settings` and `args`; returns its output and the recording.
+fn stream(
+    settings: Value,
+    args: &[&str],
+    video: usize,
+) -> (Vec<String>, dstreamy_mock_discord::Recorded) {
+    let h = Harness::new("");
+    let _serve = h.serve();
+    let mut c = obs_session(&h);
+    let until = video.to_string();
+    let mut all = vec!["--seconds", "90", "--until-video", until.as_str()];
+    all.extend_from_slice(args);
+    let (status, lines) = HarnessRun::start(&h, settings, &all).finish();
+    passed(status, &lines);
+    c.source("the attachment ending at end of stream", |e| {
+        e["reason"] == "detached"
+    });
+    let recorded = h.mock.recorded();
+    {
+        let v = stream_video(&recorded);
+        let a = producer_audio(&recorded);
+        assert!(
+            v.len() * 10 >= video * 9,
+            "{} of {video} video frames reached the mock",
+            v.len()
+        );
+        decodes(&v, &a);
+    }
+    (lines, recorded)
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn share_mode_shares_a_stream_encoder_that_passes() {
+    let (lines, _) = stream(
+        json!({"mode": "share"}),
+        &["--bf", "0", "--keyint-sec", "2"],
+        90,
+    );
+    assert!(
+        has_plugin_line(&lines, "sharing the stream's video encoder obs_x264"),
+        "{lines:#?}"
+    );
+    assert!(!has_plugin_line(&lines, "own video encoder"), "{lines:#?}");
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn share_mode_falls_back_to_the_own_encoder_when_b_frames_are_on() {
+    let (lines, _) = stream(
+        json!({"mode": "share"}),
+        &["--bf", "2", "--keyint-sec", "2"],
+        90,
+    );
+    assert!(
+        has_plugin_line(
+            &lines,
+            "not sharing the stream's video encoder (D-Streamy needs B-frames off"
+        ),
+        "{lines:#?}"
+    );
+    assert!(
+        has_plugin_line(&lines, "own video encoder obs_x264"),
+        "{lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn the_own_encoder_scales_a_1440p_canvas_to_1080p() {
+    let (lines, recorded) = stream(json!({}), &["--width", "2560", "--height", "1440"], 60);
+    assert!(
+        has_plugin_line(&lines, "own video encoder obs_x264 at 1920×1080"),
+        "{lines:#?}"
+    );
+    assert_eq!(first_picture_size(&stream_video(&recorded)), (1920, 1080));
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn the_own_encoder_divides_a_90_fps_canvas_down_to_30() {
+    let (lines, recorded) = stream(
+        json!({}),
+        &["--fps", "90", "--width", "640", "--height", "360"],
+        90,
+    );
+    assert!(
+        has_plugin_line(&lines, "own video encoder obs_x264 at 640×360, 30 FPS"),
+        "{lines:#?}"
+    );
+    let steps = rtp_steps(&stream_video(&recorded));
+    let at_30 = steps.iter().filter(|&&s| s == 3000).count();
+    assert!(
+        at_30 * 10 >= steps.len() * 9,
+        "RTP steps at 90 kHz: {steps:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn the_own_encoder_runs_at_60_fps_on_a_60_fps_canvas() {
+    let (lines, recorded) = stream(
+        json!({}),
+        &["--fps", "60", "--width", "640", "--height", "360"],
+        120,
+    );
+    assert!(
+        has_plugin_line(&lines, "own video encoder obs_x264 at 640×360, 60 FPS"),
+        "{lines:#?}"
+    );
+    let steps = rtp_steps(&stream_video(&recorded));
+    let at_60 = steps.iter().filter(|&&s| s == 1500).count();
+    assert!(
+        at_60 * 10 >= steps.len() * 9,
+        "RTP steps at 90 kHz: {steps:?}"
     );
 }
