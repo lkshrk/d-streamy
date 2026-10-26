@@ -35,6 +35,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+        env:
+          DSTREAMY_BIN: ${{ github.workspace }}/rust/target/debug/dstreamy
       - name: Cross-user IPC tests
         run: cargo test -p dstreamy-ipc --locked --test cross_user -- --ignored --skip nobody_helper
         timeout-minutes: 5
@@ -87,6 +89,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+        env:
+          DSTREAMY_BIN: ${{ github.workspace }}/rust/target/debug/dstreamy
       - name: Shipped crates never enable test-only features
         shell: bash
         run: |

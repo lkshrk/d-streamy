@@ -10,6 +10,10 @@ on:
       - "rust/crates/dstreamy-core/**"
       - "rust/crates/dstreamy-obs/**"
       - "rust/crates/dstreamy-obs-sys/**"
+      - "rust/crates/dstreamy-obs-producer/**"
+      - "rust/crates/dstreamy-obs-packet/**"
+      - "rust/crates/dstreamy-ipc/**"
+      - "rust/crates/dstreamy-cli/**"
       - "rust/Cargo.toml"
       - "rust/Cargo.lock"
       - "rust/rust-toolchain.toml"
@@ -23,6 +27,10 @@ on:
       - "rust/crates/dstreamy-core/**"
       - "rust/crates/dstreamy-obs/**"
       - "rust/crates/dstreamy-obs-sys/**"
+      - "rust/crates/dstreamy-obs-producer/**"
+      - "rust/crates/dstreamy-obs-packet/**"
+      - "rust/crates/dstreamy-ipc/**"
+      - "rust/crates/dstreamy-cli/**"
       - "rust/Cargo.toml"
       - "rust/Cargo.lock"
       - "rust/rust-toolchain.toml"
@@ -84,7 +92,7 @@ jobs:
             libspeexdsp-dev libudev-dev libv4l-dev libva-dev libpci-dev libdrm-dev \
             nlohmann-json3-dev libwebsocketpp-dev libasio-dev libqrcodegencpp-dev qt6-base-dev \
             libqt6svg6-dev qt6-base-private-dev xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils \
-            libclang-dev
+            libclang-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libopus-dev
       - name: Check apt archives
         id: apt-check
         if: always()
@@ -185,6 +193,19 @@ jobs:
           cargo fmt --all --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --locked
+
+      - name: OBS through the plugin to serve and mock Discord
+        working-directory: rust
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          DSTREAMY_OBS_HARNESS: ${{ github.workspace }}/obs/build_x86_64/harness/obs-harness
+          DSTREAMY_OBS_PLUGIN_BIN: ${{ github.workspace }}/obs/build_x86_64/rundir
+          DSTREAMY_OBS_PLUGIN_DATA: ${{ github.workspace }}/obs/build_x86_64/harness/plugin-data
+        run: |
+          set -o pipefail
+          xvfb-run -a -s "-screen 0 1280x720x24" \
+            cargo test --locked -p dstreamy-cli --test obs_plugin -- --ignored --test-threads 1 \
+            2>&1 | tee "$OBS_LOGS/obs-plugin.log"
 
       - name: Harness 5 s trace with A/V marker check
         run: |
