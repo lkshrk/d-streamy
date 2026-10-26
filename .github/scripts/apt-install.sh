@@ -17,17 +17,14 @@ retry() {
 }
 
 if [ -L "$cache" ] || { [ -e "$cache" ] && [ ! -d "$cache" ]; }; then sudo rm -rf "$cache"; fi
-if [ -L "$cache/partial" ] || { [ -e "$cache/partial" ] && [ ! -d "$cache/partial" ]; }; then
-  sudo rm -rf "$cache/partial"
-fi
+sudo rm -rf "$cache/partial"
 if [ -d "$cache" ]; then
-  sudo find "$cache" -mindepth 1 -maxdepth 1 ! -name partial ! -name lock \
-    \( ! -type f -o ! -name '*.deb' \) -exec rm -rf {} +
+  sudo find "$cache" -mindepth 1 -maxdepth 1 \( ! -type f -o ! -name '*.deb' -o -name '.*' \) -exec rm -rf {} +
 fi
 sudo mkdir -p "$cache/partial"
 retry sudo apt-get "${apt[@]}" update
 
-# apt trusts any archive of the right size in its cache; only the signed index's SHA256 makes a restored one safe.
+# apt trusts any right-sized cached archive; only the signed index's SHA256 vouches for it.
 for deb in "$cache"/*.deb; do
   [ -f "$deb" ] || continue
   IFS=_ read -r pkg ver arch <<<"$(basename "$deb" .deb)"
@@ -37,7 +34,7 @@ for deb in "$cache"/*.deb; do
     sudo rm -f "$deb"
   fi
 done
-sudo find "$cache" -type f ! -name lock -printf '%P %s\n' | sort >"$cache.manifest"
+sudo find "$cache" -type f ! -name lock ! -path '*/partial/*' -printf '%P %s\n' | sort >"$cache.manifest"
 
 retry sudo apt-get "${apt[@]}" install --download-only "${args[@]}"
 # Only fetches are retried: killing an install mid-unpack leaves dpkg broken.
