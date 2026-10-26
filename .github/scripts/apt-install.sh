@@ -27,6 +27,7 @@ prefer_archive_mirror() {
   local list=/etc/apt/apt-mirrors.txt
   local azure=$'http://azure.archive.ubuntu.com/ubuntu/\tpriority:'
   local archive=$'https://archive.ubuntu.com/ubuntu/\tpriority:'
+  grep -rqsF "mirror+file:$list" /etc/apt/sources.list /etc/apt/sources.list.d || return 0
   if grep -qxF "${azure}1" "$list" 2>/dev/null && grep -qxF "${archive}2" "$list"; then
     sudo sed -i -e "s|^${azure}1\$|${azure}2|" -e "s|^${archive}2\$|${archive}1|" "$list"
     echo "apt mirrors: archive.ubuntu.com now before azure.archive.ubuntu.com"

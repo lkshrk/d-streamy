@@ -46,6 +46,7 @@ jobs:
             "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.148/$archive"
           echo "6c23b7fb4ca82c571fc8dfedbab45bfa773d45918f933170c85d21cd7f4b852b  $RUNNER_TEMP/$archive" | shasum -a 256 -c -
           echo "logical CPUs: $(sysctl -n hw.ncpu)"
+          rm -f "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-nextest"
           mkdir -p "$RUNNER_TEMP/bin"
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/bin" cargo-nextest
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
@@ -124,6 +125,7 @@ jobs:
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
             "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.148/$archive"
           echo "223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc  $RUNNER_TEMP/$archive" | sha256sum -c -
+          rm -f "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-nextest"
           mkdir -p "$RUNNER_TEMP/bin"
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/bin" cargo-nextest
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
@@ -248,28 +250,37 @@ jobs:
     env:
       # Pinned in docs/specs.md (cargo-fuzz row).
       FUZZ_TOOLCHAIN: nightly-2026-07-20
-      # The release binary is musl-built and would otherwise default to its own musl target.
-      FUZZ_TARGET: x86_64-unknown-linux-gnu
       FUZZ_CLI_VERSION: 0.13.2
       FUZZ_CLI_SHA256: b5b704018b63e0f151c17a057ac53b5111e1db545d1b9f72fee79f08a545931c
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - name: Install the pinned nightly and cargo-fuzz
-        run: |
-          set -euo pipefail
-          rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
-          archive="cargo-fuzz-$FUZZ_CLI_VERSION-x86_64-unknown-linux-musl.tar.gz"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
-            "https://github.com/rust-fuzz/cargo-fuzz/releases/download/$FUZZ_CLI_VERSION/$archive"
-          echo "$FUZZ_CLI_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/$archive" -C "${CARGO_HOME:-$HOME/.cargo}/bin" cargo-fuzz
-          cargo +"$FUZZ_TOOLCHAIN" fuzz --version | grep -Fw "$FUZZ_CLI_VERSION"
+      - name: Install the pinned nightly
+        run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: rust/fuzz
           key: fuzz
+      - name: Install cargo-fuzz
+        run: |
+          set -euo pipefail
+          host=$(rustc +"$FUZZ_TOOLCHAIN" -vV | sed -n 's/^host: //p')
+          case "$host" in
+            x86_64-*-linux-*) ;;
+            *) echo "cargo-fuzz is pinned to its x86_64 Linux musl build; this runner's host is ${host:-unknown}" >&2; exit 1 ;;
+          esac
+          # The release binary is musl-built and would otherwise default to its own musl target.
+          echo "FUZZ_TARGET=$host" >> "$GITHUB_ENV"
+          archive="cargo-fuzz-$FUZZ_CLI_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/rust-fuzz/cargo-fuzz/releases/download/$FUZZ_CLI_VERSION/$archive"
+          echo "$FUZZ_CLI_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          rm -f "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-fuzz"
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/bin" cargo-fuzz
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          PATH="$RUNNER_TEMP/bin:$PATH" cargo +"$FUZZ_TOOLCHAIN" fuzz --version | grep -Fw "$FUZZ_CLI_VERSION"
       - name: Fuzz control_line
         run: cargo +"$FUZZ_TOOLCHAIN" fuzz run --target "$FUZZ_TARGET" control_line -- -max_total_time=60
       - name: Fuzz producer_frame
