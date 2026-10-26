@@ -22,16 +22,17 @@ use tempfile::TempDir;
 
 const T: Duration = Duration::from_secs(20);
 const TRACE: &str = "linux-x264-main-bf0-keyint2-30fps";
+const BIN_HINT: &str = "point DSTREAMY_BIN at the test-hooks build that `cargo test -p dstreamy-cli` makes (target/debug/dstreamy)";
 
 /// `None` skips the test locally; under `CI=true` a missing binary is a failure.
 fn dstreamy_bin() -> Option<PathBuf> {
     match std::env::var_os("DSTREAMY_BIN") {
         Some(bin) => Some(PathBuf::from(bin)),
         None if std::env::var("CI").is_ok_and(|v| v == "true") => {
-            panic!("DSTREAMY_BIN is unset; CI must point it at the dstreamy binary")
+            panic!("DSTREAMY_BIN is unset: {BIN_HINT}")
         }
         None => {
-            eprintln!("skipped: set DSTREAMY_BIN to a dstreamy binary to run this test");
+            eprintln!("skipped: {BIN_HINT}");
             None
         }
     }
@@ -76,8 +77,12 @@ impl Serve {
             .stdin(Stdio::null())
             .spawn()
             .unwrap();
+        let mut child = child;
         let deadline = Instant::now() + T;
         while UnixStream::connect(&endpoint).is_err() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("serve exited with {status} before listening; {BIN_HINT}");
+            }
             assert!(Instant::now() < deadline, "serve never listened");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -186,6 +191,12 @@ impl Control {
             m["type"] != "event" && m["id"] == id
         })
     }
+}
+
+/// Runs `f` on `rt`, failing the test instead of hanging after `T`.
+fn within<F: std::future::Future>(rt: &tokio::runtime::Runtime, f: F) -> F::Output {
+    rt.block_on(async { tokio::time::timeout(T, f).await })
+        .unwrap_or_else(|_| panic!("the producer run did not end within {T:?}"))
 }
 
 fn trace() -> Trace {
@@ -309,16 +320,19 @@ fn packets_stream_to_discord_and_a_stop_ends_with_end_of_stream() {
             stop_tx.send("user stop").unwrap();
             pushed
         });
-        let end = serve.rt.block_on(run(
-            connection,
-            &ring,
-            || {
-                extra_reads += 1;
-                Some(video_extra.clone())
-            },
-            async { stop_rx.await.unwrap() },
-            &Stderr,
-        ));
+        let end = within(
+            &serve.rt,
+            run(
+                connection,
+                &ring,
+                || {
+                    extra_reads += 1;
+                    Some(video_extra.clone())
+                },
+                async { stop_rx.await.unwrap() },
+                &Stderr,
+            ),
+        );
         (end, feeder.join().unwrap())
     });
     assert_eq!(end, End::Stopped("user stop"));
@@ -380,13 +394,16 @@ fn a_service_shutdown_detaches_the_producer() {
         });
         std::thread::sleep(Duration::from_millis(300));
         serve.terminate();
-        let end = serve.rt.block_on(run(
-            connection,
-            &ring,
-            || Some(video_extra.clone()),
-            std::future::pending::<()>(),
-            &Stderr,
-        ));
+        let end = within(
+            &serve.rt,
+            run(
+                connection,
+                &ring,
+                || Some(video_extra.clone()),
+                std::future::pending::<()>(),
+                &Stderr,
+            ),
+        );
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         end
     });
@@ -396,9 +413,9 @@ fn a_service_shutdown_detaches_the_producer() {
     }
 }
 
-/// serve refuses an IDR without the keyframe flag; its `detached` must surface even when a write fails first.
+/// serve refuses an IDR without the keyframe flag (tests/fake_service.rs forces the failed-write path).
 #[test]
-fn an_ingest_refusal_surfaces_as_detached_even_after_a_failed_write() {
+fn an_ingest_refusal_surfaces_as_detached() {
     let Some(bin) = dstreamy_bin() else { return };
     let serve = Serve::start(&bin);
     let trace = trace();
@@ -411,7 +428,7 @@ fn an_ingest_refusal_surfaces_as_detached_even_after_a_failed_write() {
     let idr = trace.video().find(|p| p.keyframe).unwrap();
     let mut extra = trace.video_extra.clone();
     extra.extend_from_slice(&idr.data);
-    for i in 0..2_000 {
+    for i in 0..50 {
         ring.push(Packet {
             track: Track::Video,
             keyframe: false,
@@ -422,13 +439,16 @@ fn an_ingest_refusal_surfaces_as_detached_even_after_a_failed_write() {
             arrived: Instant::now(),
         });
     }
-    let end = serve.rt.block_on(run(
-        connection,
-        &ring,
-        || None,
-        std::future::pending::<()>(),
-        &Stderr,
-    ));
+    let end = within(
+        &serve.rt,
+        run(
+            connection,
+            &ring,
+            || None,
+            std::future::pending::<()>(),
+            &Stderr,
+        ),
+    );
     match end {
         End::Detached { reason, message } => {
             assert_eq!(reason, "incompatible", "{message}");
