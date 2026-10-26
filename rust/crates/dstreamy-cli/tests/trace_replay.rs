@@ -22,6 +22,7 @@ use support::*;
 const VIDEO_HZ: i64 = 90_000;
 const AUDIO_HZ: i64 = 48_000;
 const PACING_SLACK_US: i64 = 20_000;
+const JITTER_MARGIN_US: i64 = 10_000;
 const STALL_TICK: Duration = Duration::from_millis(2);
 const STALL_MIN: Duration = Duration::from_millis(10);
 // The A/V median needs 10 unique payloads; the restart trace repeats frames 9 and 11 later, so 15 frames leave 13.
@@ -292,11 +293,12 @@ fn assert_paced<F>(
         .max()
         .unwrap_or(0);
     eprintln!("{what}: largest deviation from the median lag {largest} µs, slack {slack} µs");
-    // A trace of fewer than 50 unique frames would otherwise fail on one frame of scheduling noise past the slack.
-    let one_jitter = off.len() == 1 && (off[0] - mid).abs() <= 2 * slack;
+    // Below 50 checked frames the 2% budget allows none, so one frame of scheduling noise past the slack would fail.
+    let one_jitter = off.len() == 1 && (off[0] - mid).abs() <= slack + JITTER_MARGIN_US;
+    let deviations: Vec<i64> = off.iter().map(|l| l - mid).collect();
     assert!(
         off.len() * 50 <= checked.len() || one_jitter,
-        "{what}: {} of {} checked frames off the trace's dts pace by more than {slack} µs from the median lag {mid} µs: {off:?}",
+        "{what}: {} of {} checked frames off the trace's dts pace by more than {slack} µs from the median lag {mid} µs: lags {off:?}, deviations {deviations:?}",
         off.len(),
         checked.len()
     );
@@ -638,7 +640,7 @@ fn a_few_stalls_excuse_the_frames_they_delay() {
     check_arrivals(&sent, &arrived, &stalls);
 }
 
-/// 40 unique frames at 60 fps, as a 60 fps trace matches; `late` frames arrive that much behind their dts.
+/// 40 unique frames at 60 fps, as many as a short 60 fps trace yields; `late` frames arrive that much behind their dts.
 fn check_sixty_fps(late: &[(i64, Duration)]) {
     let start = Instant::now();
     let sent: Vec<Sent> = (0..40i64)
@@ -674,22 +676,22 @@ fn check_sixty_fps(late: &[(i64, Duration)]) {
 
 #[test]
 fn one_frame_of_jitter_past_the_slack_passes_a_short_trace() {
-    check_sixty_fps(&[(20, Duration::from_millis(26))]);
+    check_sixty_fps(&[(20, Duration::from_millis(25))]);
 }
 
 #[test]
 #[should_panic(expected = "checked frames off")]
 fn two_late_frames_fail_a_short_trace() {
     check_sixty_fps(&[
-        (10, Duration::from_millis(26)),
-        (30, Duration::from_millis(26)),
+        (10, Duration::from_millis(25)),
+        (30, Duration::from_millis(25)),
     ]);
 }
 
 #[test]
 #[should_panic(expected = "checked frames off")]
-fn one_frame_late_by_over_twice_the_slack_fails_a_short_trace() {
-    check_sixty_fps(&[(20, Duration::from_millis(45))]);
+fn one_frame_late_past_the_jitter_margin_fails_a_short_trace() {
+    check_sixty_fps(&[(20, Duration::from_millis(35))]);
 }
 
 #[test]
