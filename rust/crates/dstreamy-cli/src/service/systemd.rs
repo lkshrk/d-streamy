@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use super::{Backend, QUERY_TIMEOUT, ServiceError, Step, Supervision, checked_output};
+use super::{Backend, InstallPlan, QUERY_TIMEOUT, ServiceError, Step, Supervision, checked_output};
 
 pub const UNIT_NAME: &str = "dstreamy.service";
 
@@ -28,25 +28,28 @@ impl Systemd {
             .join(UNIT_NAME)
     }
 
-    /// The main process runs an outdated definition or a binary that was replaced.
-    fn stale(&self, show: &str) -> bool {
-        if property(show, "NeedDaemonReload") == Some("yes") {
+    /// The main process is not `<exe> serve` from the unit: another binary, a replaced one or other arguments.
+    fn runs_something_else(&self, pid: &str) -> bool {
+        if pid.is_empty() || pid == "0" {
+            return false;
+        }
+        let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+            return false;
+        };
+        // A replaced binary reads as "<path> (deleted)", so it never equals the unit's path.
+        if exe != self.exe {
             return true;
         }
-        let pid = property(show, "MainPID").unwrap_or("0");
-        let exe = std::fs::read_link(format!("/proc/{pid}/exe"));
-        if pid != "0" && exe.is_ok_and(|exe| exe.to_string_lossy().ends_with(" (deleted)")) {
-            return true;
-        }
-        let started = property(show, "ExecMainStartTimestamp")
-            .and_then(|t| t.strip_prefix('@'))
-            .and_then(|t| t.parse::<u64>().ok());
-        let written = std::fs::metadata(&self.unit_path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs());
-        matches!((started, written), (Some(started), Some(written)) if started < written)
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            return false;
+        };
+        let mut expected = self.exe.as_os_str().as_encoded_bytes().to_vec();
+        expected.extend_from_slice(b"\0serve\0");
+        cmdline != expected
+    }
+
+    fn owns_wants_link(&self) -> bool {
+        std::fs::read_link(self.wants_link()).is_ok_and(|target| target == self.unit_path)
     }
 
     fn systemctl(&self, args: &[&str]) -> Vec<OsString> {
@@ -78,9 +81,17 @@ impl Backend for Systemd {
         unit(&self.exe)
     }
 
-    fn install(&self, definition: &str, write: bool) -> Vec<Step> {
-        if !write {
-            return vec![Step::Run(self.systemctl(&["enable", "--now", UNIT_NAME]))];
+    fn install(&self, definition: &str, plan: InstallPlan) -> Vec<Step> {
+        if !plan.write {
+            let mut steps = Vec::new();
+            if plan.reload {
+                steps.push(Step::Run(self.systemctl(&["daemon-reload"])));
+            }
+            if plan.restart {
+                steps.push(Step::Run(self.systemctl(&["try-restart", UNIT_NAME])));
+            }
+            steps.push(Step::Run(self.systemctl(&["enable", "--now", UNIT_NAME])));
+            return steps;
         }
         vec![
             Step::Write {
@@ -93,7 +104,7 @@ impl Backend for Systemd {
         ]
     }
 
-    fn uninstall(&self, definition_present: bool, known: bool) -> Vec<Step> {
+    fn uninstall(&self, definition_present: bool, state: Option<&Supervision>) -> Vec<Step> {
         if definition_present {
             return vec![
                 Step::Run(self.systemctl(&["disable", "--now", UNIT_NAME])),
@@ -103,28 +114,36 @@ impl Backend for Systemd {
         }
         // `disable` fails without the unit file, before its `--now` stop.
         let mut steps = Vec::new();
-        if known {
-            steps.push(Step::Run(self.systemctl(&["stop", UNIT_NAME])));
-            steps.push(Step::Run(self.systemctl(&["reset-failed", UNIT_NAME])));
+        if state.is_none_or(|s| s.failed) {
+            steps.push(Step::TryRun(self.systemctl(&["reset-failed", UNIT_NAME])));
         }
-        steps.push(Step::Remove(self.wants_link()));
+        if state.is_none_or(|s| s.active) {
+            steps.push(Step::TryRun(self.systemctl(&["stop", UNIT_NAME])));
+        }
+        if self.owns_wants_link() {
+            steps.push(Step::Remove(self.wants_link()));
+        }
         steps.push(Step::Run(self.systemctl(&["daemon-reload"])));
         steps
     }
 
     fn enablement_left(&self) -> bool {
-        std::fs::symlink_metadata(self.wants_link()).is_ok()
+        self.owns_wants_link()
     }
 
     fn query(&self) -> Result<Supervision, ServiceError> {
         let (_, show) = self.read(&[
             "show",
-            "--timestamp=unix",
-            "--property=LoadState,ActiveState,SubState,UnitFileState,MainPID,NeedDaemonReload,ExecMainStartTimestamp",
+            "--property=LoadState,ActiveState,SubState,UnitFileState,MainPID,NeedDaemonReload,FragmentPath",
             UNIT_NAME,
         ])?;
         let mut state = supervision(&show);
-        state.stale = state.running && self.stale(&show);
+        state.runs_something_else =
+            state.running && self.runs_something_else(property(&show, "MainPID").unwrap_or(""));
+        state.foreign = property(&show, "FragmentPath")
+            .filter(|fragment| !fragment.is_empty())
+            .map(PathBuf::from)
+            .filter(|fragment| fragment.components().ne(self.unit_path.components()));
         Ok(state)
     }
 
@@ -135,7 +154,7 @@ impl Backend for Systemd {
             what: "UnitPath".to_owned(),
         })?;
         let dir = self.unit_path.parent().unwrap_or(Path::new("/"));
-        if searched(search_path, dir) {
+        if searched(&shell_words_unquoted(search_path), dir) {
             Ok(())
         } else {
             Err(ServiceError::NotSearched {
@@ -163,18 +182,49 @@ fn property<'a>(show: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
 }
 
-/// Whether `dir` is an entry of the manager's space-separated `UnitPath`, compared by path components.
-fn searched(search_path: &str, dir: &Path) -> bool {
-    let words: Vec<&str> = search_path.split(' ').collect();
-    let entries = (0..words.len())
-        .flat_map(|start| (start + 1..=words.len()).map(move |end| (start, end)))
-        .map(|(start, end)| PathBuf::from(words[start..end].join(" ")));
+/// Splits a `show` list value; elements with whitespace or shell metacharacters arrive double-quoted with `\` escapes.
+fn shell_words_unquoted(value: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quoted = false;
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                in_word = true;
+            }
+            '\\' => {
+                word.extend(chars.next());
+                in_word = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            c => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// Whether `dir` is one of `entries`, compared by path components, then canonicalised.
+fn searched(entries: &[String], dir: &Path) -> bool {
     let canonical_dir = std::fs::canonicalize(dir).ok();
-    entries.into_iter().any(|entry| {
+    entries.iter().map(Path::new).any(|entry| {
         entry.components().eq(dir.components())
             || canonical_dir
                 .as_ref()
-                .is_some_and(|dir| std::fs::canonicalize(&entry).ok().as_ref() == Some(dir))
+                .is_some_and(|dir| std::fs::canonicalize(entry).ok().as_ref() == Some(dir))
     })
 }
 
@@ -199,8 +249,11 @@ fn supervision(show: &str) -> Supervision {
         loaded: !load.is_empty() && load != "not-found",
         enabled: file == "enabled",
         active: !active.is_empty() && active != "inactive" && active != "failed",
+        failed: active == "failed",
         running,
-        stale: false,
+        need_reload: get("NeedDaemonReload") == "yes",
+        runs_something_else: false,
+        foreign: None,
         detail,
     }
 }
@@ -331,30 +384,50 @@ mod tests {
         assert_eq!(missing.detail, "not-found, inactive (dead)");
     }
 
+    fn on_path(search: &str, dir: &Path) -> bool {
+        searched(&shell_words_unquoted(search), dir)
+    }
+
     #[test]
     fn the_unit_directory_must_be_on_the_managers_search_path() {
         let search = "/home/u/.config/systemd/user.control /run/user/1/systemd/transient /home/u/.config/systemd/user /etc/systemd/user";
-        assert!(searched(search, Path::new("/home/u/.config/systemd/user")));
-        assert!(!searched(search, Path::new("/home/u/.config/systemd")));
-        assert!(!searched(search, Path::new("/elsewhere/systemd/user")));
-        assert!(searched(
-            "/a /home/my user/.config/systemd/user /b",
+        assert!(on_path(search, Path::new("/home/u/.config/systemd/user")));
+        assert!(!on_path(search, Path::new("/home/u/.config/systemd")));
+        assert!(!on_path(search, Path::new("/elsewhere/systemd/user")));
+    }
+
+    #[test]
+    fn quoted_search_path_entries_with_spaces_and_dollars_match() {
+        let search = r#"/a "/home/my user/.config/systemd/user" "/srv/\$x \"q\"/systemd/user" /b"#;
+        assert_eq!(
+            shell_words_unquoted(search),
+            [
+                "/a",
+                "/home/my user/.config/systemd/user",
+                "/srv/$x \"q\"/systemd/user",
+                "/b"
+            ]
+        );
+        assert!(on_path(
+            search,
             Path::new("/home/my user/.config/systemd/user")
         ));
+        assert!(on_path(search, Path::new("/srv/$x \"q\"/systemd/user")));
+        assert!(!on_path(search, Path::new("/home/my")));
     }
 
     #[test]
     fn doubled_and_trailing_slashes_do_not_matter_even_before_the_directory_exists() {
         let dir = Path::new("/nonexistent/home/u/.config/systemd/user");
-        assert!(searched(
+        assert!(on_path(
             "/x /nonexistent/home//u/.config/systemd/user /y",
             dir
         ));
-        assert!(searched(
+        assert!(on_path(
             "/x /nonexistent/home/u/.config/systemd/user/ /y",
             dir
         ));
-        assert!(searched(
+        assert!(on_path(
             "/x /nonexistent/home/u/.config/systemd/user",
             Path::new("/nonexistent/home//u/.config/systemd/user/")
         ));
@@ -367,6 +440,6 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
         let via_link = dir.path().join("link/systemd/user");
-        assert!(searched(&format!("/x {}", real.display()), &via_link));
+        assert!(on_path(&format!("/x {}", real.display()), &via_link));
     }
 }

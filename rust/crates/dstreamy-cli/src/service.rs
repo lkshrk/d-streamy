@@ -159,9 +159,22 @@ impl ServiceError {
 }
 
 pub enum Step {
-    Write { path: PathBuf, contents: String },
+    Write {
+        path: PathBuf,
+        contents: String,
+    },
     Remove(PathBuf),
     Run(Vec<OsString>),
+    /// A command whose failure is reported but does not stop the plan.
+    TryRun(Vec<OsString>),
+}
+
+/// What `install` does besides enabling and starting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallPlan {
+    pub write: bool,
+    pub reload: bool,
+    pub restart: bool,
 }
 
 /// The definition already on disk, compared with the one `install` writes.
@@ -177,9 +190,13 @@ pub struct Supervision {
     pub loaded: bool,
     pub enabled: bool,
     pub active: bool,
+    pub failed: bool,
     pub running: bool,
-    /// The running process predates the loaded definition or its binary was replaced.
-    pub stale: bool,
+    pub need_reload: bool,
+    /// The main process is not the command the definition runs.
+    pub runs_something_else: bool,
+    /// Where the manager loaded a service of this name from, when that is not our definition.
+    pub foreign: Option<PathBuf>,
     pub detail: String,
 }
 
@@ -188,11 +205,10 @@ pub trait Backend: Send + Sync {
     fn name(&self) -> &str;
     fn definition_path(&self) -> &Path;
     fn definition(&self) -> Result<String, ServiceError>;
-    /// With `write`, writes `definition` and restarts a running service; otherwise only enables and starts.
-    fn install(&self, definition: &str, write: bool) -> Vec<Step>;
-    /// `known`: the manager has the service loaded or active.
-    fn uninstall(&self, definition_present: bool, known: bool) -> Vec<Step>;
-    /// Whether enablement links are left without a definition.
+    fn install(&self, definition: &str, plan: InstallPlan) -> Vec<Step>;
+    /// `state` is `None` when the manager could not be asked.
+    fn uninstall(&self, definition_present: bool, state: Option<&Supervision>) -> Vec<Step>;
+    /// Whether enablement links of ours are left without a definition.
     fn enablement_left(&self) -> bool;
     fn query(&self) -> Result<Supervision, ServiceError>;
     /// Fails when the manager would not load a definition from [`Backend::definition_path`].
@@ -302,15 +318,19 @@ fn install(
     let previous = previous(path, &definition)?;
     let state = manager_state(out, backend, dry_run)?;
     let running = state.as_ref().is_some_and(|s| s.running);
-    let stale = running && state.as_ref().is_some_and(|s| s.stale);
-    let write = previous != Previous::Same || stale;
-    let steps = backend.install(&definition, write);
+    let write = previous != Previous::Same;
+    let plan = InstallPlan {
+        write,
+        reload: write || state.as_ref().is_some_and(|s| s.need_reload),
+        restart: write || (running && state.as_ref().is_some_and(|s| s.runs_something_else)),
+    };
+    let steps = backend.install(&definition, plan);
     if dry_run {
         print_plan(out, &steps);
         return Ok(ExitCode::SUCCESS);
     }
-    apply(&steps)?;
-    let outcome = match (running, write) {
+    warn_tolerated(out, apply(&steps)?);
+    let outcome = match (running, plan.restart) {
         (true, true) => "restarted",
         (true, false) => "unchanged",
         (false, _) => "started",
@@ -333,7 +353,7 @@ fn install(
         let service = match outcome {
             "unchanged" => format!("{name} is enabled and was already running"),
             "restarted" if previous == Previous::Same => format!(
-                "{name} was restarted because it ran an outdated definition or binary, which ended any Discord session it had"
+                "{name} was restarted because it ran a different or replaced binary, which ended any Discord session it had"
             ),
             "restarted" => format!(
                 "{name} is enabled and was restarted, which ended any Discord session it had"
@@ -373,7 +393,26 @@ fn uninstall(out: &Out, backend: &dyn Backend, dry_run: bool) -> Result<ExitCode
     let path = backend.definition_path();
     let present = fs::symlink_metadata(path).is_ok();
     let state = manager_state(out, backend, dry_run)?;
-    let known = state.as_ref().is_none_or(|s| s.loaded || s.active);
+    if !present && let Some(foreign) = state.as_ref().and_then(|s| s.foreign.as_ref()) {
+        if out.json {
+            out.json_line(&json!({
+                "action": "foreign",
+                "name": backend.name(),
+                "definition": path,
+                "loaded_from": foreign,
+            }));
+        } else {
+            out.line(format_args!(
+                "{} is loaded from {}, which dstreamy did not install; nothing to do",
+                backend.name(),
+                foreign.display()
+            ));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let known = state
+        .as_ref()
+        .is_none_or(|s| s.loaded || s.active || s.failed);
     if !present && !known && !backend.enablement_left() {
         if out.json {
             out.json_line(&json!({
@@ -390,12 +429,12 @@ fn uninstall(out: &Out, backend: &dyn Backend, dry_run: bool) -> Result<ExitCode
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let steps = backend.uninstall(present, known);
+    let steps = backend.uninstall(present, state.as_ref());
     if dry_run {
         print_plan(out, &steps);
         return Ok(ExitCode::SUCCESS);
     }
-    apply(&steps)?;
+    warn_tolerated(out, apply(&steps)?);
     if out.json {
         out.json_line(&json!({
             "action": "uninstalled",
@@ -418,7 +457,15 @@ fn uninstall(out: &Out, backend: &dyn Backend, dry_run: bool) -> Result<ExitCode
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn apply(steps: &[Step]) -> Result<(), ServiceError> {
+fn warn_tolerated(out: &Out, failures: Vec<ServiceError>) {
+    for e in failures {
+        out.warn(e);
+    }
+}
+
+/// Runs `steps` in order; returns the failures of [`Step::TryRun`] steps.
+pub fn apply(steps: &[Step]) -> Result<Vec<ServiceError>, ServiceError> {
+    let mut tolerated = Vec::new();
     let mut written = None;
     for step in steps {
         match step {
@@ -457,13 +504,17 @@ pub fn apply(steps: &[Step]) -> Result<(), ServiceError> {
                     });
                 }
             }
+            Step::TryRun(argv) => {
+                if let Err(e) = checked_output(argv, None) {
+                    tolerated.push(e);
+                }
+            }
         }
     }
-    Ok(())
+    Ok(tolerated)
 }
 
-/// Replaces `path` by rename, so a reader never sees half a file and a symlink there is replaced, not followed.
-/// An error says whether the rename already happened.
+/// Replaces `path` by rename (never following a symlink); an error says whether the rename happened.
 fn write_atomically(path: &Path, contents: &str) -> Result<(), (bool, ServiceError)> {
     let file_err = |action| {
         move |source| ServiceError::File {
@@ -574,6 +625,10 @@ fn print_plan(out: &Out, steps: &[Step]) {
                     let argv: Vec<_> = argv.iter().map(|a| a.to_string_lossy()).collect();
                     json!({ "run": argv })
                 }
+                Step::TryRun(argv) => {
+                    let argv: Vec<_> = argv.iter().map(|a| a.to_string_lossy()).collect();
+                    json!({ "run": argv, "may_fail": true })
+                }
             })
             .collect();
         out.json_line(&json!({"dry_run": true, "steps": steps}));
@@ -587,6 +642,10 @@ fn print_plan(out: &Out, steps: &[Step]) {
             }
             Step::Remove(path) => text.push_str(&format!("would remove {}\n", path.display())),
             Step::Run(argv) => text.push_str(&format!("would run: {}\n", shell_words(argv))),
+            Step::TryRun(argv) => text.push_str(&format!(
+                "would run: {} (a failure is only reported)\n",
+                shell_words(argv)
+            )),
         }
     }
     out.raw(&text);

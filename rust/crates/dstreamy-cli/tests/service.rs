@@ -14,16 +14,23 @@ const GOLDEN: &str = include_str!("fixtures/service/dstreamy.service");
 const NOT_FOUND: &str =
     "LoadState=not-found\nActiveState=inactive\nSubState=dead\nUnitFileState=\nMainPID=0\n";
 
-/// A running unit whose main process is `pid`, started long after any file the test writes.
-fn running(pid: u32) -> String {
-    running_since(pid, "@9999999999", "no")
+fn state(
+    load: &str,
+    active: &str,
+    sub: &str,
+    pid: u32,
+    need_reload: &str,
+    fragment: &str,
+) -> String {
+    format!(
+        "LoadState={load}\nActiveState={active}\nSubState={sub}\nUnitFileState=enabled\nMainPID={pid}\n\
+         NeedDaemonReload={need_reload}\nFragmentPath={fragment}\n"
+    )
 }
 
-fn running_since(pid: u32, started: &str, need_reload: &str) -> String {
-    format!(
-        "LoadState=loaded\nActiveState=active\nSubState=running\nUnitFileState=enabled\nMainPID={pid}\n\
-         NeedDaemonReload={need_reload}\nExecMainStartTimestamp={started}\n"
-    )
+/// A running unit whose main process is `pid`.
+fn running(pid: u32) -> String {
+    state("loaded", "active", "running", pid, "no", "")
 }
 
 fn dstreamy() -> PathBuf {
@@ -262,18 +269,99 @@ fn install_writes_the_unit_then_reloads_and_enables_it_and_uninstall_reverses_it
     );
 }
 
-#[test]
-fn an_unchanged_reinstall_over_a_running_service_does_not_restart_it() {
-    let fake = Fake::new();
+/// Polls until `child` has been running for a moment, so a failed start can't pass as a match.
+fn alive(mut child: Child) -> KillOnDrop {
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the process exited early"
+    );
+    KillOnDrop(child)
+}
+
+/// `dstreamy serve` with exactly the unit's command line, away from the real socket and config.
+fn serve_like_the_unit(fake: &Fake, extra: &[&str]) -> (KillOnDrop, TempDir) {
+    let runtime = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let child = Command::new(fs::canonicalize(dstreamy()).unwrap())
+        .arg("serve")
+        .args(extra)
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("DSTREAMY_CONFIG_DIR", fake.dir.path().join("serve-config"))
+        .env("HOME", fake.dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    (alive(child), runtime)
+}
+
+fn reinstall_over(fake: &Fake, show: &str) -> Value {
     stdout(&fake.run(&["service", "install"]));
-    fake.answer_show(&running(std::process::id()));
+    fake.answer_show(show);
     fs::remove_file(fake.dir.path().join("calls")).unwrap();
-    let v: Value =
-        serde_json::from_str(&stdout(&fake.run(&["--json", "service", "install"]))).unwrap();
+    serde_json::from_str(&stdout(&fake.run(&["--json", "service", "install"]))).unwrap()
+}
+
+const RESTART_ONLY: &str =
+    "--user try-restart dstreamy.service\n--user enable --now dstreamy.service\n";
+
+#[test]
+fn an_unchanged_reinstall_over_the_units_own_process_does_not_restart_it() {
+    let fake = Fake::new();
+    let (serve, _runtime) = serve_like_the_unit(&fake, &[]);
+    let v = reinstall_over(&fake, &running(serve.0.id()));
     assert_eq!(v["action"], "unchanged", "{v}");
     assert_eq!(fake.actions(), "--user enable --now dstreamy.service\n");
     let text = stdout(&fake.run(&["service", "install"]));
     assert!(text.contains("is unchanged"), "{text}");
+}
+
+#[test]
+fn a_rerun_after_a_failed_reload_reloads_without_restarting_the_units_own_process() {
+    let fake = Fake::new();
+    fake.script("case \"$2\" in daemon-reload) exit 1 ;; show) cat \"$d/unitpath\" ;; esac\n");
+    failure(&fake.run(&["service", "install"]));
+    fake.default_script();
+    let (serve, _runtime) = serve_like_the_unit(&fake, &[]);
+    fake.answer_show(&state(
+        "loaded",
+        "active",
+        "running",
+        serve.0.id(),
+        "yes",
+        "",
+    ));
+    fs::remove_file(fake.dir.path().join("calls")).unwrap();
+    let v: Value =
+        serde_json::from_str(&stdout(&fake.run(&["--json", "service", "install"]))).unwrap();
+    assert_eq!(v["action"], "unchanged", "{v}");
+    assert_eq!(v["written"], false, "{v}");
+    assert_eq!(
+        fake.actions(),
+        "--user daemon-reload\n--user enable --now dstreamy.service\n"
+    );
+}
+
+#[test]
+fn a_service_running_another_binary_is_restarted() {
+    let fake = Fake::new();
+    let v = reinstall_over(&fake, &running(std::process::id()));
+    assert_eq!(v["action"], "restarted", "{v}");
+    assert_eq!(v["written"], false, "{v}");
+    assert_eq!(fake.actions(), RESTART_ONLY);
+    let text = stdout(&fake.run(&["service", "install"]));
+    assert!(text.contains("different or replaced binary"), "{text}");
+}
+
+#[test]
+fn a_service_running_other_arguments_is_restarted() {
+    let fake = Fake::new();
+    let endpoint = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let socket = endpoint.path().join("d/s.sock");
+    let (serve, _runtime) = serve_like_the_unit(&fake, &["--endpoint", socket.to_str().unwrap()]);
+    let v = reinstall_over(&fake, &running(serve.0.id()));
+    assert_eq!(v["action"], "restarted", "{v}");
+    assert_eq!(fake.actions(), RESTART_ONLY);
 }
 
 #[test]
@@ -341,25 +429,31 @@ fn install_refuses_a_unit_directory_the_manager_does_not_search() {
     assert!(stderr.contains("does not load units from"), "{stderr}");
 }
 
+fn link_ours(fake: &Fake) -> PathBuf {
+    let wants = fake.unit_dir().join("default.target.wants");
+    fs::create_dir_all(&wants).unwrap();
+    let link = wants.join("dstreamy.service");
+    std::os::unix::fs::symlink(fake.unit_path(), &link).unwrap();
+    link
+}
+
 #[test]
-fn uninstall_without_the_file_stops_a_unit_the_manager_knows_and_removes_its_link() {
+fn uninstall_without_the_file_stops_a_running_unit_and_removes_its_link() {
     let fake = Fake::new();
     let v: Value =
         serde_json::from_str(&stdout(&fake.run(&["--json", "service", "uninstall"]))).unwrap();
     assert_eq!(v["action"], "absent", "{v}");
     assert_eq!(fake.actions(), "");
 
-    let wants = fake.unit_dir().join("default.target.wants");
-    fs::create_dir_all(&wants).unwrap();
-    std::os::unix::fs::symlink(fake.unit_path(), wants.join("dstreamy.service")).unwrap();
+    let link = link_ours(&fake);
     fake.answer_show(&running(std::process::id()));
     let plan = stdout(&fake.run(&["service", "uninstall", "--dry-run"]));
     assert_eq!(
         plan,
         format!(
-            "would run: {s} --user stop dstreamy.service\nwould run: {s} --user reset-failed dstreamy.service\n\
+            "would run: {s} --user stop dstreamy.service (a failure is only reported)\n\
              would remove {}\nwould run: {s} --user daemon-reload\n",
-            wants.join("dstreamy.service").display(),
+            link.display(),
             s = fake.systemctl().display()
         )
     );
@@ -368,76 +462,143 @@ fn uninstall_without_the_file_stops_a_unit_the_manager_knows_and_removes_its_lin
     assert!(out.contains("was already gone"), "{out}");
     assert_eq!(
         fake.actions(),
-        "--user stop dstreamy.service\n--user reset-failed dstreamy.service\n--user daemon-reload\n"
+        "--user stop dstreamy.service\n--user daemon-reload\n"
     );
-    assert!(fs::symlink_metadata(wants.join("dstreamy.service")).is_err());
+    assert!(fs::symlink_metadata(&link).is_err());
+}
+
+#[test]
+fn uninstall_without_the_file_resets_a_failed_unit_even_when_it_is_not_found() {
+    let fake = Fake::new();
+    fake.answer_show(&state("not-found", "failed", "failed", 0, "no", ""));
+    let out = stdout(&fake.run(&["service", "uninstall"]));
+    assert!(out.contains("was already gone"), "{out}");
+    assert_eq!(
+        fake.actions(),
+        "--user reset-failed dstreamy.service\n--user daemon-reload\n"
+    );
+}
+
+#[test]
+fn uninstall_without_the_file_only_reloads_for_an_inactive_loaded_unit() {
+    let fake = Fake::new();
+    fake.answer_show(&state("loaded", "inactive", "dead", 0, "yes", ""));
+    stdout(&fake.run(&["service", "uninstall"]));
+    assert_eq!(fake.actions(), "--user daemon-reload\n");
+}
+
+#[test]
+fn a_failed_stop_is_reported_and_the_reload_still_runs() {
+    let fake = Fake::new();
+    fake.script(&format!(
+        "case \"$2\" in stop) echo 'Unit dstreamy.service not loaded.' >&2; exit 5 ;; esac\n{DEFAULT_SCRIPT}"
+    ));
+    fake.answer_show(&running(std::process::id()));
+    let output = fake.run(&["service", "uninstall"]);
+    stdout(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not loaded"), "{stderr}");
+    assert_eq!(
+        fake.actions(),
+        "--user stop dstreamy.service\n--user daemon-reload\n"
+    );
+}
+
+#[test]
+fn uninstall_leaves_a_unit_loaded_from_elsewhere_and_a_link_to_it_alone() {
+    let fake = Fake::new();
+    let wants = fake.unit_dir().join("default.target.wants");
+    fs::create_dir_all(&wants).unwrap();
+    let theirs = "/usr/lib/systemd/user/dstreamy.service";
+    std::os::unix::fs::symlink(theirs, wants.join("dstreamy.service")).unwrap();
+    fake.answer_show(&state("loaded", "active", "running", 4242, "no", theirs));
+    let v: Value =
+        serde_json::from_str(&stdout(&fake.run(&["--json", "service", "uninstall"]))).unwrap();
+    assert_eq!(v["action"], "foreign", "{v}");
+    assert_eq!(v["loaded_from"], theirs, "{v}");
+    assert_eq!(fake.actions(), "");
+
+    fake.answer_show(NOT_FOUND);
+    let v: Value =
+        serde_json::from_str(&stdout(&fake.run(&["--json", "service", "uninstall"]))).unwrap();
+    assert_eq!(v["action"], "absent", "{v}");
+    assert!(fs::symlink_metadata(wants.join("dstreamy.service")).is_ok());
 }
 
 #[test]
 fn uninstall_removes_a_dangling_enablement_link_left_without_a_loaded_unit() {
     let fake = Fake::new();
-    let wants = fake.unit_dir().join("default.target.wants");
-    fs::create_dir_all(&wants).unwrap();
-    std::os::unix::fs::symlink(fake.unit_path(), wants.join("dstreamy.service")).unwrap();
+    let link = link_ours(&fake);
     stdout(&fake.run(&["service", "uninstall"]));
     assert_eq!(fake.actions(), "--user daemon-reload\n");
-    assert!(fs::symlink_metadata(wants.join("dstreamy.service")).is_err());
+    assert!(fs::symlink_metadata(&link).is_err());
 }
 
-fn reinstall_over(fake: &Fake, show: &str) -> Value {
-    stdout(&fake.run(&["service", "install"]));
-    fake.answer_show(show);
-    fs::remove_file(fake.dir.path().join("calls")).unwrap();
-    serde_json::from_str(&stdout(&fake.run(&["--json", "service", "install"]))).unwrap()
-}
-
-const RESTART: &str = "--user daemon-reload\n--user try-restart dstreamy.service\n--user enable --now dstreamy.service\n";
-
-#[test]
-fn a_rerun_after_a_failed_reload_restarts_the_service_that_needs_one() {
-    let fake = Fake::new();
-    fake.script("case \"$2\" in daemon-reload) exit 1 ;; show) cat \"$d/unitpath\" ;; esac\n");
-    failure(&fake.run(&["service", "install"]));
-    fake.default_script();
-    fake.answer_show(&running_since(std::process::id(), "@9999999999", "yes"));
-    fs::remove_file(fake.dir.path().join("calls")).unwrap();
-    let v: Value =
-        serde_json::from_str(&stdout(&fake.run(&["--json", "service", "install"]))).unwrap();
-    assert_eq!(v["action"], "restarted", "{v}");
-    assert_eq!(v["written"], true, "{v}");
-    assert_eq!(fake.actions(), RESTART);
-    let text = stdout(&fake.run(&["service", "install"]));
-    assert!(
-        text.contains("is unchanged") && text.contains("outdated definition"),
-        "{text}"
-    );
-}
-
-#[test]
-fn a_service_started_before_its_unit_file_was_written_is_restarted() {
-    let fake = Fake::new();
-    let v = reinstall_over(&fake, &running_since(std::process::id(), "@1", "no"));
-    assert_eq!(v["action"], "restarted", "{v}");
-    assert_eq!(fake.actions(), RESTART);
-}
-
-#[test]
-fn a_service_whose_binary_was_replaced_is_restarted() {
-    let fake = Fake::new();
-    let bin = fake.dir.path().join("old-dstreamy");
-    fs::copy("/bin/sleep", &bin).unwrap();
-    let old = loop {
-        // A concurrent test's fork can briefly hold the copy open for writing (ETXTBSY).
-        match Command::new(&bin).arg("30").spawn() {
-            Ok(child) => break KillOnDrop(child),
+/// Spawns `cmd`, retrying while a concurrent test's fork still holds the fresh copy open for writing (ETXTBSY).
+fn spawn_copy(cmd: &mut Command) -> KillOnDrop {
+    for _ in 0..50 {
+        match cmd.spawn() {
+            Ok(child) => return alive(child),
             Err(e) if e.raw_os_error() == Some(26) => std::thread::sleep(Duration::from_millis(20)),
             Err(e) => panic!("{e}"),
         }
-    };
-    fs::remove_file(&bin).unwrap();
-    let v = reinstall_over(&fake, &running(old.0.id()));
+    }
+    panic!("the copy stayed busy");
+}
+
+#[test]
+fn a_service_whose_binary_was_replaced_at_the_same_path_is_restarted() {
+    let fake = Fake::new();
+    let exe = copy_of_dstreamy_in(&fake.dir.path().join("bin"));
+    let runtime = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let old = spawn_copy(
+        Command::new(&exe)
+            .arg("serve")
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("DSTREAMY_CONFIG_DIR", fake.dir.path().join("serve-config"))
+            .env("HOME", fake.dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    );
+    stdout(
+        &fake
+            .command(&exe, &["service", "install"])
+            .output()
+            .unwrap(),
+    );
+    let upgrade = fake.dir.path().join("bin/dstreamy.new");
+    fs::copy(dstreamy(), &upgrade).unwrap();
+    fs::rename(&upgrade, &exe).unwrap();
+    fake.answer_show(&running(old.0.id()));
+    fs::remove_file(fake.dir.path().join("calls")).unwrap();
+    let output = fake
+        .command(&exe, &["--json", "service", "install"])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_str(&stdout(&output)).unwrap();
     assert_eq!(v["action"], "restarted", "{v}");
-    assert_eq!(fake.actions(), RESTART);
+    assert_eq!(fake.actions(), RESTART_ONLY);
+}
+
+#[test]
+fn install_accepts_a_unit_directory_the_manager_lists_quoted() {
+    let fake = Fake::new();
+    let config = fake.dir.path().join("my $config");
+    let unit_dir = config.join("systemd/user");
+    let quoted = unit_dir.display().to_string().replace('$', "\\$");
+    fs::write(
+        fake.dir.path().join("unitpath"),
+        format!("UnitPath=/x/systemd/user.control \"{quoted}\" /etc/systemd/user\n"),
+    )
+    .unwrap();
+    stdout(
+        &fake
+            .command(&dstreamy(), &["service", "install"])
+            .env("XDG_CONFIG_HOME", &config)
+            .output()
+            .unwrap(),
+    );
+    assert!(unit_dir.join("dstreamy.service").exists());
 }
 
 #[test]
@@ -589,7 +750,7 @@ fn status_finds_the_socket_under_the_services_runtime_directory() {
     assert!(
         fake.calls().ends_with(
             "--user show --property=UnitPath\n\
-             --user show --timestamp=unix --property=LoadState,ActiveState,SubState,UnitFileState,MainPID,NeedDaemonReload,ExecMainStartTimestamp dstreamy.service\n\
+             --user show --property=LoadState,ActiveState,SubState,UnitFileState,MainPID,NeedDaemonReload,FragmentPath dstreamy.service\n\
              --user show-environment\n"
         ),
         "{}",
@@ -783,6 +944,13 @@ fn a_real_install_survives_sigkill_and_a_user_manager_restart() {
         main_pid(),
         first,
         "an unchanged reinstall restarted the service"
+    );
+    assert!(sh("touch", &[unit_path.to_str().unwrap()]).status.success());
+    assert_eq!(install()["action"], "unchanged");
+    assert_eq!(
+        main_pid(),
+        first,
+        "a reinstall over a unit that only needed a reload restarted the service"
     );
 
     assert!(sh("kill", &["-9", &first.to_string()]).status.success());
