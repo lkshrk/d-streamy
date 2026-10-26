@@ -12,6 +12,7 @@ on:
       - "rust/rust-toolchain.toml"
       - ".github/workflows/obs-ci.yml"
       - ".github/actions/obs-prefix-*/**"
+      - ".github/scripts/obs-*.sh"
   pull_request:
     branches: [main, rust-rewrite]
     paths:
@@ -23,6 +24,7 @@ on:
       - "rust/rust-toolchain.toml"
       - ".github/workflows/obs-ci.yml"
       - ".github/actions/obs-prefix-*/**"
+      - ".github/scripts/obs-*.sh"
   # On rust-rewrite this also re-publishes the OBS prefix artifacts before they expire.
   workflow_dispatch:
 
@@ -280,11 +282,6 @@ jobs:
   obs-macos:
     runs-on: xcode-27
     timeout-minutes: 150
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [arm64, x86_64]
-    name: obs-macos (${{ matrix.arch }})
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -297,59 +294,70 @@ jobs:
         run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
 
       - name: Install Rosetta
-        if: matrix.arch == 'x86_64'
         run: |
           sudo softwareupdate --install-rosetta --agree-to-license
           arch -x86_64 /usr/bin/true
 
       - name: Set paths
         run: |
-          {
-            echo "OBS_PREFIX=$RUNNER_TEMP/obs-prefix"
-            echo "OBS_LOGS=$RUNNER_TEMP/obs-logs"
-          } >> "$GITHUB_ENV"
+          echo "OBS_LOGS=$RUNNER_TEMP/obs-logs" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/obs-logs"
 
-      - name: Restore OBS build
-        id: obs
+      - name: Restore OBS build (arm64)
+        id: obs-arm64
         uses: ./.github/actions/obs-prefix-fetch
         with:
-          key: obs-${{ env.OBS_TAG }}-xcode-27.1-${{ matrix.arch }}-r${{ env.OBS_BUILD_REV }}
-          path: ${{ runner.temp }}/obs-prefix
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-arm64-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix-arm64
 
-      - name: Build OBS ${{ env.OBS_TAG }}
-        if: steps.obs.outputs.hit != 'true'
-        run: |
-          set -o pipefail
-          start=$(date +%s)
-          git clone --depth 1 --branch "$OBS_TAG" --recurse-submodules --shallow-submodules \
-            https://github.com/obsproject/obs-studio.git "$RUNNER_TEMP/obs-src"
-          cd "$RUNNER_TEMP/obs-src"
-          test "$(git rev-parse HEAD)" = "$OBS_COMMIT"
-          cmake --preset macos \
-            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
-            -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF \
-            -DENABLE_BROWSER=OFF -DENABLE_SCRIPTING=OFF -DENABLE_VIRTUALCAM=OFF -DENABLE_AJA=OFF \
-            -DSPARKLE_APPCAST_URL= -DSPARKLE_PUBLIC_KEY=
-          cmake --build build_macos --config RelWithDebInfo --target obs-studio -- -quiet 2>&1 \
-            | xcbeautify --quiet --renderer github-actions
-          mkdir -p "$OBS_PREFIX"
-          cmake --install build_macos --config RelWithDebInfo --prefix "$OBS_PREFIX"
-          echo "OBS build took $(( $(date +%s) - start )) s" | tee "$OBS_PREFIX/build-time.txt"
+      - name: Build OBS ${{ env.OBS_TAG }} (arm64)
+        if: steps.obs-arm64.outputs.hit != 'true'
+        env:
+          ARCH: arm64
+          OBS_PREFIX: ${{ runner.temp }}/obs-prefix-arm64
+        run: bash .github/scripts/obs-macos-build.sh
 
-      - name: Save OBS build
-        if: steps.obs.outputs.hit != 'true'
+      - name: Save OBS build (arm64)
+        if: steps.obs-arm64.outputs.hit != 'true'
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          path: ${{ runner.temp }}/obs-prefix
-          key: obs-${{ env.OBS_TAG }}-xcode-27.1-${{ matrix.arch }}-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix-arm64
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-arm64-r${{ env.OBS_BUILD_REV }}
 
-      - name: Publish OBS build
+      - name: Publish OBS build (arm64)
         if: env.PUBLISH_OBS_PREFIX == 'true'
         uses: ./.github/actions/obs-prefix-publish
         with:
-          key: obs-${{ env.OBS_TAG }}-xcode-27.1-${{ matrix.arch }}-r${{ env.OBS_BUILD_REV }}
-          path: ${{ runner.temp }}/obs-prefix
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-arm64-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix-arm64
+
+      - name: Restore OBS build (x86_64)
+        id: obs-x86_64
+        uses: ./.github/actions/obs-prefix-fetch
+        with:
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-x86_64-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix-x86_64
+
+      - name: Build OBS ${{ env.OBS_TAG }} (x86_64)
+        if: steps.obs-x86_64.outputs.hit != 'true'
+        env:
+          ARCH: x86_64
+          OBS_PREFIX: ${{ runner.temp }}/obs-prefix-x86_64
+        run: bash .github/scripts/obs-macos-build.sh
+
+      - name: Save OBS build (x86_64)
+        if: steps.obs-x86_64.outputs.hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/obs-prefix-x86_64
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-x86_64-r${{ env.OBS_BUILD_REV }}
+
+      - name: Publish OBS build (x86_64)
+        if: env.PUBLISH_OBS_PREFIX == 'true'
+        uses: ./.github/actions/obs-prefix-publish
+        with:
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-x86_64-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix-x86_64
 
       - name: Install Rust toolchain from rust-toolchain.toml
         working-directory: rust
@@ -361,7 +369,7 @@ jobs:
         working-directory: obs
         run: |
           set -o pipefail
-          cat "$OBS_PREFIX/build-time.txt" || true
+          cat "$RUNNER_TEMP/obs-prefix-arm64/build-time.txt" "$RUNNER_TEMP/obs-prefix-x86_64/build-time.txt" || true
           cmake --preset macos-ci -DDSTREAMY_PLUGIN_TEST_HOOKS=ON
           cmake --build --preset macos-ci -- -quiet 2>&1 | xcbeautify --quiet --renderer github-actions
 
@@ -385,10 +393,11 @@ jobs:
           for a in arm64 x86_64; do
             minos=$(vtool -arch "$a" -show-build MacOS/obs-dstreamy | awk '$1 == "minos" {print $2}')
             test "$minos" = 12.0 || { echo "$a slice minos $minos, expected 12.0"; exit 1; }
+            lipo -archs ../../../harness/RelWithDebInfo/obs-harness | grep -qw "$a"
           done
-          lipo -archs ../../../harness/RelWithDebInfo/obs-harness | grep -qw "${{ matrix.arch }}"
 
       - name: Plugin crate gates
+        id: gates
         working-directory: rust/crates/dstreamy-obs
         env:
           DSTREAMY_OBS_CONFIG: ${{ github.workspace }}/obs/build_macos/obs-config-RelWithDebInfo.txt
@@ -398,38 +407,52 @@ jobs:
           cargo clippy --workspace --all-targets --locked --target x86_64-apple-darwin -- -D warnings
           cargo clippy --workspace --all-targets --locked --target aarch64-apple-darwin --features test-hooks -- -D warnings
 
-      - name: Load and panic tests (${{ matrix.arch }} slice)
-        run: |
-          set -o pipefail
-          app="$OBS_PREFIX/OBS.app/Contents"
-          lipo -archs "$app/Frameworks/libobs.framework/libobs" | tee "$OBS_LOGS/obs-archs.log"
-          cp obs/build_macos/harness/RelWithDebInfo/obs-harness "$app/MacOS/"
-          plugin="$GITHUB_WORKSPACE/obs/build_macos/rundir/%module%.plugin/Contents"
-          arch -${{ matrix.arch }} bash obs/tests/rust-plugin.sh "$app/MacOS/obs-harness" "$plugin/MacOS" \
-            "$plugin/Resources" "$OBS_LOGS/rust-plugin" --graphics "$app/Frameworks/libobs-opengl.dylib" \
-            | tee "$OBS_LOGS/rust-plugin.log"
+      - name: Load and panic tests (arm64 slice)
+        env:
+          ARCH: arm64
+          OBS_PREFIX: ${{ runner.temp }}/obs-prefix-arm64
+        run: bash .github/scripts/obs-macos-plugin-tests.sh
 
-      - name: H.264 encoder settings match obs/tests/encoder-settings (${{ matrix.arch }} slice)
-        run: |
-          set -o pipefail
-          app="$OBS_PREFIX/OBS.app/Contents"
-          arch -${{ matrix.arch }} "$app/MacOS/obs-harness" --graphics "$app/Frameworks/libobs-opengl.dylib" \
-            --modules image-source,obs-x264,obs-ffmpeg,mac-videotoolbox \
-            --dump-encoder-settings "$RUNNER_TEMP/encoder-settings" | tee "$OBS_LOGS/encoder-settings.log"
-          python3 obs/tests/check-encoder-settings.py "$RUNNER_TEMP/encoder-settings" obs/tests/encoder-settings \
-            "the obs-encoder-settings-macos-${{ matrix.arch }} artifact of this run" obs_x264
+      - name: H.264 encoder settings match obs/tests/encoder-settings (arm64 slice)
+        env:
+          ARCH: arm64
+          OBS_PREFIX: ${{ runner.temp }}/obs-prefix-arm64
+        run: bash .github/scripts/obs-macos-encoder-settings.sh
+
+      # Runs even when the arm64 slice failed, so one run reports both slices.
+      - name: Load and panic tests (x86_64 slice)
+        id: load-x86_64
+        if: ${{ !cancelled() && steps.gates.outcome == 'success' }}
+        env:
+          ARCH: x86_64
+          OBS_PREFIX: ${{ runner.temp }}/obs-prefix-x86_64
+        run: bash .github/scripts/obs-macos-plugin-tests.sh
+
+      - name: H.264 encoder settings match obs/tests/encoder-settings (x86_64 slice)
+        if: ${{ !cancelled() && steps.load-x86_64.outcome == 'success' }}
+        env:
+          ARCH: x86_64
+          OBS_PREFIX: ${{ runner.temp }}/obs-prefix-x86_64
+        run: bash .github/scripts/obs-macos-encoder-settings.sh
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: obs-encoder-settings-macos-${{ matrix.arch }}
-          path: ${{ runner.temp }}/encoder-settings
+          name: obs-encoder-settings-macos-arm64
+          path: ${{ runner.temp }}/encoder-settings-arm64
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: obs-logs-macos-${{ matrix.arch }}
+          name: obs-encoder-settings-macos-x86_64
+          path: ${{ runner.temp }}/encoder-settings-x86_64
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-logs-macos
           path: ${{ runner.temp }}/obs-logs
 
   obs-windows:
