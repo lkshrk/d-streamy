@@ -261,6 +261,13 @@ async fn write_packets<T>(
         }
     };
     ring.close();
+    log.log(
+        Level::Debug,
+        &format!(
+            "stop requested; sending {} queued packets and end of stream",
+            ring.stats().queued
+        ),
+    );
     let finish = async {
         while let Some(packet) = ring.pop() {
             let frame = match frame_for(packet, &mut converter, &mut video_extra_data) {

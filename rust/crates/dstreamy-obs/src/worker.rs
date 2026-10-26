@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -22,9 +21,8 @@ use crate::guard;
 use crate::log;
 use crate::output::{OutputPtr, Shared, set_last_error};
 
-#[cfg(unix)]
-/// How long `destroy` waits for a capture that began after libobs decided the output was inactive.
-const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+/// How often a destroy that is still waiting for the end of capture says so.
+const END_WAIT_LOG: Duration = Duration::from_secs(5);
 /// bindgen types the macro `0` as `u32` and the negative codes as `i32`; `obs_output_signal_stop` takes `int`.
 const SUCCESS: c_int = sys::OBS_OUTPUT_SUCCESS as c_int;
 
@@ -61,19 +59,6 @@ enum Outcome {
     Panicked(String),
 }
 
-impl Outcome {
-    /// destroy cancelled the session, so the worker exits after finishing it.
-    fn ends_worker(&self) -> bool {
-        #[cfg(unix)]
-        return matches!(
-            self,
-            Self::Cancelled(Reason::Shutdown) | Self::Ended(End::Stopped(Reason::Shutdown))
-        );
-        #[cfg(not(unix))]
-        false
-    }
-}
-
 pub fn spawn(
     shared: Arc<Shared>,
     commands: UnboundedReceiver<Command>,
@@ -91,6 +76,7 @@ fn run(
     runtime: &tokio::runtime::Runtime,
     mut commands: UnboundedReceiver<Command>,
 ) {
+    // The client's writes can't raise SIGPIPE today; this guards a future writev path (see docs/specs.md).
     #[cfg(target_os = "linux")]
     if let Err(e) = producer::block_sigpipe_on_this_thread() {
         log::warn(&format!(
@@ -110,9 +96,9 @@ fn run(
                                 guard::record_panic("worker", payload.as_ref())
                             ))
                         });
-                    let shutdown = outcome.ends_worker();
                     guard::guard("worker", (), || finish(shared, outcome));
-                    if shutdown {
+                    // A Shutdown may have been consumed by the session's stop; the flag doesn't get lost.
+                    if shared.is_destroying() {
                         break;
                     }
                 }
@@ -131,6 +117,23 @@ fn run(
             }
         }
     });
+    wait_for_end_of_capture(shared.output);
+}
+
+/// libobs joins only an end-capture thread it saw before `destroy` (obs-output.c:298-303); this joins any we started.
+fn wait_for_end_of_capture(output: OutputPtr) {
+    let mut said = Instant::now();
+    // SAFETY: destroy is blocked in join on this thread, so the output is still allocated.
+    while unsafe { sys::obs_output_active(output.0) } {
+        if said.elapsed() >= END_WAIT_LOG {
+            log::warn("destroy is still waiting for the output's capture to end");
+            said = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Once `active` is clear this joins an end thread still finishing (obs-output.c:2571-2575, 2867-2870).
+    // SAFETY: as above.
+    unsafe { sys::obs_output_can_begin_data_capture(output.0, 0) };
 }
 
 #[cfg(not(unix))]
@@ -267,14 +270,6 @@ fn ended(shared: &Shared, end: End<Reason>) {
         End::Stopped(Reason::Shutdown) => {
             // SAFETY: destroy waits in join for this thread, so the output is still allocated.
             unsafe { sys::obs_output_end_data_capture(output.0) };
-            let deadline = Instant::now() + SHUTDOWN_WAIT;
-            // SAFETY: as above.
-            while unsafe { sys::obs_output_active(output.0) } && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            // The end thread still touches the output after clearing `active`; this joins it (obs-output.c:2573-2575).
-            // SAFETY: as above.
-            unsafe { sys::obs_output_can_begin_data_capture(output.0, 0) };
         }
         End::Detached { reason, message } => fail(
             output,

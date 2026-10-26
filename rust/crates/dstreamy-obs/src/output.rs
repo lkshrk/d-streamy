@@ -52,6 +52,10 @@ pub struct Shared {
 }
 
 impl Shared {
+    pub fn is_destroying(&self) -> bool {
+        *self.destroying.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn send(&self, command: Command) {
         if self.commands.send(command).is_err() {
             log::warn("the D-Streamy worker thread is gone");
@@ -71,6 +75,8 @@ struct Output {
     worker: Mutex<Option<JoinHandle<()>>>,
     panic_at: i64,
     panic_in: PanicIn,
+    /// Test hook: widens the window between libobs's active check in destroy and our flag.
+    destroy_delay_ms: u64,
 }
 
 impl Output {
@@ -202,10 +208,11 @@ extern "C" fn output_create(
 ) -> *mut c_void {
     guard("create", ptr::null_mut(), || {
         // SAFETY: libobs passes the output's live settings object.
-        let (panic_at, panic_in) = unsafe {
+        let (panic_at, panic_in, destroy_delay_ms) = unsafe {
             (
                 sys::obs_data_get_int(settings, c"panic_at_packet".as_ptr()),
                 text(sys::obs_data_get_string(settings, c"panic_in".as_ptr())),
+                sys::obs_data_get_int(settings, c"test_destroy_delay_ms".as_ptr()),
             )
         };
         let panic_in = match panic_in.as_str() {
@@ -237,6 +244,7 @@ extern "C" fn output_create(
             worker: Mutex::new(Some(worker)),
             panic_at,
             panic_in,
+            destroy_delay_ms: u64::try_from(destroy_delay_ms).unwrap_or(0),
         }));
         // SAFETY: the handler dies with `state` in obs_output_destroy (obs-output.c:308,344); libobs copies the decl.
         unsafe {
@@ -251,6 +259,9 @@ extern "C" fn output_destroy(data: *mut c_void) {
     guard("destroy", (), || {
         // SAFETY: libobs calls destroy once, with the pointer create returned.
         let state = unsafe { Box::from_raw(data.cast::<Output>()) };
+        if state.destroy_delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(state.destroy_delay_ms));
+        }
         *state
             .shared
             .destroying

@@ -498,3 +498,96 @@ fn releasing_the_output_while_it_connects_returns_promptly() {
     );
     drop(held);
 }
+
+/// A service that replies `attached` after `reply_ms`, sends `detached` at `detached_ms` and never reads.
+fn late_service(
+    h: &Harness,
+    reply_ms: u64,
+    detached_ms: u64,
+) -> (PathBuf, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, Write};
+    let dir = h.run.path().join("late");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let path = dir.join("s.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let service = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let accepted = Instant::now();
+        let mut hello = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut hello)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(reply_ms).saturating_sub(accepted.elapsed()));
+        stream.write_all(b"{\"attached\":1}\n").unwrap();
+        std::thread::sleep(Duration::from_millis(detached_ms).saturating_sub(accepted.elapsed()));
+        let _ = stream.write_all(
+            b"{\"message\":\"late test\",\"reason\":\"stopped\",\"type\":\"detached\"}\n",
+        );
+        std::thread::sleep(Duration::from_secs(10));
+    });
+    (path, service)
+}
+
+/// Capture begins after libobs's active check in destroy (the hook delays our flag by 1.5 s).
+fn release_during_a_late_capture(detached_ms: u64) -> Vec<String> {
+    let h = Harness::new("");
+    let (path, _service) = late_service(&h, 800, detached_ms);
+    let run = HarnessRun::start(
+        &h,
+        json!({"endpoint": path, "test_destroy_delay_ms": 1500}),
+        &[
+            "--seconds",
+            "60",
+            "--until-video",
+            "100000",
+            "--bitrate",
+            "8000",
+            "--release-after-start",
+            "500",
+            "--expect-error",
+            "late test",
+            "--verbose",
+        ],
+    );
+    let (status, lines) = run.finish();
+    passed(status, &lines);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("[obs-dstreamy] attached to the D-Streamy service")),
+        "capture never began during destroy: {lines:#?}"
+    );
+    assert!(
+        has_line(
+            &lines,
+            "HARNESS output stopped with code -4: The D-Streamy service ended the stream (stopped): late test"
+        ),
+        "{lines:#?}"
+    );
+    assert!(
+        has_line(&lines, "HARNESS stop_signals=1 error_stop_signals=1"),
+        "{lines:#?}"
+    );
+    lines
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_late_capture_that_ends_before_destroy_is_joined() {
+    release_during_a_late_capture(1_000);
+}
+
+/// The writer takes destroy's Shutdown, then the reader's `detached` wins while the writer is blocked.
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_late_capture_whose_shutdown_is_lost_still_lets_destroy_return() {
+    let lines = release_during_a_late_capture(2_600);
+    let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
+    let stop = at("[obs-dstreamy] stop requested; sending").expect("the writer took the stop");
+    let detached = at("The D-Streamy service ended the stream").expect("the reader saw detached");
+    assert!(
+        stop < detached,
+        "the Shutdown was not taken before the detached: {lines:#?}"
+    );
+}
