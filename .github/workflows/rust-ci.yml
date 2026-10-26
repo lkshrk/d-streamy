@@ -199,6 +199,8 @@ jobs:
     env:
       # Pinned in docs/specs.md (cargo-fuzz row).
       FUZZ_TOOLCHAIN: nightly-2026-07-20
+      # The release binary is musl-built and would otherwise default to its own musl target.
+      FUZZ_TARGET: x86_64-unknown-linux-gnu
       FUZZ_CLI_VERSION: 0.13.2
       FUZZ_CLI_SHA256: b5b704018b63e0f151c17a057ac53b5111e1db545d1b9f72fee79f08a545931c
     steps:
@@ -220,6 +222,6 @@ jobs:
           workspaces: rust/fuzz
           key: fuzz
       - name: Fuzz control_line
-        run: cargo +"$FUZZ_TOOLCHAIN" fuzz run control_line -- -max_total_time=60
+        run: cargo +"$FUZZ_TOOLCHAIN" fuzz run --target "$FUZZ_TARGET" control_line -- -max_total_time=60
       - name: Fuzz producer_frame
-        run: cargo +"$FUZZ_TOOLCHAIN" fuzz run producer_frame -- -max_total_time=60
+        run: cargo +"$FUZZ_TOOLCHAIN" fuzz run --target "$FUZZ_TARGET" producer_frame -- -max_total_time=60
