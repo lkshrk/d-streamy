@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdarg.h>
@@ -55,7 +56,9 @@ struct harness_args {
 	const char *x264opts;
 	const char *expect_error;
 	const char *dump_encoder_settings;
+	const char *restart_video_settings;
 	bool no_encoders;
+	bool stream_output;
 	int seconds;
 	int fps;
 	int width;
@@ -446,6 +449,69 @@ static struct obs_output_info trace_output_info = {
 	.encoded_audio_codecs = "opus;aac",
 };
 
+#define STREAM_OUTPUT_ID "dstreamy_harness_stream"
+
+/* Stands in for the frontend's stream output, so the encoders it shares are active. */
+static const char *stream_name(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return "Harness stream";
+}
+
+static void *stream_create(obs_data_t *settings, obs_output_t *output)
+{
+	UNUSED_PARAMETER(settings);
+	return output;
+}
+
+static void stream_destroy(void *data)
+{
+	UNUSED_PARAMETER(data);
+}
+
+static bool stream_start(void *data)
+{
+	obs_output_t *output = data;
+	return obs_output_can_begin_data_capture(output, 0) && obs_output_initialize_encoders(output, 0) &&
+	       obs_output_begin_data_capture(output, 0);
+}
+
+static void stream_stop(void *data, uint64_t ts)
+{
+	UNUSED_PARAMETER(ts);
+	obs_output_end_data_capture(data);
+}
+
+static void stream_packet(void *data, struct encoder_packet *pkt)
+{
+	UNUSED_PARAMETER(data);
+	UNUSED_PARAMETER(pkt);
+}
+
+static struct obs_output_info stream_output_info = {
+	.id = STREAM_OUTPUT_ID,
+	.flags = OBS_OUTPUT_AV | OBS_OUTPUT_ENCODED,
+	.get_name = stream_name,
+	.create = stream_create,
+	.destroy = stream_destroy,
+	.start = stream_start,
+	.stop = stream_stop,
+	.encoded_packet = stream_packet,
+	.encoded_video_codecs = "h264",
+	.encoded_audio_codecs = "opus;aac",
+};
+
+static bool stop_and_wait(obs_output_t *output)
+{
+	obs_output_stop(output);
+	for (int i = 0; obs_output_active(output); i++) {
+		if (i == 1000)
+			return false;
+		os_sleep_ms(10);
+	}
+	return true;
+}
+
 static volatile long long stop_code;
 static volatile long stop_signals;
 static volatile long error_stop_signals;
@@ -492,6 +558,8 @@ static void usage(void)
 		"   after a stop OBS keeps running until --seconds)]\n"
 		"  [--release-after-start MS (release the output MS after a successful start, without stopping it)]\n"
 		"  [--no-encoders (the output brings its own encoders)]\n"
+		"  [--stream-output (start a stand-in stream output on the harness encoders first, so they are active)]\n"
+		"  [--restart-video-settings JSON (after a passing run, stop everything, update the video encoder, run again)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
@@ -540,6 +608,10 @@ static int parse_args(int argc, char **argv)
 			args.no_encoders = true;
 			continue;
 		}
+		if (strcmp(a, "--stream-output") == 0) {
+			args.stream_output = true;
+			continue;
+		}
 		if (strcmp(a, "--verbose") == 0) {
 			log_max_level = LOG_DEBUG;
 			continue;
@@ -564,6 +636,8 @@ static int parse_args(int argc, char **argv)
 			ok = parse_int(a, v, 0, &args.expect_panics);
 		else if (strcmp(a, "--until-video") == 0)
 			ok = parse_int(a, v, 1, &args.until_video);
+		else if (strcmp(a, "--restart-video-settings") == 0)
+			args.restart_video_settings = v;
 		else if (strcmp(a, "--dump-encoder-settings") == 0)
 			args.dump_encoder_settings = v;
 		else if (strcmp(a, "--release-after-start") == 0)
@@ -747,8 +821,15 @@ static int dump_encoder_settings(const char *dir)
 		obs_data_set_string(d, "source", "captured");
 		obs_data_set_obj(d, "defaults", values);
 		obs_data_set_array(d, "properties", names);
+		/* VideoToolbox ids can hold ':' (paravirtualized encoders), which artifact paths refuse. */
+		struct dstr name = {0};
+		dstr_copy(&name, id);
+		for (char *c = name.array; *c; c++)
+			if (!isalnum((unsigned char)*c) && *c != '.' && *c != '-' && *c != '_')
+				*c = '_';
 		struct dstr path = {0};
-		dstr_printf(&path, "%s/%s.json", dir, id);
+		dstr_printf(&path, "%s/%s.json", dir, name.array);
+		dstr_free(&name);
 		bool ok = obs_data_save_json_pretty_safe(d, path.array, "tmp", NULL);
 		printf("HARNESS encoder settings %s: %s\n", id, ok ? path.array : "write failed");
 		written += ok;
@@ -777,7 +858,9 @@ static bool check_output_stats(obs_output_t *output, obs_encoder_t *aenc)
 	}
 	// libobs counts each interleaved video packet it hands encoded_packet (obs-output.c:1689-1690, 1756).
 	long long obs_video = obs_output_get_total_frames(output);
-	double video_s = (double)video / args.fps;
+	const struct video_output_info *voi = video_output_get_info(obs_encoder_video(obs_output_get_video_encoder(output)));
+	double fps = voi && voi->fps_den ? (double)voi->fps_num / voi->fps_den : args.fps;
+	double video_s = (double)video / fps;
 	double audio_s = (double)audio * (double)obs_encoder_get_frame_size(aenc) / SAMPLE_RATE;
 	printf("HARNESS output=%s video=%lld audio=%lld panics=%lld obs_video=%lld video_s=%.2f audio_s=%.2f\n",
 	       args.output_id, video, audio, panics, obs_video, video_s, audio_s);
@@ -795,7 +878,7 @@ static bool check_output_stats(obs_output_t *output, obs_encoder_t *aenc)
 		harness_error("output counted %lld video packets, libobs delivered %lld", video, obs_video);
 		pass = false;
 	}
-	if (video < args.fps) {
+	if (video < fps) {
 		harness_error("output received less than 1 s of video (%lld packets)", video);
 		pass = false;
 	}
@@ -949,6 +1032,7 @@ int main(int argc, char **argv)
 	obs_encoder_t *venc = NULL;
 	obs_encoder_t *aenc = NULL;
 	obs_output_t *output = NULL;
+	obs_output_t *stream = NULL;
 	struct flash_state flash = {0};
 	bool tick_added = false;
 
@@ -1029,6 +1113,7 @@ int main(int argc, char **argv)
 
 	obs_register_source(&audio_source_info);
 	obs_register_output(&trace_output_info);
+	obs_register_output(&stream_output_info);
 	uint64_t interval_ns = obs_get_frame_interval_ns();
 	// Mid-frame, so the beep - flash offset is about half a frame instead of anywhere in [0, 1) frames.
 	marker_base_ns = obs_get_video_frame_time() + util_mul_div64(FLASH_PERIOD_NS, 1, interval_ns) * interval_ns +
@@ -1097,6 +1182,19 @@ int main(int argc, char **argv)
 	signal_handler_connect(obs_output_get_signal_handler(output), "stop", on_output_stop, NULL);
 	signal_handler_connect(obs_output_get_signal_handler(output), "start", on_output_start, NULL);
 
+	if (args.stream_output) {
+		if (!venc || !aenc)
+			FAIL("--stream-output needs the harness's encoders; drop --no-encoders");
+		stream = obs_output_create(STREAM_OUTPUT_ID, "harness stream", NULL, NULL);
+		if (!stream)
+			FAIL("stream output create failed");
+		obs_output_set_video_encoder(stream, venc);
+		obs_output_set_audio_encoder(stream, aenc, 0);
+		if (!obs_output_start(stream))
+			FAIL("stream output start failed");
+		printf("HARNESS stream output started\n");
+	}
+
 	if (!obs_output_start(output)) {
 		const char *err = obs_output_get_last_error(output);
 		if (contains_expected_error(err)) {
@@ -1163,6 +1261,37 @@ int main(int argc, char **argv)
 	if (!recording) {
 		if (!check_output_stats(output, obs_output_get_audio_encoder(output, 0)))
 			rc = 1;
+		if (rc || !args.restart_video_settings)
+			goto cleanup;
+		obs_data_t *update = obs_data_create_from_json(args.restart_video_settings);
+		if (!update)
+			FAIL("--restart-video-settings is not a JSON object");
+		if (stream && !stop_and_wait(stream))
+			FAIL("stream output did not stop for the restart");
+		if (venc)
+			obs_encoder_update(venc, update);
+		obs_data_release(update);
+		if (stream && !obs_output_start(stream))
+			FAIL("stream output restart failed");
+		os_event_reset(stopped_event);
+		os_event_reset(full_event);
+		printf("HARNESS restarting the output\n");
+		if (!obs_output_start(output))
+			FAIL("obs_output_start on restart: %s", obs_output_get_last_error(output));
+		started = true;
+		if (!wait_for_plugin_video(output))
+			rc = 1;
+		obs_output_stop(output);
+		if (os_event_timedwait(stopped_event, 10000) != 0)
+			FAIL("output did not stop within 10 s after the restart");
+		for (int i = 0; obs_output_active(output); i++) {
+			if (i == 1000)
+				FAIL("output still active 10 s after its stop signal");
+			os_sleep_ms(10);
+		}
+		started = false;
+		if (!check_output_stats(output, obs_output_get_audio_encoder(output, 0)))
+			rc = 1;
 		goto cleanup;
 	}
 
@@ -1185,6 +1314,9 @@ cleanup:
 	if (output && started)
 		obs_output_force_stop(output);
 	obs_output_release(output);
+	if (stream && obs_output_active(stream) && !stop_and_wait(stream))
+		harness_error("stream output did not stop");
+	obs_output_release(stream);
 	obs_encoder_release(venc);
 	obs_encoder_release(aenc);
 	if (initialized) {

@@ -56,15 +56,25 @@ impl HarnessRun {
             settings["endpoint"] = json!(h.endpoint());
         }
         let trace_dir = h.dir.path().join("harness-trace");
-        let encoders: &[&str] = if settings["mode"] == "share" {
-            &[
+        let idle_stream = settings
+            .as_object_mut()
+            .and_then(|m| m.remove("harness_idle_stream"))
+            .is_some();
+        let encoders: &[&str] = match (settings["mode"] == "share", idle_stream) {
+            (true, false) => &[
                 "--video-encoder",
                 "obs_x264",
                 "--audio-encoder",
                 "ffmpeg_opus",
-            ]
-        } else {
-            &["--no-encoders"]
+                "--stream-output",
+            ],
+            (true, true) => &[
+                "--video-encoder",
+                "obs_x264",
+                "--audio-encoder",
+                "ffmpeg_opus",
+            ],
+            (false, _) => &["--no-encoders"],
         };
         let mut child = Command::new(&env.harness)
             .args(["--output", "dstreamy_output", "--modules", MODULES])
@@ -608,7 +618,6 @@ fn has_plugin_line(lines: &[String], text: &str) -> bool {
         .any(|l| l.contains("[obs-dstreamy] ") && l.contains(text))
 }
 
-/// The width and height of the first picture openh264 decodes from the stream.
 fn first_picture_size(video: &[&RecordedVideoFrame]) -> (usize, usize) {
     use openh264::formats::YUVSource;
     let mut decoder = openh264::decoder::Decoder::new().unwrap();
@@ -631,7 +640,6 @@ fn rtp_steps(video: &[&RecordedVideoFrame]) -> Vec<u32> {
         .collect()
 }
 
-/// Streams `video` frames from the harness started with `settings` and `args`; returns its output and the recording.
 fn stream(
     settings: Value,
     args: &[&str],
@@ -671,7 +679,7 @@ fn share_mode_shares_a_stream_encoder_that_passes() {
         90,
     );
     assert!(
-        has_plugin_line(&lines, "sharing the stream's video encoder obs_x264"),
+        has_plugin_line(&lines, "] sharing the stream's video encoder obs_x264"),
         "{lines:#?}"
     );
     assert!(!has_plugin_line(&lines, "own video encoder"), "{lines:#?}");
@@ -688,7 +696,7 @@ fn share_mode_falls_back_to_the_own_encoder_when_b_frames_are_on() {
     assert!(
         has_plugin_line(
             &lines,
-            "not sharing the stream's video encoder (D-Streamy needs B-frames off"
+            "not sharing the stream's video encoder obs_x264 (D-Streamy needs B-frames off"
         ),
         "{lines:#?}"
     );
@@ -772,4 +780,63 @@ fn share_mode_replaces_an_attached_aac_encoder_with_opus() {
         ),
         "{lines:#?}"
     );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn share_mode_rechecks_the_stream_encoder_after_a_fallback() {
+    let (lines, _) = stream(
+        json!({"mode": "share"}),
+        &[
+            "--bf",
+            "2",
+            "--keyint-sec",
+            "2",
+            "--restart-video-settings",
+            r#"{"bf": 0}"#,
+        ],
+        60,
+    );
+    let at = |text: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains("[obs-dstreamy] ") && l.contains(text))
+    };
+    let fell_back =
+        at("not sharing the stream's video encoder obs_x264").expect("first start falls back");
+    let restarted = lines
+        .iter()
+        .position(|l| l == "HARNESS restarting the output")
+        .expect("a restart");
+    let shared = at("] sharing the stream's video encoder obs_x264").expect("the restart shares");
+    assert!(fell_back < restarted && restarted < shared, "{lines:#?}");
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn share_mode_uses_the_own_encoder_while_the_stream_is_idle() {
+    let (lines, _) = stream(
+        json!({"mode": "share", "harness_idle_stream": true}),
+        &["--bf", "0", "--keyint-sec", "2"],
+        60,
+    );
+    assert!(
+        has_plugin_line(&lines, "only while streaming"),
+        "{lines:#?}"
+    );
+    assert!(
+        has_plugin_line(&lines, "own video encoder obs_x264"),
+        "{lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn the_own_encoder_restarts_on_the_same_output() {
+    let (lines, _) = stream(json!({}), &["--restart-video-settings", "{}"], 60);
+    let own = lines
+        .iter()
+        .filter(|l| l.contains("[obs-dstreamy] own video encoder obs_x264"))
+        .count();
+    assert_eq!(own, 2, "{lines:#?}");
 }

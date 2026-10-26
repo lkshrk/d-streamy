@@ -60,31 +60,29 @@ expect start-panic '^HARNESS expected_error start: D-Streamy plugin error \(pani
 expect start-panic 'HARNESS shutdown libobs_leaks=0'
 expect start-panic 'HARNESS result=PASS'
 
+# The expected error is matched inside the harness, so keep it ASCII: Windows passes argv in the ANSI code page.
 settings_error() {
-  local name=$1 error=$2
-  shift 2
+  local name=$1 error=$2 full=$3
+  shift 3
   run "$name" --seconds 3 --expect-error "$error" "$@"
-  expect "$name" "^HARNESS expected_error start: .*$error"
+  expect "$name" "^HARNESS expected_error start: .*$full"
   expect "$name" 'HARNESS shutdown libobs_leaks=0'
   expect "$name" 'HARNESS result=PASS'
 }
 
-share="--video-encoder obs_x264 --audio-encoder ffmpeg_opus"
+share=(--video-encoder obs_x264 --audio-encoder ffmpeg_opus --stream-output)
 no_fallback="{\"mode\": \"share\", \"share_fallback\": false, \"endpoint\": \"$absent\"}"
-# shellcheck disable=SC2086
-settings_error share-bf2 "D-Streamy needs B-frames off: " $share --bf 2 --keyint-sec 2 --output-settings "$no_fallback" "$@"
-# shellcheck disable=SC2086
-settings_error share-bf-unset "D-Streamy needs B-frames off: " $share --keyint-sec 2 --output-settings "$no_fallback" "$@"
-# shellcheck disable=SC2086
-settings_error share-keyint0 "D-Streamy needs a keyframe interval of 1 or 2 seconds, not 0" \
-  $share --bf 0 --keyint-sec 0 --output-settings "$no_fallback" "$@"
-# shellcheck disable=SC2086
-settings_error share-1440p "D-Streamy needs an output size of at most 1920×1080 with even sides, not 2560×1440" \
-  $share --bf 0 --keyint-sec 2 --width 2560 --height 1440 --output-settings "$no_fallback" "$@"
-settings_error own-24fps "D-Streamy needs 15, 30 or 60 FPS, not 24: Settings › Video › Common FPS Values" \
+settings_error share-bf2 "D-Streamy needs B-frames off: " "Tune: zerolatency, or Profile: baseline" "${share[@]}" --bf 2 --keyint-sec 2 --output-settings "$no_fallback" "$@"
+settings_error share-bf-unset "D-Streamy needs B-frames off: " "Tune: zerolatency, or Profile: baseline" "${share[@]}" --keyint-sec 2 --output-settings "$no_fallback" "$@"
+settings_error share-keyint0 "D-Streamy needs a keyframe interval of 1 or 2 seconds, not 0" "Keyframe Interval \(0=auto\)" \
+  "${share[@]}" --bf 0 --keyint-sec 0 --output-settings "$no_fallback" "$@"
+settings_error share-1440p "D-Streamy needs an output size of at most 1920" "1920×1080 with even sides, not 2560×1440: Settings › Video › Output \(Scaled\) Resolution" \
+  "${share[@]}" --bf 0 --keyint-sec 2 --width 2560 --height 1440 --output-settings "$no_fallback" "$@"
+settings_error share-idle "D-Streamy can share the stream's encoder only while streaming" "start streaming first" \
+  --video-encoder obs_x264 --audio-encoder ffmpeg_opus --bf 0 --keyint-sec 2 --output-settings "$no_fallback" "$@"
+settings_error own-24fps "D-Streamy needs 15, 30 or 60 FPS, not 24" "not 24: Settings › Video › Common FPS Values" \
   --no-encoders --fps 24 --output-settings "{\"endpoint\": \"$absent\"}" "$@"
-modules="image-source,obs-x264,obs-dstreamy"
-settings_error no-opus "D-Streamy needs the FFmpeg Opus audio encoder" \
-  --no-encoders --output-settings "{\"endpoint\": \"$absent\"}" "$@"
+settings_error no-opus "D-Streamy needs the FFmpeg Opus audio encoder" "ffmpeg_opus, from the obs-ffmpeg module" \
+  --no-encoders --output-settings "{\"endpoint\": \"$absent\"}" "$@" --modules image-source,obs-x264,obs-dstreamy
 
 echo "rust-plugin: PASS"
