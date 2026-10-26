@@ -14,7 +14,7 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio_util::bytes::Bytes;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use crate::ring::{Packet, Ring, Track};
+use crate::ring::{Oversized, Packet, Ring, Track};
 use crate::types::{End, Hello, Level, Log};
 
 /// Above serve's 5 s wait for the session to announce the producer's video.
@@ -239,8 +239,10 @@ async fn write_packets<T>(
             t = &mut stop => break t,
             packet = ring.next() => packet,
         };
-        let Some(packet) = packet else {
-            return WriterEnd::Failed("the packet ring closed".into());
+        let packet = match packet {
+            Some(Ok(packet)) => packet,
+            Some(Err(oversized)) => return WriterEnd::Refused(oversized_message(oversized)),
+            None => return WriterEnd::Failed("the packet ring closed".into()),
         };
         let arrived = packet.arrived;
         let frame = match frame_for(packet, &mut converter, &mut video_extra_data) {
@@ -279,6 +281,19 @@ async fn write_packets<T>(
     );
     let finish = async {
         while let Some(packet) = ring.pop() {
+            let packet = match packet {
+                Ok(packet) => packet,
+                Err(oversized) => {
+                    log.log(
+                        Level::Warn,
+                        &format!(
+                            "not sending a queued packet: {}",
+                            oversized_message(oversized)
+                        ),
+                    );
+                    break;
+                }
+            };
             let frame = match frame_for(packet, &mut converter, &mut video_extra_data) {
                 Ok(frame) => frame,
                 Err(e) => {
@@ -347,17 +362,25 @@ fn frame_for(
     let frame = convert(packet, converter, video_extra_data).map_err(|e| e.to_string())?;
     let len = u64::from(HEADER_LEN) + frame.payload.len() as u64;
     if len > u64::from(MAX_FRAME_LEN) {
-        return Err(format!(
-            "a {} packet of {} bytes is over the {MAX_FRAME_LEN}-byte frame limit",
-            if frame.kind == Kind::Video {
-                "video"
-            } else {
-                "audio"
-            },
-            frame.payload.len()
-        ));
+        let track = if frame.kind == Kind::Video {
+            Track::Video
+        } else {
+            Track::Audio
+        };
+        return Err(oversized_message(Oversized {
+            track,
+            len: frame.payload.len(),
+        }));
     }
     Ok(frame)
+}
+
+fn oversized_message(Oversized { track, len }: Oversized) -> String {
+    let track = match track {
+        Track::Video => "video",
+        Track::Audio => "audio",
+    };
+    format!("a {track} packet of {len} bytes is over the {MAX_FRAME_LEN}-byte frame limit")
 }
 
 /// One OBS packet to a producer frame; the video extra data is read once the first video packet exists.

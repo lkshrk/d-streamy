@@ -11,5 +11,5 @@ pub use client::block_sigpipe_on_this_thread;
 pub use client::{Connection, StartError, attach, run};
 #[cfg(unix)]
 pub use dstreamy_ipc::Endpoint;
-pub use ring::{Packet, Ring, RingStats, Track};
+pub use ring::{Oversized, Packet, Ring, RingStats, Track};
 pub use types::{End, Hello, Level, Log};

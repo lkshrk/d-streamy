@@ -31,6 +31,13 @@ pub struct Packet {
     pub arrived: Instant,
 }
 
+/// A packet over `MAX_PACKET`, kept as its size only: never queued, so no eviction can lose it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Oversized {
+    pub track: Track,
+    pub len: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RingStats {
     pub queued: usize,
@@ -46,6 +53,7 @@ struct Inner {
     awaiting_keyframe: bool,
     dropped_video: u64,
     dropped_audio: u64,
+    oversized: Option<Oversized>,
     closed: bool,
 }
 
@@ -79,11 +87,22 @@ impl Inner {
         true
     }
 
+    fn take(&mut self) -> Option<Result<Packet, Oversized>> {
+        if let Some(oversized) = self.oversized.take() {
+            return Some(Err(oversized));
+        }
+        let packet = self.queue.pop_front()?;
+        self.bytes -= packet.data.len();
+        Some(Ok(packet))
+    }
+
     fn admit(&mut self, packet: Packet, capacity: usize, max_bytes: usize) {
         let len = packet.data.len();
         if len > MAX_PACKET {
-            self.bytes += len;
-            self.queue.push_back(packet);
+            self.oversized.get_or_insert(Oversized {
+                track: packet.track,
+                len,
+            });
             return;
         }
         if len > max_bytes {
@@ -167,30 +186,27 @@ impl Ring {
             if inner.closed {
                 return;
             }
-            let was_empty = inner.queue.is_empty();
+            let was_empty = inner.queue.is_empty() && inner.oversized.is_none();
             inner.admit(packet, self.capacity, self.max_bytes);
-            was_empty && !inner.queue.is_empty()
+            was_empty && (!inner.queue.is_empty() || inner.oversized.is_some())
         };
         if wake {
             self.ready.notify_one();
         }
     }
 
-    pub fn pop(&self) -> Option<Packet> {
-        let mut inner = self.lock();
-        let packet = inner.queue.pop_front()?;
-        inner.bytes -= packet.data.len();
-        Some(packet)
+    /// An oversized packet comes first: it ends the run, so what is queued behind it no longer matters.
+    pub fn pop(&self) -> Option<Result<Packet, Oversized>> {
+        self.lock().take()
     }
 
-    /// The next packet; `None` once the ring is closed and drained.
-    pub async fn next(&self) -> Option<Packet> {
+    /// The next packet or oversized marker; `None` once the ring is closed and drained.
+    pub async fn next(&self) -> Option<Result<Packet, Oversized>> {
         loop {
             {
                 let mut inner = self.lock();
-                if let Some(packet) = inner.queue.pop_front() {
-                    inner.bytes -= packet.data.len();
-                    return Some(packet);
+                if let Some(item) = inner.take() {
+                    return Some(item);
                 }
                 if inner.closed {
                     return None;
@@ -255,6 +271,7 @@ mod tests {
 
     fn drain(ring: &Ring) -> Vec<(Track, i64)> {
         std::iter::from_fn(|| ring.pop())
+            .map(|p| p.expect("no oversized packet"))
             .map(|p| (p.track, p.pts))
             .collect()
     }
@@ -355,13 +372,30 @@ mod tests {
     }
 
     #[test]
-    fn a_packet_over_the_frame_limit_still_reaches_the_writer() {
-        let ring = Ring::default();
-        let mut big = audio(0);
+    fn a_packet_over_the_frame_limit_survives_later_pushes_and_evictions() {
+        let ring = Ring::new(2, 1 << 20);
+        let mut big = video(0, true);
         big.data = vec![0; MAX_PACKET + 1];
         ring.push(big);
-        assert_eq!(ring.pop().map(|p| p.data.len()), Some(MAX_PACKET + 1));
-        assert_eq!(ring.stats().dropped_audio, 0);
+        for i in 1..20 {
+            ring.push(audio(i));
+            ring.push(video(i, i % 5 == 0));
+        }
+        assert_eq!(
+            ring.pop(),
+            Some(Err(Oversized {
+                track: Track::Video,
+                len: MAX_PACKET + 1
+            }))
+        );
+        assert!(
+            ring.stats().queued_bytes < MAX_PACKET,
+            "the marker holds no bytes"
+        );
+        assert!(
+            matches!(ring.pop(), Some(Ok(_))),
+            "queued packets follow the marker"
+        );
     }
 
     #[test]
@@ -403,7 +437,7 @@ mod tests {
             async move {
                 let mut got = Vec::new();
                 while let Some(p) = ring.next().await {
-                    got.push(p.pts);
+                    got.push(p.unwrap().pts);
                 }
                 got
             }
@@ -437,6 +471,7 @@ mod tests {
         let got = runtime.block_on(async {
             let mut got = Vec::new();
             while let Some(p) = ring.next().await {
+                let p = p.unwrap();
                 got.push((p.track, p.pts, p.keyframe));
                 if got.len() % 1000 == 0 {
                     tokio::task::yield_now().await;
