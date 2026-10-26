@@ -273,6 +273,15 @@ struct Conn {
     client: Arc<DiscordClient>,
     session: Session,
     forwarder: JoinHandle<()>,
+    /// Tells this connection's forwarder from one an older connection left running.
+    seq: u64,
+}
+
+/// A start's `Place`, and which forwarder may move it: the connection's, once it has seen this start's `Connecting`.
+struct Placed {
+    place: Place,
+    conn: u64,
+    announced: bool,
 }
 
 impl Conn {
@@ -324,7 +333,8 @@ pub struct Engine {
     last_stats: Mutex<Option<StreamStats>>,
     running: Mutex<Option<Running>>,
     /// Set before the session starts, so a session that stops at once never leaves it behind.
-    place: Mutex<Option<Place>>,
+    place: Mutex<Option<Placed>>,
+    conn_seq: std::sync::atomic::AtomicU64,
     started_by: Mutex<Option<u64>>,
     external: Mutex<Option<External>>,
     portal: Mutex<Option<PortalBook>>,
@@ -391,6 +401,7 @@ impl Engine {
             last_stats: Mutex::new(None),
             running: Mutex::new(None),
             place: Mutex::new(None),
+            conn_seq: std::sync::atomic::AtomicU64::new(0),
             started_by: Mutex::new(None),
             external: Mutex::new(None),
             portal: Mutex::new(None),
@@ -474,7 +485,8 @@ impl Engine {
         let session = self.current().map(|c| {
             let state = c.session.state().borrow().clone();
             let place = lock(&self.place)
-                .clone()
+                .as_ref()
+                .map(|p| p.place.clone())
                 .filter(|_| !matches!(state, SessionState::Stopped { .. }));
             SessionView { state, place }
         });
@@ -564,30 +576,41 @@ impl Engine {
             .expect("an engine is only reachable through its Arc");
         let client = Arc::new(discord::connect(&self.ctx, Persistence::Long).await?);
         let session = Session::new(client.clone());
-        let forwarder = tokio::spawn(engine.forward(session.subscribe()));
+        let seq = self
+            .conn_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let forwarder = tokio::spawn(engine.forward(session.subscribe(), seq));
         let conn = Arc::new(Conn {
             client,
             session,
             forwarder,
+            seq,
         });
         *lock(&self.conn) = Some(conn.clone());
         Ok(conn)
     }
 
-    async fn forward(self: Arc<Self>, mut events: broadcast::Receiver<SessionEvent>) {
+    async fn forward(self: Arc<Self>, mut events: broadcast::Receiver<SessionEvent>, conn: u64) {
         loop {
             match events.recv().await {
                 Ok(event) => {
                     match &event {
                         SessionEvent::Health(h) => *lock(&self.last_stats) = Some(h.stats.clone()),
-                        SessionEvent::State { .. } => {
+                        SessionEvent::State { state } => {
+                            if *state == SessionState::Connecting
+                                && let Some(placed) = lock(&self.place).as_mut()
+                                && placed.conn == conn
+                            {
+                                placed.announced = true;
+                            }
                             self.remember_portal_token();
                             self.release_if_stopped();
                         }
                         SessionEvent::ChannelMoved {
                             guild_id,
                             channel_id,
-                        } => self.moved(guild_id.as_deref(), channel_id),
+                        } => self.moved(conn, guild_id.as_deref(), channel_id),
                         _ => {}
                     }
                     self.publish(EngineEvent::Session(event));
@@ -601,10 +624,13 @@ impl Engine {
         }
     }
 
-    fn moved(&self, guild_id: Option<&str>, channel_id: &str) {
+    fn moved(&self, from: u64, guild_id: Option<&str>, channel_id: &str) {
         let Some(conn) = self.current() else { return };
-        let mut place = lock(&self.place);
-        let Some(place) = place.as_mut() else { return };
+        let mut placed = lock(&self.place);
+        let Some(Placed { place, .. }) = placed.as_mut().filter(|p| p.conn == from && p.announced)
+        else {
+            return;
+        };
         if let Some(guild_id) = guild_id {
             place.guild_id = guild_id.to_owned();
         }
@@ -674,7 +700,7 @@ impl Engine {
             .then(|| external_options(&config.serve))
             .transpose()
             .map_err(CliError::from)?;
-        // Protocol 1 never had grace_secs and ignores fields it does not know.
+        // The protocol 1 daemon never had grace_secs and ignores fields it does not know.
         let grace_secs = p.grace_secs.filter(|_| self.opts.allow_external);
         match (grace_secs, external_options.as_mut()) {
             (None, _) => {}
@@ -744,7 +770,11 @@ impl Engine {
             }
             hold.starting = true;
         }
-        *lock(&self.place) = Some(place);
+        *lock(&self.place) = Some(Placed {
+            place,
+            conn: conn.seq,
+            announced: false,
+        });
         #[cfg(test)]
         drop(self.start_gate.lock().await);
         let started = stream::start(&conn.session, p.guild_id, p.channel_id, source, capture).await;
@@ -873,6 +903,7 @@ impl Engine {
                 client,
                 session,
                 forwarder,
+                ..
             }) => {
                 stream::teardown(session, client).await;
                 if timeout(FORWARDER_DRAIN, forwarder).await.is_err() {
@@ -1240,6 +1271,54 @@ mod tests {
             f.engine.shutdown().await;
         }
 
+        /// Runs `events` through a forwarder of connection `conn`, as a lagging or leftover one would.
+        async fn forward_events(f: &Fixture, conn: u64, events: &[SessionEvent]) {
+            let (tx, rx) = broadcast::channel(16);
+            for e in events {
+                tx.send(e.clone()).unwrap();
+            }
+            drop(tx);
+            timeout(T, f.engine.clone().forward(rx, conn))
+                .await
+                .unwrap();
+        }
+
+        fn moved_to_gaming() -> SessionEvent {
+            SessionEvent::ChannelMoved {
+                guild_id: Some(MOCK_GUILD_ID.into()),
+                channel_id: MOCK_OTHER_VOICE_CHANNEL_ID.into(),
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_move_from_before_this_start_or_another_connection_leaves_the_place_alone() {
+            let f = Fixture::new().await;
+            f.engine.start(params(), None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            let conn = f.engine.current().unwrap().seq;
+            f.engine.current().unwrap().forwarder.abort();
+            lock(&f.engine.place).as_mut().unwrap().announced = false;
+            forward_events(&f, conn, &[moved_to_gaming()]).await;
+            assert_eq!(
+                status_place(&f)[1],
+                json!(MOCK_VOICE_CHANNEL_ID),
+                "a queued move from before the start"
+            );
+            let connecting = SessionEvent::State {
+                state: SessionState::Connecting,
+            };
+            forward_events(&f, conn, &[connecting]).await;
+            forward_events(&f, conn + 1, &[moved_to_gaming()]).await;
+            assert_eq!(
+                status_place(&f)[1],
+                json!(MOCK_VOICE_CHANNEL_ID),
+                "another connection's move"
+            );
+            forward_events(&f, conn, &[moved_to_gaming()]).await;
+            assert_eq!(status_place(&f)[1], json!(MOCK_OTHER_VOICE_CHANNEL_ID));
+            f.engine.shutdown().await;
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_session_that_stops_itself_leaves_no_place_behind() {
             let f = Fixture::new().await;
@@ -1382,7 +1461,8 @@ mod tests {
                 tx.send(SessionEvent::Resumed).unwrap();
             }
             drop(tx);
-            timeout(T, f.engine.clone().forward(rx)).await.unwrap();
+            let seq = f.engine.current().unwrap().seq;
+            timeout(T, f.engine.clone().forward(rx, seq)).await.unwrap();
             assert!(f.lock_is_free(), "a lagged forwarder kept the lock");
             f.engine.shutdown().await;
         }
@@ -1608,7 +1688,7 @@ mod tests {
             tx.send(SessionEvent::Resumed).unwrap();
         }
         drop(tx);
-        engine.clone().forward(rx).await;
+        engine.clone().forward(rx, 0).await;
         let mut n = 0;
         while let Ok(EngineEvent::Session(SessionEvent::Resumed)) = lossless.try_recv() {
             n += 1;
