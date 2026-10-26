@@ -11,6 +11,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Line tables keep file:line in backtraces at a fraction of full debuginfo's size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 jobs:
   version:
     runs-on: ubuntu-24.04

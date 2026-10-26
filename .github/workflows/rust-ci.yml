@@ -214,7 +214,7 @@ jobs:
             "https://github.com/rust-fuzz/cargo-fuzz/releases/download/$FUZZ_CLI_VERSION/$archive"
           echo "$FUZZ_CLI_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$archive" -C "${CARGO_HOME:-$HOME/.cargo}/bin" cargo-fuzz
-          cargo fuzz --version | grep -Fw "$FUZZ_CLI_VERSION"
+          cargo +"$FUZZ_TOOLCHAIN" fuzz --version | grep -Fw "$FUZZ_CLI_VERSION"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: rust/fuzz
