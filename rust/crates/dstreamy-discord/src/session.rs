@@ -490,8 +490,9 @@ struct Run {
     reconfigure_pending: bool,
     sampler: MetricsSampler,
     history: Vec<StreamMetrics>,
-    /// Until the first join completes, voice states may answer the previous run's ops; only the latest is kept.
+    /// Set once the first join completes; before that, voice states may answer the previous run's ops.
     joined: bool,
+    /// The latest voice state held back while not `joined`.
     unacked: Option<VoiceState>,
 }
 

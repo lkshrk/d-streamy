@@ -503,6 +503,44 @@ async fn stop_and_start(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_kick_while_joining_recovers_on_the_step_timeout() {
+    let mut f = Fixture::streaming().await;
+    let mut options = options();
+    options.stream.step_timeout = Duration::from_secs(2);
+    stop_and_start(&mut f, MOCK_VOICE_CHANNEL_ID, options, |mock| {
+        mock.kick_during_next_join();
+    })
+    .await;
+    f.wait_state_explained(|s| *s == SessionState::Streaming)
+        .await;
+    f.video_flowing().await;
+    let events = events_seen(&mut f);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::ChannelMoved { .. })),
+        "{events:?}"
+    );
+    let errors: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::Error { message, .. } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors, ["connecting failed: timed out joining voice"]);
+    assert_eq!(
+        f.voice_joins(),
+        [
+            MOCK_VOICE_CHANNEL_ID,
+            MOCK_VOICE_CHANNEL_ID,
+            MOCK_VOICE_CHANNEL_ID
+        ]
+    );
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn voice_states_queued_when_the_join_completes_never_move_the_run() {
     let mut f = Fixture::streaming().await;
     stop_and_start(&mut f, MOCK_OTHER_VOICE_CHANNEL_ID, options(), |mock| {
@@ -608,9 +646,10 @@ async fn late_voice_states_of_the_last_run_never_move_the_next_one() {
     );
     let streams = f.mock.streams();
     assert!(
-        streams
-            .iter()
-            .all(|s| s.stream_key.contains(MOCK_OTHER_VOICE_CHANNEL_ID)),
+        !streams.is_empty()
+            && streams
+                .iter()
+                .all(|s| s.stream_key.contains(MOCK_OTHER_VOICE_CHANNEL_ID)),
         "{streams:?}"
     );
     f.finish().await;
@@ -623,7 +662,27 @@ async fn a_move_while_joining_is_followed() {
         mock.move_during_next_join(MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID);
     })
     .await;
-    assert_eq!(moves_seen(&mut f), [MOCK_OTHER_VOICE_CHANNEL_ID]);
+    let events = events_seen(&mut f);
+    let moves: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::ChannelMoved { channel_id, .. } => Some(channel_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(moves, [MOCK_OTHER_VOICE_CHANNEL_ID]);
+    let replayed = |e: &SessionEvent| {
+        matches!(
+            e,
+            SessionEvent::State {
+                state: SessionState::Reconnecting { attempt: 1 }
+            }
+        )
+    };
+    assert!(
+        events.iter().any(replayed),
+        "the move was not replayed at the join: {events:?}"
+    );
     assert_eq!(
         f.voice_joins(),
         [MOCK_VOICE_CHANNEL_ID, MOCK_VOICE_CHANNEL_ID]

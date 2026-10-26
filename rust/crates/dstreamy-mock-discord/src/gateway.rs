@@ -292,6 +292,10 @@ pub(crate) fn voice_state_update(shared: &Shared, state: &mut State, d: &Value) 
     if let Some((guild_id, channel_id)) = state.move_during_join.take() {
         move_to_channel(shared, state, &guild_id, &channel_id);
     }
+    if std::mem::take(&mut state.kick_during_join) {
+        leave_voice(shared, state);
+        return;
+    }
 
     let token = random_hex(8);
     state.voice_auth.insert(

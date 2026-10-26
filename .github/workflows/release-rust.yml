@@ -120,7 +120,7 @@ jobs:
       - name: Refuse test-only features in the release build
         run: |
           set -euo pipefail
-          out=$(for c in dstreamy-cli discord-stream-rs dstreamy-ipc; do
+          out=$(for c in dstreamy-cli dstreamy-discord discord-stream-rs dstreamy-ipc; do
             cargo tree --locked -p dstreamy-cli -e features,normal --target ${{ matrix.target }} -i "$c"
           done)
           if grep -E 'feature "(test-hooks|test-rtp-start|test-support)"' <<<"$out"; then

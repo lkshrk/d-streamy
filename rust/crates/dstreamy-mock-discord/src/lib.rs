@@ -245,6 +245,11 @@ impl MockDiscord {
         self.shared.state().move_during_join = Some((guild_id.to_owned(), channel_id.to_owned()));
     }
 
+    /// Removes the user from voice right after the next join's VOICE_STATE_UPDATE; that join gets no VOICE_SERVER_UPDATE.
+    pub fn kick_during_next_join(&self) {
+        self.shared.state().kick_during_join = true;
+    }
+
     /// Holds the next op 4 that joins a channel unanswered until [`MockDiscord::answer_deferred_join`].
     pub fn defer_next_join(&self) {
         self.shared.state().defer_join = true;
