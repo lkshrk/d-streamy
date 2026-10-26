@@ -2,7 +2,7 @@ name: OBS
 
 on:
   push:
-    branches: [rust-rewrite, "ci/obs-**"]
+    branches: [main, rust-rewrite, "ci/obs-**"]
     paths:
       - "obs/**"
       - "rust/crates/dstreamy-test-producer/**"
@@ -15,7 +15,7 @@ on:
       - "rust/rust-toolchain.toml"
       - ".github/workflows/obs-ci.yml"
   pull_request:
-    branches: [rust-rewrite]
+    branches: [main, rust-rewrite]
     paths:
       - "obs/**"
       - "rust/crates/dstreamy-test-producer/**"
@@ -58,6 +58,9 @@ jobs:
             echo "OBS_TRACES=$RUNNER_TEMP/traces"
           } >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/obs-logs"
+
+      - name: OBS pin matches obs/buildspec.json
+        run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
 
       - name: Install build and runtime dependencies
         run: |
@@ -142,6 +145,16 @@ jobs:
           xvfb-run -a -s "-screen 0 1280x720x24" ctest --preset ubuntu-ci-x86_64
           echo "HARNESS=$PWD/build_x86_64/harness/obs-harness" >> "$GITHUB_ENV"
 
+      - name: Plugin workspace settings match rust/Cargo.toml
+        run: |
+          python3 - <<'PY'
+          import tomllib
+          main = tomllib.load(open("rust/Cargo.toml", "rb"))["workspace"]
+          plugin = tomllib.load(open("rust/crates/dstreamy-obs/Cargo.toml", "rb"))["workspace"]
+          for key in ("package", "lints"):
+              assert main[key] == plugin[key], f"[workspace.{key}] differs"
+          PY
+
       - name: Plugin crate gates
         working-directory: rust/crates/dstreamy-obs
         env:
@@ -204,6 +217,11 @@ jobs:
   obs-macos:
     runs-on: xcode-27
     timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    name: obs-macos (${{ matrix.arch }})
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -211,6 +229,15 @@ jobs:
 
       - name: Select Xcode 27.1
         run: sudo xcode-select -s /Applications/Xcode_27.1.app
+
+      - name: OBS pin matches obs/buildspec.json
+        run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
+
+      - name: Install Rosetta
+        if: matrix.arch == 'x86_64'
+        run: |
+          sudo softwareupdate --install-rosetta --agree-to-license
+          arch -x86_64 /usr/bin/true
 
       - name: Set paths
         run: |
@@ -225,7 +252,7 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/obs-prefix
-          key: obs-${{ env.OBS_TAG }}-xcode-27.1-arm64-r${{ env.OBS_BUILD_REV }}
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-${{ matrix.arch }}-r${{ env.OBS_BUILD_REV }}
 
       - name: Build OBS ${{ env.OBS_TAG }}
         if: steps.obs-cache.outputs.cache-hit != 'true'
@@ -237,7 +264,7 @@ jobs:
           cd "$RUNNER_TEMP/obs-src"
           test "$(git rev-parse HEAD)" = "$OBS_COMMIT"
           cmake --preset macos \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
             -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF \
             -DENABLE_BROWSER=OFF -DENABLE_SCRIPTING=OFF -DENABLE_VIRTUALCAM=OFF -DENABLE_AJA=OFF \
             -DSPARKLE_APPCAST_URL= -DSPARKLE_PUBLIC_KEY=
@@ -252,7 +279,7 @@ jobs:
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/obs-prefix
-          key: obs-${{ env.OBS_TAG }}-xcode-27.1-arm64-r${{ env.OBS_BUILD_REV }}
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-${{ matrix.arch }}-r${{ env.OBS_BUILD_REV }}
 
       - name: Install Rust toolchain from rust-toolchain.toml
         working-directory: rust
@@ -279,28 +306,46 @@ jobs:
             nm -gU -arch x86_64 MacOS/obs-dstreamy | grep ' _obs_'
             otool -L -arch arm64 MacOS/obs-dstreamy
             otool -l -arch arm64 MacOS/obs-dstreamy | grep -A2 LC_RPATH
+            vtool -arch arm64 -show-build MacOS/obs-dstreamy
+            vtool -arch x86_64 -show-build MacOS/obs-dstreamy
             codesign -dv MacOS/obs-dstreamy 2>&1 || true
           } | tee "$OBS_LOGS/plugin-bundle.log"
           test "$(lipo -archs MacOS/obs-dstreamy)" = "x86_64 arm64"
           test "$(otool -D -arch arm64 MacOS/obs-dstreamy | tail -n 1)" = "@rpath/obs-dstreamy"
+          for a in arm64 x86_64; do
+            minos=$(vtool -arch "$a" -show-build MacOS/obs-dstreamy | awk '$1 == "minos" {print $2}')
+            test "$minos" = 12.0 || { echo "$a slice minos $minos, expected 12.0"; exit 1; }
+          done
+          lipo -archs ../../../harness/RelWithDebInfo/obs-harness | grep -qw "${{ matrix.arch }}"
 
-      - name: Load and panic tests
+      - name: Plugin crate gates
+        working-directory: rust/crates/dstreamy-obs
+        env:
+          DSTREAMY_OBS_CONFIG: ${{ github.workspace }}/obs/build_macos/obs-config-RelWithDebInfo.txt
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked --target aarch64-apple-darwin -- -D warnings
+          cargo clippy --workspace --all-targets --locked --target x86_64-apple-darwin -- -D warnings
+
+      - name: Load and panic tests (${{ matrix.arch }} slice)
         run: |
           set -o pipefail
           app="$OBS_PREFIX/OBS.app/Contents"
+          lipo -archs "$app/Frameworks/libobs.framework/libobs" | tee "$OBS_LOGS/obs-archs.log"
           cp obs/build_macos/harness/RelWithDebInfo/obs-harness "$app/MacOS/"
           plugin="$GITHUB_WORKSPACE/obs/build_macos/rundir/%module%.plugin/Contents"
-          bash obs/tests/rust-plugin.sh "$app/MacOS/obs-harness" "$plugin/MacOS" "$plugin/Resources" \
-            "$OBS_LOGS/rust-plugin" --graphics "$app/Frameworks/libobs-opengl.dylib" | tee "$OBS_LOGS/rust-plugin.log"
+          arch -${{ matrix.arch }} bash obs/tests/rust-plugin.sh "$app/MacOS/obs-harness" "$plugin/MacOS" \
+            "$plugin/Resources" "$OBS_LOGS/rust-plugin" --graphics "$app/Frameworks/libobs-opengl.dylib" \
+            | tee "$OBS_LOGS/rust-plugin.log"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: obs-logs-macos
+          name: obs-logs-macos-${{ matrix.arch }}
           path: ${{ runner.temp }}/obs-logs
 
   obs-windows:
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 180
     defaults:
       run:
@@ -309,6 +354,10 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
+
+      - name: OBS pin matches obs/buildspec.json
+        shell: bash
+        run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
 
       - name: Set paths
         run: |
@@ -365,6 +414,16 @@ jobs:
           Get-Content "$env:OBS_PREFIX\build-time.txt" -ErrorAction SilentlyContinue
           cmake --preset windows-ci-x64
           cmake --build --preset windows-ci-x64 -- /consoleLoggerParameters:Summary /noLogo /verbosity:minimal
+
+      - name: Plugin crate gates
+        working-directory: rust/crates/dstreamy-obs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:DSTREAMY_OBS_CONFIG = "$env:GITHUB_WORKSPACE\obs\build_x64\obs-config-RelWithDebInfo.txt"
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
 
       - name: Check the plugin DLL
         shell: bash
