@@ -30,6 +30,9 @@ pub enum Command {
         endpoint: Option<PathBuf>,
     },
     Stop,
+    /// `stop` panicked: answered even when idle, since libobs waits for a stop signal.
+    StopFailed(String),
+    /// A callback panicked mid-stream: ends a running session, ignored when idle.
     Fail(String),
     EncodeError,
     Shutdown,
@@ -56,22 +59,25 @@ pub fn spawn(
     shared: Arc<Shared>,
     commands: UnboundedReceiver<Command>,
 ) -> std::io::Result<JoinHandle<()>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     std::thread::Builder::new()
         .name("dstreamy output".into())
-        .spawn(move || run(&shared, commands))
+        .spawn(move || run(&shared, &runtime, commands))
 }
 
-fn run(shared: &Shared, mut commands: UnboundedReceiver<Command>) {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(e) => {
-            log::error(&format!("cannot start the D-Streamy IPC runtime: {e}"));
-            return;
-        }
-    };
+fn run(
+    shared: &Shared,
+    runtime: &tokio::runtime::Runtime,
+    mut commands: UnboundedReceiver<Command>,
+) {
+    #[cfg(unix)]
+    if let Err(e) = producer::block_sigpipe_on_this_thread() {
+        log::warn(&format!(
+            "cannot block SIGPIPE on the D-Streamy thread: {e}"
+        ));
+    }
     runtime.block_on(async {
         while let Some(command) = commands.recv().await {
             match command {
@@ -97,10 +103,12 @@ fn run(shared: &Shared, mut commands: UnboundedReceiver<Command>) {
                 }
                 // libobs reset its stopping event before calling stop, so an idle output still signals (rtmp-stream.c:222-224).
                 Command::Stop => guard::guard("worker", (), || signal_stop(shared.output, SUCCESS)),
-                Command::Fail(message) => {
+                Command::StopFailed(message) => {
                     guard::guard("worker", (), || fail(shared.output, &message))
                 }
-                Command::EncodeError => log::warn("the encoder failed after D-Streamy stopped"),
+                Command::Fail(_) | Command::EncodeError => {
+                    log::debug("ignoring an error reported after the output stopped")
+                }
                 Command::Shutdown => break,
             }
         }
@@ -143,9 +151,15 @@ async fn session(
         "attached to the D-Streamy service as producer {}",
         connection.attachment()
     ));
-    // SAFETY: the output is live until destroy, which joins this thread; rtmp begins capture on its connect thread.
-    if !unsafe { sys::obs_output_begin_data_capture(shared.output.0, 0) } {
-        return Outcome::CaptureRefused;
+    {
+        let destroying = shared.destroying.lock().unwrap_or_else(|e| e.into_inner());
+        if *destroying {
+            return Outcome::Cancelled(Reason::Shutdown);
+        }
+        // SAFETY: destroy can't pass the flag while we hold it; rtmp begins capture on its connect thread too.
+        if !unsafe { sys::obs_output_begin_data_capture(shared.output.0, 0) } {
+            return Outcome::CaptureRefused;
+        }
     }
     let output = shared.output;
     let end = producer::run(
@@ -164,7 +178,9 @@ async fn next_reason(commands: &mut UnboundedReceiver<Command>) -> Reason {
     loop {
         match commands.recv().await {
             Some(Command::Stop) => return Reason::Stop,
-            Some(Command::Fail(message)) => return Reason::Fail(message),
+            Some(Command::Fail(message) | Command::StopFailed(message)) => {
+                return Reason::Fail(message);
+            }
             Some(Command::EncodeError) => return Reason::EncodeError,
             Some(Command::Shutdown) | None => return Reason::Shutdown,
             Some(Command::Start { .. }) => log::warn("ignoring a start while D-Streamy runs"),
@@ -194,6 +210,8 @@ fn video_extra_data(output: OutputPtr) -> Option<Vec<u8>> {
 fn finish(shared: &Shared, outcome: Outcome) {
     let output = shared.output;
     shared.ring.close();
+    // Before the stop signal, so a restart from its handler isn't refused as "already starting".
+    shared.busy.store(false, Ordering::Release);
     match outcome {
         Outcome::Cancelled(Reason::Shutdown) => {}
         Outcome::Cancelled(Reason::Fail(message)) | Outcome::Panicked(message) => {
@@ -208,7 +226,6 @@ fn finish(shared: &Shared, outcome: Outcome) {
         Outcome::CaptureRefused => fail(output, "D-Streamy could not begin data capture"),
         Outcome::Ended(end) => ended(shared, end),
     }
-    shared.busy.store(false, Ordering::Release);
 }
 
 fn ended(shared: &Shared, end: End<Reason>) {
@@ -232,6 +249,9 @@ fn ended(shared: &Shared, end: End<Reason>) {
             while unsafe { sys::obs_output_active(output.0) } && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            // The end thread still touches the output after clearing `active`; this joins it (obs-output.c:2573-2575).
+            // SAFETY: as above.
+            unsafe { sys::obs_output_can_begin_data_capture(output.0, 0) };
         }
         End::Detached { reason, message } => fail(
             output,

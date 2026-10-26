@@ -42,8 +42,11 @@ pub struct Shared {
     pub ring: Ring,
     pub commands: mpsc::UnboundedSender<Command>,
     pub encode_error: AtomicBool,
-    /// Set by `start`, cleared by the worker once it signalled the stop.
+    /// Set by `start`, cleared by the worker just before it signals the stop.
     pub busy: AtomicBool,
+    /// Set by `destroy`; the worker never begins capture once it is set.
+    pub destroying: Mutex<bool>,
+    failed: AtomicBool,
     video: AtomicI64,
     audio: AtomicI64,
 }
@@ -55,8 +58,11 @@ impl Shared {
         }
     }
 
+    /// One per session: a panic that repeats on every packet must not queue a stop per packet.
     fn fail(&self, message: &str) {
-        self.send(Command::Fail(format!("D-Streamy plugin error ({message})")));
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            self.send(Command::Fail(format!("D-Streamy plugin error ({message})")));
+        }
     }
 }
 
@@ -214,6 +220,8 @@ extern "C" fn output_create(
             commands,
             encode_error: AtomicBool::new(false),
             busy: AtomicBool::new(false),
+            destroying: Mutex::new(false),
+            failed: AtomicBool::new(false),
             video: AtomicI64::new(0),
             audio: AtomicI64::new(0),
         });
@@ -243,6 +251,11 @@ extern "C" fn output_destroy(data: *mut c_void) {
     guard("destroy", (), || {
         // SAFETY: libobs calls destroy once, with the pointer create returned.
         let state = unsafe { Box::from_raw(data.cast::<Output>()) };
+        *state
+            .shared
+            .destroying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
         state.shared.send(Command::Shutdown);
         let worker = state
             .worker
@@ -312,6 +325,7 @@ fn start(state: &Output) -> bool {
     };
     shared.ring.reopen();
     shared.encode_error.store(false, Ordering::Release);
+    shared.failed.store(false, Ordering::Release);
     shared.video.store(0, Ordering::Relaxed);
     shared.audio.store(0, Ordering::Relaxed);
     let endpoint = endpoint_setting(output);
@@ -336,7 +350,11 @@ extern "C" fn output_stop(data: *mut c_void, _ts: u64) {
             state.maybe_panic(PanicIn::Stop);
             state.shared.send(Command::Stop);
         },
-        |message| state.shared.fail(message),
+        |message| {
+            state.shared.send(Command::StopFailed(format!(
+                "D-Streamy plugin error ({message})"
+            )))
+        },
     );
 }
 
