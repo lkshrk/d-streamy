@@ -5,6 +5,7 @@ use std::fmt;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
+use dstreamy_ipc::producer::{HEADER_LEN, MAX_FRAME_LEN};
 use dstreamy_ipc::{ControlCodec, Endpoint, Frame, IpcError, Kind, ProducerCodec};
 use dstreamy_obs_packet::{self as packet, Converter, PacketError};
 use futures_util::{SinkExt, StreamExt};
@@ -20,6 +21,8 @@ use crate::types::{End, Hello, Level, Log};
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to read pending events after a failed write, so a `detached` already sent is not missed.
 pub const PENDING_EVENTS: Duration = Duration::from_secs(1);
+/// Service text shown in OBS is cut to this many characters.
+pub const MAX_SERVICE_TEXT: usize = 300;
 /// After a stop, the queued packets and end of stream get this long before the connection is dropped.
 pub const STOP_DEADLINE: Duration = Duration::from_millis(1500);
 
@@ -109,10 +112,12 @@ pub async fn attach(endpoint: &Endpoint, hello: &Hello) -> Result<Connection, St
     }
     match (reply["type"].as_str(), reply["code"].as_str()) {
         (Some("error"), Some(code)) => Err(StartError::Refused {
-            code: code.to_owned(),
-            message: reply["message"].as_str().unwrap_or_default().to_owned(),
+            code: service_text(code),
+            message: service_text(reply["message"].as_str().unwrap_or_default()),
         }),
-        _ => Err(StartError::Protocol(format!("hello reply {reply}"))),
+        _ => Err(StartError::Protocol(service_text(&format!(
+            "hello reply {reply}"
+        )))),
     }
 }
 
@@ -120,7 +125,7 @@ pub async fn attach(endpoint: &Endpoint, hello: &Hello) -> Result<Connection, St
 enum WriterEnd<T> {
     Stopped(T),
     Failed(String),
-    Refused(PacketError),
+    Refused(String),
 }
 
 /// Sends the ring's packets until `stop` fires or the service ends the attachment.
@@ -136,30 +141,38 @@ pub async fn run<T>(
     let writer = write_packets(sink, ring, video_extra_data, stop, log);
     tokio::pin!(reader, writer);
     tokio::select! {
-        ended = &mut reader => ended,
+        biased;
         written = &mut writer => match written {
             WriterEnd::Stopped(t) => End::Stopped(t),
             WriterEnd::Refused(e) => End::Refused(e),
-            WriterEnd::Failed(e) => tokio::time::timeout(PENDING_EVENTS, reader)
-                .await
-                .unwrap_or(End::Closed(e)),
+            WriterEnd::Failed(e) => {
+                log.log(Level::Debug, &format!("{e}; reading pending events"));
+                tokio::time::timeout(PENDING_EVENTS, reader)
+                    .await
+                    .unwrap_or(End::Closed(e))
+            }
         },
+        ended = &mut reader => ended,
     }
 }
 
 async fn read_events<T>(mut lines: Lines, log: &dyn Log) -> End<T> {
-    loop {
+    let mut malformed = 0u64;
+    let end = loop {
         let event = match lines.next().await {
             Some(Ok(Ok(event))) => event,
             Some(Ok(Err(e))) => {
-                log.log(
-                    Level::Warn,
-                    &format!("ignoring a malformed event line: {e}"),
-                );
+                malformed += 1;
+                if malformed == 1 {
+                    log.log(
+                        Level::Warn,
+                        &format!("ignoring a malformed event line: {e}"),
+                    );
+                }
                 continue;
             }
-            Some(Err(e)) => return End::Closed(format!("reading from the service: {e}")),
-            None => return End::Closed("the service closed the connection".into()),
+            Some(Err(e)) => break End::Closed(format!("reading from the service: {e}")),
+            None => break End::Closed("the service closed the connection".into()),
         };
         match event["type"].as_str() {
             Some("keyframe_request") => log.log(
@@ -167,14 +180,38 @@ async fn read_events<T>(mut lines: Lines, log: &dyn Log) -> End<T> {
                 "keyframe requested; the encoder's keyframe interval answers it",
             ),
             Some("detached") => {
-                return End::Detached {
-                    reason: event["reason"].as_str().unwrap_or("unknown").to_owned(),
-                    message: event["message"].as_str().unwrap_or_default().to_owned(),
+                break End::Detached {
+                    reason: service_text(event["reason"].as_str().unwrap_or("unknown")),
+                    message: service_text(event["message"].as_str().unwrap_or_default()),
                 };
             }
-            _ => log.log(Level::Debug, &format!("service event {event}")),
+            _ => log.log(
+                Level::Debug,
+                &service_text(&format!("service event {event}")),
+            ),
         }
+    };
+    if malformed > 1 {
+        log.log(
+            Level::Warn,
+            &format!("ignored {malformed} malformed event lines"),
+        );
     }
+    end
+}
+
+/// Service text as OBS may show it: no control or bidi-override characters, at most `MAX_SERVICE_TEXT` characters.
+fn service_text(text: &str) -> String {
+    let bidi = |c: char| matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    let mut out: String = text
+        .chars()
+        .take(MAX_SERVICE_TEXT)
+        .map(|c| if c.is_control() || bidi(c) { ' ' } else { c })
+        .collect();
+    if text.chars().nth(MAX_SERVICE_TEXT).is_some() {
+        out.push('…');
+    }
+    out
 }
 
 async fn write_packets<T>(
@@ -197,7 +234,7 @@ async fn write_packets<T>(
             return WriterEnd::Failed("the packet ring closed".into());
         };
         let arrived = packet.arrived;
-        let frame = match convert(packet, &mut converter, &mut video_extra_data) {
+        let frame = match frame_for(packet, &mut converter, &mut video_extra_data) {
             Ok(frame) => frame,
             Err(e) => return WriterEnd::Refused(e),
         };
@@ -226,7 +263,7 @@ async fn write_packets<T>(
     ring.close();
     let finish = async {
         while let Some(packet) = ring.pop() {
-            let frame = match convert(packet, &mut converter, &mut video_extra_data) {
+            let frame = match frame_for(packet, &mut converter, &mut video_extra_data) {
                 Ok(frame) => frame,
                 Err(e) => {
                     log.log(Level::Warn, &format!("not sending a queued packet: {e}"));
@@ -282,6 +319,28 @@ fn monotonic_ns(at: Instant) -> i64 {
     }
     let now_ns = ts.tv_sec * 1_000_000_000 + ts.tv_nsec;
     now_ns - i64::try_from(now.saturating_duration_since(at).as_nanos()).unwrap_or(0)
+}
+
+/// A packet as a frame the protocol can carry; conversion and size refusals become the stop message.
+fn frame_for(
+    packet: Packet,
+    converter: &mut Converter,
+    video_extra_data: &mut impl FnMut() -> Option<Vec<u8>>,
+) -> Result<Frame, String> {
+    let frame = convert(packet, converter, video_extra_data).map_err(|e| e.to_string())?;
+    let len = u64::from(HEADER_LEN) + frame.payload.len() as u64;
+    if len > u64::from(MAX_FRAME_LEN) {
+        return Err(format!(
+            "a {} packet of {} bytes is over the {MAX_FRAME_LEN}-byte frame limit",
+            if frame.kind == Kind::Video {
+                "video"
+            } else {
+                "audio"
+            },
+            frame.payload.len()
+        ));
+    }
+    Ok(frame)
 }
 
 /// One OBS packet to a producer frame; the video extra data is read once the first video packet exists.
@@ -360,6 +419,45 @@ mod tests {
         let frame = convert(packet(p.clone(), false), &mut converter, &mut extra).unwrap();
         assert_eq!(&frame.payload[..], &p[..]);
         assert_eq!(asked, 1, "extra data is read once");
+    }
+
+    #[test]
+    fn a_packet_over_the_frame_limit_is_refused_before_writing() {
+        let mut converter = Converter::new();
+        let packet = Packet {
+            track: Track::Audio,
+            keyframe: true,
+            pts: 0,
+            dts: 0,
+            timebase: (1, 48_000),
+            data: vec![0; (MAX_FRAME_LEN - HEADER_LEN) as usize + 1],
+            arrived: Instant::now(),
+        };
+        let refused = frame_for(packet, &mut converter, &mut || None).unwrap_err();
+        assert!(
+            refused.contains("over the 8388608-byte frame limit"),
+            "{refused}"
+        );
+        let fits = Packet {
+            track: Track::Audio,
+            keyframe: true,
+            pts: 0,
+            dts: 0,
+            timebase: (1, 48_000),
+            data: vec![0; (MAX_FRAME_LEN - HEADER_LEN) as usize],
+            arrived: Instant::now(),
+        };
+        assert!(frame_for(fits, &mut converter, &mut || None).is_ok());
+    }
+
+    #[test]
+    fn service_text_drops_controls_and_bidi_overrides_and_is_capped() {
+        assert_eq!(service_text("a\nb\u{1b}[31mc\u{202E}d"), "a b [31mc d");
+        let long = "x".repeat(MAX_SERVICE_TEXT + 5);
+        let cut = service_text(&long);
+        assert_eq!(cut.chars().count(), MAX_SERVICE_TEXT + 1);
+        assert!(cut.ends_with('…'));
+        assert_eq!(service_text("ok"), "ok");
     }
 
     #[test]

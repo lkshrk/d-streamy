@@ -1,6 +1,5 @@
 //! What the plugin and the producer connection share on every platform.
 
-use dstreamy_obs_packet::PacketError;
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +53,7 @@ pub enum End<T> {
         message: String,
     },
     Closed(String),
-    Refused(PacketError),
+    Refused(String),
 }
 
 #[cfg(test)]

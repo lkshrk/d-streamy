@@ -79,6 +79,16 @@ impl Inner {
 
     fn admit(&mut self, packet: Packet, capacity: usize, max_bytes: usize) {
         let len = packet.data.len();
+        if len > max_bytes {
+            match packet.track {
+                Track::Video => {
+                    self.dropped_video += 1;
+                    self.awaiting_keyframe = true;
+                }
+                Track::Audio => self.dropped_audio += 1,
+            }
+            return;
+        }
         match packet.track {
             Track::Video => {
                 if self.awaiting_keyframe && !packet.keyframe {
@@ -324,12 +334,15 @@ mod tests {
             [(Track::Video, 0), (Track::Video, 1), (Track::Audio, 1)]
         );
         assert_eq!(ring.stats().dropped_audio, 1);
+        ring.push(audio(2));
         let mut big = video(3, true);
         big.data = vec![0; 26];
         ring.push(big);
-        assert!(
-            drain(&ring).is_empty(),
-            "a packet over the byte limit never fits"
+        ring.push(video(4, false));
+        assert_eq!(
+            drain(&ring),
+            [(Track::Audio, 2)],
+            "an oversized packet is dropped alone, and video waits for a keyframe"
         );
         assert_eq!(ring.stats().queued_bytes, 0);
     }
@@ -438,5 +451,9 @@ mod tests {
         }
         assert_eq!(stats.queued, 0);
         assert_eq!(stats.queued_bytes, 0);
+        assert!(
+            stats.dropped_video + stats.dropped_audio > 0,
+            "the consumer never fell behind, so the drop policy was not exercised"
+        );
     }
 }
