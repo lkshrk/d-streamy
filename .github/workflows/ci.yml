@@ -2,23 +2,26 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
+    branches:
+      - '**'
   workflow_dispatch:
 
+# Preserve CI evidence for every direct-to-main commit by never cancelling main runs.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build-test:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - name: Select latest Xcode 16 (needs SDK >= 15.2 for SCContentFilter.includedWindows)
-        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
+      - name: Select latest Xcode 26 (needs SDK >= 15.2 for SCContentFilter.includedWindows)
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
 
       - uses: oven-sh/setup-bun@v2
         with:
