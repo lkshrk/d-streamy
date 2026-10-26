@@ -54,9 +54,9 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_27.1.app
       - name: Install system dependencies
         if: runner.os == 'Linux'
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
-          retry() { for i in 1 2 3; do timeout 300 "$@" && return; echo "attempt $i failed: $*"; done; return 1; }
+          retry() { for i in 1 2 3; do timeout 180 "$@" && return; echo "attempt $i failed: $*"; sleep 15; done; return 1; }
           apt=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120)
           args=(-y --no-install-recommends clang libclang-dev pkg-config \
             libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
@@ -65,7 +65,7 @@ jobs:
           retry sudo apt-get "${apt[@]}" update
           # Only fetches are retried: killing an install mid-unpack leaves dpkg broken.
           retry sudo apt-get "${apt[@]}" install --download-only "${args[@]}"
-          sudo apt-get "${apt[@]}" install "${args[@]}"
+          sudo apt-get "${apt[@]}" install --no-download "${args[@]}"
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - run: cargo fmt --check
@@ -102,9 +102,9 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_27.1.app
       - name: Install system dependencies
         if: runner.os == 'Linux'
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
-          retry() { for i in 1 2 3; do timeout 300 "$@" && return; echo "attempt $i failed: $*"; done; return 1; }
+          retry() { for i in 1 2 3; do timeout 180 "$@" && return; echo "attempt $i failed: $*"; sleep 15; done; return 1; }
           apt=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120)
           args=(-y --no-install-recommends clang libclang-dev pkg-config \
             libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
@@ -112,7 +112,7 @@ jobs:
           retry sudo apt-get "${apt[@]}" update
           # Only fetches are retried: killing an install mid-unpack leaves dpkg broken.
           retry sudo apt-get "${apt[@]}" install --download-only "${args[@]}"
-          sudo apt-get "${apt[@]}" install "${args[@]}"
+          sudo apt-get "${apt[@]}" install --no-download "${args[@]}"
       - name: Install toolchain from rust-toolchain.toml
         run: |
           rustup toolchain install
