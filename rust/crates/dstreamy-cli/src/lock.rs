@@ -17,7 +17,7 @@ pub enum LockError {
 /// Released when dropped, or by the OS when the process dies.
 #[derive(Debug)]
 pub struct SessionLock {
-    _file: File,
+    file: File,
     pid_file: PathBuf,
 }
 
@@ -48,10 +48,7 @@ impl SessionLock {
             Err(TryLockError::Error(e)) => return Err(io_err(&lock_file)(e)),
         }
         fs::write(&pid_file, format!("{}\n", std::process::id())).map_err(io_err(&pid_file))?;
-        Ok(Self {
-            _file: file,
-            pid_file,
-        })
+        Ok(Self { file, pid_file })
     }
 }
 
@@ -59,6 +56,8 @@ impl Drop for SessionLock {
     fn drop(&mut self) {
         // Runs before the lock file closes, so it never deletes the next holder's PID.
         let _ = fs::remove_file(&self.pid_file);
+        // Closing alone leaves it held while a child forked before its exec still has the descriptor.
+        let _ = self.file.unlock();
     }
 }
 
@@ -96,6 +95,17 @@ mod tests {
         let again = SessionLock::acquire(&paths).unwrap();
         drop(again);
         SessionLock::acquire(&paths).unwrap();
+    }
+
+    #[test]
+    fn a_dropped_lock_is_free_while_a_copy_of_its_descriptor_lives() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::in_dir(dir.path());
+        let held = SessionLock::acquire(&paths).unwrap();
+        let forked_copy = held.file.try_clone().unwrap();
+        drop(held);
+        SessionLock::acquire(&paths).unwrap();
+        drop(forked_copy);
     }
 
     #[test]
