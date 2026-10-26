@@ -197,6 +197,22 @@ jobs:
             cargo test --locked -p dstreamy-cli --test obs_plugin -- --ignored --test-threads 1 \
             2>&1 | tee "$OBS_LOGS/obs-plugin.log"
 
+      - name: H.264 encoder settings match obs/tests/encoder-settings
+        run: |
+          set -o pipefail
+          export LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a -s "-screen 0 1280x720x24" "$HARNESS" --modules image-source,obs-x264,obs-ffmpeg \
+            --dump-encoder-settings "$RUNNER_TEMP/encoder-settings" | tee "$OBS_LOGS/encoder-settings.log"
+          python3 obs/tests/check-encoder-settings.py "$RUNNER_TEMP/encoder-settings" obs/tests/encoder-settings \
+            "the obs-encoder-settings-linux artifact of this run"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-encoder-settings-linux
+          path: ${{ runner.temp }}/encoder-settings
+          if-no-files-found: ignore
+
       - name: Harness 5 s trace with A/V marker check
         run: |
           set -o pipefail
@@ -371,6 +387,23 @@ jobs:
           arch -${{ matrix.arch }} bash obs/tests/rust-plugin.sh "$app/MacOS/obs-harness" "$plugin/MacOS" \
             "$plugin/Resources" "$OBS_LOGS/rust-plugin" --graphics "$app/Frameworks/libobs-opengl.dylib" \
             | tee "$OBS_LOGS/rust-plugin.log"
+
+      - name: H.264 encoder settings match obs/tests/encoder-settings (${{ matrix.arch }} slice)
+        run: |
+          set -o pipefail
+          app="$OBS_PREFIX/OBS.app/Contents"
+          arch -${{ matrix.arch }} "$app/MacOS/obs-harness" --graphics "$app/Frameworks/libobs-opengl.dylib" \
+            --modules image-source,obs-x264,obs-ffmpeg,mac-videotoolbox \
+            --dump-encoder-settings "$RUNNER_TEMP/encoder-settings" | tee "$OBS_LOGS/encoder-settings.log"
+          python3 obs/tests/check-encoder-settings.py "$RUNNER_TEMP/encoder-settings" obs/tests/encoder-settings \
+            "the obs-encoder-settings-macos-${{ matrix.arch }} artifact of this run"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-encoder-settings-macos-${{ matrix.arch }}
+          path: ${{ runner.temp }}/encoder-settings
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
