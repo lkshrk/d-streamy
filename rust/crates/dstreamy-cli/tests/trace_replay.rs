@@ -397,13 +397,17 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
         if stream_video(&r).len() >= frames && producer_audio(&r).len() + lost >= packets {
             break r;
         }
-        assert!(
-            Instant::now() < deadline,
-            "{name}: {} of {frames} video and {} of {packets} audio frames arrived, dropped {:?}",
-            stream_video(&r).len(),
-            producer_audio(&r).len(),
-            r.dropped_frames
-        );
+        if Instant::now() >= deadline {
+            let status = c.status();
+            panic!(
+                "{name}: {} of {frames} video and {} of {packets} audio frames arrived, dropped {:?}; session {}; source {}",
+                stream_video(&r).len(),
+                producer_audio(&r).len(),
+                r.dropped_frames,
+                status["stats"],
+                status["source"]["stats"]
+            );
+        }
         std::thread::sleep(Duration::from_millis(if plis { 50 } else { 100 }));
     };
     let lines = p.lines();
