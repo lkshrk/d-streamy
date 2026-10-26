@@ -349,6 +349,8 @@ pub struct Engine {
     #[cfg(test)]
     moves_applied: Mutex<Vec<Place>>,
     #[cfg(test)]
+    catch_ups_requested: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
     stop_entered: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     shutdown_entered: std::sync::atomic::AtomicBool,
@@ -419,6 +421,8 @@ impl Engine {
             forward_gate: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             moves_applied: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            catch_ups_requested: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             stop_entered: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -674,10 +678,13 @@ impl Engine {
     /// Waits, bounded, until `conn`'s forwarder has handled every event its session sent so far.
     async fn catch_up(&self, conn: &Conn) -> bool {
         let (caught_up, handled) = oneshot::channel();
+        // A forwarder that is gone has nothing left to handle.
         if conn.catch_up.send(caught_up).is_err() {
             return true;
         }
-        // A forwarder that is gone has nothing left to handle.
+        #[cfg(test)]
+        self.catch_ups_requested
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let behind = timeout(FORWARDER_DRAIN, handled).await.is_err();
         if behind {
             tracing::warn!("session events are still queued after {FORWARDER_DRAIN:?}");
@@ -1404,6 +1411,12 @@ mod tests {
                 f.wait_state(|s| matches!(s, SessionState::Stopped { .. }))
                     .await;
             }
+            let requested = || {
+                f.engine
+                    .catch_ups_requested
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            };
+            let before = requested();
             let engine = f.engine.clone();
             let restart = tokio::spawn(async move {
                 if !self_stops {
@@ -1411,7 +1424,13 @@ mod tests {
                 }
                 engine.start(second, None).await.unwrap();
             });
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            timeout(T, async {
+                while requested() == before && !restart.is_finished() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
             let waited = !restart.is_finished();
             drop(gate);
             timeout(T, restart).await.unwrap().unwrap();
