@@ -513,6 +513,8 @@ impl CaptureSource for FloodSource {
                 let keyframe = index % 300 == 0 || requested;
                 served = wanted;
                 let mut data = vec![0, 0, 0, 1, if keyframe { 0x65 } else { 0x41 }];
+                data.extend(index.to_be_bytes().map(|b| b | 0x80));
+                data.extend((wanted as u64).to_be_bytes().map(|b| b | 0x80));
                 data.resize(size, if requested { REQUESTED_FILL } else { 0x55 });
                 let frame = MediaFrame::Video(EncodedVideoFrame {
                     codec: VideoCodec::H264,
@@ -584,6 +586,16 @@ async fn left_voice_times(mock: &MockDiscord, n: usize) {
 /// Filler of a FloodSource keyframe produced because a keyframe was requested.
 const REQUESTED_FILL: u8 = 0x5A;
 
+/// A FloodSource frame's index and the keyframe requests seen when it was made; bytes carry a high bit so no start code forms.
+fn flood_tag(f: &RecordedVideoFrame) -> Option<(u64, u64)> {
+    let unit = *nal_units(&f.data).first()?;
+    let field = |at: usize| -> Option<u64> {
+        let bytes: [u8; 8] = unit.get(at..at + 8)?.try_into().ok()?;
+        Some(u64::from_be_bytes(bytes.map(|b| b & 0x7F)))
+    };
+    Some((field(1)?, field(9)?))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn transport_lag_drops_video_until_a_requested_keyframe() {
     let mock = MockDiscord::start().await.unwrap();
@@ -591,13 +603,20 @@ async fn transport_lag_drops_video_until_a_requested_keyframe() {
     let source = FloodSource::new(100_000);
     let requests = source.keyframe_requests.clone();
     let handle = start(&client, source).await;
+    let pacer_full = |s: &StreamStats| {
+        s.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("pacer queue is full"))
+    };
     timeout(T, async {
-        while handle.stats().keyframe_requests == 0 || handle.stats().video_frames_dropped == 0 {
+        while !pacer_full(&handle.stats()) || requests.load(Ordering::Relaxed) == 0 {
             sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("no keyframe requested: {:?}", handle.stats()));
+    .unwrap_or_else(|_| panic!("the pacer never filled: {:?}", handle.stats()));
+    // Taken after the loss, so it can only count stale frames that already arrived as acceptable.
+    let at_loss = mock.recorded().video.len();
     let lagged = handle.stats();
     assert!(lagged.video_frames_dropped > 0, "{lagged:?}");
     assert!(requests.load(Ordering::Relaxed) > 0);
@@ -606,16 +625,29 @@ async fn transport_lag_drops_video_until_a_requested_keyframe() {
             .first()
             .is_some_and(|n| n[0] & 0x1F == 5 && n.last() == Some(&REQUESTED_FILL))
     };
-    // Far below the seconds of backlog the pacer held before the lag.
-    let requested = mock
-        .wait_for(Duration::from_secs(1), |r| {
-            r.video.iter().any(requested_idr).then_some(())
+    // Only a hang guard: what is under test is the order below, not how fast it arrives.
+    let recorded = mock
+        .wait_for(T, |r| {
+            r.video[at_loss.min(r.video.len())..]
+                .iter()
+                .any(requested_idr)
+                .then(|| r.clone())
         })
-        .await;
+        .await
+        .unwrap_or_else(|| panic!("the requested keyframe never arrived: {:?}", handle.stats()));
+    let keyframe_at = at_loss
+        + recorded.video[at_loss..]
+            .iter()
+            .position(requested_idr)
+            .unwrap();
+    let stale: Vec<_> = recorded.video[at_loss..keyframe_at]
+        .iter()
+        .filter(|f| nal_units(&f.data).first().is_some_and(|n| n[0] & 0x1F != 5))
+        .map(flood_tag)
+        .collect();
     assert!(
-        requested.is_some(),
-        "no keyframe produced after the request reached the mock: {:?}",
-        handle.stats()
+        stale.len() <= 1,
+        "video queued before the loss went out ahead of the requested keyframe (only the frame in flight may): {stale:?}"
     );
 
     let stats = timeout(T, handle.stop()).await.unwrap().unwrap();
