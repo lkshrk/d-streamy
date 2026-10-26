@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: OBS_PREFIX=... obs-linux-check-install.sh; exports LD_LIBRARY_PATH through GITHUB_ENV.
+# Exports LD_LIBRARY_PATH for later steps through GITHUB_ENV.
 set -euo pipefail
 
 cat "$OBS_PREFIX/build-time.txt" || true

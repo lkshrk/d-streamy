@@ -25,7 +25,7 @@ on:
       - ".github/workflows/obs-ci.yml"
       - ".github/actions/obs-prefix-*/**"
       - ".github/scripts/obs-*.sh"
-  # On rust-rewrite this also re-publishes the OBS prefix artifacts before they expire.
+  # Dispatching on rust-rewrite re-publishes the OBS prefix artifacts, e.g. after a long gap without pushes.
   workflow_dispatch:
 
 permissions:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: ARCH=arm64|x86_64 OBS_PREFIX=... OBS_LOGS=... obs-macos-encoder-settings.sh, from the repository root.
+# Run from the repository root.
 set -euo pipefail
 
 logs="$OBS_LOGS/$ARCH"

@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Usage: OBS_TAG=... OBS_COMMIT=... OBS_PREFIX=... obs-linux-build.sh
 set -euo pipefail
 
 start=$(date +%s)

@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Usage: ARCH=arm64|x86_64 OBS_TAG=... OBS_COMMIT=... OBS_PREFIX=... obs-macos-build.sh
 set -euo pipefail
 
 start=$(date +%s)
@@ -17,4 +16,6 @@ cmake --build build_macos --config RelWithDebInfo --target obs-studio -- -quiet 
   xcbeautify --quiet --renderer github-actions
 mkdir -p "$OBS_PREFIX"
 cmake --install build_macos --config RelWithDebInfo --prefix "$OBS_PREFIX"
+cd "$RUNNER_TEMP"
+rm -rf "$src"
 echo "OBS build took $(($(date +%s) - start)) s" | tee "$OBS_PREFIX/build-time.txt"
