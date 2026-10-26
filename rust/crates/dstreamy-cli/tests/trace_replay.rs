@@ -274,8 +274,10 @@ fn assert_paced<F>(
         .map(|p| lag(p))
         .filter(|l| (l - mid).abs() > slack)
         .collect();
+    // A trace of fewer than 50 unique frames would otherwise fail on one frame of scheduling noise past the slack.
+    let one_jitter = off.len() == 1 && (off[0] - mid).abs() <= 2 * slack;
     assert!(
-        off.len() * 50 <= checked.len(),
+        off.len() * 50 <= checked.len() || one_jitter,
         "{what}: {} of {} checked frames off the trace's dts pace by more than {slack} µs from the median lag {mid} µs: {off:?}",
         off.len(),
         checked.len()
@@ -612,6 +614,60 @@ fn a_few_stalls_excuse_the_frames_they_delay() {
         .collect();
     let (sent, arrived) = paced_arrivals(start, &stalls, Duration::from_millis(70));
     check_arrivals(&sent, &arrived, &stalls);
+}
+
+/// 40 unique frames at 60 fps, as a 60 fps trace matches; `late` frames arrive that much behind their dts.
+fn check_sixty_fps(late: &[(i64, Duration)]) {
+    let start = Instant::now();
+    let sent: Vec<Sent> = (0..40i64)
+        .map(|i| Sent {
+            key: i.to_le_bytes().to_vec(),
+            pts_us: i * 16_667,
+            dts_usec: i * 16_667,
+        })
+        .collect();
+    let arrived: Vec<(Vec<u8>, Instant)> = sent
+        .iter()
+        .zip(0..)
+        .map(|(s, i)| {
+            let delay = late
+                .iter()
+                .find(|(n, _)| *n == i)
+                .map_or(Duration::ZERO, |l| l.1);
+            let due = start + Duration::from_micros(s.dts_usec as u64);
+            (s.key.clone(), due + delay)
+        })
+        .collect();
+    let recorded: Vec<&(Vec<u8>, Instant)> = arrived.iter().collect();
+    assert_paced(
+        &recorded,
+        |a| a.0.clone(),
+        |a| a.1,
+        &sent,
+        16_667,
+        &[],
+        "synthetic 60 fps",
+    );
+}
+
+#[test]
+fn one_frame_of_jitter_past_the_slack_passes_a_short_trace() {
+    check_sixty_fps(&[(20, Duration::from_millis(26))]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn two_late_frames_fail_a_short_trace() {
+    check_sixty_fps(&[
+        (10, Duration::from_millis(26)),
+        (30, Duration::from_millis(26)),
+    ]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn one_frame_late_by_over_twice_the_slack_fails_a_short_trace() {
+    check_sixty_fps(&[(20, Duration::from_millis(45))]);
 }
 
 #[test]
