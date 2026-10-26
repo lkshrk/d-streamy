@@ -10,8 +10,6 @@ shift 4
 mkdir -p "$logs"
 modules="image-source,obs-x264,obs-ffmpeg,obs-outputs,obs-dstreamy"
 seconds=${RUST_PLUGIN_SECONDS:-3}
-min_video=$((seconds * 30 / 2))
-min_audio=$((seconds * 50 / 2))
 
 run() {
   local name=$1
@@ -36,29 +34,16 @@ expect() {
   fi
 }
 
-expect_packets() {
-  local name=$1 panics=$2 line video audio
-  line=$(grep -E "^HARNESS output=dstreamy_output .* panics=$panics\$" "$logs/$name.log") || {
-    echo "FAIL $name: no stats line with panics=$panics"
-    return 1
-  }
-  video=$(sed -E 's/.* video=([0-9]+) .*/\1/' <<<"$line")
-  audio=$(sed -E 's/.* audio=([0-9]+) .*/\1/' <<<"$line")
-  if ((video < min_video || audio < min_audio)); then
-    echo "FAIL $name: video=$video (min $min_video), audio=$audio (min $min_audio)"
-    return 1
-  fi
-}
 
 run load "$@"
 expect load '\[obs-dstreamy\] loaded \(version '
-expect_packets load 0
+expect load "^HARNESS output=dstreamy_output .* panics=0 "
 expect load 'HARNESS shutdown libobs_leaks=0'
 expect load 'HARNESS result=PASS'
 
 run panic --output-settings '{"panic_at_packet": 5}' --expect-panics 1 "$@"
 expect panic '\[obs-dstreamy\] panic caught in encoded_packet: test panic at packet 5'
-expect_packets panic 1
+expect panic "^HARNESS output=dstreamy_output .* panics=1 "
 expect panic 'HARNESS shutdown libobs_leaks=0'
 expect panic 'HARNESS result=PASS'
 

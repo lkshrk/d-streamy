@@ -587,7 +587,7 @@ static struct frame_counts frame_counts(void)
 
 static struct frame_counts frame_delta;
 
-static bool check_output_stats(obs_output_t *output)
+static bool check_output_stats(obs_output_t *output, obs_encoder_t *aenc)
 {
 	calldata_t cd = {0};
 	bool ok = proc_handler_call(obs_output_get_proc_handler(output), "get_stats", &cd);
@@ -599,14 +599,36 @@ static bool check_output_stats(obs_output_t *output)
 		harness_error("output %s has no get_stats proc", args.output_id);
 		return false;
 	}
-	printf("HARNESS output=%s video=%lld audio=%lld panics=%lld\n", args.output_id, video, audio, panics);
-	if (stop_code != OBS_OUTPUT_SUCCESS)
+	// libobs counts each video packet it hands encoded_packet (obs-output.c:2318-2321).
+	long long obs_video = obs_output_get_total_frames(output);
+	double video_s = (double)video / args.fps;
+	double audio_s = (double)audio * (double)obs_encoder_get_frame_size(aenc) / SAMPLE_RATE;
+	printf("HARNESS output=%s video=%lld audio=%lld panics=%lld obs_video=%lld video_s=%.2f audio_s=%.2f\n",
+	       args.output_id, video, audio, panics, obs_video, video_s, audio_s);
+
+	bool pass = true;
+	if (stop_code != OBS_OUTPUT_SUCCESS) {
 		harness_error("output stopped with code %lld", stop_code);
-	if (panics != args.expect_panics)
+		pass = false;
+	}
+	if (panics != args.expect_panics) {
 		harness_error("output counted %lld panic(s), expected %d", panics, args.expect_panics);
-	if (!video || !audio)
-		harness_error("output counted no video or no audio packets");
-	return stop_code == OBS_OUTPUT_SUCCESS && panics == args.expect_panics && video && audio;
+		pass = false;
+	}
+	if (video != obs_video) {
+		harness_error("output counted %lld video packets, libobs delivered %lld", video, obs_video);
+		pass = false;
+	}
+	if (video < args.fps) {
+		harness_error("output received less than 1 s of video (%lld packets)", video);
+		pass = false;
+	}
+	// Interleaving releases audio in step with video, so both tracks cover about the same media time.
+	if (audio_s < 0.8 * video_s) {
+		harness_error("output received %.2f s of audio for %.2f s of video", audio_s, video_s);
+		pass = false;
+	}
+	return pass;
 }
 
 static void describe_os(struct dstr *out)
@@ -918,7 +940,7 @@ int main(int argc, char **argv)
 	started = false;
 
 	if (!recording) {
-		if (!check_output_stats(output))
+		if (!check_output_stats(output, aenc))
 			rc = 1;
 		goto cleanup;
 	}
