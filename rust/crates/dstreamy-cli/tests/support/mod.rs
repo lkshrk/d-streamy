@@ -22,16 +22,15 @@ use tokio::runtime::Runtime;
 pub const T: Duration = Duration::from_secs(20);
 pub const FPS: u32 = 30;
 
-/// `DSTREAMY_MOCK_PRODUCER` if set, else built once per test binary next to `dstreamy` with the same profile and target:
-/// `cargo test` builds only this package's binaries.
+/// `DSTREAMY_MOCK_PRODUCER` if set, else built once per test binary next to `dstreamy` (same profile and target).
 pub fn mock_producer() -> &'static Path {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
         if let Some(bin) = std::env::var_os("DSTREAMY_MOCK_PRODUCER") {
             let bin = PathBuf::from(bin);
             assert!(
-                bin.is_file(),
-                "DSTREAMY_MOCK_PRODUCER={} is not a file",
+                bin.is_absolute() && bin.is_file(),
+                "DSTREAMY_MOCK_PRODUCER={} is not an absolute path to a file",
                 bin.display()
             );
             return bin;
