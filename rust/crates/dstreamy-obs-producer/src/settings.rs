@@ -15,6 +15,7 @@ pub enum Family {
     Amf,
     Qsv,
     VideoToolbox,
+    OpenH264,
 }
 
 impl Family {
@@ -29,6 +30,7 @@ impl Family {
             "ffmpeg_vaapi" | "ffmpeg_vaapi_tex" => Self::Vaapi,
             "h264_texture_amf" | "h264_fallback_amf" => Self::Amf,
             "obs_qsv11" | "obs_qsv11_soft" | "obs_qsv11_v2" | "obs_qsv11_soft_v2" => Self::Qsv,
+            "ffmpeg_openh264" => Self::OpenH264,
             _ if id.starts_with("com.apple.videotoolbox.") => Self::VideoToolbox,
             _ => return None,
         })
@@ -37,10 +39,11 @@ impl Family {
     fn b_frames_label(self) -> &'static str {
         match self {
             Self::X264 => "Tune: zerolatency, or Profile: baseline",
-            Self::Nvenc => "B-Frames: 0",
+            Self::Nvenc => "B-Frames: 0, and Tuning other than Ultra High Quality",
             Self::Vaapi | Self::Amf => "Max B-frames: 0",
             Self::Qsv => "B Frames: 0",
             Self::VideoToolbox => "Use B-Frames: off",
+            Self::OpenH264 => "Video Encoder",
         }
     }
 
@@ -56,7 +59,7 @@ impl Family {
         match self {
             Self::X264 => Some(("x264opts", "x264 Options (separated by space)")),
             Self::Nvenc => Some(("opts", "Custom Encoder Options")),
-            Self::Vaapi => Some(("ffmpeg_opts", "FFmpeg Options")),
+            Self::Vaapi | Self::OpenH264 => Some(("ffmpeg_opts", "FFmpeg Options")),
             Self::Amf => Some(("ffmpeg_opts", "AMF/FFmpeg Options")),
             Self::Qsv | Self::VideoToolbox => None,
         }
@@ -107,7 +110,7 @@ impl EncoderSettings {
     }
 
     fn int(&self, key: &str) -> i64 {
-        self.values.get(key).and_then(Value::as_i64).unwrap_or(0)
+        self.values.get(key).and_then(as_int).unwrap_or(0)
     }
 
     fn bool(&self, key: &str) -> bool {
@@ -122,8 +125,13 @@ impl EncoderSettings {
     }
 
     fn user_int(&self, key: &str) -> Option<i64> {
-        self.user.get(key).and_then(Value::as_i64)
+        self.user.get(key).and_then(as_int)
     }
+}
+
+/// `obs_data_get_int` truncates a double item (obs-data.c `item_int`).
+fn as_int(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
 }
 
 /// One rule an encoder broke, with the setting to change.
@@ -195,24 +203,53 @@ pub fn own_video_settings(family: Family, bitrate_kbps: i64) -> Value {
         Family::X264 | Family::Nvenc | Family::Vaapi | Family::Amf => {
             map.insert("bf".into(), 0.into());
         }
+        Family::OpenH264 => {}
     }
     v
 }
 
+/// x264's names, matched exactly as obs-x264's `validate` does (obs-x264.c:225-239).
+const X264_PRESETS: [&str; 10] = [
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+    "placebo",
+];
+const X264_TUNES: [&str; 8] = [
+    "film",
+    "animation",
+    "grain",
+    "stillimage",
+    "psnr",
+    "ssim",
+    "fastdecode",
+    "zerolatency",
+];
+
 /// x264's B-frames in obs-x264's order: preset and tune, then a user-set `bf`, then the profile.
 fn x264_b_frames(s: &EncoderSettings) -> i64 {
-    let mut b = match s.string("preset").to_ascii_lowercase().as_str() {
+    let preset = match s.string("preset") {
+        "" => "ultrafast",
+        p if X264_PRESETS.contains(&p) => p,
+        _ => "veryfast",
+    };
+    let mut b = match preset {
         "ultrafast" => 0,
         "veryslow" => 8,
         "placebo" => 16,
         _ => 3,
     };
-    for tune in s.string("tune").split([',', '.', '/', '-', '+']) {
-        match tune.to_ascii_lowercase().as_str() {
-            "animation" => b += 2,
-            "zerolatency" => b = 0,
-            _ => {}
-        }
+    match s.string("tune") {
+        tune if !X264_TUNES.contains(&tune) => {}
+        "animation" => b += 2,
+        "zerolatency" => b = 0,
+        _ => {}
     }
     if let Some(bf) = s.user_int("bf") {
         b = bf;
@@ -223,10 +260,19 @@ fn x264_b_frames(s: &EncoderSettings) -> i64 {
     b
 }
 
+/// NVENC's Ultra High Quality tuning forces at least 4 B-frames, except in lossless mode (nvenc.c:201-202,241,259-260,294-298).
+fn nvenc_b_frames(s: &EncoderSettings) -> i64 {
+    let uhq =
+        s.string("tune").eq_ignore_ascii_case("uhq") && s.string("rate_control") != "lossless";
+    if uhq { s.int("bf").max(4) } else { s.int("bf") }
+}
+
 fn b_frames(family: Family, s: &EncoderSettings) -> i64 {
     match family {
         Family::X264 => x264_b_frames(s),
-        Family::Nvenc | Family::Vaapi | Family::Amf => s.int("bf"),
+        Family::Nvenc => nvenc_b_frames(s),
+        Family::Vaapi | Family::Amf => s.int("bf"),
+        Family::OpenH264 => 0,
         Family::Qsv => s.user_int("bf").unwrap_or_else(|| s.int("bframes")),
         Family::VideoToolbox => i64::from(s.bool("bframes")),
     }
@@ -369,7 +415,11 @@ mod tests {
         assert!(case(json!({"bf": 0})).is_empty());
         assert_eq!(case(json!({"bf": 2})), [b()]);
         assert!(case(json!({"tune": "zerolatency"})).is_empty());
-        assert!(case(json!({"tune": "film,zerolatency"})).is_empty());
+        assert_eq!(
+            case(json!({"tune": "film,zerolatency"})),
+            [b()],
+            "not a valid tune name"
+        );
         assert_eq!(
             case(json!({"tune": "zerolatency", "bf": 2})),
             [b()],
@@ -384,6 +434,86 @@ mod tests {
             case(json!({"preset": "ultrafast", "tune": "animation"})),
             [b()]
         );
+    }
+
+    #[test]
+    fn x264_preset_and_tune_match_obs_x264s_exact_lists() {
+        let defaults = json!({"preset": "veryfast", "tune": "", "profile": "", "keyint_sec": 2, "x264opts": ""});
+        let b_frames = |user: Value| {
+            !check_video_encoder(&settings("obs_x264", defaults.clone(), user)).is_empty()
+        };
+        for tune in [
+            "film,zerolatency",
+            "ZeroLatency",
+            "zerolatency+fastdecode",
+            "zero latency",
+        ] {
+            assert!(
+                b_frames(json!({"tune": tune})),
+                "tune {tune:?} is invalid, so dropped"
+            );
+        }
+        for preset in ["UltraFast", "ultra", "1"] {
+            assert!(
+                b_frames(json!({"preset": preset})),
+                "preset {preset:?} becomes veryfast"
+            );
+        }
+        assert!(
+            !b_frames(json!({"preset": ""})),
+            "x264 maps an empty preset to ultrafast"
+        );
+        assert!(
+            !b_frames(json!({"profile": "BASELINE"})),
+            "the profile is case-insensitive"
+        );
+    }
+
+    #[test]
+    fn nvenc_uhq_tuning_forces_b_frames_unless_lossless() {
+        let defaults =
+            json!({"bf": 2, "keyint_sec": 0, "tune": "hq", "rate_control": "cbr", "opts": ""});
+        let problems = |user: Value| {
+            check_video_encoder(&settings("obs_nvenc_h264_tex", defaults.clone(), user))
+        };
+        assert!(problems(json!({"bf": 0, "keyint_sec": 2})).is_empty());
+        let uhq = problems(json!({"bf": 0, "keyint_sec": 2, "tune": "UHQ"}));
+        assert_eq!(
+            uhq,
+            [Problem::BFrames {
+                family: Family::Nvenc
+            }]
+        );
+        assert!(uhq[0].message().contains("Tuning"), "{}", uhq[0].message());
+        assert!(
+            problems(json!({"bf": 0, "keyint_sec": 2, "tune": "uhq", "rate_control": "lossless"}))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn integers_stored_as_floats_count() {
+        let p = check_video_encoder(&settings(
+            "ffmpeg_vaapi",
+            json!({"bf": 0, "keyint_sec": 0, "ffmpeg_opts": ""}),
+            json!({"bf": 2.0, "keyint_sec": 2.9}),
+        ));
+        assert_eq!(
+            p,
+            [Problem::BFrames {
+                family: Family::Vaapi
+            }]
+        );
+    }
+
+    #[test]
+    fn openh264_makes_no_b_frames() {
+        let s = settings(
+            "ffmpeg_openh264",
+            json!({"bitrate": 6000, "profile": "main"}),
+            json!({"keyint_sec": 2}),
+        );
+        assert!(check_video_encoder(&s).is_empty());
     }
 
     #[test]
@@ -524,7 +654,7 @@ mod tests {
         .message();
         assert_eq!(
             m,
-            "D-Streamy needs B-frames off: Settings › Output (Output Mode: Advanced) › Streaming › B-Frames: 0"
+            "D-Streamy needs B-frames off: Settings › Output (Output Mode: Advanced) › Streaming › B-Frames: 0, and Tuning other than Ultra High Quality"
         );
         assert!(
             Problem::Fps { num: 24, den: 1 }

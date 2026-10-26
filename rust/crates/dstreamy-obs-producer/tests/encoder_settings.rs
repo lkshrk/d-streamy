@@ -75,6 +75,7 @@ fn b_frames_off(family: Family) -> Value {
         Family::Qsv => json!({"bframes": 0}),
         Family::VideoToolbox => json!({"bframes": false}),
         Family::Nvenc | Family::Vaapi | Family::Amf => json!({"bf": 0}),
+        Family::OpenH264 => json!({}),
     }
 }
 
@@ -95,6 +96,7 @@ fn every_rule_key_is_a_real_setting_of_its_encoder() {
             Family::Vaapi | Family::Amf => &["bf", "keyint_sec", "ffmpeg_opts"],
             Family::Qsv => &["bframes", "keyint_sec"],
             Family::VideoToolbox => &["bframes", "keyint_sec"],
+            Family::OpenH264 => &["keyint_sec", "ffmpeg_opts"],
         };
         for key in keys {
             assert!(
@@ -116,7 +118,7 @@ fn defaults_alone_never_pass_except_where_the_encoder_defaults_to_no_b_frames() 
         let keyint = problems
             .iter()
             .any(|p| matches!(p, Problem::KeyframeInterval { .. }));
-        let defaults_b_off = f.family == Family::Vaapi;
+        let defaults_b_off = matches!(f.family, Family::Vaapi | Family::OpenH264);
         assert_eq!(b, !defaults_b_off, "{}: {problems:?}", f.id);
         let defaults_keyint_ok = f.family == Family::VideoToolbox;
         assert_eq!(keyint, !defaults_keyint_ok, "{}: {problems:?}", f.id);
@@ -143,6 +145,7 @@ fn b_frames_off_and_a_short_keyframe_interval_pass() {
 fn explicit_b_frames_fail() {
     for f in fixtures() {
         let on = match f.family {
+            Family::OpenH264 => continue,
             Family::X264 | Family::Nvenc | Family::Vaapi | Family::Amf => json!({"bf": 2}),
             Family::Qsv => json!({"bframes": 2}),
             Family::VideoToolbox => json!({"bframes": true}),
@@ -181,7 +184,7 @@ fn custom_options_fail_wherever_the_encoder_has_them() {
         let key = match f.family {
             Family::X264 => "x264opts",
             Family::Nvenc if f.properties.iter().any(|p| p == "opts") => "opts",
-            Family::Vaapi | Family::Amf => "ffmpeg_opts",
+            Family::Vaapi | Family::Amf | Family::OpenH264 => "ffmpeg_opts",
             _ => continue,
         };
         let user = merged(
