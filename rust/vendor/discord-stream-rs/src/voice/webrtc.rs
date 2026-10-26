@@ -1300,27 +1300,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_flush_reports_whether_it_dropped_a_keyframe() {
-        let (pacer, _rx) = pacer(TestWriter::Hangs).await;
-        pacer.enqueue(slice(0, 0x41, 0)).unwrap();
+    async fn the_gate_drains_queued_frames_and_reports_a_keyframe() {
+        let (pacer, rx, gate) = gated_pacer(TestWriter::Hangs).await;
+        pacer.enqueue(slice(0, 0x41, gate.generation())).unwrap();
         started(&pacer, 1).await;
-        pacer.enqueue(slice(33, 0x41, 0)).unwrap();
+        pacer.enqueue(slice(33, 0x41, gate.generation())).unwrap();
         assert_eq!(
-            pacer.flush(),
+            gate.flush(),
             Flushed {
                 frames: 1,
                 keyframe: false
             }
         );
-        pacer.enqueue(slice(66, 0x41, 0)).unwrap();
-        pacer.enqueue(slice(99, 0x65, 0)).unwrap();
+        pacer.enqueue(slice(66, 0x41, gate.generation())).unwrap();
+        pacer.enqueue(slice(99, 0x65, gate.generation())).unwrap();
         assert_eq!(
-            pacer.flush(),
+            gate.flush(),
             Flushed {
                 frames: 2,
                 keyframe: true
             }
         );
+        assert!(pacer.shared.queue.lock().is_empty());
+        assert_eq!(
+            pacer.shared.queued_bytes.load(Ordering::Relaxed),
+            3000,
+            "only the frame in flight"
+        );
+        assert_eq!(rx.borrow().flushed_frames, 3);
     }
 
     #[tokio::test]
@@ -1372,40 +1379,60 @@ mod tests {
         };
         assert!(frame(VideoCodec::H264, &[0x65]).is_keyframe());
         assert!(!frame(VideoCodec::H264, &[0x41]).is_keyframe());
-        assert!(frame(VideoCodec::H265, &[19 << 1, 1]).is_keyframe());
-        assert!(!frame(VideoCodec::H265, &[1 << 1, 1]).is_keyframe());
+        for (nal_type, irap) in [
+            (15, false),
+            (16, true),
+            (19, true),
+            (21, true),
+            (22, false),
+            (1, false),
+        ] {
+            assert_eq!(
+                frame(VideoCodec::H265, &[nal_type << 1, 1]).is_keyframe(),
+                irap,
+                "H.265 type {nal_type}"
+            );
+        }
         for codec in [VideoCodec::Vp8, VideoCodec::Vp9, VideoCodec::Av1] {
             assert!(!frame(codec, &[19 << 1, 1]).is_keyframe(), "{codec:?}");
         }
     }
 
-    #[tokio::test]
-    async fn a_frame_enqueued_while_the_pacer_stops_is_still_counted() {
-        let (pacer, rx) = pacer(TestWriter::Hangs).await;
-        let shared = pacer.shared.clone();
-        let queue = shared.queue.lock();
-        assert!(
-            shared.alive.load(Ordering::Acquire),
-            "enqueue passed its check"
-        );
-        let stopper = {
-            let shared = shared.clone();
-            std::thread::spawn(move || shared.stop("stopped"))
-        };
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(
-            !stopper.is_finished(),
-            "stop waits for the enqueue in progress"
-        );
-        shared.queued_bytes.fetch_add(3000, Ordering::Relaxed);
-        shared.outstanding.fetch_add(1, Ordering::AcqRel);
-        shared.progress.send_modify(|p| p.accepted_frames += 1);
-        drop(queue);
-        stopper.join().unwrap();
-        let p = rx.borrow().clone();
-        assert_eq!(p.dropped_frames, 1);
-        assert!(p.settled());
-        drop(pacer);
+    fn idle_shared() -> Arc<PacerShared> {
+        let progress = Arc::new(watch::channel(VideoProgress::default()).0);
+        Arc::new(PacerShared {
+            track: Arc::new(DiscordTrack::new(RTPCodecType::Video, MIME_TYPE_H264, 2)),
+            packetizer: Arc::default(),
+            dave: Arc::new(StdMutex::new(DaveHandler::new(1, 2))),
+            send_order: Arc::default(),
+            queue: Arc::default(),
+            queued_bytes: Arc::default(),
+            outstanding: Arc::default(),
+            gate: Arc::new(VideoGate::new(progress.clone())),
+            progress,
+            alive: AtomicBool::new(true),
+        })
+    }
+
+    #[test]
+    fn a_frame_enqueued_while_the_pacer_stops_is_settled_either_way() {
+        for _ in 0..50_000 {
+            let shared = idle_shared();
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let enqueue = {
+                let (shared, start) = (shared.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    shared.enqueue(frame(0)).is_ok()
+                })
+            };
+            start.wait();
+            shared.stop("stopped");
+            let accepted = enqueue.join().unwrap();
+            let p = shared.progress.borrow().clone();
+            assert_eq!(p.accepted_frames, u64::from(accepted));
+            assert!(p.settled(), "an accepted frame was never counted: {p:?}");
+        }
     }
 
     #[tokio::test]

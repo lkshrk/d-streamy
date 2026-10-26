@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use dstreamy_core::{FrameIntervalSnapshot, FrameIntervalTracker};
-use dstreamy_media::{CaptureSource, FrameReceiver, MediaFrame};
+use dstreamy_media::{CaptureSource, EncodedVideoFrame, FrameReceiver, MediaFrame};
 use tokio::sync::{Notify, RwLock, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout};
@@ -120,13 +120,30 @@ impl Shared {
     }
 
     /// Drops video up to the next keyframe here and in `conn`'s pacer, in one step against `send_frames`' pops.
-    fn video_lost(&self, conn: &MediaConnection, keyframe_lost: bool) {
+    fn video_lost(
+        &self,
+        conn: &MediaConnection,
+        attached: &watch::Receiver<Option<MediaConnection>>,
+        keyframe_lost: bool,
+        now: Instant,
+    ) {
         let effects = {
             let mut queue = self.queue();
+            // attach swaps under this lock and already dropped queued video for the new connection.
+            if !attached.borrow().as_ref().is_some_and(|c| c.ptr_eq(conn)) {
+                return;
+            }
             let flushed = conn.flush_video();
-            queue.video_lost(Instant::now(), keyframe_lost || flushed.keyframe)
+            queue.video_lost(now, keyframe_lost || flushed.keyframe)
         };
         self.handle(effects);
+    }
+
+    /// A keyframe the pacer skipped as stale: valid later video is already queued, so only ask again if still waiting.
+    fn stale_keyframe(&self, now: Instant) {
+        if self.queue().keyframe_lost(now) {
+            self.request_keyframe();
+        }
     }
 
     /// The next frame with the connection and flush generation current at its pop; `None` once closed and empty.
@@ -146,11 +163,18 @@ impl Shared {
         Some((frame, current, generation))
     }
 
-    fn send_failed(&self, conn: &MediaConnection, loss: SendLoss) {
-        match loss {
-            SendLoss::Transport { keyframe } => self.video_lost(conn, keyframe),
+    fn send_failed(
+        &self,
+        conn: &MediaConnection,
+        attached: &watch::Receiver<Option<MediaConnection>>,
+        error: &WebRtcError,
+        frame: &EncodedVideoFrame,
+        now: Instant,
+    ) {
+        match send_loss(error, frame.keyframe) {
+            SendLoss::Transport { keyframe } => self.video_lost(conn, attached, keyframe, now),
             SendLoss::Refused => {
-                let effects = self.queue().video_lost(Instant::now(), false);
+                let effects = self.queue().video_lost(now, false);
                 self.handle(effects);
             }
         }
@@ -457,23 +481,42 @@ async fn read_frames(
 
 #[derive(Debug, PartialEq, Eq)]
 enum SendLoss {
-    /// The transport lost it: flush, skip to a keyframe; a lost keyframe is asked for again at once.
+    /// The transport lost it: flush and skip to a keyframe; `keyframe` asks again soon instead of after the retry.
     Transport { keyframe: bool },
     /// Refused as oversized: the transport is fine, but later frames reference it, so skip to a keyframe at the normal rate.
     Refused,
 }
 
+/// Only a keyframe refused by a full pacer is lost for good; a keyframe failing because the connection is down would ask again every frame.
 fn send_loss(e: &WebRtcError, keyframe: bool) -> SendLoss {
     match e {
         WebRtcError::FrameTooLarge(_) => SendLoss::Refused,
-        _ => SendLoss::Transport { keyframe },
+        WebRtcError::PacerQueueFull => SendLoss::Transport { keyframe },
+        _ => SendLoss::Transport { keyframe: false },
     }
 }
 
-/// Whether a pacer delta needs the loss path, and if so whether a keyframe went with it.
-fn loss_reaction(delta: &VideoProgress, attached: bool) -> Option<bool> {
-    let keyframe_lost = delta.stale_keyframes > 0;
-    (attached && (delta.dropped_frames > 0 || keyframe_lost)).then_some(keyframe_lost)
+#[derive(Debug, PartialEq, Eq)]
+enum LossReaction {
+    /// Frames were lost on the wire: the full loss path; `keyframe` when a stale keyframe went with them.
+    Lost {
+        keyframe: bool,
+    },
+    StaleKeyframe,
+}
+
+fn loss_reaction(delta: &VideoProgress, attached: bool) -> Option<LossReaction> {
+    if !attached {
+        None
+    } else if delta.dropped_frames > 0 {
+        Some(LossReaction::Lost {
+            keyframe: delta.stale_keyframes > 0,
+        })
+    } else if delta.stale_keyframes > 0 {
+        Some(LossReaction::StaleKeyframe)
+    } else {
+        None
+    }
 }
 
 async fn send_frames(
@@ -509,9 +552,8 @@ async fn send_frames(
                     .await;
                 if let Err(e) = sent {
                     shared.stats().stats.video_frames_dropped += 1;
-                    let loss = send_loss(&e, video.keyframe);
+                    shared.send_failed(&current, &conn, &e, &video, Instant::now());
                     shared.error(e);
-                    shared.send_failed(&current, loss);
                 }
             }
             MediaFrame::Audio(audio) => {
@@ -579,9 +621,15 @@ async fn watch_keyframes(
                     *lock_carried(&shared) = progress.carried();
                     let reaction = loss_reaction(&delta, attached);
                     shared.stats().video_progress(delta, Instant::now());
-                    if let (Some(keyframe_lost), Some(c)) = (reaction, &current) {
-                        shared.video_lost(c, keyframe_lost);
-                        shared.frame_ready.notify_one();
+                    match (reaction, &current) {
+                        (Some(LossReaction::Lost { keyframe }), Some(c)) => {
+                            shared.video_lost(c, &conn, keyframe, Instant::now());
+                            shared.frame_ready.notify_one();
+                        }
+                        (Some(LossReaction::StaleKeyframe), Some(_)) => {
+                            shared.stale_keyframe(Instant::now())
+                        }
+                        _ => {}
                     }
                 }
                 () = next_request(&mut viewer_requests) => {
@@ -936,6 +984,7 @@ mod tests {
             .await
             .ok()
             .unwrap();
+        let started = Instant::now();
         let attached = requests.load(Ordering::Relaxed);
         let generation = conn.video_generation();
         for i in 0..4 {
@@ -962,10 +1011,12 @@ mod tests {
             "{:?}",
             stats.last_error
         );
-        assert_eq!(
-            requests.load(Ordering::Relaxed) - attached,
-            1,
-            "four oversized keyframes within a second ask once, so a broken encoder cannot spin"
+        let asked = requests.load(Ordering::Relaxed) - attached;
+        let allowed = 1 + started.elapsed().as_secs();
+        assert!(
+            (1..=allowed).contains(&asked),
+            "{asked} requests in {:?}: at least one, and at most one per retry",
+            started.elapsed()
         );
         assert_eq!(
             conn.video_generation(),
@@ -976,39 +1027,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_keyframe_asks_again_once_the_retry_allows() {
-        let conn = offline_connection();
-        let source = SilentSource::default();
-        let requests = source.requests.clone();
-        let options = StreamOptions::new(dstreamy_media::CaptureConfig::default());
-        let pump = MediaPump::start(Box::new(source), &options, Some(conn.clone()))
-            .await
-            .ok()
-            .unwrap();
-        let before = requests.load(Ordering::Relaxed);
-        for (i, wait) in [Duration::ZERO, super::super::queue::KEYFRAME_RETRY]
-            .into_iter()
-            .enumerate()
-        {
-            tokio::time::sleep(wait).await;
-            pump.shared
-                .queue()
-                .push(oversized(i as u64 * 33_333, true), Instant::now());
-            pump.shared.frame_ready.notify_one();
-            timeout(Duration::from_secs(5), async {
-                while pump.stats().video_frames_dropped < i as u64 + 1 {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            })
-            .await
-            .expect("the oversized frame was handled");
-        }
-        assert_eq!(requests.load(Ordering::Relaxed) - before, 2);
-        let _ = pump.stop().await;
-    }
-
-    #[tokio::test]
-    async fn a_frame_popped_after_an_attach_goes_to_the_new_connection() {
+    async fn take_next_returns_the_latest_attached_connection() {
         let (old, new) = (offline_connection(), offline_connection());
         let pump = pump(&old).await;
         pump.detach();
@@ -1043,21 +1062,135 @@ mod tests {
         assert!(conn.video_generation() > before);
     }
 
-    #[test]
-    fn a_keyframe_refused_by_a_full_pacer_is_asked_for_again_at_once() {
-        let now = Instant::now();
-        let mut queue = FrameQueue::new(8, 8);
-        queue.video_lost(now, false);
-        let loss = send_loss(&WebRtcError::PacerQueueFull, true);
-        assert_eq!(loss, SendLoss::Transport { keyframe: true });
-        assert!(
-            queue.video_lost(now, true).request_keyframe,
-            "not held back by the request made a moment ago"
+    fn idr() -> EncodedVideoFrame {
+        EncodedVideoFrame {
+            codec: dstreamy_media::VideoCodec::H264,
+            data: vec![0, 0, 0, 1, 0x65],
+            pts_us: 0,
+            keyframe: true,
+        }
+    }
+
+    /// A pump on an offline connection that last asked for a keyframe at `asked`, waiting for it.
+    async fn waiting_pump(conn: &MediaConnection) -> (MediaPump, Instant) {
+        let pump = pump(conn).await;
+        let asked = Instant::now();
+        pump.shared.queue().clear();
+        pump.shared.queue().video_lost(asked, false);
+        (pump, asked)
+    }
+
+    fn requests(pump: &MediaPump) -> u64 {
+        pump.stats().keyframe_requests
+    }
+
+    #[tokio::test]
+    async fn a_keyframe_refused_by_a_full_pacer_is_asked_for_again_soon() {
+        let conn = offline_connection();
+        let (pump, asked) = waiting_pump(&conn).await;
+        let attached = pump.conn.subscribe();
+        let before = requests(&pump);
+        let soon = asked + super::super::queue::KEYFRAME_RETRY_SOON;
+        pump.shared
+            .send_failed(&conn, &attached, &WebRtcError::PacerQueueFull, &idr(), soon);
+        assert_eq!(
+            requests(&pump) - before,
+            1,
+            "not held back by the full retry"
+        );
+        pump.shared
+            .send_failed(&conn, &attached, &WebRtcError::PacerQueueFull, &idr(), soon);
+        assert_eq!(requests(&pump) - before, 1, "the floor holds");
+        let _ = pump.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_keyframe_failing_on_a_down_connection_asks_at_most_once_per_retry() {
+        let conn = offline_connection();
+        let (pump, asked) = waiting_pump(&conn).await;
+        let attached = pump.conn.subscribe();
+        let before = requests(&pump);
+        for i in 1..30u32 {
+            let at = asked + Duration::from_millis(33) * i;
+            pump.shared
+                .send_failed(&conn, &attached, &WebRtcError::NotConnected, &idr(), at);
+        }
+        assert_eq!(
+            requests(&pump) - before,
+            0,
+            "under a second since the last request"
+        );
+        let at = asked + super::super::queue::KEYFRAME_RETRY;
+        pump.shared
+            .send_failed(&conn, &attached, &WebRtcError::NotConnected, &idr(), at);
+        assert_eq!(requests(&pump) - before, 1);
+        let _ = pump.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_oversized_keyframe_asks_at_most_once_per_retry() {
+        let conn = offline_connection();
+        let (pump, asked) = waiting_pump(&conn).await;
+        let attached = pump.conn.subscribe();
+        let generation = conn.video_generation();
+        let too_large = WebRtcError::FrameTooLarge(4_000_000);
+        let before = requests(&pump);
+        for i in 1..30u32 {
+            let at = asked + Duration::from_millis(33) * i;
+            pump.shared
+                .send_failed(&conn, &attached, &too_large, &idr(), at);
+        }
+        assert_eq!(requests(&pump) - before, 0, "a broken encoder cannot spin");
+        let at = asked + super::super::queue::KEYFRAME_RETRY;
+        pump.shared
+            .send_failed(&conn, &attached, &too_large, &idr(), at);
+        assert_eq!(
+            requests(&pump) - before,
+            1,
+            "the broken reference chain is repaired"
         );
         assert_eq!(
-            send_loss(&WebRtcError::PacerQueueFull, false),
-            SendLoss::Transport { keyframe: false }
+            conn.video_generation(),
+            generation,
+            "the transport is not flushed"
         );
+        let _ = pump.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_keyframe_neither_flushes_nor_cuts_and_asks_only_while_waiting() {
+        let conn = offline_connection();
+        let (pump, asked) = waiting_pump(&conn).await;
+        let generation = conn.video_generation();
+        let soon = asked + super::super::queue::KEYFRAME_RETRY_SOON;
+        let before = requests(&pump);
+        pump.shared.stale_keyframe(soon);
+        assert_eq!(requests(&pump) - before, 1);
+        assert_eq!(conn.video_generation(), generation, "no second flush");
+        pump.shared.queue().push(MediaFrame::Video(idr()), soon);
+        pump.shared
+            .stale_keyframe(soon + super::super::queue::KEYFRAME_RETRY);
+        assert_eq!(requests(&pump) - before, 1, "a keyframe is queued again");
+        assert_eq!(pump.shared.queue().len(), 1, "queued video is kept");
+        let _ = pump.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_loss_on_a_connection_no_longer_attached_is_ignored() {
+        let (old, new) = (offline_connection(), offline_connection());
+        let pump = pump(&old).await;
+        pump.attach(new.clone());
+        let attached = pump.conn.subscribe();
+        let (old_generation, new_generation) = (old.video_generation(), new.video_generation());
+        let before = requests(&pump);
+        let later = Instant::now() + super::super::queue::KEYFRAME_RETRY;
+        pump.shared.video_lost(&old, &attached, true, later);
+        assert_eq!(requests(&pump), before);
+        assert_eq!(old.video_generation(), old_generation);
+        assert_eq!(new.video_generation(), new_generation);
+        pump.shared.video_lost(&new, &attached, true, later);
+        assert!(new.video_generation() > new_generation);
+        let _ = pump.stop().await;
     }
 
     #[test]
@@ -1071,8 +1204,23 @@ mod tests {
             stale_keyframes: 1,
             ..VideoProgress::default()
         };
-        assert_eq!(loss_reaction(&dropped, true), Some(false));
-        assert_eq!(loss_reaction(&stale_keyframe, true), Some(true));
+        let both = VideoProgress {
+            dropped_frames: 1,
+            stale_keyframes: 1,
+            ..VideoProgress::default()
+        };
+        assert_eq!(
+            loss_reaction(&dropped, true),
+            Some(LossReaction::Lost { keyframe: false })
+        );
+        assert_eq!(
+            loss_reaction(&both, true),
+            Some(LossReaction::Lost { keyframe: true })
+        );
+        assert_eq!(
+            loss_reaction(&stale_keyframe, true),
+            Some(LossReaction::StaleKeyframe)
+        );
         assert_eq!(
             loss_reaction(&dropped, false),
             None,

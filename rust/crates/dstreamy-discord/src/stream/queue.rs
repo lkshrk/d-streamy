@@ -5,6 +5,8 @@ use dstreamy_media::MediaFrame;
 
 /// How often a still-missing keyframe is asked for again.
 pub const KEYFRAME_RETRY: Duration = Duration::from_secs(1);
+/// The floor for asking again at once after a keyframe was lost; caps a loss cycle at four requests a second.
+pub const KEYFRAME_RETRY_SOON: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Effects {
@@ -74,12 +76,7 @@ impl FrameQueue {
                 }
                 if self.awaiting_keyframe {
                     effects.dropped_video += 1;
-                    effects.request_keyframe = if keyframe_dropped {
-                        self.last_request = Some(now);
-                        true
-                    } else {
-                        self.should_request(now)
-                    };
+                    effects.request_keyframe = self.request(now, keyframe_dropped);
                 } else {
                     self.video_len += 1;
                     self.frames.push_back(frame);
@@ -110,14 +107,14 @@ impl FrameQueue {
         };
         if next_key.is_none() {
             self.awaiting_keyframe = true;
-            effects.request_keyframe = if keyframe_flushed {
-                self.last_request = Some(now);
-                true
-            } else {
-                self.should_request(now)
-            };
+            effects.request_keyframe = self.request(now, keyframe_flushed);
         }
         effects
+    }
+
+    /// A keyframe the transport dropped unstarted; asks again only if the queue is still waiting for one.
+    pub fn keyframe_lost(&mut self, now: Instant) -> bool {
+        self.awaiting_keyframe && self.request(now, true)
     }
 
     /// A new connection needs a keyframe: drop queued video and ask for one now.
@@ -157,10 +154,16 @@ impl FrameQueue {
         self.frames.len()
     }
 
-    fn should_request(&mut self, now: Instant) -> bool {
+    /// `soon` when the keyframe being waited for was lost, not merely late.
+    fn request(&mut self, now: Instant, soon: bool) -> bool {
+        let interval = if soon {
+            KEYFRAME_RETRY_SOON
+        } else {
+            KEYFRAME_RETRY
+        };
         let due = self
             .last_request
-            .is_none_or(|t| now.duration_since(t) >= KEYFRAME_RETRY);
+            .is_none_or(|t| now.duration_since(t) >= interval);
         if due {
             self.last_request = Some(now);
         }
@@ -339,22 +342,30 @@ mod tests {
     }
 
     #[test]
-    fn a_keyframe_flushed_in_transport_is_asked_for_again_at_once() {
+    fn a_keyframe_flushed_in_transport_is_asked_for_again_soon() {
         let now = Instant::now();
+        let soon = now + KEYFRAME_RETRY_SOON;
         let mut q = FrameQueue::new(8, 8);
         q.push(video(0, true), now);
         q.pop();
         q.push(video(33, false), now);
         assert!(q.video_lost(now, false).request_keyframe);
-        assert!(!q.video_lost(now, false).request_keyframe, "rate-limited");
         assert!(
-            q.video_lost(now, true).request_keyframe,
+            !q.video_lost(soon, false).request_keyframe,
+            "a late keyframe waits the full retry"
+        );
+        assert!(
+            !q.video_lost(now, true).request_keyframe,
+            "not before the floor"
+        );
+        assert!(
+            q.video_lost(soon, true).request_keyframe,
             "the requested keyframe was flushed"
         );
     }
 
     #[test]
-    fn a_queued_keyframe_lost_to_overflow_is_asked_for_again_at_once() {
+    fn a_queued_keyframe_lost_to_overflow_is_asked_for_again_soon() {
         let now = Instant::now();
         let mut q = FrameQueue::new(2, 8);
         q.push(video(0, true), now);
@@ -363,12 +374,47 @@ mod tests {
         assert!(q.video_lost(now, false).request_keyframe);
         q.push(video(66, true), now);
         q.push(video(100, false), now);
-        let e = q.push(video(133, false), now);
+        let e = q.push(video(133, false), now + KEYFRAME_RETRY_SOON);
         assert_eq!(e.dropped_video, 3);
         assert!(
             e.request_keyframe,
             "the queued keyframe was dropped, not delayed"
         );
+    }
+
+    #[test]
+    fn a_stalled_sender_losing_each_keyframe_to_overflow_asks_at_most_four_times_a_second() {
+        let start = Instant::now();
+        let mut q = FrameQueue::new(8, 8);
+        let (mut requests, mut asked) = (0, false);
+        // 60 fps for 2 s, nothing popped; the source answers each request with its next frame.
+        for i in 0..120u64 {
+            let at = start + Duration::from_micros(16_667 * i);
+            let keyframe = i == 0 || std::mem::take(&mut asked);
+            let e = q.push(video(16_667 * i, keyframe), at);
+            asked = e.request_keyframe;
+            requests += u32::from(e.request_keyframe);
+        }
+        assert!(requests >= 2, "the cycle still asks: {requests}");
+        assert!(requests <= 9, "{requests} requests in 2 s");
+    }
+
+    #[test]
+    fn a_stale_keyframe_asks_again_only_while_waiting_for_one() {
+        let now = Instant::now();
+        let soon = now + KEYFRAME_RETRY_SOON;
+        let mut q = FrameQueue::new(8, 8);
+        q.push(video(0, true), now);
+        assert!(
+            !q.keyframe_lost(soon),
+            "a keyframe is queued, so nothing is waited for"
+        );
+        q.pop();
+        q.push(video(33, false), now);
+        assert!(q.video_lost(now, false).request_keyframe);
+        assert!(!q.keyframe_lost(now), "not before the floor");
+        assert!(q.keyframe_lost(soon));
+        assert_eq!(q.len(), 0, "nothing is cut");
     }
 
     #[test]
