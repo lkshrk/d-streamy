@@ -1,0 +1,28 @@
+{
+    "id": "obs_qsv11_v2",
+    "codec": "h264",
+    "kind": "source",
+    "source": "plugins/obs-qsv11/obs-qsv11.c:163-183 (defaults; a user-set bf overrides bframes at :463-464), :393-409 (properties) at obs-studio ba2f32b",
+    "defaults": {
+        "target_usage": "TU4",
+        "bitrate": 5000,
+        "max_bitrate": 6000,
+        "profile": "high",
+        "rate_control": "CBR",
+        "keyint_sec": 0,
+        "latency": "normal",
+        "bframes": 3,
+        "repeat_headers": false
+    },
+    "properties": [
+        {
+            "name": "profile"
+        },
+        {
+            "name": "keyint_sec"
+        },
+        {
+            "name": "bframes"
+        }
+    ]
+}

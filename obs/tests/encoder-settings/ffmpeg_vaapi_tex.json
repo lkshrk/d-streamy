@@ -1,0 +1,28 @@
+{
+    "id": "ffmpeg_vaapi_tex",
+    "codec": "h264",
+    "kind": "source",
+    "source": "plugins/obs-ffmpeg/obs-ffmpeg-vaapi.c:850-870 (defaults; profile is AV_PROFILE_H264_HIGH = 100), :1098-1163 (properties) at obs-studio ba2f32b",
+    "defaults": {
+        "profile": 100,
+        "bitrate": 6000,
+        "keyint_sec": 0,
+        "bf": 0,
+        "qp": 20,
+        "maxrate": 0
+    },
+    "properties": [
+        {
+            "name": "profile"
+        },
+        {
+            "name": "keyint_sec"
+        },
+        {
+            "name": "bf"
+        },
+        {
+            "name": "ffmpeg_opts"
+        }
+    ]
+}

@@ -3,6 +3,7 @@
 #[cfg(unix)]
 pub mod client;
 pub mod ring;
+pub mod settings;
 mod types;
 
 #[cfg(target_os = "linux")]

@@ -1,0 +1,54 @@
+{
+    "id": "obs_x264",
+    "codec": "h264",
+    "kind": "source",
+    "source": "plugins/obs-x264/obs-x264.c:100-117 (defaults, vfr only with ENABLE_VFR), :179-219 (properties; vfr only with ENABLE_VFR, off in OBS builds) at obs-studio ba2f32b",
+    "defaults": {
+        "bitrate": 6000,
+        "use_bufsize": false,
+        "buffer_size": 6000,
+        "keyint_sec": 0,
+        "crf": 23,
+        "rate_control": "CBR",
+        "preset": "veryfast",
+        "profile": "",
+        "tune": "",
+        "x264opts": "",
+        "repeat_headers": false
+    },
+    "properties": [
+        {
+            "name": "rate_control"
+        },
+        {
+            "name": "bitrate"
+        },
+        {
+            "name": "use_bufsize"
+        },
+        {
+            "name": "buffer_size"
+        },
+        {
+            "name": "crf"
+        },
+        {
+            "name": "keyint_sec"
+        },
+        {
+            "name": "preset"
+        },
+        {
+            "name": "profile"
+        },
+        {
+            "name": "tune"
+        },
+        {
+            "name": "x264opts"
+        },
+        {
+            "name": "repeat_headers"
+        }
+    ]
+}

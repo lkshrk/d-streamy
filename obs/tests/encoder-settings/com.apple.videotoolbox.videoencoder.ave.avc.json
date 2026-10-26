@@ -1,0 +1,26 @@
+{
+    "id": "com.apple.videotoolbox.videoencoder.ave.avc",
+    "codec": "h264",
+    "kind": "source",
+    "source": "plugins/mac-videotoolbox/encoder.c:1378-1390 (defaults), :1274-1294 (properties); ids are VideoToolbox encoder ids registered at runtime (:1502-1523) at obs-studio ba2f32b",
+    "defaults": {
+        "bitrate": 6000,
+        "quality": 60,
+        "limit_bitrate": false,
+        "max_bitrate": 6000,
+        "keyint_sec": 2,
+        "profile": "high",
+        "bframes": true
+    },
+    "properties": [
+        {
+            "name": "keyint_sec"
+        },
+        {
+            "name": "profile"
+        },
+        {
+            "name": "bframes"
+        }
+    ]
+}

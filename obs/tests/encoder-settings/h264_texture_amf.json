@@ -1,0 +1,31 @@
+{
+    "id": "h264_texture_amf",
+    "codec": "h264",
+    "kind": "source",
+    "source": "plugins/obs-ffmpeg/texture-amf.cpp:1224-1232 (defaults; bf 0 above 1920x1088 or 60 fps at :1461-1471), :1270-1307 (properties; bf only with hardware B-frames) at obs-studio ba2f32b",
+    "defaults": {
+        "rate_control": "CBR",
+        "bitrate": 6000,
+        "cqp": 20,
+        "preset": "quality",
+        "profile": "high",
+        "bf": 2
+    },
+    "properties": [
+        {
+            "name": "keyint_sec"
+        },
+        {
+            "name": "preset"
+        },
+        {
+            "name": "profile"
+        },
+        {
+            "name": "bf"
+        },
+        {
+            "name": "ffmpeg_opts"
+        }
+    ]
+}
