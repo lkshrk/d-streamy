@@ -114,7 +114,7 @@ async fn session(
     _endpoint: Option<PathBuf>,
     _commands: &mut UnboundedReceiver<Command>,
 ) -> Outcome {
-    Outcome::StartFailed("D-Streamy does not support Windows yet".into())
+    Outcome::StartFailed("D-Streamy for OBS doesn't support Windows yet".into())
 }
 
 #[cfg(unix)]

@@ -38,8 +38,8 @@ expect() {
 
 if [[ ${OS:-} == Windows_NT ]]; then
   absent="/dstreamy-absent/d/s.sock"
-  not_running="D-Streamy does not support Windows yet"
-  not_running_line="^HARNESS expected_error code=-2: D-Streamy does not support Windows yet"
+  not_running="D-Streamy for OBS doesn't support Windows yet"
+  not_running_line="^HARNESS expected_error code=-2: D-Streamy for OBS doesn't support Windows yet"
 else
   absent="${TMPDIR:-/tmp}/dstreamy-absent-$$/d/s.sock"
   not_running="The D-Streamy service is not running"
