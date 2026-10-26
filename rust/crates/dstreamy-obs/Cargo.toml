@@ -15,6 +15,10 @@ dstreamy-obs-sys = { path = "../dstreamy-obs-sys" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["macros", "rt", "sync"] }
 
+[features]
+# Settings that force panics and delays, for the obs/ tests only; never in a shipped plugin.
+test-hooks = []
+
 [lints]
 workspace = true
 

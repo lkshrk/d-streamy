@@ -14,6 +14,7 @@ use dstreamy_obs_sys as sys;
 use tokio::sync::mpsc;
 
 use crate::guard::{self, guard, guard_with};
+use crate::hooks::Hooks;
 use crate::log;
 use crate::worker::{self, Command};
 
@@ -28,13 +29,6 @@ pub struct OutputPtr(pub *mut sys::obs_output_t);
 unsafe impl Send for OutputPtr {}
 // SAFETY: as above.
 unsafe impl Sync for OutputPtr {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PanicIn {
-    Nowhere,
-    Start,
-    Stop,
-}
 
 /// What the libobs callbacks and the worker thread share.
 pub struct Shared {
@@ -73,19 +67,10 @@ impl Shared {
 struct Output {
     shared: Arc<Shared>,
     worker: Mutex<Option<JoinHandle<()>>>,
-    panic_at: i64,
-    panic_in: PanicIn,
-    /// Test hook: widens the window between libobs's active check in destroy and our flag.
-    destroy_delay_ms: u64,
+    hooks: Hooks,
 }
 
 impl Output {
-    fn maybe_panic(&self, at: PanicIn) {
-        if self.panic_in == at {
-            panic!("test panic in {at:?}");
-        }
-    }
-
     fn count(&self, packet: &sys::encoder_packet) {
         let shared = &self.shared;
         let counter = if packet.type_ == sys::OBS_ENCODER_VIDEO {
@@ -95,9 +80,7 @@ impl Output {
         };
         counter.fetch_add(1, Ordering::Relaxed);
         let seen = shared.video.load(Ordering::Relaxed) + shared.audio.load(Ordering::Relaxed);
-        if self.panic_at > 0 && seen == self.panic_at {
-            panic!("test panic at packet {seen}");
-        }
+        self.hooks.on_packet(seen);
     }
 
     /// The only work done on the encoder thread: one copy into the ring.
@@ -208,18 +191,7 @@ extern "C" fn output_create(
 ) -> *mut c_void {
     guard("create", ptr::null_mut(), || {
         // SAFETY: libobs passes the output's live settings object.
-        let (panic_at, panic_in, destroy_delay_ms) = unsafe {
-            (
-                sys::obs_data_get_int(settings, c"panic_at_packet".as_ptr()),
-                text(sys::obs_data_get_string(settings, c"panic_in".as_ptr())),
-                sys::obs_data_get_int(settings, c"test_destroy_delay_ms".as_ptr()),
-            )
-        };
-        let panic_in = match panic_in.as_str() {
-            "start" => PanicIn::Start,
-            "stop" => PanicIn::Stop,
-            _ => PanicIn::Nowhere,
-        };
+        let hooks = unsafe { Hooks::read(settings) };
         let (commands, receiver) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             output: OutputPtr(output),
@@ -242,9 +214,7 @@ extern "C" fn output_create(
         let state = Box::into_raw(Box::new(Output {
             shared,
             worker: Mutex::new(Some(worker)),
-            panic_at,
-            panic_in,
-            destroy_delay_ms: u64::try_from(destroy_delay_ms).unwrap_or(0),
+            hooks,
         }));
         // SAFETY: the handler dies with `state` in obs_output_destroy (obs-output.c:308,344); libobs copies the decl.
         unsafe {
@@ -259,9 +229,7 @@ extern "C" fn output_destroy(data: *mut c_void) {
     guard("destroy", (), || {
         // SAFETY: libobs calls destroy once, with the pointer create returned.
         let state = unsafe { Box::from_raw(data.cast::<Output>()) };
-        if state.destroy_delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(state.destroy_delay_ms));
-        }
+        state.hooks.before_destroy();
         *state
             .shared
             .destroying
@@ -289,7 +257,7 @@ extern "C" fn output_start(data: *mut c_void) -> bool {
         "start",
         false,
         || {
-            state.maybe_panic(PanicIn::Start);
+            state.hooks.on_start();
             let shared = &state.shared;
             if shared.busy.swap(true, Ordering::AcqRel) {
                 set_last_error(output, "D-Streamy is already starting");
@@ -358,7 +326,7 @@ extern "C" fn output_stop(data: *mut c_void, _ts: u64) {
         "stop",
         (),
         || {
-            state.maybe_panic(PanicIn::Stop);
+            state.hooks.on_stop();
             state.shared.send(Command::Stop);
         },
         |message| {

@@ -2,6 +2,8 @@ include_guard(GLOBAL)
 
 find_program(CARGO_EXECUTABLE cargo HINTS "$ENV{CARGO_HOME}/bin" "$ENV{HOME}/.cargo/bin" REQUIRED)
 
+option(DSTREAMY_PLUGIN_TEST_HOOKS "Build the plugin with its test-only hooks (obs/ tests only, never shipped)" OFF)
+
 # add_rust_plugin(<target> CRATE_DIR <dir> LIB_NAME <name>): cargo-built cdylib laid out as OBS module <target>
 function(add_rust_plugin target)
   cmake_parse_arguments(PARSE_ARGV 1 _ARP "" "CRATE_DIR;LIB_NAME" "")
@@ -33,6 +35,11 @@ link=$<TARGET_LINKER_FILE:OBS::libobs>
 
   set(cargo_build "${CMAKE_COMMAND}" -E env ${cargo_env} "${CARGO_EXECUTABLE}" build --release --locked --target-dir
                   "${cargo_target_dir}")
+  if(DSTREAMY_PLUGIN_TEST_HOOKS)
+    list(APPEND cargo_build --features test-hooks)
+  endif()
+  set(check_hooks "${CMAKE_COMMAND}" -DTEST_HOOKS=${DSTREAMY_PLUGIN_TEST_HOOKS})
+  set(hooks_script "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/check_test_hooks.cmake")
 
   if(OS_MACOS)
     set(arches ${CMAKE_OSX_ARCHITECTURES})
@@ -79,6 +86,7 @@ link=$<TARGET_LINKER_FILE:OBS::libobs>
       COMMAND "${CMAKE_COMMAND}" -E make_directory "${contents}/MacOS" "${contents}/Resources"
       COMMAND lipo -create ${slices} -output "${cargo_target_dir}/${target}.universal"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${cargo_target_dir}/${target}.universal" "${module}"
+      COMMAND ${check_hooks} "-DLIBRARY=${module}" -P "${hooks_script}"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${contents}/Info.plist"
       WORKING_DIRECTORY "${_ARP_CRATE_DIR}"
       BYPRODUCTS "${module}"
@@ -96,6 +104,7 @@ link=$<TARGET_LINKER_FILE:OBS::libobs>
       COMMAND ${cargo_build}
       COMMAND "${CMAKE_COMMAND}" -E make_directory "${rundir}"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${built}" "${rundir}/${target}.dll"
+      COMMAND ${check_hooks} "-DLIBRARY=${rundir}/${target}.dll" -P "${hooks_script}"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${pdb}" "${rundir}/${_ARP_LIB_NAME}.pdb"
       WORKING_DIRECTORY "${_ARP_CRATE_DIR}"
       BYPRODUCTS "${rundir}/${target}.dll"
@@ -115,6 +124,7 @@ link=$<TARGET_LINKER_FILE:OBS::libobs>
       COMMAND ${cargo_build}
       COMMAND "${CMAKE_COMMAND}" -E make_directory "${rundir}"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${built}" "${rundir}/${target}.so"
+      COMMAND ${check_hooks} "-DLIBRARY=${rundir}/${target}.so" -P "${hooks_script}"
       WORKING_DIRECTORY "${_ARP_CRATE_DIR}"
       BYPRODUCTS "${rundir}/${target}.so"
       COMMENT "Build ${target} with cargo"

@@ -156,7 +156,7 @@ jobs:
       - name: Configure, build and test obs/
         working-directory: obs
         run: |
-          cmake --preset ubuntu-ci-x86_64 -DCMAKE_PREFIX_PATH="$OBS_PREFIX"
+          cmake --preset ubuntu-ci-x86_64 -DCMAKE_PREFIX_PATH="$OBS_PREFIX" -DDSTREAMY_PLUGIN_TEST_HOOKS=ON
           cmake --build --preset ubuntu-ci-x86_64
           xvfb-run -a -s "-screen 0 1280x720x24" ctest --preset ubuntu-ci-x86_64
           echo "HARNESS=$PWD/build_x86_64/harness/obs-harness" >> "$GITHUB_ENV"
@@ -178,7 +178,11 @@ jobs:
         run: |
           cargo fmt --all --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy --workspace --all-targets --locked --features test-hooks -- -D warnings
           cargo test --workspace --locked
+          cargo build --release --locked --target-dir "$RUNNER_TEMP/plugin-without-hooks"
+          cmake -DTEST_HOOKS=OFF -DLIBRARY="$RUNNER_TEMP/plugin-without-hooks/release/libdstreamy_obs.so" \
+            -P "$GITHUB_WORKSPACE/obs/cmake/common/check_test_hooks.cmake"
 
       - name: OBS through the plugin to serve and mock Discord
         working-directory: rust
@@ -321,7 +325,7 @@ jobs:
         run: |
           set -o pipefail
           cat "$OBS_PREFIX/build-time.txt" || true
-          cmake --preset macos-ci
+          cmake --preset macos-ci -DDSTREAMY_PLUGIN_TEST_HOOKS=ON
           cmake --build --preset macos-ci -- -quiet 2>&1 | xcbeautify --quiet --renderer github-actions
 
       - name: Check the plugin bundle
@@ -355,6 +359,7 @@ jobs:
           cargo fmt --all --check
           cargo clippy --workspace --all-targets --locked --target aarch64-apple-darwin -- -D warnings
           cargo clippy --workspace --all-targets --locked --target x86_64-apple-darwin -- -D warnings
+          cargo clippy --workspace --all-targets --locked --target aarch64-apple-darwin --features test-hooks -- -D warnings
 
       - name: Load and panic tests (${{ matrix.arch }} slice)
         run: |
@@ -441,7 +446,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           Get-Content "$env:OBS_PREFIX\build-time.txt" -ErrorAction SilentlyContinue
-          cmake --preset windows-ci-x64
+          cmake --preset windows-ci-x64 -DDSTREAMY_PLUGIN_TEST_HOOKS=ON
           cmake --build --preset windows-ci-x64 -- /consoleLoggerParameters:Summary /noLogo /verbosity:minimal
 
       - name: Plugin crate gates
@@ -452,6 +457,7 @@ jobs:
           $env:DSTREAMY_OBS_CONFIG = "$env:GITHUB_WORKSPACE\obs\build_x64\obs-config-RelWithDebInfo.txt"
           cargo fmt --all --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy --workspace --all-targets --locked --features test-hooks -- -D warnings
           cargo test --workspace --locked
 
       - name: Check the plugin DLL
