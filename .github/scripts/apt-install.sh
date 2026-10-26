@@ -7,16 +7,19 @@ apt=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeo
   -o DPkg::Lock::Timeout=120)
 args=(-y --no-install-recommends "$@")
 
+# apt's Timeout only catches a silent connection, not a slow one.
 retry() {
-  for i in 1 2 3; do
-    "$@" && return
-    echo "attempt $i failed: $*"
-    if [ "$i" -lt 3 ]; then sleep 15; fi
+  local tries=$1 secs=$2 i
+  shift 2
+  for ((i = 1; i <= tries; i++)); do
+    sudo timeout --kill-after=30 "$secs" apt-get "$@" && return
+    echo "apt-get attempt $i/$tries failed or timed out"
+    if [ "$i" -lt "$tries" ]; then sleep 15; fi
   done
   return 1
 }
 
-retry sudo apt-get "${apt[@]}" update
+retry 3 60 "${apt[@]}" update
 
 # apt trusts any right-sized cached archive; only the signed index's SHA256 vouches for it.
 empty=$(mktemp -d)
@@ -52,6 +55,6 @@ sudo rm -rf "$cache.manifest"
 sudo find "$cache" -type f ! -name lock ! -path '*/partial/*' -printf '%P %s\n' | sort >"$cache.manifest"
 
 apt+=(-o "Dir::Cache::archives=$cache/")
-retry sudo apt-get "${apt[@]}" install --download-only "${args[@]}"
+retry 4 240 "${apt[@]}" install --download-only "${args[@]}"
 # Only fetches are retried: killing an install mid-unpack leaves dpkg broken.
 sudo apt-get "${apt[@]}" install --no-download "${args[@]}"
