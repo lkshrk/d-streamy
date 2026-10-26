@@ -64,6 +64,7 @@ struct harness_args {
 	int keyint_sec;
 	int expect_panics;
 	int until_video;
+	int release_after_start_ms;
 	bool bf_set;
 	bool keyint_set;
 	int argc;
@@ -444,6 +445,8 @@ static struct obs_output_info trace_output_info = {
 };
 
 static volatile long long stop_code;
+static volatile long stop_signals;
+static volatile long error_stop_signals;
 // Written by the first failing stop signal before it signals the events the main thread waits on.
 static char *stop_error;
 
@@ -451,6 +454,9 @@ static void on_output_stop(void *param, calldata_t *cd)
 {
 	UNUSED_PARAMETER(param);
 	long long code = calldata_int(cd, "code");
+	os_atomic_inc_long(&stop_signals);
+	if (code != OBS_OUTPUT_SUCCESS)
+		os_atomic_inc_long(&error_stop_signals);
 	if (code != OBS_OUTPUT_SUCCESS && stop_code == OBS_OUTPUT_SUCCESS) {
 		const char *err = calldata_string(cd, "last_error");
 		stop_error = bstrdup(err ? err : "");
@@ -482,6 +488,7 @@ static void usage(void)
 		"  [--until-video N (plugin output: run until it counted N video packets; --seconds is the timeout)]\n"
 		"  [--expect-error TEXT (pass only if the output fails to start or stops with an error containing TEXT;\n"
 		"   after a stop OBS keeps running until --seconds)]\n"
+		"  [--release-after-start MS (release the output MS after a successful start, without stopping it)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
 		"  [--modules a,b,c] [--plugin-bin DIR --plugin-data DIR] [--note TEXT] [--x264opts OPTS] [--verbose]\n");
@@ -549,6 +556,8 @@ static int parse_args(int argc, char **argv)
 			ok = parse_int(a, v, 0, &args.expect_panics);
 		else if (strcmp(a, "--until-video") == 0)
 			ok = parse_int(a, v, 1, &args.until_video);
+		else if (strcmp(a, "--release-after-start") == 0)
+			ok = parse_int(a, v, 0, &args.release_after_start_ms);
 		else if (strcmp(a, "--expect-error") == 0)
 			args.expect_error = v;
 		else if (strcmp(a, "--trace-dir") == 0)
@@ -1026,6 +1035,17 @@ int main(int argc, char **argv)
 	printf("HARNESS obs_output_start=ok\n");
 	struct frame_counts at_start = frame_counts();
 
+	if (args.release_after_start_ms) {
+		os_sleep_ms((uint32_t)args.release_after_start_ms);
+		uint64_t before = os_gettime_ns();
+		obs_output_release(output);
+		output = NULL;
+		started = false;
+		printf("HARNESS released the output during its start in %llu ms\n",
+		       (unsigned long long)((os_gettime_ns() - before) / 1000000));
+		goto cleanup;
+	}
+
 	unsigned long budget_ms = (unsigned long)args.seconds * 1000 + 30000;
 	if (!recording) {
 		if (!args.until_video)
@@ -1122,6 +1142,8 @@ cleanup:
 		rc = 1;
 	}
 	long libobs_leaks = bnum_allocs();
+	printf("HARNESS stop_signals=%ld error_stop_signals=%ld\n", os_atomic_load_long(&stop_signals),
+	       os_atomic_load_long(&error_stop_signals));
 	printf("HARNESS shutdown libobs_leaks=%ld\n", libobs_leaks);
 	if (initialized && libobs_leaks) {
 		harness_error("%ld libobs allocation(s) leaked after obs_shutdown", libobs_leaks);

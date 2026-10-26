@@ -52,7 +52,9 @@ impl HarnessRun {
     fn start(h: &Harness, settings: Value, args: &[&str]) -> Self {
         let env = obs_env();
         let mut settings = settings;
-        settings["endpoint"] = json!(h.endpoint());
+        if settings.get("endpoint").is_none() {
+            settings["endpoint"] = json!(h.endpoint());
+        }
         let trace_dir = h.dir.path().join("harness-trace");
         let mut child = Command::new(&env.harness)
             .args(["--output", "dstreamy_output", "--video-encoder", "obs_x264"])
@@ -274,6 +276,20 @@ fn obs_streams_through_the_plugin_in_sync_and_within_a_second() {
         .collect();
     assert!(!keyframes.is_empty(), "the plugin logged no keyframes");
     let offset_us = first_us - keyframes[0].0;
+    let last_us = rtp_us(video.last().unwrap().rtp_timestamp, VIDEO_HZ);
+    for (pts, _) in &keyframes {
+        let at = pts + offset_us;
+        if !(first_us..=last_us).contains(&at) {
+            continue;
+        }
+        assert!(
+            video
+                .iter()
+                .any(|v| (rtp_us(v.rtp_timestamp, VIDEO_HZ) - at).abs() <= 1_000
+                    && is_keyframe(&v.data)),
+            "the plugin's keyframe at {pts} µs is no IDR at the mock ({at} µs); the first video there is not its first keyframe"
+        );
+    }
     let encode_to_mock: Vec<i64> = pairs
         .iter()
         .filter_map(|p| {
@@ -326,7 +342,7 @@ fn a_killed_service_stops_the_output_with_an_error_and_obs_keeps_running() {
         json!({}),
         &[
             "--seconds",
-            "20",
+            "40",
             "--until-video",
             "100000",
             "--expect-error",
@@ -354,7 +370,7 @@ fn a_killed_service_stops_the_output_with_an_error_and_obs_keeps_running() {
 
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
-fn a_panic_in_encoded_packet_stops_the_output_with_an_error() {
+fn a_panic_in_encoded_packet_stops_the_output_once_with_an_error() {
     let h = Harness::new("");
     let _serve = h.serve();
     let mut c = obs_session(&h);
@@ -382,6 +398,10 @@ fn a_panic_in_encoded_packet_stops_the_output_with_an_error() {
         "{lines:#?}"
     );
     assert!(has_line(&lines, "HARNESS alive after the stop: "));
+    assert!(
+        has_line(&lines, "HARNESS stop_signals=1 error_stop_signals=1"),
+        "exactly one stop: {lines:#?}"
+    );
     c.source("the attachment ending at end of stream", |e| {
         e["reason"] == "detached"
     });
@@ -419,4 +439,62 @@ fn a_panic_in_stop_still_stops_the_output_with_an_error() {
     c.source("the attachment ending at end of stream", |e| {
         e["reason"] == "detached"
     });
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_stalled_service_cannot_hold_up_the_stop() {
+    let h = Harness::new("");
+    let serve = h.serve();
+    let _c = obs_session(&h);
+    let run = HarnessRun::start(&h, json!({}), &["--seconds", "60", "--until-video", "240"]);
+    h.wait("60 video frames from OBS", |r| {
+        (stream_video(r).len() >= 60).then_some(())
+    });
+    let pid = libc::pid_t::try_from(serve.pid()).unwrap();
+    // SAFETY: kill has no memory preconditions; serve is our unreaped child.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let (status, lines) = run.finish();
+    // SAFETY: as above.
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    passed(status, &lines);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("[obs-dstreamy] the service read nothing for")),
+        "the writer never blocked on the stopped service: {lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn releasing_the_output_while_it_connects_returns_promptly() {
+    let h = Harness::new("");
+    let dir = h.run.path().join("silent");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let path = dir.join("s.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let held = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+    let run = HarnessRun::start(
+        &h,
+        json!({"endpoint": path}),
+        &[
+            "--seconds",
+            "30",
+            "--until-video",
+            "60",
+            "--release-after-start",
+            "500",
+        ],
+    );
+    let (status, lines) = run.finish();
+    passed(status, &lines);
+    let took = number_after(&lines, "released the output during its start in ");
+    assert!(took < 2_000, "release took {took} ms");
+    assert!(
+        has_line(&lines, "HARNESS stop_signals=0 "),
+        "no capture began: {lines:#?}"
+    );
+    drop(held);
 }
