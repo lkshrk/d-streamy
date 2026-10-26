@@ -573,15 +573,14 @@ fn overload_run_with(burst: Option<u32>, secs: u64, extra: &[&str]) -> Overload 
         depths.push(c.status()["source"]["stats"]["queued"].as_u64().unwrap());
         std::thread::sleep(Duration::from_millis(50));
     }
-    let keyframe_requests = p
-        .lines()
-        .iter()
-        .filter(|v| v["event"]["type"] == "keyframe_request")
-        .count();
     let lines = p.lines.clone();
     let (status, stderr) = p.finish();
     assert!(status.success(), "{stderr}");
     let lines = lines.lock().unwrap().clone();
+    let keyframe_requests = lines
+        .iter()
+        .filter(|v| v["event"]["type"] == "keyframe_request")
+        .count();
     let outcome = lines.iter().find_map(|v| v["outcome"].as_str());
     assert_eq!(outcome, Some("Finished"), "{lines:?}");
     let sent_bytes = lines

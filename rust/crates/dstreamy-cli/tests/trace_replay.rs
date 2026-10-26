@@ -453,9 +453,10 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) {
         }
         std::thread::sleep(Duration::from_millis(if plis { 50 } else { 100 }));
     };
-    let lines = p.lines();
+    let lines = p.lines.clone();
     let (status, stderr) = p.finish();
     assert!(status.success(), "{name}: {stderr}");
+    let lines = lines.lock().unwrap().clone();
     let lost_audio = start_drops(&recorded, name);
     if plis {
         let requests = lines
