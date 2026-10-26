@@ -53,7 +53,7 @@ jobs:
           echo "DSTREAMY_MOCK_PRODUCER=$PWD/target/debug/mock-producer" >> "$GITHUB_ENV"
       - name: Tests except trace_replay
         run: >-
-          cargo nextest run --workspace --locked --profile ci --test-threads 3
+          cargo nextest run --workspace --locked --profile ci
           -E 'not binary_id(dstreamy-cli::trace_replay)'
         env:
           DSTREAMY_BIN: ${{ github.workspace }}/rust/target/debug/dstreamy
@@ -129,7 +129,7 @@ jobs:
           echo "DSTREAMY_MOCK_PRODUCER=$PWD/target/debug/mock-producer" >> "$GITHUB_ENV"
       - name: Tests except trace_replay
         run: >-
-          cargo nextest run --workspace --locked --profile ci --test-threads 4
+          cargo nextest run --workspace --locked --profile ci
           -E 'not binary_id(dstreamy-cli::trace_replay)'
         env:
           DSTREAMY_BIN: ${{ github.workspace }}/rust/target/debug/dstreamy

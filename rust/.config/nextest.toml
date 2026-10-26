@@ -9,4 +9,3 @@ test-group = 'trace-replay-macos'
 
 [profile.ci]
 fail-fast = false
-slow-timeout = { period = "60s" }
