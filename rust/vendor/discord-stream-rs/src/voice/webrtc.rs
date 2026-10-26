@@ -176,6 +176,8 @@ pub struct VideoProgress {
     pub dropped_frames: u64,
     /// Frames dropped unstarted by `flush_video`, which the caller already knows about.
     pub flushed_frames: u64,
+    /// Keyframes the pacer dropped as stale after a flush; `flush_video` already reports the ones it drains.
+    pub stale_keyframes: u64,
     pub last_error: Option<String>,
 }
 
@@ -194,13 +196,16 @@ struct PacedFrame {
 }
 
 impl PacedFrame {
+    /// Only Annex B codecs are paced (`set_packetizer`); others never report a keyframe.
     fn is_keyframe(&self) -> bool {
-        split_nalu(&self.data).iter().any(|n| match self.codec {
+        let irap = |n: &&[u8]| match self.codec {
             VideoCodec::H264 => {
                 H264Helpers::nal_unit_type(n) == H264NalUnitType::CodedSliceIdr as u8
             }
-            _ => (16..=21).contains(&H265Helpers::nal_unit_type(n)),
-        })
+            VideoCodec::H265 => (16..=21).contains(&H265Helpers::nal_unit_type(n)),
+            VideoCodec::Vp8 | VideoCodec::Vp9 | VideoCodec::Av1 => false,
+        };
+        split_nalu(&self.data).iter().any(irap)
     }
 }
 
@@ -310,27 +315,36 @@ impl PacerShared {
 
     fn flush(&self) -> Flushed {
         let frames: Vec<PacedFrame> = self.queue.lock().drain(..).collect();
-        self.flushed(&frames)
+        self.flushed(&frames, false)
     }
 
-    fn flushed(&self, frames: &[PacedFrame]) -> Flushed {
+    fn flushed(&self, frames: &[PacedFrame], stale: bool) -> Flushed {
         let bytes: usize = frames.iter().map(|f| f.data.len()).sum();
         self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        let counted = frames.iter().filter(|_| self.settle()).count() as u64;
-        if counted > 0 {
-            debug!("video pacer flushed {} queued frames", counted);
-            self.progress.send_modify(|p| p.flushed_frames += counted);
+        let counted: Vec<&PacedFrame> = frames.iter().filter(|_| self.settle()).collect();
+        let keyframes = counted.iter().filter(|f| f.is_keyframe()).count() as u64;
+        if !counted.is_empty() {
+            debug!("video pacer flushed {} queued frames", counted.len());
+            self.progress.send_modify(|p| {
+                p.flushed_frames += counted.len() as u64;
+                if stale {
+                    p.stale_keyframes += keyframes;
+                }
+            });
         }
         Flushed {
-            frames: counted,
-            keyframe: counted > 0 && frames.iter().any(PacedFrame::is_keyframe),
+            frames: counted.len() as u64,
+            keyframe: keyframes > 0,
         }
     }
 
     /// Counts every frame not yet settled as dropped; later settles find nothing to claim.
     fn stop(&self, why: &str) {
+        let mut queue = self.queue.lock();
         self.alive.store(false, Ordering::Release);
         let lost = self.outstanding.swap(0, Ordering::AcqRel);
+        queue.clear();
+        drop(queue);
         if lost > 0 {
             warn!("video pacer {} with {} frames unsent", why, lost);
             self.progress.send_modify(|p| {
@@ -408,7 +422,7 @@ async fn run_pacer(shared: Arc<PacerShared>, bytes_per_second: f64) {
         let order = shared.send_order.lock().await;
         if frame.generation < shared.gate.generation() {
             drop(order);
-            shared.flushed(std::slice::from_ref(&frame));
+            shared.flushed(std::slice::from_ref(&frame), true);
             continue;
         }
         let encrypted =
@@ -1330,6 +1344,68 @@ mod tests {
             90_000,
             "the stale frame was skipped"
         );
+    }
+
+    #[tokio::test]
+    async fn a_keyframe_dropped_as_stale_is_reported() {
+        let open = Arc::new(watch::channel(false).0);
+        let written = Arc::new(StdMutex::new(Vec::new()));
+        let (pacer, mut rx, gate) =
+            gated_pacer(TestWriter::Gate(open.clone(), written.clone())).await;
+        pacer.enqueue(slice(0, 0x41, gate.generation())).unwrap();
+        started(&pacer, 1).await;
+        let stamped = gate.generation();
+        assert_eq!(gate.flush(), Flushed::default());
+        pacer.enqueue(slice(33, 0x65, stamped)).unwrap();
+        open.send_replace(true);
+        let p = settled(&mut rx, 2).await;
+        assert_eq!((p.flushed_frames, p.stale_keyframes), (1, 1));
+    }
+
+    #[test]
+    fn only_annex_b_irap_units_are_keyframes() {
+        let frame = |codec, nal: &[u8]| PacedFrame {
+            data: [&[0, 0, 0, 1][..], nal].concat(),
+            codec,
+            timing: Timing::Advance(33.0),
+            generation: 0,
+        };
+        assert!(frame(VideoCodec::H264, &[0x65]).is_keyframe());
+        assert!(!frame(VideoCodec::H264, &[0x41]).is_keyframe());
+        assert!(frame(VideoCodec::H265, &[19 << 1, 1]).is_keyframe());
+        assert!(!frame(VideoCodec::H265, &[1 << 1, 1]).is_keyframe());
+        for codec in [VideoCodec::Vp8, VideoCodec::Vp9, VideoCodec::Av1] {
+            assert!(!frame(codec, &[19 << 1, 1]).is_keyframe(), "{codec:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_enqueued_while_the_pacer_stops_is_still_counted() {
+        let (pacer, rx) = pacer(TestWriter::Hangs).await;
+        let shared = pacer.shared.clone();
+        let queue = shared.queue.lock();
+        assert!(
+            shared.alive.load(Ordering::Acquire),
+            "enqueue passed its check"
+        );
+        let stopper = {
+            let shared = shared.clone();
+            std::thread::spawn(move || shared.stop("stopped"))
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !stopper.is_finished(),
+            "stop waits for the enqueue in progress"
+        );
+        shared.queued_bytes.fetch_add(3000, Ordering::Relaxed);
+        shared.outstanding.fetch_add(1, Ordering::AcqRel);
+        shared.progress.send_modify(|p| p.accepted_frames += 1);
+        drop(queue);
+        stopper.join().unwrap();
+        let p = rx.borrow().clone();
+        assert_eq!(p.dropped_frames, 1);
+        assert!(p.settled());
+        drop(pacer);
     }
 
     #[tokio::test]

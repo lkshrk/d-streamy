@@ -63,13 +63,23 @@ impl FrameQueue {
                 self.frames.push_back(frame);
             }
             MediaFrame::Video(_) => {
+                let mut keyframe_dropped = false;
                 if !self.awaiting_keyframe && self.video_len >= self.max_video {
+                    keyframe_dropped = self
+                        .frames
+                        .iter()
+                        .any(|f| matches!(f, MediaFrame::Video(v) if v.keyframe));
                     effects.dropped_video = self.drop_video_before(self.frames.len());
                     self.awaiting_keyframe = true;
                 }
                 if self.awaiting_keyframe {
                     effects.dropped_video += 1;
-                    effects.request_keyframe = self.should_request(now);
+                    effects.request_keyframe = if keyframe_dropped {
+                        self.last_request = Some(now);
+                        true
+                    } else {
+                        self.should_request(now)
+                    };
                 } else {
                     self.video_len += 1;
                     self.frames.push_back(frame);
@@ -340,6 +350,24 @@ mod tests {
         assert!(
             q.video_lost(now, true).request_keyframe,
             "the requested keyframe was flushed"
+        );
+    }
+
+    #[test]
+    fn a_queued_keyframe_lost_to_overflow_is_asked_for_again_at_once() {
+        let now = Instant::now();
+        let mut q = FrameQueue::new(2, 8);
+        q.push(video(0, true), now);
+        q.pop();
+        q.push(video(33, false), now);
+        assert!(q.video_lost(now, false).request_keyframe);
+        q.push(video(66, true), now);
+        q.push(video(100, false), now);
+        let e = q.push(video(133, false), now);
+        assert_eq!(e.dropped_video, 3);
+        assert!(
+            e.request_keyframe,
+            "the queued keyframe was dropped, not delayed"
         );
     }
 

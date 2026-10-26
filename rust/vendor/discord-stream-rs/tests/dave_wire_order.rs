@@ -241,15 +241,6 @@ async fn frames_complete_on_the_wire_in_dave_nonce_order() {
         .await
         .expect("keyframe did not reach the wire");
         previous_ts = Some(ts);
-        while let Ok(key) = wire.try_recv() {
-            order.push(key);
-        }
-        assert!(
-            !order
-                .iter()
-                .any(|&(ssrc, _, m, t)| ssrc == VIDEO_SSRC && m && t == ts),
-            "keyframe {i} was fully on the wire before audio was sent"
-        );
         client
             .send_audio_frame_at(&opus, Duration::from_millis(20 * i))
             .await

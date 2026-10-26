@@ -160,7 +160,7 @@ impl MediaConnection {
         self.shared.keyframe_requests.clone()
     }
 
-    /// Drops queued video the pacer has not started; the frame being sent finishes. Never waits.
+    /// `VideoGate::flush`; never waits on the connection's lock.
     pub fn flush_video(&self) -> Flushed {
         self.shared.video_gate.flush()
     }
