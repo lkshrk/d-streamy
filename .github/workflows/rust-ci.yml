@@ -48,8 +48,9 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$archive" -C "${CARGO_HOME:-$HOME/.cargo}/bin" cargo-nextest
           cargo nextest --version
       - name: Build mock-producer
-        # Same command as mock_producer() in dstreamy-cli tests/support, so each test process finds it fresh.
-        run: cargo build --locked -p dstreamy-test-producer --bin mock-producer --profile dev
+        run: |
+          cargo build --locked -p dstreamy-test-producer --bin mock-producer
+          echo "DSTREAMY_MOCK_PRODUCER=$PWD/target/debug/mock-producer" >> "$GITHUB_ENV"
       - name: Tests except trace_replay
         run: >-
           cargo nextest run --workspace --locked --profile ci --test-threads 3
@@ -123,8 +124,9 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$archive" -C "${CARGO_HOME:-$HOME/.cargo}/bin" cargo-nextest
           cargo nextest --version
       - name: Build mock-producer
-        # Same command as mock_producer() in dstreamy-cli tests/support, so each test process finds it fresh.
-        run: cargo build --locked -p dstreamy-test-producer --bin mock-producer --profile dev
+        run: |
+          cargo build --locked -p dstreamy-test-producer --bin mock-producer
+          echo "DSTREAMY_MOCK_PRODUCER=$PWD/target/debug/mock-producer" >> "$GITHUB_ENV"
       - name: Tests except trace_replay
         run: >-
           cargo nextest run --workspace --locked --profile ci --test-threads 4
