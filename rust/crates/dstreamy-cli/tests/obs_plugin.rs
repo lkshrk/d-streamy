@@ -1,0 +1,422 @@
+//! Real OBS through the plugin: `obs-harness` loads `obs-dstreamy` and streams to `serve` + mock Discord; obs-ci only.
+#![cfg(target_os = "linux")]
+
+mod support;
+
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use dstreamy_mock_discord::{
+    MOCK_GUILD_ID, MOCK_VOICE_CHANNEL_ID, RecordedAudioFrame, RecordedVideoFrame,
+};
+use dstreamy_test_producer::sync::{self, H264LumaDecoder, OpusMonoDecoder, SAMPLE_RATE};
+use serde_json::{Value, json};
+use support::*;
+
+const VIDEO_HZ: i64 = 90_000;
+const AUDIO_HZ: i64 = 48_000;
+const OBS_FPS: i64 = 30;
+const MODULES: &str = "image-source,obs-x264,obs-ffmpeg,obs-dstreamy";
+const HARNESS_EXIT: Duration = Duration::from_secs(120);
+
+struct ObsEnv {
+    harness: PathBuf,
+    plugin_bin: String,
+    plugin_data: String,
+}
+
+fn obs_env() -> ObsEnv {
+    let var = |name: &str| {
+        std::env::var(name).unwrap_or_else(|_| {
+            panic!("{name} is unset: set DSTREAMY_OBS_HARNESS, DSTREAMY_OBS_PLUGIN_BIN and DSTREAMY_OBS_PLUGIN_DATA")
+        })
+    };
+    ObsEnv {
+        harness: var("DSTREAMY_OBS_HARNESS").into(),
+        plugin_bin: var("DSTREAMY_OBS_PLUGIN_BIN"),
+        plugin_data: var("DSTREAMY_OBS_PLUGIN_DATA"),
+    }
+}
+
+/// An `obs-harness` run whose output lines are collected.
+struct HarnessRun {
+    child: Child,
+    lines: Arc<Mutex<Vec<String>>>,
+    readers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl HarnessRun {
+    fn start(h: &Harness, settings: Value, args: &[&str]) -> Self {
+        let env = obs_env();
+        let mut settings = settings;
+        settings["endpoint"] = json!(h.endpoint());
+        let trace_dir = h.dir.path().join("harness-trace");
+        let mut child = Command::new(&env.harness)
+            .args(["--output", "dstreamy_output", "--video-encoder", "obs_x264"])
+            .args(["--audio-encoder", "ffmpeg_opus", "--modules", MODULES])
+            .args(["--bf", "0", "--keyint-sec", "2", "--profile", "main"])
+            .arg("--plugin-bin")
+            .arg(&env.plugin_bin)
+            .arg("--plugin-data")
+            .arg(&env.plugin_data)
+            .arg("--trace-dir")
+            .arg(&trace_dir)
+            .arg("--output-settings")
+            .arg(settings.to_string())
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("{}: {e}", env.harness.display()));
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let mut readers = Vec::new();
+        let out: Box<dyn std::io::Read + Send> = Box::new(child.stdout.take().unwrap());
+        let err: Box<dyn std::io::Read + Send> = Box::new(child.stderr.take().unwrap());
+        for pipe in [out, err] {
+            let sink = lines.clone();
+            readers.push(std::thread::spawn(move || {
+                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    eprintln!("obs-harness: {line}");
+                    sink.lock().unwrap().push(line);
+                }
+            }));
+        }
+        Self {
+            child,
+            lines,
+            readers,
+        }
+    }
+
+    fn lines(&self) -> Vec<String> {
+        self.lines.lock().unwrap().clone()
+    }
+
+    fn finish(mut self) -> (ExitStatus, Vec<String>) {
+        let deadline = Instant::now() + HARNESS_EXIT;
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                panic!("obs-harness did not exit; output {:#?}", self.lines());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+        (status, self.lines())
+    }
+}
+
+impl Drop for HarnessRun {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn passed(status: ExitStatus, lines: &[String]) {
+    assert!(
+        status.success() && lines.iter().any(|l| l == "HARNESS result=PASS"),
+        "obs-harness failed ({status}): {lines:#?}"
+    );
+}
+
+fn has_line(lines: &[String], prefix: &str) -> bool {
+    lines.iter().any(|l| l.starts_with(prefix))
+}
+
+fn number_after(lines: &[String], key: &str) -> u64 {
+    lines
+        .iter()
+        .find_map(|l| l.split(key).nth(1)?.split_whitespace().next()?.parse().ok())
+        .unwrap_or_else(|| panic!("no {key} in the harness output"))
+}
+
+/// An external session at the harness's canvas, streaming at the mock.
+fn obs_session(h: &Harness) -> Client {
+    let mut c = h.control();
+    c.send(&json!({
+        "id": "start", "cmd": "start", "guild_id": MOCK_GUILD_ID,
+        "channel_id": MOCK_VOICE_CHANNEL_ID, "target": "external",
+        "resolution": "1280x720", "fps": OBS_FPS, "bitrate_kbps": 2500,
+    }));
+    let reply = c.reply("start");
+    assert_eq!(reply["type"], "result", "{reply}");
+    c.until("streaming", |m| m["event"]["state"]["state"] == "streaming");
+    c
+}
+
+/// CLOCK_MONOTONIC in ns, the clock of both std `Instant` on Linux and libobs `os_gettime_ns`.
+fn monotonic_ns(at: Instant) -> i64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let now = Instant::now();
+    // SAFETY: `ts` is a valid out pointer.
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) },
+        0
+    );
+    let now_ns = ts.tv_sec * 1_000_000_000 + ts.tv_nsec;
+    now_ns - i64::try_from(now.duration_since(at).as_nanos()).unwrap()
+}
+
+fn luma_frames(video: &[&RecordedVideoFrame]) -> Vec<sync::LumaFrame> {
+    let mut decoder = H264LumaDecoder::new().unwrap();
+    let mut frames = Vec::new();
+    for (i, v) in video.iter().enumerate() {
+        frames.extend(
+            decoder
+                .decode(&v.data, rtp_us(v.rtp_timestamp, VIDEO_HZ))
+                .unwrap_or_else(|e| panic!("video {i} does not decode: {e}")),
+        );
+    }
+    frames.extend(decoder.finish().unwrap());
+    frames
+}
+
+fn pcm(audio: &[&RecordedAudioFrame]) -> Vec<f32> {
+    let mut opus = OpusMonoDecoder::new().unwrap();
+    let mut pcm = Vec::new();
+    for (i, a) in audio.iter().enumerate() {
+        let samples = opus
+            .decode(&a.data)
+            .unwrap_or_else(|e| panic!("audio {i} does not decode: {e}"));
+        assert_eq!(samples.len(), 960, "audio {i}: 20 ms");
+        pcm.extend(samples);
+    }
+    pcm
+}
+
+/// Flash/beep pairs on `serve`'s timeline; each beep within a quarter frame of half a frame after its flash.
+fn markers(video: &[&RecordedVideoFrame], audio: &[&RecordedAudioFrame]) -> Vec<sync::MarkerPair> {
+    let frames = luma_frames(video);
+    let flashes = sync::flash_onsets(&frames);
+    let pcm = pcm(audio);
+    let start_us = rtp_us(audio[0].rtp_timestamp, AUDIO_HZ);
+    let beeps = sync::beep_onsets(&pcm, start_us, SAMPLE_RATE);
+    let frame_us = 1_000_000 / OBS_FPS;
+    let video_span = (frames[0].pts_us, frames.last().unwrap().pts_us);
+    let audio_span = (
+        start_us,
+        start_us + sync::samples_to_us(pcm.len(), SAMPLE_RATE),
+    );
+    let pairs = sync::align(&flashes, &beeps, video_span, audio_span, frame_us)
+        .unwrap_or_else(|e| panic!("{e}; flashes {flashes:?}, beeps {beeps:?}"));
+    sync::check_offsets(&pairs, frame_us / 2, frame_us / 4)
+        .unwrap_or_else(|e| panic!("{e}; pairs {pairs:?}"));
+    pairs
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn obs_streams_through_the_plugin_in_sync_and_within_a_second() {
+    let h = Harness::new("");
+    let _serve = h.serve();
+    let mut c = obs_session(&h);
+    let run = HarnessRun::start(
+        &h,
+        json!({}),
+        &["--seconds", "90", "--until-video", "300", "--verbose"],
+    );
+    let (status, lines) = run.finish();
+    passed(status, &lines);
+    c.source("the attachment ending at end of stream", |e| {
+        e["reason"] == "detached"
+    });
+
+    let recorded = h.mock.recorded();
+    let video = stream_video(&recorded);
+    let audio = producer_audio(&recorded);
+    assert!(
+        video.len() >= 270,
+        "{} of the 300 video frames reached the mock",
+        video.len()
+    );
+    assert!(is_keyframe(&video[0].data), "the first video is an IDR");
+    increasing(
+        "video",
+        &video.iter().map(|v| v.rtp_timestamp).collect::<Vec<_>>(),
+    );
+    increasing(
+        "audio",
+        &audio.iter().map(|a| a.rtp_timestamp).collect::<Vec<_>>(),
+    );
+    decodes(&video, &audio);
+    let pairs = markers(&video, &audio);
+    assert!(pairs.len() >= 7, "only {} flash/beep pairs", pairs.len());
+
+    let first_us = rtp_us(video[0].rtp_timestamp, VIDEO_HZ);
+    let flash_frame = |p: &sync::MarkerPair| {
+        video
+            .iter()
+            .find(|v| rtp_us(v.rtp_timestamp, VIDEO_HZ) == p.flash_us)
+            .expect("the flash onset is a recorded frame")
+    };
+
+    // The plugin logs when each keyframe reached `encoded_packet`; x264's scenecut makes every flash an IDR.
+    let keyframes: Vec<(i64, i64)> = lines
+        .iter()
+        .filter_map(|l| {
+            let rest = l.split("[obs-dstreamy] sent keyframe pts_us=").nth(1)?;
+            let (pts, arrived) = rest.split_once(" arrived_ns=")?;
+            Some((pts.parse().ok()?, arrived.trim().parse().ok()?))
+        })
+        .collect();
+    assert!(!keyframes.is_empty(), "the plugin logged no keyframes");
+    let offset_us = first_us - keyframes[0].0;
+    let encode_to_mock: Vec<i64> = pairs
+        .iter()
+        .filter_map(|p| {
+            let (_, arrived) = keyframes
+                .iter()
+                .find(|(pts, _)| (pts + offset_us - p.flash_us).abs() <= 1_000)?;
+            Some((monotonic_ns(flash_frame(p).received_at) - arrived) / 1_000_000)
+        })
+        .collect();
+
+    // Each flash is rendered at base + k * period; its pts since the first frame says which k.
+    let base = i64::try_from(number_after(&lines, "base_ns=")).unwrap();
+    let period = i64::try_from(number_after(&lines, "period_ns=")).unwrap();
+    let capture = i64::try_from(number_after(&lines, "capture_start_ns=")).unwrap();
+    let render_to_mock: Vec<i64> = pairs
+        .iter()
+        .map(|p| {
+            let estimate = capture + (p.flash_us - first_us) * 1000;
+            let k = (estimate - base + period / 2).div_euclid(period);
+            (monotonic_ns(flash_frame(p).received_at) - (base + k * period)) / 1_000_000
+        })
+        .collect();
+    eprintln!(
+        "per flash, ms: encode-to-mock {encode_to_mock:?}, render-to-mock {render_to_mock:?}"
+    );
+    assert!(
+        encode_to_mock.len() * 2 >= pairs.len(),
+        "only {} of {} flashes matched a logged keyframe",
+        encode_to_mock.len(),
+        pairs.len()
+    );
+    assert!(
+        encode_to_mock.iter().all(|&ms| (0..1000).contains(&ms)),
+        "encode-to-mock latency outside [0, 1000) ms: {encode_to_mock:?}"
+    );
+    assert!(
+        render_to_mock.iter().all(|&ms| ms >= 0),
+        "a flash reached the mock before OBS rendered it: {render_to_mock:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_killed_service_stops_the_output_with_an_error_and_obs_keeps_running() {
+    let h = Harness::new("");
+    let mut serve = h.serve();
+    let _c = obs_session(&h);
+    let run = HarnessRun::start(
+        &h,
+        json!({}),
+        &[
+            "--seconds",
+            "20",
+            "--until-video",
+            "100000",
+            "--expect-error",
+            "Lost the D-Streamy service",
+        ],
+    );
+    h.wait("60 video frames from OBS", |r| {
+        (stream_video(r).len() >= 60).then_some(())
+    });
+    serve.kill();
+    let (status, lines) = run.finish();
+    passed(status, &lines);
+    assert!(
+        has_line(
+            &lines,
+            "HARNESS expected_error code=-4: Lost the D-Streamy service"
+        ),
+        "{lines:#?}"
+    );
+    assert!(
+        has_line(&lines, "HARNESS alive after the stop: "),
+        "{lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_panic_in_encoded_packet_stops_the_output_with_an_error() {
+    let h = Harness::new("");
+    let _serve = h.serve();
+    let mut c = obs_session(&h);
+    let run = HarnessRun::start(
+        &h,
+        json!({"panic_at_packet": 50}),
+        &[
+            "--seconds",
+            "15",
+            "--until-video",
+            "100000",
+            "--expect-panics",
+            "1",
+            "--expect-error",
+            "panic caught in encoded_packet: test panic at packet 50",
+        ],
+    );
+    let (status, lines) = run.finish();
+    passed(status, &lines);
+    assert!(
+        has_line(
+            &lines,
+            "HARNESS expected_error code=-4: D-Streamy plugin error (panic caught in encoded_packet"
+        ),
+        "{lines:#?}"
+    );
+    assert!(has_line(&lines, "HARNESS alive after the stop: "));
+    c.source("the attachment ending at end of stream", |e| {
+        e["reason"] == "detached"
+    });
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_panic_in_stop_still_stops_the_output_with_an_error() {
+    let h = Harness::new("");
+    let _serve = h.serve();
+    let mut c = obs_session(&h);
+    let run = HarnessRun::start(
+        &h,
+        json!({"panic_in": "stop"}),
+        &[
+            "--seconds",
+            "60",
+            "--until-video",
+            "60",
+            "--expect-panics",
+            "1",
+            "--expect-error",
+            "panic caught in stop: test panic in Stop",
+        ],
+    );
+    let (status, lines) = run.finish();
+    passed(status, &lines);
+    assert!(
+        has_line(
+            &lines,
+            "HARNESS expected_error code=-4: D-Streamy plugin error (panic caught in stop"
+        ),
+        "{lines:#?}"
+    );
+    c.source("the attachment ending at end of stream", |e| {
+        e["reason"] == "detached"
+    });
+}

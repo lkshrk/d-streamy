@@ -53,6 +53,7 @@ struct harness_args {
 	const char *preset;
 	const char *note;
 	const char *x264opts;
+	const char *expect_error;
 	int seconds;
 	int fps;
 	int width;
@@ -443,19 +444,34 @@ static struct obs_output_info trace_output_info = {
 };
 
 static volatile long long stop_code;
+// Written by the first failing stop signal before it signals the events the main thread waits on.
+static char *stop_error;
 
 static void on_output_stop(void *param, calldata_t *cd)
 {
 	UNUSED_PARAMETER(param);
 	long long code = calldata_int(cd, "code");
-	if (code != OBS_OUTPUT_SUCCESS && stop_code == OBS_OUTPUT_SUCCESS)
+	if (code != OBS_OUTPUT_SUCCESS && stop_code == OBS_OUTPUT_SUCCESS) {
+		const char *err = calldata_string(cd, "last_error");
+		stop_error = bstrdup(err ? err : "");
 		stop_code = code;
+	}
 	if (code != OBS_OUTPUT_SUCCESS) {
 		const char *err = calldata_string(cd, "last_error");
-		harness_error("output stopped with code %lld: %s", code, err ? err : "(none)");
+		if (args.expect_error)
+			printf("HARNESS output stopped with code %lld: %s\n", code, err ? err : "(none)");
+		else
+			harness_error("output stopped with code %lld: %s", code, err ? err : "(none)");
 	}
 	os_event_signal(stopped_event);
 	os_event_signal(full_event);
+}
+
+static void on_output_start(void *param, calldata_t *cd)
+{
+	UNUSED_PARAMETER(param);
+	UNUSED_PARAMETER(cd);
+	printf("HARNESS capture_start_ns=%" PRIu64 "\n", os_gettime_ns());
 }
 
 static void usage(void)
@@ -464,6 +480,8 @@ static void usage(void)
 		"usage: obs-harness [--trace-dir DIR] [--seconds N] [--fps N] [--width N] [--height N]\n"
 		"  [--video-encoder ID] [--audio-encoder ID] [--output ID] [--output-settings JSON] [--expect-panics N]\n"
 		"  [--until-video N (plugin output: run until it counted N video packets; --seconds is the timeout)]\n"
+		"  [--expect-error TEXT (pass only if the output fails to start or stops with an error containing TEXT;\n"
+		"   after a stop OBS keeps running until --seconds)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
 		"  [--modules a,b,c] [--plugin-bin DIR --plugin-data DIR] [--note TEXT] [--x264opts OPTS] [--verbose]\n");
@@ -531,6 +549,8 @@ static int parse_args(int argc, char **argv)
 			ok = parse_int(a, v, 0, &args.expect_panics);
 		else if (strcmp(a, "--until-video") == 0)
 			ok = parse_int(a, v, 1, &args.until_video);
+		else if (strcmp(a, "--expect-error") == 0)
+			args.expect_error = v;
 		else if (strcmp(a, "--trace-dir") == 0)
 			args.trace_dir = v;
 		else if (strcmp(a, "--plugin-bin") == 0)
@@ -616,19 +636,56 @@ static bool wait_for_plugin_video(obs_output_t *output)
 	while (os_gettime_ns() < deadline) {
 		if (!output_stats(output, &st))
 			return false;
-		if (st.video >= args.until_video && st.panics >= args.expect_panics) {
+		// With --expect-error a panic may come only at stop, so it is checked after shutdown instead.
+		if (st.video >= args.until_video && (args.expect_error || st.panics >= args.expect_panics)) {
 			printf("HARNESS reached video=%lld after %llu ms\n", st.video,
 			       (unsigned long long)((os_gettime_ns() - start) / 1000000));
 			return true;
 		}
 		if (os_event_timedwait(full_event, 100) == 0) {
 			output_stats(output, &st);
-			harness_error("output stopped after %lld of %d video packets", st.video, args.until_video);
+			if (args.expect_error)
+				printf("HARNESS output stopped after %lld of %d video packets\n", st.video,
+				       args.until_video);
+			else
+				harness_error("output stopped after %lld of %d video packets", st.video,
+					      args.until_video);
 			return false;
 		}
 	}
 	harness_error("plugin counted %lld of %d video packets within %d s", st.video, args.until_video, args.seconds);
 	return false;
+}
+
+static bool contains_expected_error(const char *err)
+{
+	return args.expect_error && err && strstr(err, args.expect_error);
+}
+
+static bool stopped_with_expected_error(void)
+{
+	if (stop_code != OBS_OUTPUT_SUCCESS && contains_expected_error(stop_error)) {
+		printf("HARNESS expected_error code=%lld: %s\n", stop_code, stop_error);
+		return true;
+	}
+	harness_error("expected an output error containing \"%s\", got code %lld: %s", args.expect_error, stop_code,
+		      stop_error ? stop_error : "(none)");
+	return false;
+}
+
+static bool stay_alive_until(uint64_t start_ns)
+{
+	uint64_t deadline = start_ns + (uint64_t)args.seconds * 1000000000ULL;
+	uint32_t frames = obs_get_total_frames();
+	while (os_gettime_ns() < deadline)
+		os_sleep_ms(50);
+	uint32_t rendered = obs_get_total_frames() - frames;
+	printf("HARNESS alive after the stop: %u more frames rendered\n", rendered);
+	if (!rendered) {
+		harness_error("OBS stopped rendering after the output stopped");
+		return false;
+	}
+	return true;
 }
 
 static bool check_output_stats(obs_output_t *output, obs_encoder_t *aenc)
@@ -895,6 +952,7 @@ int main(int argc, char **argv)
 	// Mid-frame, so the beep - flash offset is about half a frame instead of anywhere in [0, 1) frames.
 	marker_base_ns = obs_get_video_frame_time() + util_mul_div64(FLASH_PERIOD_NS, 1, interval_ns) * interval_ns +
 			 interval_ns / 2;
+	printf("HARNESS markers base_ns=%" PRIu64 " period_ns=%llu\n", marker_base_ns, FLASH_PERIOD_NS);
 
 	obs_data_t *cs = obs_data_create();
 	obs_data_set_int(cs, "color", DARK_COLOR);
@@ -950,15 +1008,21 @@ int main(int argc, char **argv)
 	obs_output_set_video_encoder(output, venc);
 	obs_output_set_audio_encoder(output, aenc, 0);
 	signal_handler_connect(obs_output_get_signal_handler(output), "stop", on_output_stop, NULL);
+	signal_handler_connect(obs_output_get_signal_handler(output), "start", on_output_start, NULL);
 
 	if (!obs_output_start(output)) {
 		const char *err = obs_output_get_last_error(output);
+		if (contains_expected_error(err)) {
+			printf("HARNESS expected_error start: %s\n", err);
+			goto cleanup;
+		}
 		const char *verr = obs_encoder_get_last_error(venc);
 		const char *aerr = obs_encoder_get_last_error(aenc);
 		FAIL("obs_output_start: %s (video encoder: %s, audio encoder: %s)", err ? err : "(no error)",
 		     verr ? verr : "-", aerr ? aerr : "-");
 	}
 	started = true;
+	uint64_t start_ns = os_gettime_ns();
 	printf("HARNESS obs_output_start=ok\n");
 	struct frame_counts at_start = frame_counts();
 
@@ -966,7 +1030,14 @@ int main(int argc, char **argv)
 	if (!recording) {
 		if (!args.until_video)
 			FAIL("--output %s needs --until-video", args.output_id);
-		if (!wait_for_plugin_video(output))
+		bool reached = wait_for_plugin_video(output);
+		if (!reached && args.expect_error && os_event_try(full_event) == 0) {
+			started = false;
+			if (!stopped_with_expected_error() || !stay_alive_until(start_ns))
+				rc = 1;
+			goto cleanup;
+		}
+		if (!reached)
 			rc = 1;
 	} else if (os_event_timedwait(full_event, budget_ms) != 0)
 		FAIL("no %d s of video within %lu ms", args.seconds, budget_ms);
@@ -984,6 +1055,12 @@ int main(int argc, char **argv)
 		os_sleep_ms(10);
 	}
 	started = false;
+
+	if (args.expect_error) {
+		if (!stopped_with_expected_error())
+			rc = 1;
+		goto cleanup;
+	}
 
 	if (!recording) {
 		if (!check_output_stats(output, aenc))
@@ -1032,6 +1109,7 @@ cleanup:
 	}
 	os_event_destroy(stopped_event);
 	os_event_destroy(full_event);
+	bfree(stop_error);
 
 	long errors = os_atomic_load_long(&obs_errors);
 	if (errors) {

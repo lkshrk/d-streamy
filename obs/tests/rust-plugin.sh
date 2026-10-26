@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # usage: rust-plugin.sh <obs-harness> <plugin-bin-path> <plugin-data-path> <log-dir> [harness args...] (macOS paths: %module% patterns)
+# Runs without a D-Streamy service; streaming through `dstreamy serve` is rust/crates/dstreamy-cli/tests/obs_plugin.rs.
 set -euo pipefail
 
 harness=$1
@@ -35,17 +36,28 @@ expect() {
   fi
 }
 
+if [[ ${OS:-} == Windows_NT ]]; then
+  absent="/dstreamy-absent/d/s.sock"
+  not_running="D-Streamy does not support Windows yet"
+  not_running_line="^HARNESS expected_error code=-2: D-Streamy does not support Windows yet"
+else
+  absent="${TMPDIR:-/tmp}/dstreamy-absent-$$/d/s.sock"
+  not_running="The D-Streamy service is not running"
+  not_running_line="^HARNESS expected_error code=-2: The D-Streamy service is not running \(no service is listening at $absent\)"
+fi
 
-run load "$@"
-expect load '\[obs-dstreamy\] loaded \(version '
-expect load "^HARNESS output=dstreamy_output .* panics=0 "
-expect load 'HARNESS shutdown libobs_leaks=0'
-expect load 'HARNESS result=PASS'
+run not-running --seconds 3 --output-settings "{\"endpoint\": \"$absent\"}" --expect-error "$not_running" "$@"
+expect not-running '\[obs-dstreamy\] loaded \(version '
+expect not-running "$not_running_line"
+expect not-running '^HARNESS alive after the stop: [1-9][0-9]* more frames rendered'
+expect not-running 'HARNESS shutdown libobs_leaks=0'
+expect not-running 'HARNESS result=PASS'
 
-run panic --output-settings '{"panic_at_packet": 5}' --expect-panics 1 "$@"
-expect panic '\[obs-dstreamy\] panic caught in encoded_packet: test panic at packet 5'
-expect panic "^HARNESS output=dstreamy_output .* panics=1 "
-expect panic 'HARNESS shutdown libobs_leaks=0'
-expect panic 'HARNESS result=PASS'
+run start-panic --output-settings '{"panic_in": "start"}' --expect-panics 1 \
+  --expect-error "panic caught in start: test panic in Start" "$@"
+expect start-panic '\[obs-dstreamy\] panic caught in start: test panic in Start'
+expect start-panic '^HARNESS expected_error start: D-Streamy plugin error \(panic caught in start'
+expect start-panic 'HARNESS shutdown libobs_leaks=0'
+expect start-panic 'HARNESS result=PASS'
 
 echo "rust-plugin: PASS"
