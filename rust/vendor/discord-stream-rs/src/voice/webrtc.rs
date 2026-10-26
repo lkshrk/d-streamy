@@ -51,6 +51,10 @@ pub const DEFAULT_ICE_SERVERS: &[&str] = &["stun:stun.l.google.com:19302"];
 
 /// Video pacing rate of the JS reference (`PacingHandler(25 * 1000 * 1000, 1)`).
 pub const VIDEO_PACING_BITS_PER_SECOND: f64 = 25_000_000.0;
+/// What the pacer may send at once after waiting for a frame, as the reference's one-millisecond bucket.
+const PACING_IDLE_BURST: Duration = Duration::from_millis(1);
+/// Send time lost while backlogged (oversleeping, a slow encrypt, a stall) is made up only this far, so a long stall cannot become a long burst.
+pub const PACING_MAX_DEBT: Duration = Duration::from_millis(20);
 
 const AUDIO_PLAYOUT_DELAY: (u16, u16) = (0, 1);
 const VIDEO_PLAYOUT_DELAY: (u16, u16) = (0, 10);
@@ -263,13 +267,16 @@ impl PacerQueue {
         self.frames.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    async fn next(&self) -> PacedFrame {
+    /// The next frame, and whether the pacer had to wait for it.
+    async fn next(&self) -> (PacedFrame, bool) {
+        let mut waited = false;
         loop {
             let notified = self.ready.notified();
             if let Some(frame) = self.lock().pop_front() {
-                return frame;
+                return (frame, waited);
             }
             notified.await;
+            waited = true;
         }
     }
 }
@@ -411,14 +418,46 @@ impl Drop for PacerExit {
     }
 }
 
+/// When each video packet may go out: a deadline that advances by the packet's time on the wire.
+struct Pacing {
+    bytes_per_second: f64,
+    next: Instant,
+}
+
+impl Pacing {
+    fn new(bytes_per_second: f64, now: Instant) -> Self {
+        Self {
+            bytes_per_second,
+            next: earlier(now, PACING_IDLE_BURST),
+        }
+    }
+
+    fn idle(&mut self, now: Instant) {
+        self.next = self.next.max(earlier(now, PACING_IDLE_BURST));
+    }
+
+    /// When a packet of `size` bytes may be sent.
+    fn reserve(&mut self, size: usize, now: Instant) -> Instant {
+        self.next = self.next.max(earlier(now, PACING_MAX_DEBT));
+        let at = self.next;
+        self.next += Duration::from_secs_f64(size as f64 / self.bytes_per_second);
+        at
+    }
+}
+
+fn earlier(now: Instant, by: Duration) -> Instant {
+    now.checked_sub(by).unwrap_or(now)
+}
+
 /// DAVE-encrypts each frame when it is sent, so nonces follow wire order on both tracks.
 async fn run_pacer(shared: Arc<PacerShared>, bytes_per_second: f64) {
     let _exit = PacerExit(shared.clone());
-    let burst = bytes_per_second / 1000.0;
-    let mut budget = burst;
-    let mut last = Instant::now();
+    let mut pacing = Pacing::new(bytes_per_second, Instant::now());
     loop {
-        let frame = shared.queue.next().await;
+        let (frame, waited) = shared.queue.next().await;
+        if waited {
+            pacing.idle(Instant::now());
+        }
         let order = shared.send_order.lock().await;
         if frame.generation < shared.gate.generation() {
             drop(order);
@@ -453,17 +492,9 @@ async fn run_pacer(shared: Arc<PacerShared>, bytes_per_second: f64) {
         };
         let mut write_error = None;
         for packet in &packets {
-            let size = (packet.payload.len() + 12) as f64;
-            loop {
-                let now = Instant::now();
-                budget = (budget + now.duration_since(last).as_secs_f64() * bytes_per_second)
-                    .min(burst.max(size));
-                last = now;
-                if budget >= size {
-                    budget -= size;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+            let at = pacing.reserve(packet.payload.len() + 12, Instant::now());
+            if at > Instant::now() {
+                tokio::time::sleep_until(at).await;
             }
             if let Err(e) = shared.track.write_rtp(packet).await {
                 write_error.get_or_insert(e);
@@ -1101,6 +1132,8 @@ mod tests {
         Hangs,
         /// Holds every write until opened; records the RTP timestamp of each frame's marker packet.
         Gate(Arc<watch::Sender<bool>>, Arc<StdMutex<Vec<u32>>>),
+        /// Records when each packet was written and its size on the wire; stalls after packet `n` for `stall(n)`.
+        Timed(Arc<StdMutex<Vec<(Instant, usize)>>>, fn(usize) -> Duration),
     }
 
     #[async_trait]
@@ -1118,6 +1151,18 @@ mod tests {
                     let _ = open.subscribe().wait_for(|o| *o).await;
                     if pkt.header.marker {
                         written.lock().unwrap().push(pkt.header.timestamp);
+                    }
+                    Ok(pkt.payload.len())
+                }
+                TestWriter::Timed(writes, stall) => {
+                    let n = {
+                        let mut writes = writes.lock().unwrap();
+                        writes.push((Instant::now(), pkt.payload.len() + 12));
+                        writes.len()
+                    };
+                    let pause = stall(n);
+                    if !pause.is_zero() {
+                        tokio::time::sleep(pause).await;
                     }
                     Ok(pkt.payload.len())
                 }
@@ -1287,6 +1332,103 @@ mod tests {
         assert_eq!(lost, 3);
         assert_eq!(pacer.flush().frames, 0);
         assert_eq!(rx.borrow().flushed_frames, 0);
+    }
+
+    const BYTES_PER_SECOND: f64 = VIDEO_PACING_BITS_PER_SECOND / 8.0;
+
+    fn sized(pts_ms: u64, bytes: usize) -> PacedFrame {
+        PacedFrame {
+            data: vec![0, 0, 0, 1, 0x41]
+                .into_iter()
+                .chain(std::iter::repeat_n(7, bytes - 5))
+                .collect(),
+            codec: VideoCodec::H264,
+            timing: Timing::Pts(Duration::from_millis(pts_ms)),
+            generation: 0,
+        }
+    }
+
+    /// Paces `frames` frames of 100 KB through a writer that stalls as `stall` says; returns each write's time and size.
+    async fn paced(frames: u64, stall: fn(usize) -> Duration) -> Vec<(Instant, usize)> {
+        let writes = Arc::new(StdMutex::new(Vec::new()));
+        let (pacer, mut rx) = pacer(TestWriter::Timed(writes.clone(), stall)).await;
+        for i in 0..frames {
+            pacer.enqueue(sized(33 * i, 100_000)).unwrap();
+        }
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            rx.wait_for(|p| p.sent_frames >= frames),
+        )
+        .await
+        .expect("all frames written")
+        .unwrap();
+        writes.lock().unwrap().clone()
+    }
+
+    fn rate(writes: &[(Instant, usize)]) -> f64 {
+        let span = writes.last().unwrap().0 - writes[0].0;
+        let bytes: usize = writes[..writes.len() - 1].iter().map(|w| w.1).sum();
+        bytes as f64 / span.as_secs_f64()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_pacer_sends_at_the_configured_rate() {
+        let writes = paced(12, |_| Duration::ZERO).await;
+        let rate = rate(&writes);
+        assert!((rate / BYTES_PER_SECOND - 1.0).abs() < 0.02, "{rate} B/s");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn time_lost_to_a_late_wakeup_is_made_up() {
+        // Every tenth write takes 2 ms longer, as a timer that oversleeps or a slow encrypt does.
+        let writes = paced(12, |n| {
+            Duration::from_millis(if n % 10 == 0 { 2 } else { 0 })
+        })
+        .await;
+        let rate = rate(&writes);
+        assert!(
+            rate / BYTES_PER_SECOND > 0.97,
+            "{rate} B/s of {BYTES_PER_SECOND}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_stall_is_made_up_by_at_most_the_debt_bound() {
+        let writes = paced(6, |n| Duration::from_millis(if n == 20 { 200 } else { 0 })).await;
+        let resumed = writes[20].0;
+        let burst: usize = writes[20..]
+            .iter()
+            .filter(|w| w.0 == resumed)
+            .map(|w| w.1)
+            .sum();
+        let bound = BYTES_PER_SECOND * PACING_MAX_DEBT.as_secs_f64() + 1300.0;
+        assert!(
+            burst as f64 <= bound,
+            "{burst} bytes at once after a 200 ms stall"
+        );
+        assert!(
+            burst as f64 >= bound / 2.0,
+            "the stall's time is still partly made up: {burst}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn after_waiting_for_a_frame_at_most_one_millisecond_goes_at_once() {
+        let writes = Arc::new(StdMutex::new(Vec::new()));
+        let (pacer, mut rx) = pacer(TestWriter::Timed(writes.clone(), |_| Duration::ZERO)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        pacer.enqueue(sized(0, 100_000)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|p| p.sent_frames >= 1))
+            .await
+            .unwrap()
+            .unwrap();
+        let writes = writes.lock().unwrap().clone();
+        let first = writes[0].0;
+        let burst: usize = writes.iter().filter(|w| w.0 == first).map(|w| w.1).sum();
+        assert!(
+            burst as f64 <= BYTES_PER_SECOND / 1000.0 + 1300.0,
+            "{burst} bytes at once after idle"
+        );
     }
 
     async fn started(pacer: &Pacer, queued: usize) {
