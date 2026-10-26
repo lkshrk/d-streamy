@@ -72,6 +72,8 @@ impl Family {
 pub struct EncoderSettings {
     pub id: String,
     pub codec: String,
+    /// The video format the encoder is fed, as libobs's `VIDEO_FORMAT_` name without the prefix ("NV12").
+    pub format: Option<String>,
     values: Map<String, Value>,
     user: Map<String, Value>,
 }
@@ -105,6 +107,7 @@ impl EncoderSettings {
         Self {
             id: id.to_owned(),
             codec: codec.to_owned(),
+            format: None,
             values,
             user,
         }
@@ -147,6 +150,7 @@ pub enum Problem {
     Fps { num: u32, den: u32 },
     Audio { detail: String },
     StreamNotRunning,
+    ColorFormat { format: String },
 }
 
 impl Problem {
@@ -187,6 +191,9 @@ impl Problem {
                 )
             }
             Self::Audio { detail } => format!("D-Streamy's audio encoder {detail}"),
+            Self::ColorFormat { format } => format!(
+                "D-Streamy needs an 8-bit 4:2:0 color format (NV12 or I420), not {format}: Settings › Advanced › Color Format"
+            ),
             Self::StreamNotRunning => {
                 "D-Streamy can share the stream's encoder only while streaming: start streaming first, or use D-Streamy's own encoder".into()
             }
@@ -259,16 +266,28 @@ fn x264_b_frames(s: &EncoderSettings) -> i64 {
     if let Some(bf) = s.user_int("bf") {
         b = bf;
     }
-    if s.string("profile").eq_ignore_ascii_case("baseline") {
+    if s.string("profile").eq_ignore_ascii_case("baseline") && x264_baseline_applies(s) {
         b = 0;
     }
     b
 }
 
+/// x264_param_apply_profile gives up before zeroing B-frames for 4:4:4 input and for lossless CRF (x264 base.c:761-770),
+/// and obs-x264 only warns (obs-x264.c:293-299); obs-x264 feeds x264 4:4:4 only from I444 (:482-489).
+fn x264_baseline_applies(s: &EncoderSettings) -> bool {
+    let crf_mode = ["VBR", "CRF"]
+        .iter()
+        .any(|m| s.string("rate_control").eq_ignore_ascii_case(m));
+    let lossless = crf_mode && s.int("crf") <= 0;
+    !lossless && s.format.as_deref() != Some("I444")
+}
+
 /// NVENC's Ultra High Quality tuning forces at least 4 B-frames, except in lossless mode (nvenc.c:201-202,241,259-260,294-298).
 fn nvenc_b_frames(s: &EncoderSettings) -> i64 {
-    let uhq =
-        s.string("tune").eq_ignore_ascii_case("uhq") && s.string("rate_control") != "lossless";
+    // ffmpeg_nvenc at the pin is obs-ffmpeg's FFmpeg NVENC, which passes the tune to FFmpeg without forcing B-frames.
+    let uhq = s.id != "ffmpeg_nvenc"
+        && s.string("tune").eq_ignore_ascii_case("uhq")
+        && s.string("rate_control") != "lossless";
     if uhq { s.int("bf").max(4) } else { s.int("bf") }
 }
 
@@ -306,7 +325,25 @@ pub fn check_video_encoder(s: &EncoderSettings) -> Vec<Problem> {
     if !(1..=2).contains(&seconds) {
         problems.push(Problem::KeyframeInterval { family, seconds });
     }
+    if let Some(format) = &s.format {
+        problems.extend(check_format(format));
+    }
     problems
+}
+
+/// 4:4:4, 4:2:2 and high-bit-depth formats give profiles most H.264 decoders lack (obs-x264.c:482-489 emits 4:4:4).
+pub fn check_format(format: &str) -> Vec<Problem> {
+    const REFUSED: [&str; 14] = [
+        "I444", "I422", "I412", "I210", "I010", "P010", "P216", "P416", "YUVA", "I42A", "AYUV",
+        "YA2L", "V210", "R10L",
+    ];
+    if REFUSED.contains(&format) {
+        vec![Problem::ColorFormat {
+            format: format.to_owned(),
+        }]
+    } else {
+        Vec::new()
+    }
 }
 
 /// What the encoder will produce: an even size within 1920×1080 at 15, 30 or 60 fps.
@@ -494,6 +531,67 @@ mod tests {
             problems(json!({"bf": 0, "keyint_sec": 2, "tune": "uhq", "rate_control": "lossless"}))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn x264_baseline_does_not_apply_to_444_input_or_lossless_crf() {
+        let defaults = json!({"preset": "veryfast", "tune": "", "profile": "baseline", "keyint_sec": 2, "x264opts": "", "rate_control": "CBR", "crf": 23});
+        let check = |user: Value, format: &str| {
+            let mut s = settings("obs_x264", defaults.clone(), user);
+            s.format = Some(format.into());
+            check_video_encoder(&s)
+        };
+        let b = Problem::BFrames {
+            family: Family::X264,
+        };
+        assert!(check(json!({}), "NV12").is_empty());
+        assert!(check(json!({}), "I444").contains(&b), "4:4:4 input");
+        assert!(
+            check(json!({"rate_control": "VBR", "crf": 0}), "NV12").contains(&b),
+            "lossless VBR"
+        );
+        assert!(
+            check(json!({"rate_control": "crf", "crf": 0}), "NV12").contains(&b),
+            "lossless CRF"
+        );
+        assert!(check(json!({"rate_control": "CRF", "crf": 1}), "NV12").is_empty());
+    }
+
+    #[test]
+    fn color_formats_other_than_8_bit_4_2_0_fail() {
+        for format in ["NV12", "I420", "BGRA"] {
+            assert!(check_format(format).is_empty(), "{format}");
+        }
+        for format in ["I444", "P010", "I010", "P216", "P416", "I422"] {
+            assert_eq!(
+                check_format(format),
+                [Problem::ColorFormat {
+                    format: format.into()
+                }],
+                "{format}"
+            );
+        }
+        assert!(
+            Problem::ColorFormat {
+                format: "I444".into()
+            }
+            .message()
+            .ends_with("not I444: Settings › Advanced › Color Format")
+        );
+    }
+
+    #[test]
+    fn nvenc_uhq_with_capitalised_lossless_still_has_b_frames_and_ffmpeg_nvenc_never_forces() {
+        let defaults = json!({"bf": 0, "keyint_sec": 2, "tune": "uhq", "rate_control": "Lossless", "opts": ""});
+        let p = check_video_encoder(&settings("obs_nvenc_h264_tex", defaults.clone(), json!({})));
+        assert_eq!(
+            p,
+            [Problem::BFrames {
+                family: Family::Nvenc
+            }],
+            "lossless is matched exactly"
+        );
+        assert!(check_video_encoder(&settings("ffmpeg_nvenc", defaults, json!({}))).is_empty());
     }
 
     #[test]
