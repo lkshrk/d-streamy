@@ -23,7 +23,7 @@ for path in dumped:
             f"copy {path.name} from {artifact} to {fixtures}/, set \"kind\": \"captured\" and \"source\" "
             "to the CI run, and commit it"
         )
-        if got["id"].startswith("com.apple.videotoolbox."):
+        if "com.apple.videotoolbox.videoencoder." in got["id"]:
             print(f"::warning::{got['id']}: VideoToolbox encoder with no fixture; {advice}")
         else:
             failures.append(f"{got['id']}: no fixture; {advice}")
@@ -31,7 +31,8 @@ for path in dumped:
     want = json.loads(fixture.read_text())
     for key, value in want["defaults"].items():
         actual = got["defaults"].get(key, MISSING)
-        if actual is MISSING or actual != value:
+        # Python's True == 1, but a bool default and an int default are different settings.
+        if actual is MISSING or actual != value or isinstance(actual, bool) != isinstance(value, bool):
             shown = "missing" if actual is MISSING else repr(actual)
             failures.append(
                 f"{got['id']}: default {key} is {shown} in libobs, {value!r} in {fixture}. "
