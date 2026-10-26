@@ -5,7 +5,7 @@ mod support;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use dstreamy_media::annexb;
@@ -26,6 +26,18 @@ const STALL_TICK: Duration = Duration::from_millis(2);
 const STALL_MIN: Duration = Duration::from_millis(10);
 // The A/V median needs 10 unique payloads; the restart trace repeats frames 9 and 11 later, so 15 frames leave 13.
 const MIN_BASELINE_FRAMES: usize = 15;
+// GitHub's macOS runners have too few cores to pace six replays, their serves and producers at once.
+const CONCURRENT_TRACES: usize = if cfg!(target_os = "macos") {
+    2
+} else {
+    usize::MAX
+};
+
+/// On macOS, held for the whole of each pace-checked replay test, so those tests never overlap.
+fn exclusive_on_macos() -> Option<MutexGuard<'static, ()>> {
+    static PACED: Mutex<()> = Mutex::new(());
+    cfg!(target_os = "macos").then(|| PACED.lock().unwrap_or_else(PoisonError::into_inner))
+}
 
 fn traces_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../obs/tests/traces")
@@ -274,6 +286,12 @@ fn assert_paced<F>(
         .map(|p| lag(p))
         .filter(|l| (l - mid).abs() > slack)
         .collect();
+    let largest = checked
+        .iter()
+        .map(|p| (lag(p) - mid).abs())
+        .max()
+        .unwrap_or(0);
+    eprintln!("{what}: largest deviation from the median lag {largest} µs, slack {slack} µs");
     // A trace of fewer than 50 unique frames would otherwise fail on one frame of scheduling noise past the slack.
     let one_jitter = off.len() == 1 && (off[0] - mid).abs() <= 2 * slack;
     assert!(
@@ -547,11 +565,14 @@ fn every_positive_trace_replays_through_serve() {
         .filter(|(n, _, t)| positive(n, t))
         .collect();
     assert!(positives.len() >= 6, "{} positive traces", positives.len());
-    std::thread::scope(|s| {
-        for (name, dir, trace) in &positives {
-            s.spawn(move || replay_through_serve(name, dir, trace, false));
-        }
-    });
+    let _paced = exclusive_on_macos();
+    for batch in positives.chunks(CONCURRENT_TRACES) {
+        std::thread::scope(|s| {
+            for (name, dir, trace) in batch {
+                s.spawn(move || replay_through_serve(name, dir, trace, false));
+            }
+        });
+    }
 }
 
 #[test]
@@ -560,6 +581,7 @@ fn control_events_during_a_replay_lose_no_packet() {
         .into_iter()
         .find(|(n, _, _)| n == "linux-x264-main-bf0-keyint2-30fps")
         .unwrap();
+    let _paced = exclusive_on_macos();
     replay_through_serve(&name, &dir, &trace, true);
 }
 
@@ -820,6 +842,7 @@ fn split<'a, T>(
 }
 
 fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
+    let _paced = exclusive_on_macos();
     let (_, dir, trace) = traces()
         .into_iter()
         .find(|(n, _, _)| n == "linux-x264-main-bf0-keyint2-30fps")
