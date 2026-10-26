@@ -572,9 +572,10 @@ fn release_during_a_late_capture(detached_ms: u64) -> Vec<String> {
     lines
 }
 
+/// Path coverage only: the missing join it exercises can't be observed without ASan, so it passes on old code too.
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
-fn a_late_capture_that_ends_before_destroy_is_joined() {
+fn a_late_capture_that_ends_before_destroy_takes_the_join_path() {
     release_during_a_late_capture(1_000);
 }
 
