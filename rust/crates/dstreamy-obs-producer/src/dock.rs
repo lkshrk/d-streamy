@@ -84,6 +84,58 @@ impl DockSettings {
         .clamped()
     }
 
+    /// Reads settings from outside the plugin, such as a vendor request; a bad field is an error, an omitted one its default.
+    pub fn from_external_json(text: &str) -> Result<Self, String> {
+        let Ok(Value::Object(map)) = serde_json::from_str::<Value>(text) else {
+            return Err("settings must be a JSON object".into());
+        };
+        fn field<T: serde::de::DeserializeOwned>(
+            map: &serde_json::Map<String, Value>,
+            key: &str,
+            expected: &str,
+        ) -> Result<Option<T>, String> {
+            map.get(key)
+                .map(|v| {
+                    serde_json::from_value(v.clone())
+                        .map_err(|_| format!("{key} must be {expected}"))
+                })
+                .transpose()
+        }
+        let d = Self::default();
+        let grace_secs: Option<u64> =
+            field::<Option<u64>>(&map, "grace_secs", "a number of seconds or null")?.flatten();
+        if grace_secs.is_some_and(|s| s > MAX_GRACE_SECS) {
+            return Err(format!("grace_secs must be at most {MAX_GRACE_SECS}"));
+        }
+        let bitrate_kbps =
+            field::<i64>(&map, "bitrate_kbps", "a whole number")?.unwrap_or(d.bitrate_kbps);
+        if !BITRATE_KBPS.contains(&bitrate_kbps) {
+            return Err(format!(
+                "bitrate_kbps must be between {} and {}",
+                BITRATE_KBPS.start(),
+                BITRATE_KBPS.end()
+            ));
+        }
+        let video_encoder =
+            field::<String>(&map, "video_encoder", "a string")?.unwrap_or(d.video_encoder);
+        if video_encoder.is_empty() {
+            return Err("video_encoder must not be empty".into());
+        }
+        Ok(Self {
+            guild_id: field::<Option<String>>(&map, "guild_id", "a string or null")?.flatten(),
+            channel_id: field::<Option<String>>(&map, "channel_id", "a string or null")?.flatten(),
+            grace_secs,
+            mode: field(&map, "mode", "\"own\" or \"share\"")?.unwrap_or(d.mode),
+            video_encoder,
+            bitrate_kbps,
+            share_fallback: field(&map, "share_fallback", "true or false")?
+                .unwrap_or(d.share_fallback),
+            start_with_stream: field(&map, "start_with_stream", "true or false")?
+                .unwrap_or(d.start_with_stream),
+            owned: None,
+        })
+    }
+
     fn clamped(self) -> Self {
         Self {
             bitrate_kbps: self
@@ -336,9 +388,10 @@ impl DockModel {
         }
     }
 
-    /// Moves to `Stopping` and returns the ownership the stop should use, or `None` if not live.
+    /// Moves to `Stopping` and returns the ownership the stop should use, or `None` if neither live nor still owning.
     pub fn stop(&mut self) -> Option<Option<Ownership>> {
-        if !matches!(self.state, DockState::Live { .. }) {
+        let owning_idle = self.state == DockState::Idle && self.settings.owned.is_some();
+        if !owning_idle && !matches!(self.state, DockState::Live { .. }) {
             return None;
         }
         self.state = DockState::Stopping;
@@ -823,6 +876,126 @@ mod tests {
         assert_eq!(m.state(), &DockState::Idle);
         assert_eq!(m.error(), Some("timed out"));
         assert_eq!(m.persisted(), Some(&ownership(3)));
+    }
+
+    #[test]
+    fn an_owned_idle_dock_can_still_stop_but_an_unowned_one_cannot() {
+        let mut m = DockModel::new(DockSettings {
+            owned: Some(ownership(3)),
+            ..picked().settings().clone()
+        });
+        assert_eq!(m.state(), &DockState::Idle);
+        assert_eq!(m.stop(), Some(Some(ownership(3))));
+        assert_eq!(m.state(), &DockState::Stopping);
+        m.stopped(Err("still pending".into()));
+        assert_eq!(m.state(), &DockState::Idle);
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+        assert_eq!(m.stop(), Some(Some(ownership(3))));
+        m.stopped(Ok(()));
+        assert_eq!(m.persisted(), None);
+        assert_eq!(m.stop(), None);
+        let mut starting = DockModel::new(DockSettings {
+            owned: Some(ownership(3)),
+            ..picked().settings().clone()
+        });
+        starting.start(canvas()).unwrap();
+        assert_eq!(starting.stop(), None);
+    }
+
+    #[test]
+    fn external_settings_default_only_what_is_omitted() {
+        assert_eq!(
+            DockSettings::from_external_json("{}"),
+            Ok(DockSettings::default())
+        );
+        let s = DockSettings::from_external_json(
+            r#"{"guild_id":"g","channel_id":null,"grace_secs":3600,"mode":"share",
+                "video_encoder":"obs_nvenc","bitrate_kbps":50000,"share_fallback":false,
+                "start_with_stream":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            s,
+            DockSettings {
+                guild_id: Some("g".into()),
+                channel_id: None,
+                grace_secs: Some(3600),
+                mode: VideoMode::Share,
+                video_encoder: "obs_nvenc".into(),
+                bitrate_kbps: 50_000,
+                share_fallback: false,
+                start_with_stream: true,
+                owned: None,
+            }
+        );
+        let low = DockSettings::from_external_json(r#"{"bitrate_kbps":500,"grace_secs":0}"#);
+        assert_eq!(low.unwrap().bitrate_kbps, 500);
+    }
+
+    #[test]
+    fn external_settings_reject_bad_types_and_ranges() {
+        for (text, field) in [
+            ("not json", "settings"),
+            ("[1]", "settings"),
+            (r#"{"mode":"hybrid"}"#, "mode"),
+            (r#"{"mode":7}"#, "mode"),
+            (r#"{"bitrate_kbps":"fast"}"#, "bitrate_kbps"),
+            (r#"{"bitrate_kbps":6000.5}"#, "bitrate_kbps"),
+            (r#"{"bitrate_kbps":6000.0}"#, "bitrate_kbps"),
+            (r#"{"bitrate_kbps":499}"#, "bitrate_kbps"),
+            (r#"{"bitrate_kbps":50001}"#, "bitrate_kbps"),
+            (r#"{"grace_secs":-5}"#, "grace_secs"),
+            (r#"{"grace_secs":3601}"#, "grace_secs"),
+            (r#"{"grace_secs":"long"}"#, "grace_secs"),
+            (r#"{"guild_id":5}"#, "guild_id"),
+            (r#"{"channel_id":false}"#, "channel_id"),
+            (r#"{"share_fallback":"no"}"#, "share_fallback"),
+            (r#"{"start_with_stream":1}"#, "start_with_stream"),
+            (r#"{"video_encoder":7}"#, "video_encoder"),
+        ] {
+            let err = DockSettings::from_external_json(text).unwrap_err();
+            assert!(err.contains(field), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn external_settings_cannot_carry_the_ownership_journal() {
+        let s = DockSettings::from_external_json(&format!(
+            r#"{{"bitrate_kbps":2500,{OWNED},"certainty":"confirmed"}}"#
+        ))
+        .unwrap();
+        assert_eq!(s.owned, None);
+        assert_eq!(s.bitrate_kbps, 2500);
+        let mut m = DockModel::new(DockSettings {
+            owned: Some(ownership(3)),
+            ..DockSettings::default()
+        });
+        m.set_settings(s);
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+    }
+
+    #[test]
+    fn the_state_snapshot_is_internally_tagged() {
+        let mut m = picked();
+        let state = |m: &DockModel| serde_json::to_value(m.state()).unwrap();
+        assert_eq!(state(&m), json!({"state": "idle"}));
+        m.start(canvas()).unwrap();
+        assert_eq!(state(&m), json!({"state": "starting"}));
+        m.started(Ok(started(Some(ownership_at(3, Some(60))))));
+        assert_eq!(
+            state(&m),
+            json!({"state": "live", "channel": "General", "session_fps": 60})
+        );
+        assert_eq!(m.view()["state"], state(&m));
+        m.stop();
+        assert_eq!(state(&m), json!({"state": "stopping"}));
+        m.stopped(Ok(()));
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(None)));
+        assert_eq!(
+            state(&m),
+            json!({"state": "live", "channel": "General", "session_fps": null})
+        );
     }
 
     #[test]

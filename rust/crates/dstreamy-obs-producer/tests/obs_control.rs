@@ -5,6 +5,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use dstreamy_core::ConfigPaths;
@@ -14,8 +15,8 @@ use dstreamy_mock_discord::{
 };
 use dstreamy_obs_producer::Endpoint;
 use dstreamy_obs_producer::control::{
-    Candidate, ControlError, Instance, Named, ObsControl, Ownership, StartFailed, StartRequest,
-    Started, Stopped,
+    Candidate, ControlError, Instance, Named, ObsControl, Ownership, StartCertainty, StartFailed,
+    StartRequest, Started, Stopped,
 };
 use dstreamy_obs_producer::dock::{DockModel, DockSettings};
 use serde_json::{Value, json};
@@ -701,6 +702,133 @@ async fn not_logged_in_tells_the_user_to_log_in() {
         .await
         .unwrap_err();
     assert_eq!(err.to_string(), "Log in first: run `dstreamy login`");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkpoint_precedes_the_start_that_joins_voice() {
+    let serve = serve!(true);
+    let control = serve.control();
+    let saved = Mutex::new(Vec::new());
+    let started = control
+        .start_persistent(&request(MOCK_VOICE_CHANNEL_ID), None, |pending| {
+            saved
+                .lock()
+                .unwrap()
+                .push((pending.clone(), serve.mock.voice_state()));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let saved = saved.into_inner().unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].1, None, "nothing had joined voice yet");
+    assert_eq!(Some(&saved[0].0), started.ownership.as_ref());
+    serve.voice_channel(Some(MOCK_VOICE_CHANNEL_ID)).await;
+    assert_eq!(
+        control
+            .stop_reconciled(started.ownership.as_ref(), StartCertainty::Confirmed)
+            .await,
+        Ok(Stopped::Stopped)
+    );
+    serve.voice_channel(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_status_after_timed_out_start_keeps_pending_owner() {
+    let serve = serve!(true);
+    serve.mock.defer_next_identify();
+    let control = serve.control();
+    let journal = Mutex::new(None);
+    let lost = control
+        .clone()
+        .with_start_timeout(Duration::from_millis(300))
+        .start_persistent(&request(MOCK_VOICE_CHANNEL_ID), None, |pending| {
+            *journal.lock().unwrap() = Some(pending.clone());
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        lost.error,
+        ControlError::Timeout {
+            command: "start",
+            ..
+        }
+    ));
+    let pending = journal.into_inner().unwrap().expect("a checkpoint");
+    assert_eq!(lost.ownership.as_deref(), Some(&pending));
+
+    assert_eq!(
+        control.status().await,
+        Ok(None),
+        "the service has no session yet"
+    );
+    assert_eq!(serve.mock.voice_state(), None);
+    assert_eq!(
+        control
+            .stop_reconciled(Some(&pending), StartCertainty::Pending)
+            .await,
+        Err(ControlError::UnresolvedStart)
+    );
+    let reloaded: Ownership =
+        serde_json::from_str(&serde_json::to_string(&pending).unwrap()).unwrap();
+    assert_eq!(
+        control
+            .stop_reconciled(Some(&reloaded), StartCertainty::default())
+            .await,
+        Err(ControlError::UnresolvedStart),
+        "a relaunch finds the same record"
+    );
+
+    assert!(serve.mock.answer_deferred_identify());
+    serve.voice_channel(Some(MOCK_VOICE_CHANNEL_ID)).await;
+    let deadline = Instant::now() + T;
+    loop {
+        match control
+            .stop_reconciled(Some(&reloaded), StartCertainty::Pending)
+            .await
+        {
+            Ok(Stopped::Stopped) => break,
+            Err(ControlError::UnresolvedStart | ControlError::StillStarting) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(Instant::now() < deadline, "the late start was never named");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    serve.voice_channel(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_service_retires_a_lost_start() {
+    let mut serve = serve!(true);
+    let lost = lost_start(&mut serve).await;
+    serve.restart().await;
+    assert_eq!(
+        serve
+            .control()
+            .stop_reconciled(Some(&lost), StartCertainty::Pending)
+            .await,
+        Ok(Stopped::NotRunning)
+    );
+    let started = serve
+        .control()
+        .start_reconciled(
+            &request(MOCK_VOICE_CHANNEL_ID),
+            Some(&lost),
+            StartCertainty::Pending,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        started.ownership.as_ref().map(|o| o.connections.len()),
+        Some(1)
+    );
+    serve
+        .control()
+        .stop(started.ownership.as_ref())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

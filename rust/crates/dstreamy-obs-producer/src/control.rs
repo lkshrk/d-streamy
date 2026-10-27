@@ -43,6 +43,15 @@ pub struct Candidate {
     pub fps: Option<u32>,
 }
 
+/// Whether the ownership journal still waits on a start whose outcome is unknown; a missing record reads as pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartCertainty {
+    #[default]
+    Pending,
+    Confirmed,
+}
+
 /// The session this plugin started, kept in the module config so a relaunched OBS still stops it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "StoredOwnership")]
@@ -365,6 +374,76 @@ pub fn resolve(
     })
 }
 
+/// [`resolve`] for a journal with a certainty; a pending one never lets a new start through.
+pub fn resolve_reconciled(
+    request: &StartRequest,
+    status: &Value,
+    persisted: Option<&Ownership>,
+    certainty: StartCertainty,
+    instance: Instance,
+) -> Result<Resolution, ControlError> {
+    let Some(pending) = persisted.filter(|_| certainty == StartCertainty::Pending) else {
+        return resolve(request, status, persisted, instance);
+    };
+    if unknown_pending(pending, certainty) {
+        return Err(ControlError::UnresolvedStart);
+    }
+    if pending.instance != Some(instance) {
+        return resolve(request, status, persisted, instance);
+    }
+    match resolve(request, status, persisted, instance)? {
+        Resolution::Attach(started)
+            if started.ownership.is_some() && pending.connections.len() == 1 =>
+        {
+            Ok(Resolution::Attach(started))
+        }
+        _ => Err(ControlError::UnresolvedStart),
+    }
+}
+
+/// A pending start of an unknown service run cannot be told from a later run's, so no status resolves it.
+fn unknown_pending(ownership: &Ownership, certainty: StartCertainty) -> bool {
+    certainty == StartCertainty::Pending && ownership.instance.is_none()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StopStep {
+    Done(Stopped),
+    Send,
+}
+
+/// What a stop does after reading `status`; only a confirmed ownership may read an idle service as over.
+fn stop_step(
+    ownership: &Ownership,
+    certainty: StartCertainty,
+    status: &Value,
+    instance: Instance,
+) -> Result<StopStep, ControlError> {
+    if unknown_pending(ownership, certainty) {
+        return Err(ControlError::UnresolvedStart);
+    }
+    let may_still_land =
+        certainty == StartCertainty::Pending && ownership.instance == Some(instance);
+    Ok(match owns(status, ownership, instance)? {
+        Some(true) => StopStep::Send,
+        _ if may_still_land => return Err(ControlError::UnresolvedStart),
+        None => StopStep::Done(Stopped::NotRunning),
+        Some(false) => StopStep::Done(Stopped::LeftRunning),
+    })
+}
+
+/// The outcome of a stop that was sent; stopping one of several pending starts proves nothing about the others.
+fn settle_stop(
+    ownership: &Ownership,
+    certainty: StartCertainty,
+    stopped: Stopped,
+) -> Result<Stopped, ControlError> {
+    if certainty == StartCertainty::Pending && ownership.connections.len() != 1 {
+        return Err(ControlError::UnresolvedStart);
+    }
+    Ok(stopped)
+}
+
 /// A start that failed; `ownership` is set once the start was sent, since serve may still carry it out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartFailed {
@@ -424,6 +503,10 @@ pub enum ControlError {
         secs: u64,
     },
     Protocol(String),
+    /// The caller could not save the ownership a start must record before it is sent.
+    Persistence(String),
+    /// A start whose outcome is unknown may still land, so nothing may start or clear the ownership yet.
+    UnresolvedStart,
 }
 
 impl ControlError {
@@ -494,6 +577,10 @@ impl fmt::Display for ControlError {
                 "The D-Streamy service didn't answer {command} within {secs} s"
             ),
             Self::Protocol(m) => write!(f, "The D-Streamy service answered unexpectedly: {m}"),
+            Self::Persistence(e) => write!(f, "Cannot save the D-Streamy session record: {e}"),
+            Self::UnresolvedStart => f.write_str(
+                "An earlier D-Streamy start may still be in progress: wait for it to settle, or restart the service",
+            ),
         }
     }
 }
@@ -943,6 +1030,197 @@ mod tests {
                 ownership: Some(candidates(&[3], 1)),
                 channel: "c".into(),
             }))
+        );
+    }
+
+    fn serving(started_by: Option<u64>) -> Value {
+        json!({"session": {"state": "streaming", "guild_id": "g", "channel_id": "c",
+            "channel_name": "General", "target": "external"}, "started_by": started_by})
+    }
+
+    fn nothing_live() -> Value {
+        json!({"session": null, "started_by": null})
+    }
+
+    fn legacy(ids: &[u64]) -> Ownership {
+        Ownership {
+            instance: None,
+            ..candidates(ids, 1)
+        }
+    }
+
+    const PENDING: StartCertainty = StartCertainty::Pending;
+    const CONFIRMED: StartCertainty = StartCertainty::Confirmed;
+
+    #[test]
+    fn a_missing_certainty_reads_as_pending() {
+        assert_eq!(StartCertainty::default(), PENDING);
+        assert_eq!(serde_json::to_value(CONFIRMED).unwrap(), json!("confirmed"));
+        assert_eq!(
+            serde_json::from_value::<StartCertainty>(json!("pending")).unwrap(),
+            PENDING
+        );
+    }
+
+    #[test]
+    fn a_pending_start_with_nothing_live_is_not_over() {
+        let known = candidates(&[3], 1);
+        for status in [nothing_live(), json!({"session": {"state": "idle"}})] {
+            assert_eq!(
+                stop_step(&known, PENDING, &status, instance(1)),
+                Err(ControlError::UnresolvedStart)
+            );
+            assert_eq!(
+                stop_step(&known, CONFIRMED, &status, instance(1)),
+                Ok(StopStep::Done(Stopped::NotRunning))
+            );
+        }
+        assert_eq!(
+            stop_step(&known, PENDING, &serving(Some(4)), instance(1)),
+            Err(ControlError::UnresolvedStart)
+        );
+        assert_eq!(
+            stop_step(&known, CONFIRMED, &serving(Some(4)), instance(1)),
+            Ok(StopStep::Done(Stopped::LeftRunning))
+        );
+        for certainty in [PENDING, CONFIRMED] {
+            assert_eq!(
+                stop_step(&known, certainty, &serving(Some(3)), instance(1)),
+                Ok(StopStep::Send)
+            );
+        }
+    }
+
+    #[test]
+    fn a_replaced_service_retires_a_pending_identity() {
+        let known = candidates(&[3, 5], 1);
+        assert_eq!(
+            stop_step(&known, PENDING, &nothing_live(), instance(2)),
+            Ok(StopStep::Done(Stopped::NotRunning))
+        );
+        assert_eq!(
+            stop_step(&known, PENDING, &serving(Some(3)), instance(2)),
+            Ok(StopStep::Done(Stopped::LeftRunning))
+        );
+    }
+
+    #[test]
+    fn a_pending_start_of_an_unknown_service_is_never_resolved_by_status() {
+        let unknown = legacy(&[3]);
+        for status in [nothing_live(), serving(Some(3)), serving(Some(4))] {
+            assert_eq!(
+                stop_step(&unknown, PENDING, &status, instance(1)),
+                Err(ControlError::UnresolvedStart)
+            );
+        }
+        assert_eq!(
+            stop_step(&unknown, CONFIRMED, &nothing_live(), instance(1)),
+            Ok(StopStep::Done(Stopped::NotRunning))
+        );
+    }
+
+    #[test]
+    fn stopping_one_of_several_pending_starts_leaves_the_rest_unresolved() {
+        let several = candidates(&[3, 5], 1);
+        assert_eq!(
+            stop_step(&several, PENDING, &serving(Some(5)), instance(1)),
+            Ok(StopStep::Send)
+        );
+        assert_eq!(
+            settle_stop(&several, PENDING, Stopped::Stopped),
+            Err(ControlError::UnresolvedStart)
+        );
+        assert_eq!(
+            settle_stop(&several, PENDING, Stopped::NotRunning),
+            Err(ControlError::UnresolvedStart)
+        );
+        assert_eq!(
+            settle_stop(&candidates(&[3], 1), PENDING, Stopped::Stopped),
+            Ok(Stopped::Stopped)
+        );
+        assert_eq!(
+            settle_stop(&several, CONFIRMED, Stopped::Stopped),
+            Ok(Stopped::Stopped)
+        );
+    }
+
+    #[test]
+    fn a_pending_start_never_lets_a_new_remote_start_through() {
+        let r = request();
+        let one = candidates(&[3], 1);
+        assert_eq!(
+            resolve_reconciled(&r, &nothing_live(), Some(&one), PENDING, instance(1)),
+            Err(ControlError::UnresolvedStart)
+        );
+        assert_eq!(
+            resolve_reconciled(&r, &nothing_live(), Some(&one), CONFIRMED, instance(1)),
+            Ok(Resolution::Start)
+        );
+        assert_eq!(
+            resolve_reconciled(
+                &r,
+                &nothing_live(),
+                Some(&legacy(&[3])),
+                PENDING,
+                instance(1)
+            ),
+            Err(ControlError::UnresolvedStart)
+        );
+        assert_eq!(
+            resolve_reconciled(&r, &nothing_live(), Some(&one), PENDING, instance(2)),
+            Ok(Resolution::Start),
+            "another service run cannot land the old start"
+        );
+        assert_eq!(
+            resolve_reconciled(&r, &nothing_live(), None, PENDING, instance(1)),
+            Ok(Resolution::Start)
+        );
+    }
+
+    #[test]
+    fn a_pending_start_attaches_only_to_its_single_late_candidate() {
+        let r = request();
+        let one = candidates(&[3], 1);
+        assert_eq!(
+            resolve_reconciled(&r, &serving(Some(3)), Some(&one), PENDING, instance(1)),
+            Ok(Resolution::Attach(Started {
+                ownership: Some(one.confirmed(3)),
+                channel: "General".into(),
+            }))
+        );
+        assert_eq!(
+            resolve_reconciled(&r, &serving(Some(4)), Some(&one), PENDING, instance(1)),
+            Err(ControlError::UnresolvedStart),
+            "a foreign session does not resolve it nor replace the record"
+        );
+        let several = candidates(&[3, 5], 1);
+        assert_eq!(
+            resolve_reconciled(&r, &serving(Some(3)), Some(&several), PENDING, instance(1)),
+            Err(ControlError::UnresolvedStart),
+            "attaching must not collapse the other candidates"
+        );
+        assert_eq!(
+            resolve_reconciled(
+                &r,
+                &serving(Some(3)),
+                Some(&several),
+                CONFIRMED,
+                instance(1)
+            ),
+            resolve(&r, &serving(Some(3)), Some(&several), instance(1))
+        );
+    }
+
+    #[test]
+    fn the_new_error_texts_say_what_to_do() {
+        assert_eq!(
+            ControlError::Persistence("disk full".into()).to_string(),
+            "Cannot save the D-Streamy session record: disk full"
+        );
+        assert!(
+            ControlError::UnresolvedStart
+                .to_string()
+                .starts_with("An earlier D-Streamy start may still be in progress")
         );
     }
 

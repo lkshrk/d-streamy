@@ -255,6 +255,23 @@ impl MockDiscord {
         self.shared.state().defer_join = true;
     }
 
+    /// Holds the next gateway IDENTIFY unanswered until [`MockDiscord::answer_deferred_identify`].
+    pub fn defer_next_identify(&self) {
+        self.shared.state().defer_identify = true;
+    }
+
+    /// Answers the held IDENTIFY with READY; false when none is held.
+    pub fn answer_deferred_identify(&self) -> bool {
+        let mut state = self.shared.state();
+        let Some(id) = state.deferred_identify.take() else {
+            return false;
+        };
+        gateway::identify(&self.shared, &mut state, id);
+        drop(state);
+        self.shared.notify();
+        true
+    }
+
     /// Answers the held op 4; false when none is held.
     pub fn answer_deferred_join(&self) -> bool {
         let mut state = self.shared.state();

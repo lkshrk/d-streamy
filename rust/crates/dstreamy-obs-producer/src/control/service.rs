@@ -9,7 +9,8 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 use super::{
     Candidate, ControlError, Instance, Live, Named, Ownership, Resolution, START_GRACE_SECS,
-    STATUS_PLACE, StartFailed, StartRequest, Started, Stopped, owns, resolve, start_in_flight,
+    STATUS_PLACE, StartCertainty, StartFailed, StartRequest, Started, StopStep, Stopped, resolve,
+    resolve_reconciled, settle_stop, start_in_flight, stop_step, unknown_pending,
 };
 use crate::client::REPLY_TIMEOUT;
 use crate::types::service_text;
@@ -92,6 +93,55 @@ impl ObsControl {
         request: &StartRequest,
         persisted: Option<&Ownership>,
     ) -> Result<Started, StartFailed> {
+        self.start_persistent(request, persisted, |_| Ok(())).await
+    }
+
+    /// [`Self::start`], calling `checkpoint` with the ownership to record just before `start` is sent.
+    pub async fn start_persistent<F>(
+        &self,
+        request: &StartRequest,
+        persisted: Option<&Ownership>,
+        checkpoint: F,
+    ) -> Result<Started, StartFailed>
+    where
+        F: FnMut(&Ownership) -> Result<(), ControlError>,
+    {
+        self.start_checkpointed(
+            request,
+            persisted,
+            StartCertainty::Confirmed,
+            true,
+            checkpoint,
+        )
+        .await
+    }
+
+    /// [`Self::start_persistent`] for a journal with a certainty; a pending one never sends a new `start`, and the checkpoint names only the new start.
+    pub async fn start_reconciled<F>(
+        &self,
+        request: &StartRequest,
+        persisted: Option<&Ownership>,
+        certainty: StartCertainty,
+        checkpoint: F,
+    ) -> Result<Started, StartFailed>
+    where
+        F: FnMut(&Ownership) -> Result<(), ControlError>,
+    {
+        self.start_checkpointed(request, persisted, certainty, false, checkpoint)
+            .await
+    }
+
+    async fn start_checkpointed<F>(
+        &self,
+        request: &StartRequest,
+        persisted: Option<&Ownership>,
+        certainty: StartCertainty,
+        merge_previous: bool,
+        mut checkpoint: F,
+    ) -> Result<Started, StartFailed>
+    where
+        F: FnMut(&Ownership) -> Result<(), ControlError>,
+    {
         let mut c = self.open().await?;
         if request.grace_secs.is_some() {
             c.require(START_GRACE_SECS)?;
@@ -99,7 +149,7 @@ impl ObsControl {
         let status = c
             .settled(c.hello["status"].clone(), persisted, self.settle_timeout)
             .await?;
-        match resolve(request, &status, persisted, c.instance)? {
+        match resolve_reconciled(request, &status, persisted, certainty, c.instance)? {
             Resolution::Attach(started) => Ok(started),
             Resolution::Start => {
                 let provisional = Ownership {
@@ -111,13 +161,16 @@ impl ObsControl {
                     channel_id: request.channel_id.clone(),
                     instance: Some(c.instance),
                 };
+                let pending = if merge_previous {
+                    Ownership::with_candidate(persisted, provisional.clone())
+                } else {
+                    provisional.clone()
+                };
+                checkpoint(&pending)?;
                 // serve finishes a start whose connection went away, so from here on the start may still land.
                 let unconfirmed = |error| StartFailed {
                     error,
-                    ownership: Some(Box::new(Ownership::with_candidate(
-                        persisted,
-                        provisional.clone(),
-                    ))),
+                    ownership: Some(Box::new(pending.clone())),
                 };
                 let id = c.id();
                 c.send(request.command(&id)).await.map_err(unconfirmed)?;
@@ -149,9 +202,22 @@ impl ObsControl {
 
     /// Sends `stop` only while the live session is still the one `ownership` names.
     pub async fn stop(&self, ownership: Option<&Ownership>) -> Result<Stopped, ControlError> {
+        self.stop_reconciled(ownership, StartCertainty::Confirmed)
+            .await
+    }
+
+    /// [`Self::stop`] for a journal with a certainty; it never reports a pending start as over while one may still land.
+    pub async fn stop_reconciled(
+        &self,
+        ownership: Option<&Ownership>,
+        certainty: StartCertainty,
+    ) -> Result<Stopped, ControlError> {
         let Some(ownership) = ownership else {
             return Ok(Stopped::LeftRunning);
         };
+        if unknown_pending(ownership, certainty) {
+            return Err(ControlError::UnresolvedStart);
+        }
         let mut c = match self.open().await {
             Ok(c) => c,
             Err(e) => return stop_without_connection(e),
@@ -163,18 +229,15 @@ impl ObsControl {
                 self.settle_timeout,
             )
             .await?;
-        match owns(&status, ownership, c.instance)? {
-            None => return Ok(Stopped::NotRunning),
-            Some(false) => return Ok(Stopped::LeftRunning),
-            Some(true) => {}
+        if let StopStep::Done(stopped) = stop_step(ownership, certainty, &status, c.instance)? {
+            return Ok(stopped);
         }
-        match c.call(json!({"cmd": "stop"}), "stop", STOP_TIMEOUT).await {
-            Ok(_) => Ok(Stopped::Stopped),
-            Err(ControlError::Refused { code, .. }) if code == "not_running" => {
-                Ok(Stopped::NotRunning)
-            }
-            Err(e) => Err(e),
-        }
+        let stopped = match c.call(json!({"cmd": "stop"}), "stop", STOP_TIMEOUT).await {
+            Ok(_) => Stopped::Stopped,
+            Err(ControlError::Refused { code, .. }) if code == "not_running" => Stopped::NotRunning,
+            Err(e) => return Err(e),
+        };
+        settle_stop(ownership, certainty, stopped)
     }
 
     async fn open(&self) -> Result<Connection, ControlError> {

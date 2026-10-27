@@ -195,6 +195,11 @@ fn on_text(shared: &Shared, id: u64, text: &str) -> Result<(), u16> {
             if d["token"].as_str() != Some(&shared.config.token) {
                 return Err(CLOSE_AUTHENTICATION_FAILED);
             }
+            if state.defer_identify {
+                state.defer_identify = false;
+                state.deferred_identify = Some(id);
+                return Ok(());
+            }
             identify(shared, &mut state, id);
         }
         OP_RESUME => {
@@ -219,7 +224,7 @@ fn on_text(shared: &Shared, id: u64, text: &str) -> Result<(), u16> {
     Ok(())
 }
 
-fn identify(shared: &Shared, state: &mut State, id: u64) {
+pub(crate) fn identify(shared: &Shared, state: &mut State, id: u64) {
     let session_id = random_hex(16);
     state.sessions.insert(
         session_id.clone(),
