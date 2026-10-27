@@ -406,6 +406,7 @@ fn unknown_pending(ownership: &Ownership, certainty: StartCertainty) -> bool {
     certainty == StartCertainty::Pending && ownership.instance.is_none()
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, PartialEq, Eq)]
 enum StopStep {
     Done(Stopped),
@@ -413,6 +414,7 @@ enum StopStep {
 }
 
 /// What a stop does after reading `status`; only a confirmed ownership may read an idle service as over.
+#[cfg(any(unix, test))]
 fn stop_step(
     ownership: &Ownership,
     certainty: StartCertainty,
@@ -433,6 +435,7 @@ fn stop_step(
 }
 
 /// The outcome of a stop that was sent; stopping one of several pending starts proves nothing about the others.
+#[cfg(any(unix, test))]
 fn settle_stop(
     ownership: &Ownership,
     certainty: StartCertainty,

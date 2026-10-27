@@ -6,10 +6,13 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+#[cfg(unix)]
 use dstreamy_obs_producer::Endpoint;
+#[cfg(unix)]
+use dstreamy_obs_producer::control::ObsControl;
 use dstreamy_obs_producer::control::{
-    ControlError, Live, Named, ObsControl, Ownership, StartCertainty, StartFailed, StartRequest,
-    Started, Stopped,
+    ControlError, Live, Named, Ownership, StartCertainty, StartFailed, StartRequest, Started,
+    Stopped,
 };
 use dstreamy_obs_producer::dock::{Canvas, DockModel, DockSettings};
 use dstreamy_obs_sys as sys;
@@ -25,6 +28,8 @@ use crate::proc::{
 
 pub const START_UNWIRED: &str = "Starting D-Streamy from OBS is not available in this build yet";
 pub const STOP_UNWIRED: &str = "Stopping D-Streamy from OBS is not available in this build yet";
+#[cfg(not(unix))]
+pub const UNSUPPORTED: &str = "D-Streamy for OBS doesn't support Windows yet";
 
 pub trait Service {
     async fn status(&self) -> Result<Option<Live>, ControlError>;
@@ -145,13 +150,37 @@ where
 /// The service at the user's default endpoint.
 pub struct Remote(Result<ObsControl, String>);
 
+#[cfg(not(unix))]
+enum ObsControl {}
+
+#[cfg(not(unix))]
+impl ObsControl {
+    async fn status(&self) -> Result<Option<Live>, ControlError> {
+        match *self {}
+    }
+
+    async fn guilds(&self) -> Result<Vec<Named>, ControlError> {
+        match *self {}
+    }
+
+    async fn channels(&self, _: &str) -> Result<Vec<Named>, ControlError> {
+        match *self {}
+    }
+}
+
 impl Remote {
+    #[cfg(unix)]
     pub fn for_user() -> Self {
         Self(
             Endpoint::default_for_user()
                 .map(ObsControl::new)
                 .map_err(|e| e.to_string()),
         )
+    }
+
+    #[cfg(not(unix))]
+    pub fn for_user() -> Self {
+        Self(Err(UNSUPPORTED.into()))
     }
 
     fn control(&self) -> Result<&ObsControl, ControlError> {
@@ -484,6 +513,7 @@ async fn cancelable<T>(shared: &Shared, work: impl Future<Output = T>) -> Result
 mod tests {
     use std::ffi::c_void;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1114,6 +1144,7 @@ mod tests {
         assert_eq!(bytes(&path), before);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_checkpoint_sends_nothing() {
         let dir = testdir::fresh("ctl-checkpoint");
@@ -1190,6 +1221,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_paused_start_is_journalled_and_a_failed_confirmation_stays_pending() {
         let dir = testdir::fresh("ctl-journal-pause");
@@ -1441,6 +1473,22 @@ mod tests {
         let begun = Instant::now();
         handle.join();
         assert!(begun.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn the_remote_service_is_unsupported_off_unix() {
+        let remote = Remote::for_user();
+        let unsupported = ControlError::Connect(UNSUPPORTED.into());
+        assert_eq!(
+            remote.status().now_or_never(),
+            Some(Err(unsupported.clone()))
+        );
+        assert_eq!(
+            remote.guilds().now_or_never(),
+            Some(Err(unsupported.clone()))
+        );
+        assert_eq!(remote.channels("g").now_or_never(), Some(Err(unsupported)));
     }
 
     fn wait_calls(service: &FakeService, n: usize) {

@@ -285,6 +285,7 @@ fn encode(snapshot: &ConfigSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
@@ -621,6 +622,7 @@ mod tests {
         assert!(store.save(&ConfigSnapshot::default()).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_save_is_reported() {
         let dir = testdir::fresh("config-readonly");
