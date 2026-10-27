@@ -8,8 +8,8 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use super::{
-    ControlError, Instance, Live, Named, Ownership, Resolution, START_GRACE_SECS, STATUS_PLACE,
-    StartFailed, StartRequest, Started, Stopped, owns, resolve, start_in_flight,
+    Candidate, ControlError, Instance, Live, Named, Ownership, Resolution, START_GRACE_SECS,
+    STATUS_PLACE, StartFailed, StartRequest, Started, Stopped, owns, resolve, start_in_flight,
 };
 use crate::client::REPLY_TIMEOUT;
 use crate::types::service_text;
@@ -103,11 +103,13 @@ impl ObsControl {
             Resolution::Attach(started) => Ok(started),
             Resolution::Start => {
                 let provisional = Ownership {
-                    connections: vec![c.connection()?],
+                    connections: vec![Candidate {
+                        id: c.connection()?,
+                        fps: Some(request.fps),
+                    }],
                     guild_id: request.guild_id.clone(),
                     channel_id: request.channel_id.clone(),
                     instance: Some(c.instance),
-                    fps: Some(request.fps),
                 };
                 // serve finishes a start whose connection went away, so from here on the start may still land.
                 let unconfirmed = |error| StartFailed {

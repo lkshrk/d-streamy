@@ -14,8 +14,8 @@ use dstreamy_mock_discord::{
 };
 use dstreamy_obs_producer::Endpoint;
 use dstreamy_obs_producer::control::{
-    ControlError, Instance, Named, ObsControl, Ownership, StartFailed, StartRequest, Started,
-    Stopped,
+    Candidate, ControlError, Instance, Named, ObsControl, Ownership, StartFailed, StartRequest,
+    Started, Stopped,
 };
 use dstreamy_obs_producer::dock::{DockModel, DockSettings};
 use serde_json::{Value, json};
@@ -292,7 +292,7 @@ async fn a_start_from_obs_owns_the_session_and_its_stop_ends_it() {
     assert_eq!(ownership.channel_id, MOCK_VOICE_CHANNEL_ID);
     serve.voice_channel(Some(MOCK_VOICE_CHANNEL_ID)).await;
     let live = control.status().await.unwrap().expect("live");
-    assert_eq!(live.started_by, Some(ownership.connections[0]));
+    assert_eq!(live.started_by, Some(ownership.connections[0].id));
     assert_eq!(live.target, "external");
 
     assert_eq!(control.stop(Some(&ownership)).await, Ok(Stopped::Stopped));
@@ -374,7 +374,10 @@ async fn a_start_whose_reply_is_lost_is_still_stopped_by_its_starter() {
     loop {
         let live = control.status().await.unwrap();
         if live.as_ref().is_some_and(|l| l.started_by.is_some()) {
-            assert_eq!(live.unwrap().started_by, Some(provisional.connections[0]));
+            assert_eq!(
+                live.unwrap().started_by,
+                Some(provisional.connections[0].id)
+            );
             break;
         }
         assert!(Instant::now() < deadline, "the start never landed");
@@ -464,7 +467,10 @@ async fn lost_start_without_reading(serve: &Serve) -> Ownership {
         .unwrap();
     drop(client);
     Ownership {
-        connections: vec![hello["data"]["connection"].as_u64().unwrap()],
+        connections: vec![Candidate {
+            id: hello["data"]["connection"].as_u64().unwrap(),
+            fps: Some(30),
+        }],
         guild_id: MOCK_GUILD_ID.into(),
         channel_id: MOCK_VOICE_CHANNEL_ID.into(),
         instance: Some(Instance {
@@ -473,7 +479,6 @@ async fn lost_start_without_reading(serve: &Serve) -> Ownership {
             mtime: meta.mtime(),
             mtime_nsec: meta.mtime_nsec(),
         }),
-        fps: Some(30),
     }
 }
 
@@ -543,11 +548,10 @@ async fn a_session_another_client_started_is_attached_and_left_running() {
     );
     assert_eq!(control.stop(None).await, Ok(Stopped::LeftRunning));
     let foreign = Ownership {
-        connections: vec![999],
+        connections: vec![Candidate { id: 999, fps: None }],
         guild_id: MOCK_GUILD_ID.into(),
         channel_id: MOCK_VOICE_CHANNEL_ID.into(),
         instance: None,
-        fps: None,
     };
     assert_eq!(control.stop(Some(&foreign)).await, Ok(Stopped::LeftRunning));
     assert!(control.status().await.unwrap().is_some());
@@ -663,7 +667,7 @@ async fn an_ownership_from_before_a_serve_restart_is_ignored() {
     let live = control.status().await.unwrap().expect("live");
     assert_eq!(
         live.started_by,
-        Some(old.connections[0]),
+        Some(old.connections[0].id),
         "the new serve reuses the connection id, which is what the instance guards against"
     );
     let started = control

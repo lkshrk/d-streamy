@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use dstreamy_obs_producer::Endpoint;
 use dstreamy_obs_producer::control::{
-    ControlError, Instance, ObsControl, Ownership, StartRequest, Started, Stopped,
+    Candidate, ControlError, Instance, ObsControl, Ownership, StartRequest, Started, Stopped,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -77,7 +77,16 @@ impl Fake {
     fn ownership(&self) -> Ownership {
         let meta = std::fs::metadata(&self.path).unwrap();
         Ownership {
-            connections: vec![CONNECTION, 4],
+            connections: vec![
+                Candidate {
+                    id: CONNECTION,
+                    fps: Some(30),
+                },
+                Candidate {
+                    id: 4,
+                    fps: Some(60),
+                },
+            ],
             guild_id: "g".into(),
             channel_id: "c".into(),
             instance: Some(Instance {
@@ -86,7 +95,6 @@ impl Fake {
                 mtime: meta.mtime(),
                 mtime_nsec: meta.mtime_nsec(),
             }),
-            fps: Some(30),
         }
     }
 
@@ -134,6 +142,11 @@ async fn a_start_waits_until_serve_names_our_start_and_keeps_only_it() {
             ownership: Some(ownership.confirmed(CONNECTION)),
             channel: "c".into(),
         })
+    );
+    assert_eq!(
+        started.unwrap().session_fps(),
+        Some(30),
+        "the winner's fps, not the newest candidate's"
     );
     assert_eq!(fake.commands(), ["hello", "status"]);
 }

@@ -392,6 +392,7 @@ impl DockModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::Candidate;
 
     fn named(id: &str) -> Named {
         Named {
@@ -410,12 +411,18 @@ mod tests {
     }
 
     fn ownership(connection: u64) -> Ownership {
+        ownership_at(connection, None)
+    }
+
+    fn ownership_at(connection: u64, fps: Option<u32>) -> Ownership {
         Ownership {
-            connections: vec![connection],
+            connections: vec![Candidate {
+                id: connection,
+                fps,
+            }],
             guild_id: "g".into(),
             channel_id: "c".into(),
             instance: None,
-            fps: None,
         }
     }
 
@@ -774,10 +781,7 @@ mod tests {
     fn the_session_fps_is_known_only_for_our_own_session() {
         let mut m = picked();
         m.start(canvas()).unwrap();
-        m.started(Ok(started(Some(Ownership {
-            fps: Some(60),
-            ..ownership(3)
-        }))));
+        m.started(Ok(started(Some(ownership_at(3, Some(60))))));
         assert_eq!(m.session_fps(), Some(60));
         m.stop();
         assert_eq!(m.session_fps(), None);
