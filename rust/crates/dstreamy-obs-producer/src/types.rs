@@ -2,6 +2,9 @@
 
 use serde_json::{Value, json};
 
+/// Service text shown in OBS is cut to this many characters.
+pub const MAX_SERVICE_TEXT: usize = 300;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
     Debug,
@@ -54,6 +57,29 @@ pub enum End<T> {
     },
     Closed(String),
     Refused(String),
+}
+
+/// Service text as OBS may show it: no control or bidi-override characters, at most `MAX_SERVICE_TEXT` characters.
+pub(crate) fn service_text(text: &str) -> String {
+    let hidden = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    };
+    let long = text.chars().nth(MAX_SERVICE_TEXT).is_some();
+    let keep = if long {
+        MAX_SERVICE_TEXT - 1
+    } else {
+        MAX_SERVICE_TEXT
+    };
+    let mut out: String = text
+        .chars()
+        .take(keep)
+        .map(|c| if hidden(c) { ' ' } else { c })
+        .collect();
+    if long {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(test)]

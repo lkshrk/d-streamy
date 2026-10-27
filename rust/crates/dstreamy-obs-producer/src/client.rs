@@ -15,14 +15,13 @@ use tokio_util::bytes::Bytes;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::ring::{MAX_PACKET, Oversized, Packet, Ring, Track};
-use crate::types::{End, Hello, Level, Log};
+use crate::types::{End, Hello, Level, Log, service_text};
 
 /// Above serve's 5 s wait for the session to announce the producer's video.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to read pending events after a failed write, so a `detached` already sent is not missed.
 pub const PENDING_EVENTS: Duration = Duration::from_secs(1);
-/// Service text shown in OBS is cut to this many characters.
-pub const MAX_SERVICE_TEXT: usize = 300;
+pub use crate::types::MAX_SERVICE_TEXT;
 /// After a stop, the queued packets and end of stream get this long before the connection is dropped.
 pub const STOP_DEADLINE: Duration = Duration::from_millis(1500);
 
@@ -198,29 +197,6 @@ async fn read_events<T>(mut lines: Lines, log: &dyn Log) -> End<T> {
         );
     }
     end
-}
-
-/// Service text as OBS may show it: no control or bidi-override characters, at most `MAX_SERVICE_TEXT` characters.
-fn service_text(text: &str) -> String {
-    let hidden = |c: char| {
-        c.is_control()
-            || matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-    };
-    let long = text.chars().nth(MAX_SERVICE_TEXT).is_some();
-    let keep = if long {
-        MAX_SERVICE_TEXT - 1
-    } else {
-        MAX_SERVICE_TEXT
-    };
-    let mut out: String = text
-        .chars()
-        .take(keep)
-        .map(|c| if hidden(c) { ' ' } else { c })
-        .collect();
-    if long {
-        out.push('…');
-    }
-    out
 }
 
 async fn write_packets<T>(
