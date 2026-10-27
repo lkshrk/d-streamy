@@ -28,49 +28,41 @@ struct Fake {
     commands: Arc<Mutex<Vec<String>>>,
 }
 
+struct Script {
+    connection: u64,
+    hello: Value,
+    statuses: Vec<Option<Value>>,
+    answer_start: bool,
+}
+
 impl Fake {
     fn start(hello: Value, statuses: Vec<Option<Value>>) -> Self {
-        let dir = tempfile::Builder::new().prefix("ds").tempdir().unwrap();
-        let private = dir.path().join("d");
-        std::fs::create_dir(&private).unwrap();
-        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let path = private.join("s.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let commands = Arc::new(Mutex::new(Vec::new()));
-        let seen = commands.clone();
-        tokio::spawn(async move {
-            let mut statuses: VecDeque<Option<Value>> = statuses.into();
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let command: Value = serde_json::from_str(&line).unwrap();
-                let cmd = command["cmd"].as_str().unwrap().to_owned();
-                seen.lock().unwrap().push(cmd.clone());
-                let data = match cmd.as_str() {
-                    "hello" => json!({"protocol": 2, "connection": 9,
-                        "features": ["start_grace_secs", "status_place"], "status": hello}),
-                    "status" => match statuses.pop_front().flatten() {
-                        Some(status) => status,
-                        None => continue,
-                    },
-                    _ => Value::Null,
-                };
-                let reply = json!({"id": command["id"], "type": "result", "data": data});
-                write
-                    .write_all(format!("{reply}\n").as_bytes())
-                    .await
-                    .unwrap();
-            }
-        });
-        Self {
-            _dir: dir,
-            path,
-            commands,
-        }
+        Self::scripted(vec![Script {
+            connection: 9,
+            hello,
+            statuses,
+            answer_start: true,
+        }])
     }
 
     fn two_unanswered_starts_then_first_wins() -> Self {
+        Self::scripted(
+            (1..=4)
+                .map(|connection| Script {
+                    connection,
+                    hello: if connection <= 2 {
+                        Value::Null
+                    } else {
+                        status(Some(CONNECTION))
+                    },
+                    statuses: vec![],
+                    answer_start: connection > 2,
+                })
+                .collect(),
+        )
+    }
+
+    fn scripted(scripts: Vec<Script>) -> Self {
         let dir = tempfile::Builder::new().prefix("ds").tempdir().unwrap();
         let private = dir.path().join("d");
         std::fs::create_dir(&private).unwrap();
@@ -80,25 +72,30 @@ impl Fake {
         let commands = Arc::new(Mutex::new(Vec::new()));
         let seen = commands.clone();
         tokio::spawn(async move {
-            for connection in 1..=4u64 {
+            for Script {
+                connection,
+                hello,
+                statuses,
+                answer_start,
+            } in scripts
+            {
+                let mut statuses: VecDeque<Option<Value>> = statuses.into();
                 let (stream, _) = listener.accept().await.unwrap();
                 let (read, mut write) = stream.into_split();
                 let mut lines = BufReader::new(read).lines();
-                let hello = if connection <= 2 {
-                    Value::Null
-                } else {
-                    status(Some(CONNECTION))
-                };
                 while let Ok(Some(line)) = lines.next_line().await {
                     let command: Value = serde_json::from_str(&line).unwrap();
-                    let cmd = command["cmd"].as_str().unwrap();
-                    seen.lock().unwrap().push(format!("{connection}:{cmd}"));
-                    let data = match cmd {
+                    let cmd = command["cmd"].as_str().unwrap().to_owned();
+                    seen.lock().unwrap().push(cmd.clone());
+                    let data = match cmd.as_str() {
                         "hello" => json!({"protocol": 2, "connection": connection,
                             "features": ["start_grace_secs", "status_place"], "status": hello}),
-                        "start" if connection <= 2 => continue,
-                        "stop" if connection == 4 => Value::Null,
-                        _ => panic!("unexpected {connection}:{cmd}"),
+                        "status" => match statuses.pop_front().flatten() {
+                            Some(status) => status,
+                            None => continue,
+                        },
+                        "start" if !answer_start => continue,
+                        _ => Value::Null,
                     };
                     let reply = json!({"id": command["id"], "type": "result", "data": data});
                     write
@@ -202,9 +199,7 @@ async fn two_lost_starts_in_a_row_still_own_the_session() {
     assert_eq!(control().stop(Some(&confirmed)).await, Ok(Stopped::Stopped));
     assert_eq!(
         fake.commands(),
-        [
-            "1:hello", "1:start", "2:hello", "2:start", "3:hello", "4:hello", "4:stop",
-        ]
+        ["hello", "start", "hello", "start", "hello", "hello", "stop"]
     );
 }
 
