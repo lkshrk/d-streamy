@@ -70,6 +70,51 @@ impl Fake {
         }
     }
 
+    fn two_unanswered_starts_then_first_wins() -> Self {
+        let dir = tempfile::Builder::new().prefix("ds").tempdir().unwrap();
+        let private = dir.path().join("d");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = private.join("s.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let seen = commands.clone();
+        tokio::spawn(async move {
+            for connection in 1..=4u64 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                let hello = if connection <= 2 {
+                    Value::Null
+                } else {
+                    status(Some(CONNECTION))
+                };
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let command: Value = serde_json::from_str(&line).unwrap();
+                    let cmd = command["cmd"].as_str().unwrap();
+                    seen.lock().unwrap().push(format!("{connection}:{cmd}"));
+                    let data = match cmd {
+                        "hello" => json!({"protocol": 2, "connection": connection,
+                            "features": ["start_grace_secs", "status_place"], "status": hello}),
+                        "start" if connection <= 2 => continue,
+                        "stop" if connection == 4 => Value::Null,
+                        _ => panic!("unexpected {connection}:{cmd}"),
+                    };
+                    let reply = json!({"id": command["id"], "type": "result", "data": data});
+                    write
+                        .write_all(format!("{reply}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        Self {
+            _dir: dir,
+            path,
+            commands,
+        }
+    }
+
     fn control(&self, settle: Duration) -> ObsControl {
         ObsControl::new(Endpoint::new(&self.path)).with_settle_timeout(settle)
     }
@@ -112,6 +157,55 @@ fn request() -> StartRequest {
         fps: 30,
         grace_secs: None,
     }
+}
+
+#[tokio::test]
+async fn two_lost_starts_in_a_row_still_own_the_session() {
+    let fake = Fake::two_unanswered_starts_then_first_wins();
+    let control =
+        || ObsControl::new(Endpoint::new(&fake.path)).with_start_timeout(Duration::from_millis(10));
+
+    let first = control().start(&request(), None).await.unwrap_err();
+    assert!(matches!(
+        first.error,
+        ControlError::Timeout {
+            command: "start",
+            ..
+        }
+    ));
+    let first = *first.ownership.expect("the first candidate");
+    assert_eq!(first.connections[0].id, 1);
+
+    let second = control().start(&request(), Some(&first)).await.unwrap_err();
+    assert!(matches!(
+        second.error,
+        ControlError::Timeout {
+            command: "start",
+            ..
+        }
+    ));
+    let ownership = *second.ownership.expect("both candidates");
+    assert_eq!(
+        ownership
+            .connections
+            .iter()
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+
+    let third = control().start(&request(), Some(&ownership)).await.unwrap();
+    assert_eq!(third.session_fps(), Some(30));
+    let confirmed = third.ownership.expect("the first start won");
+    assert_eq!(confirmed.connections.len(), 1);
+    assert_eq!(confirmed.connections[0].id, 1);
+    assert_eq!(control().stop(Some(&confirmed)).await, Ok(Stopped::Stopped));
+    assert_eq!(
+        fake.commands(),
+        [
+            "1:hello", "1:start", "2:hello", "2:start", "3:hello", "4:hello", "4:stop",
+        ]
+    );
 }
 
 #[tokio::test]

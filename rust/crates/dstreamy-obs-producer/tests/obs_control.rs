@@ -1,7 +1,6 @@
 //! The dock's control logic against a real `dstreamy serve` from `DSTREAMY_BIN`, with mock Discord in process.
 #![cfg(unix)]
 
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -14,8 +13,8 @@ use dstreamy_mock_discord::{
 };
 use dstreamy_obs_producer::Endpoint;
 use dstreamy_obs_producer::control::{
-    Candidate, ControlError, Instance, Named, ObsControl, Ownership, StartFailed, StartRequest,
-    Started, Stopped,
+    Candidate, ControlError, Named, ObsControl, Ownership, StartFailed, StartRequest, Started,
+    Stopped,
 };
 use dstreamy_obs_producer::dock::{DockModel, DockSettings};
 use serde_json::{Value, json};
@@ -410,75 +409,6 @@ async fn a_retry_after_a_lost_start_reply_keeps_the_ownership() {
         );
         serve.voice_channel(None).await;
         serve.restart().await;
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_lost_starts_in_a_row_still_own_the_session() {
-    let mut serve = serve!(true);
-    let mut second_lost = 0;
-    for round in 0..8 {
-        let first = lost_start_without_reading(&serve).await;
-        let second = serve
-            .control()
-            .with_start_timeout(Duration::from_millis(1))
-            .start(&request(MOCK_VOICE_CHANNEL_ID), Some(&first))
-            .await;
-        let ownership = match second {
-            Err(failed) => {
-                second_lost += 1;
-                *failed.ownership.expect("a provisional ownership")
-            }
-            Ok(started) => started.ownership.expect("our own session"),
-        };
-        // A stop now could still run before either start reaches serve, so the dock's next step is another start.
-        let third = serve
-            .control()
-            .start(&request(MOCK_VOICE_CHANNEL_ID), Some(&ownership))
-            .await
-            .unwrap();
-        let confirmed = third.ownership.expect("still ours");
-        assert_eq!(confirmed.connections.len(), 1, "round {round}");
-        assert_eq!(
-            serve.control().stop(Some(&confirmed)).await,
-            Ok(Stopped::Stopped),
-            "round {round}"
-        );
-        serve.voice_channel(None).await;
-        serve.restart().await;
-    }
-    assert!(
-        second_lost > 0,
-        "the second start was never lost behind the first"
-    );
-}
-
-/// Sends a start and hangs up without its reply, as a timed-out start does, and returns the ownership it left.
-async fn lost_start_without_reading(serve: &Serve) -> Ownership {
-    let mut client = serve.client().await;
-    let hello = client
-        .call(json!({"id": "h2", "cmd": "hello", "role": "control", "protocol": 2}))
-        .await;
-    let meta = std::fs::metadata(serve.endpoint().as_path()).unwrap();
-    client
-        .write
-        .write_all(format!("{}\n", request(MOCK_VOICE_CHANNEL_ID).command("lost")).as_bytes())
-        .await
-        .unwrap();
-    drop(client);
-    Ownership {
-        connections: vec![Candidate {
-            id: hello["data"]["connection"].as_u64().unwrap(),
-            fps: Some(30),
-        }],
-        guild_id: MOCK_GUILD_ID.into(),
-        channel_id: MOCK_VOICE_CHANNEL_ID.into(),
-        instance: Some(Instance {
-            dev: meta.dev(),
-            ino: meta.ino(),
-            mtime: meta.mtime(),
-            mtime_nsec: meta.mtime_nsec(),
-        }),
     }
 }
 
