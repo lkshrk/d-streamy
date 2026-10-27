@@ -13,7 +13,7 @@ use dstreamy_mock_discord::{
 };
 use dstreamy_obs_producer::Endpoint;
 use dstreamy_obs_producer::control::{
-    ControlError, Named, ObsControl, Ownership, StartRequest, Started, Stopped,
+    ControlError, Named, ObsControl, Ownership, StartFailed, StartRequest, Started, Stopped,
 };
 use dstreamy_obs_producer::dock::{DockModel, DockSettings};
 use serde_json::{Value, json};
@@ -24,7 +24,7 @@ use tokio::net::UnixStream;
 const T: Duration = Duration::from_secs(20);
 const SECOND_GUILD_ID: &str = "200000000000000002";
 const SECOND_VOICE_CHANNEL_ID: &str = "300000000000000011";
-const BIN_HINT: &str = "point DSTREAMY_BIN at the build that `cargo test -p dstreamy-cli` makes (target/debug/dstreamy)";
+const BIN_HINT: &str = "point DSTREAMY_BIN at a test-hooks build of serve: `cargo build -p dstreamy-cli --features test-hooks` (target/debug/dstreamy); a plain build exits 2 on --skip-platform";
 
 /// `None` skips the test locally; under `CI=true` a missing binary is a failure.
 fn dstreamy_bin() -> Option<PathBuf> {
@@ -301,8 +301,21 @@ async fn a_start_from_obs_owns_the_session_and_its_stop_ends_it() {
     );
 }
 
+async fn moved_to(serve: &Serve, control: &ObsControl, guild_id: &str, channel_id: &str) {
+    assert!(serve.mock.move_to_channel(guild_id, channel_id));
+    let deadline = Instant::now() + T;
+    loop {
+        let live = control.status().await.unwrap().unwrap();
+        if live.guild_id == guild_id && live.channel_id == channel_id {
+            return;
+        }
+        assert!(Instant::now() < deadline, "status never showed the move");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_session_moved_in_discord_is_still_stopped_by_its_starter() {
+async fn a_session_moved_in_discord_is_still_ours_after_a_relaunch() {
     let serve = serve!(true);
     let control = serve.control();
     let ownership = control
@@ -312,23 +325,93 @@ async fn a_session_moved_in_discord_is_still_stopped_by_its_starter() {
         .ownership
         .unwrap();
     serve.voice_channel(Some(MOCK_VOICE_CHANNEL_ID)).await;
-    assert!(
-        serve
-            .mock
-            .move_to_channel(MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID)
-    );
-    let deadline = Instant::now() + T;
-    while control.status().await.unwrap().unwrap().channel_id != MOCK_OTHER_VOICE_CHANNEL_ID {
-        assert!(Instant::now() < deadline, "status never showed the move");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    moved_to(&serve, &control, MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID).await;
     let err = control
-        .start(&request(MOCK_VOICE_CHANNEL_ID), Some(&ownership))
+        .start(&request(MOCK_VOICE_CHANNEL_ID), None)
         .await
         .unwrap_err();
     assert_eq!(err.to_string(), "D-Streamy is already live in Gaming");
+    let started = control
+        .start(&request(MOCK_VOICE_CHANNEL_ID), Some(&ownership))
+        .await
+        .unwrap();
+    assert_eq!(
+        started,
+        Started {
+            ownership: Some(ownership.clone()),
+            channel: "Gaming".into()
+        }
+    );
     assert_eq!(control.stop(Some(&ownership)).await, Ok(Stopped::Stopped));
     serve.voice_channel(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_moved_to_another_guild_is_still_stopped_by_its_starter() {
+    let serve = serve!(true);
+    let control = serve.control();
+    let ownership = control
+        .start(&request(MOCK_VOICE_CHANNEL_ID), None)
+        .await
+        .unwrap()
+        .ownership
+        .unwrap();
+    serve.voice_channel(Some(MOCK_VOICE_CHANNEL_ID)).await;
+    moved_to(&serve, &control, SECOND_GUILD_ID, SECOND_VOICE_CHANNEL_ID).await;
+    assert_eq!(control.stop(Some(&ownership)).await, Ok(Stopped::Stopped));
+    serve.voice_channel(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_whose_reply_is_lost_is_still_stopped_by_its_starter() {
+    let serve = serve!(true);
+    let failed = serve
+        .control()
+        .with_start_timeout(Duration::ZERO)
+        .start(&request(MOCK_VOICE_CHANNEL_ID), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            failed.error,
+            ControlError::Timeout {
+                command: "start",
+                ..
+            }
+        ),
+        "{failed:?}"
+    );
+    let provisional = *failed.ownership.expect("a provisional ownership");
+    let control = serve.control();
+    let deadline = Instant::now() + T;
+    let live = loop {
+        if let Some(live) = control.status().await.unwrap() {
+            break live;
+        }
+        assert!(Instant::now() < deadline, "the start never landed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(live.started_by, Some(provisional.connection));
+    assert_eq!(control.stop(Some(&provisional)).await, Ok(Stopped::Stopped));
+    serve.voice_channel(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_after_serve_died_clears_the_session() {
+    let mut serve = serve!(true);
+    let control = serve.control();
+    let ownership = control
+        .start(&request(MOCK_VOICE_CHANNEL_ID), None)
+        .await
+        .unwrap()
+        .ownership
+        .unwrap();
+    serve.child.kill().unwrap();
+    serve.child.wait().unwrap();
+    assert_eq!(
+        control.stop(Some(&ownership)).await,
+        Ok(Stopped::NotRunning)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -385,7 +468,7 @@ async fn a_capture_session_in_the_same_channel_is_refused() {
         .await
         .unwrap_err();
     assert_eq!(
-        err,
+        err.error,
         ControlError::OtherSource {
             channel: "General".into()
         }
@@ -485,7 +568,7 @@ async fn a_grace_override_is_sent_with_the_start() {
     r.grace_secs = Some(3601);
     assert!(matches!(
         control.start(&r, None).await,
-        Err(ControlError::Refused { code, .. }) if code == "invalid_params"
+        Err(StartFailed { error: ControlError::Refused { code, .. }, .. }) if code == "invalid_params"
     ));
     r.grace_secs = Some(120);
     let started = control.start(&r, None).await.unwrap();

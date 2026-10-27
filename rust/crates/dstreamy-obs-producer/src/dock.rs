@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::control::{ControlError, Named, Ownership, StartRequest, Started};
+use crate::control::{ControlError, Named, Ownership, StartFailed, StartRequest, Started};
 use crate::settings::{fit_1080p, target_fps};
 
 pub const DEFAULT_VIDEO_ENCODER: &str = "obs_x264";
@@ -237,18 +237,27 @@ impl DockModel {
     }
 
     /// A start's outcome: `ownership` replaces what was persisted, since it says whether the live session is ours.
-    pub fn started(&mut self, result: Result<Started, String>) {
+    /// A start that failed after it was sent keeps its provisional ownership, in case serve still carried it out.
+    pub fn started(&mut self, result: Result<Started, StartFailed>) {
         if self.state != DockState::Starting {
             return;
         }
         match result {
             Ok(Started { ownership, channel }) => {
                 self.settings.owned = ownership;
+                let channel = self
+                    .channels
+                    .iter()
+                    .find(|c| c.id == channel)
+                    .map_or(channel, |c| c.name.clone());
                 self.state = DockState::Live { channel };
             }
-            Err(e) => {
+            Err(failed) => {
+                if let Some(provisional) = failed.ownership {
+                    self.settings.owned = Some(*provisional);
+                }
                 self.state = DockState::Idle;
-                self.error = Some(e);
+                self.error = Some(failed.error.to_string());
             }
         }
     }
@@ -489,7 +498,10 @@ mod tests {
             ..picked().settings().clone()
         });
         m.start(canvas()).unwrap();
-        m.started(Err("D-Streamy is already live in Gaming".into()));
+        m.started(Err(ControlError::Busy {
+            channel: "Gaming".into(),
+        }
+        .into()));
         assert_eq!(m.state(), &DockState::Idle);
         assert_eq!(m.error(), Some("D-Streamy is already live in Gaming"));
         assert_eq!(m.persisted(), Some(&ownership(3)));
@@ -499,6 +511,44 @@ mod tests {
         m.stopped(Err("timed out".into()));
         assert_eq!(m.persisted(), Some(&ownership(3)));
         assert_eq!(m.error(), Some("timed out"));
+    }
+
+    #[test]
+    fn a_start_lost_after_sending_keeps_its_provisional_ownership() {
+        let mut m = DockModel::new(DockSettings {
+            owned: Some(ownership(3)),
+            ..picked().settings().clone()
+        });
+        m.start(canvas()).unwrap();
+        m.started(Err(StartFailed {
+            error: ControlError::Timeout {
+                command: "start",
+                secs: 10,
+            },
+            ownership: Some(Box::new(ownership(7))),
+        }));
+        assert_eq!(m.state(), &DockState::Idle);
+        assert_eq!(m.persisted(), Some(&ownership(7)));
+        assert_eq!(
+            m.error(),
+            Some("The D-Streamy service didn't answer start within 10 s")
+        );
+    }
+
+    #[test]
+    fn a_channel_id_is_shown_by_its_name_when_the_list_has_it() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(Started {
+            ownership: None,
+            channel: "c".into(),
+        }));
+        assert_eq!(
+            m.state(),
+            &DockState::Live {
+                channel: "C".into()
+            }
+        );
     }
 
     #[test]

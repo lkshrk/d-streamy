@@ -9,7 +9,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 use super::{
     ControlError, Decision, Instance, Live, Named, Ownership, START_GRACE_SECS, STATUS_PLACE,
-    StartRequest, Started, Stopped, decide,
+    StartFailed, StartRequest, Started, Stopped, decide, owns,
 };
 use crate::client::REPLY_TIMEOUT;
 use crate::types::service_text;
@@ -21,6 +21,7 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct ObsControl {
     endpoint: Endpoint,
+    start_timeout: Duration,
 }
 
 struct Connection {
@@ -33,7 +34,18 @@ struct Connection {
 
 impl ObsControl {
     pub fn new(endpoint: Endpoint) -> Self {
-        Self { endpoint }
+        Self {
+            endpoint,
+            start_timeout: REPLY_TIMEOUT,
+        }
+    }
+
+    /// How long a `start` waits for its reply; [`REPLY_TIMEOUT`] by default.
+    pub fn with_start_timeout(self, start_timeout: Duration) -> Self {
+        Self {
+            start_timeout,
+            ..self
+        }
     }
 
     pub async fn guilds(&self) -> Result<Vec<Named>, ControlError> {
@@ -61,15 +73,27 @@ impl ObsControl {
         c.hello_live()
     }
 
-    /// Starts the session, or attaches to it when it is already live in the requested channel.
+    /// Starts the session, or attaches to it when it is already live in the requested channel or was ours.
     pub async fn start(
         &self,
         request: &StartRequest,
         persisted: Option<&Ownership>,
-    ) -> Result<Started, ControlError> {
+    ) -> Result<Started, StartFailed> {
         let mut c = self.open().await?;
         if request.grace_secs.is_some() {
             c.require(START_GRACE_SECS)?;
+        }
+        if let Some(ours) = persisted
+            && owns(&c.hello["status"], ours, c.instance)? == Some(true)
+        {
+            let channel = match c.hello_live() {
+                Ok(Some(live)) => live.channel(),
+                _ => ours.channel_id.clone(),
+            };
+            return Ok(Started {
+                ownership: Some(ours.clone()),
+                channel,
+            });
         }
         let live = c.hello_live()?;
         match decide(request, live.as_ref(), persisted)? {
@@ -78,15 +102,29 @@ impl ObsControl {
                 channel: live.map(|l| l.channel()).unwrap_or_default(),
             }),
             Decision::Start => {
-                let connection = c.connection()?;
+                let provisional = Ownership {
+                    connection: c.connection()?,
+                    guild_id: request.guild_id.clone(),
+                    channel_id: request.channel_id.clone(),
+                    instance: Some(c.instance),
+                };
+                // serve finishes a start whose connection went away, so from here on the start may still land.
+                let unconfirmed = |error| StartFailed {
+                    error,
+                    ownership: Some(Box::new(provisional.clone())),
+                };
                 let id = c.id();
-                c.send(request.command(&id)).await?;
-                match c.reply(&id, "start", REPLY_TIMEOUT).await? {
+                c.send(request.command(&id)).await.map_err(unconfirmed)?;
+                match c
+                    .reply(&id, "start", self.start_timeout)
+                    .await
+                    .map_err(unconfirmed)?
+                {
                     Ok(_) => {}
                     Err(e @ ControlError::Locked(_)) => {
-                        return c.attach_after_race(request, e).await;
+                        return Ok(c.attach_after_race(request, e).await?);
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
                 // The session is ours now, so a status without a place must not fail the start.
                 let channel = match c.live().await {
@@ -94,12 +132,7 @@ impl ObsControl {
                     _ => request.channel_id.clone(),
                 };
                 Ok(Started {
-                    ownership: Some(Ownership {
-                        connection,
-                        guild_id: request.guild_id.clone(),
-                        channel_id: request.channel_id.clone(),
-                        instance: Some(c.instance),
-                    }),
+                    ownership: Some(provisional),
                     channel,
                 })
             }
@@ -111,11 +144,20 @@ impl ObsControl {
         let Some(ownership) = ownership else {
             return Ok(Stopped::LeftRunning);
         };
-        let mut c = self.open().await?;
-        match c.hello_live()? {
+        // Our session can't outlive its serve, and a restarted one never matches the ownership again.
+        let mut c = match self.open().await {
+            Ok(c) => c,
+            Err(
+                ControlError::NotRunning(_) | ControlError::Connect(_) | ControlError::Restarted,
+            ) => {
+                return Ok(Stopped::NotRunning);
+            }
+            Err(e) => return Err(e),
+        };
+        match owns(&c.hello["status"], ownership, c.instance)? {
             None => return Ok(Stopped::NotRunning),
-            Some(live) if !live.owned_by(ownership) => return Ok(Stopped::LeftRunning),
-            Some(_) => {}
+            Some(false) => return Ok(Stopped::LeftRunning),
+            Some(true) => {}
         }
         match c.call(json!({"cmd": "stop"}), "stop", STOP_TIMEOUT).await {
             Ok(_) => Ok(Stopped::Stopped),
@@ -159,11 +201,12 @@ impl ObsControl {
     }
 
     fn instance(&self) -> Option<Instance> {
-        let meta = std::fs::symlink_metadata(self.endpoint.as_path()).ok()?;
+        let meta = std::fs::metadata(self.endpoint.as_path()).ok()?;
         Some(Instance {
             dev: meta.dev(),
             ino: meta.ino(),
-            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
         })
     }
 }

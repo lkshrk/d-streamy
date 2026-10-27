@@ -28,7 +28,8 @@ pub struct Named {
 pub struct Instance {
     pub dev: u64,
     pub ino: u64,
-    pub mtime_ns: i128,
+    pub mtime: i64,
+    pub mtime_nsec: i64,
 }
 
 /// The session this plugin started, kept in the module config so a relaunched OBS still stops it.
@@ -36,10 +37,51 @@ pub struct Instance {
 pub struct Ownership {
     /// The control connection whose `start` began the session, as serve's `started_by` names it.
     pub connection: u64,
+    /// Where the start asked to stream; the session may have moved since.
     pub guild_id: String,
     pub channel_id: String,
     #[serde(default)]
     pub instance: Option<Instance>,
+}
+
+impl Ownership {
+    /// Connection ids restart with serve, so only the same serve run's id names the same start.
+    pub fn matches(&self, started_by: Option<u64>, instance: Option<Instance>) -> bool {
+        started_by == Some(self.connection) && instance.is_some() && instance == self.instance
+    }
+}
+
+/// Whether `status` shows a live session; its place is not needed.
+fn is_live(status: &Value) -> Result<bool, ControlError> {
+    let session = &status["session"];
+    if session.is_null() {
+        return Ok(false);
+    }
+    match session["state"].as_str() {
+        Some("connecting" | "streaming" | "reconnecting") => Ok(true),
+        Some("idle" | "stopped") => Ok(false),
+        Some("stopping") => Err(ControlError::Stopping),
+        Some(other) => Err(ControlError::Protocol(service_text(&format!(
+            "unknown session state {other}"
+        )))),
+        None => Err(ControlError::Protocol(service_text(&format!(
+            "status without a session state: {status}"
+        )))),
+    }
+}
+
+/// `Some(true)` when `status` shows a live session that `ownership` started, even one without a place.
+pub fn owns(
+    status: &Value,
+    ownership: &Ownership,
+    instance: Instance,
+) -> Result<Option<bool>, ControlError> {
+    if !is_live(status)? {
+        return Ok(None);
+    }
+    Ok(Some(
+        ownership.matches(status["started_by"].as_u64(), Some(instance)),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,25 +123,10 @@ pub struct Live {
 impl Live {
     /// Reads a `status` result; `Ok(None)` when no session is live.
     pub fn from_status(status: &Value) -> Result<Option<Self>, ControlError> {
-        let session = &status["session"];
-        if session.is_null() {
+        if !is_live(status)? {
             return Ok(None);
         }
-        let Some(state) = session["state"].as_str() else {
-            return Err(ControlError::Protocol(service_text(&format!(
-                "status without a session state: {status}"
-            ))));
-        };
-        match state {
-            "connecting" | "streaming" | "reconnecting" => {}
-            "idle" | "stopped" => return Ok(None),
-            "stopping" => return Err(ControlError::Stopping),
-            other => {
-                return Err(ControlError::Protocol(service_text(&format!(
-                    "unknown session state {other}"
-                ))));
-            }
-        }
+        let session = &status["session"];
         let text = |key: &str| session[key].as_str().map(str::to_owned);
         let (Some(guild_id), Some(channel_id), Some(target)) =
             (text("guild_id"), text("channel_id"), text("target"))
@@ -124,12 +151,8 @@ impl Live {
         self.guild_id == guild_id && self.channel_id == channel_id
     }
 
-    /// Connection ids restart with serve, hence the instance; the channel may have moved since.
     pub fn owned_by(&self, ownership: &Ownership) -> bool {
-        self.started_by == Some(ownership.connection)
-            && self.guild_id == ownership.guild_id
-            && self.instance.is_some()
-            && self.instance == ownership.instance
+        ownership.matches(self.started_by, self.instance)
     }
 }
 
@@ -155,7 +178,7 @@ pub enum Decision {
     Attach { owned: Option<Ownership> },
 }
 
-/// Starts when nothing is live, attaches to a live external session in the requested channel, and refuses anything else.
+/// Starts when nothing is live, attaches to our session wherever it is or to an external one in the requested channel.
 pub fn decide(
     request: &StartRequest,
     live: Option<&Live>,
@@ -164,6 +187,11 @@ pub fn decide(
     let Some(live) = live else {
         return Ok(Decision::Start);
     };
+    if let Some(owned) = persisted.filter(|o| live.owned_by(o)) {
+        return Ok(Decision::Attach {
+            owned: Some(owned.clone()),
+        });
+    }
     if !live.is_in(&request.guild_id, &request.channel_id) {
         return Err(ControlError::Busy {
             channel: live.channel(),
@@ -174,10 +202,32 @@ pub fn decide(
             channel: live.channel(),
         });
     }
-    Ok(Decision::Attach {
-        owned: persisted.filter(|o| live.owned_by(o)).cloned(),
-    })
+    Ok(Decision::Attach { owned: None })
 }
+
+/// A start that failed; `ownership` is set once the start was sent, since serve may still carry it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartFailed {
+    pub error: ControlError,
+    pub ownership: Option<Box<Ownership>>,
+}
+
+impl From<ControlError> for StartFailed {
+    fn from(error: ControlError) -> Self {
+        Self {
+            error,
+            ownership: None,
+        }
+    }
+}
+
+impl fmt::Display for StartFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for StartFailed {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlError {
@@ -227,6 +277,9 @@ impl ControlError {
             "unknown_channel" => Self::UnknownChannel,
             "guild_unavailable" => Self::GuildUnavailable,
             "already_running" => Self::Locked(message),
+            "unsupported_protocol" => Self::Outdated {
+                feature: "control protocol 2",
+            },
             _ => Self::Refused {
                 code: service_text(code),
                 message,
@@ -315,7 +368,8 @@ mod tests {
         Instance {
             dev: 1,
             ino,
-            mtime_ns: 5,
+            mtime: 5,
+            mtime_nsec: 6,
         }
     }
 
@@ -366,21 +420,49 @@ mod tests {
             decide(&r, Some(&ours), None),
             Ok(Decision::Attach { owned: None })
         );
-        let other_guild = Ownership {
-            guild_id: "h".into(),
-            ..owned(3)
-        };
-        assert_eq!(
-            decide(&r, Some(&ours), Some(&other_guild)),
-            Ok(Decision::Attach { owned: None })
-        );
     }
 
     #[test]
-    fn a_session_moved_to_another_channel_is_still_owned() {
-        let moved = live("d", "external", Some(3));
+    fn our_session_is_attached_wherever_it_moved() {
+        let r = request();
+        let mut moved = live("d", "external", Some(3));
+        moved.guild_id = "h".into();
         assert!(moved.owned_by(&owned(3)));
         assert!(!moved.owned_by(&owned(4)));
+        assert_eq!(
+            decide(&r, Some(&moved), Some(&owned(3))),
+            Ok(Decision::Attach {
+                owned: Some(owned(3))
+            })
+        );
+        assert!(matches!(
+            decide(&r, Some(&moved), Some(&owned(4))),
+            Err(ControlError::Busy { .. })
+        ));
+    }
+
+    #[test]
+    fn ownership_is_read_without_a_place() {
+        let status = |state: &str, started_by: u64| json!({"session": {"state": state}, "started_by": started_by});
+        let here = instance(1);
+        assert_eq!(
+            owns(&status("streaming", 3), &owned(3), here),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            owns(&status("streaming", 4), &owned(3), here),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            owns(&status("streaming", 3), &owned(3), instance(2)),
+            Ok(Some(false))
+        );
+        assert_eq!(owns(&status("stopped", 3), &owned(3), here), Ok(None));
+        assert_eq!(owns(&json!({"session": null}), &owned(3), here), Ok(None));
+        assert_eq!(
+            Live::from_status(&status("streaming", 3)),
+            Err(ControlError::NoPlace)
+        );
     }
 
     #[test]
@@ -489,6 +571,10 @@ mod tests {
             ControlError::Locked("m".into())
         );
         assert_eq!(
+            ControlError::from_reply(&reply("unsupported_protocol")).to_string(),
+            "The D-Streamy service is too old for this plugin (it lacks control protocol 2): update and restart it"
+        );
+        assert_eq!(
             ControlError::from_reply(&reply("gateway")).to_string(),
             "The D-Streamy service refused (gateway): m"
         );
@@ -501,7 +587,7 @@ mod tests {
         assert_eq!(
             v,
             json!({"connection": 9, "guild_id": "g", "channel_id": "c",
-                   "instance": {"dev": 1, "ino": 1, "mtime_ns": 5}})
+                   "instance": {"dev": 1, "ino": 1, "mtime": 5, "mtime_nsec": 6}})
         );
         assert_eq!(serde_json::from_value::<Ownership>(v).unwrap(), o);
         let older: Ownership =
