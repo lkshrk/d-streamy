@@ -151,6 +151,8 @@ pub(crate) enum Control {
     Send(String),
     /// `None` drops the TCP connection without a close frame.
     Close(Option<u16>),
+    /// Ends the voice session, then drops TCP without a close frame, as an RST that lost the close frame would look.
+    Reset,
 }
 
 pub(crate) struct Connection {
@@ -193,6 +195,7 @@ pub(crate) struct State {
     pub defer_join: bool,
     pub deferred_join: Option<Value>,
     pub close_voice_on_stream_create: bool,
+    pub reset_voice_on_stream_create: bool,
     pub ignore_stream_creates: usize,
 }
 

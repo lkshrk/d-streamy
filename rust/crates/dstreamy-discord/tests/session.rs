@@ -604,6 +604,41 @@ async fn voice_closing_during_every_stream_create_gives_up() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_refused_voice_resume_during_every_stream_create_gives_up() {
+    let mut f = Fixture::streaming().await;
+    let max_attempts = options().backoff.max_attempts;
+    stop_and_start(&mut f, MOCK_VOICE_CHANNEL_ID, options(), |mock| {
+        mock.reset_voice_on_stream_create();
+    })
+    .await;
+    wait_state(&mut f.state, |s| {
+        matches!(
+            s,
+            SessionState::Stopped {
+                reason: StopReason::GaveUp { .. }
+            }
+        )
+    })
+    .await;
+    assert_eq!(
+        *f.state.borrow(),
+        SessionState::Stopped {
+            reason: StopReason::GaveUp {
+                attempts: max_attempts
+            }
+        }
+    );
+    let resumes = f
+        .mock
+        .received_ops()
+        .iter()
+        .filter(|o| o.is(Some(VoiceKind::Voice), vo::OP_RESUME))
+        .count();
+    assert_eq!(resumes, max_attempts as usize + 1);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_failed_stream_create_rejoins_once_without_a_stale_voice_close() {
     let mut f = Fixture::streaming().await;
     let mut options = options();

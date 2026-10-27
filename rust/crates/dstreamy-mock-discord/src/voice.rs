@@ -123,6 +123,29 @@ impl VoiceConn {
 type Ws = WebSocketStream<TcpStream>;
 type SharedConn = Arc<tokio::sync::Mutex<VoiceConn>>;
 
+fn ends_session(code: u16) -> bool {
+    matches!(code, CLOSE_SESSION_NO_LONGER_VALID | CLOSE_SESSION_TIMEOUT)
+}
+
+/// Forgets `conn`'s session, so a RESUME of it is refused with 4006.
+async fn end_session(shared: &Shared, conn: &SharedConn) {
+    let server_id = conn.lock().await.server_id.clone();
+    let ours = {
+        let mut state = shared.state();
+        let ours = state
+            .voice_conns
+            .get(&server_id)
+            .is_some_and(|c| Arc::ptr_eq(c, conn));
+        if ours {
+            state.voice_conns.remove(&server_id);
+        }
+        ours
+    };
+    if ours {
+        conn.lock().await.close_peer().await;
+    }
+}
+
 pub(crate) async fn serve(shared: Arc<Shared>, listener: TcpListener) {
     while let Ok((tcp, _)) = listener.accept().await {
         tokio::spawn(handle(shared.clone(), tcp));
@@ -342,12 +365,20 @@ async fn run(
                     }
                 }
                 Some(Control::Close(Some(code))) => {
+                    if ends_session(code) {
+                        end_session(shared, conn).await;
+                    }
                     close(&mut ws, code).await;
+                    return;
+                }
+                Some(Control::Reset) => {
+                    end_session(shared, conn).await;
                     return;
                 }
                 Some(Control::Close(None)) | None => return,
             },
             () = tokio::time::sleep_until(heartbeat_deadline) => {
+                end_session(shared, conn).await;
                 close(&mut ws, CLOSE_SESSION_TIMEOUT).await;
                 return;
             }

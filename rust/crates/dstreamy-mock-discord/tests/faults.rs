@@ -166,6 +166,51 @@ async fn voice_ws_close_4015_is_resumed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn voice_resume_after_4006_closes_4006() {
+    let mock = MockDiscord::start().await.unwrap();
+    let mut client = Client::connect(&mock).await;
+    let mut voice = client
+        .streamer
+        .join_voice(Some(MOCK_GUILD_ID.into()), MOCK_VOICE_CHANNEL_ID.into());
+    client.ready(&mut voice).await;
+    let identify = mock
+        .wait_for_op(Some(VoiceKind::Voice), vo::OP_IDENTIFY, 0, T)
+        .await
+        .expect("voice IDENTIFY");
+    let identify = identify.json().unwrap();
+
+    assert!(mock.drop_voice(VoiceKind::Voice, Some(vo::CLOSE_SESSION_NO_LONGER_VALID)));
+    timeout(T, async {
+        while let Some(ev) = voice.events.recv().await {
+            if let VoiceEvent::Closed { code } = ev {
+                assert_eq!(code, Some(vo::CLOSE_SESSION_NO_LONGER_VALID));
+                return;
+            }
+        }
+        panic!("voice events closed");
+    })
+    .await
+    .expect("Closed");
+
+    let (mut ws, _) = connect_async(format!("{}/?v=8", mock.voice_endpoint()))
+        .await
+        .unwrap();
+    ws.next().await.unwrap().unwrap();
+    let resume = json!({ "op": vo::OP_RESUME, "d": {
+        "server_id": identify["server_id"], "session_id": identify["session_id"],
+        "token": identify["token"], "seq_ack": 0,
+    } });
+    ws.send(Message::Text(resume.to_string())).await.unwrap();
+    match timeout(T, ws.next()).await.unwrap() {
+        Some(Ok(Message::Close(Some(f)))) => {
+            assert_eq!(u16::from(f.code), vo::CLOSE_SESSION_NO_LONGER_VALID)
+        }
+        other => panic!("expected close, got {other:?}"),
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn channel_move_retargets_the_next_stream() {
     let mock = MockDiscord::start().await.unwrap();
     let mut client = Client::connect(&mock).await;

@@ -272,6 +272,11 @@ impl MockDiscord {
         self.shared.state().close_voice_on_stream_create = true;
     }
 
+    /// From now on every STREAM_CREATE ends the voice session and drops its TCP without a close frame, so the client's RESUME is refused.
+    pub fn reset_voice_on_stream_create(&self) {
+        self.shared.state().reset_voice_on_stream_create = true;
+    }
+
     /// Leaves the next `n` STREAM_CREATEs unanswered.
     pub fn ignore_stream_creates(&self, n: usize) {
         self.shared.state().ignore_stream_creates = n;

@@ -1,6 +1,7 @@
 //! Main gateway (v9, JSON) as Discord serves it to a user account.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use flate2::{Compress, Compression, FlushCompress};
 use futures_util::{SinkExt, StreamExt};
@@ -34,6 +35,8 @@ pub const OP_STREAM_CREATE: u8 = 18;
 pub const OP_STREAM_DELETE: u8 = 19;
 pub const OP_STREAM_WATCH: u8 = 20;
 pub const OP_STREAM_SET_PAUSED: u8 = 22;
+
+const CLOSE_HANDSHAKE: Duration = Duration::from_secs(2);
 
 pub const CLOSE_UNKNOWN_ERROR: u16 = 4000;
 pub const CLOSE_DECODE_ERROR: u16 = 4002;
@@ -116,7 +119,7 @@ async fn run(
                     close(&mut ws, code).await;
                     return;
                 }
-                Some(Control::Close(None)) | None => return,
+                Some(Control::Close(None) | Control::Reset) | None => return,
             },
         }
     }
@@ -138,6 +141,7 @@ fn zlib_sync_flush(c: &mut Compress, data: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Sends `code`, then reads until the peer closes: TCP dropped with frames unread sends RST, which fails the peer's next write.
 pub(crate) async fn close(ws: &mut WebSocketStream<TcpStream>, code: u16) {
     let _ = ws
         .close(Some(CloseFrame {
@@ -145,6 +149,14 @@ pub(crate) async fn close(ws: &mut WebSocketStream<TcpStream>, code: u16) {
             reason: "".into(),
         }))
         .await;
+    let _ = tokio::time::timeout(CLOSE_HANDSHAKE, async {
+        while let Some(Ok(msg)) = ws.next().await {
+            if msg.is_close() {
+                return;
+            }
+        }
+    })
+    .await;
 }
 
 fn on_text(shared: &Shared, id: u64, text: &str) -> Result<(), u16> {
@@ -361,12 +373,14 @@ fn stream_key(guild_id: &str, channel_id: &str, user_id: &str) -> String {
 }
 
 fn stream_create(shared: &Shared, state: &mut State, d: &Value) {
-    if state.close_voice_on_stream_create {
+    if state.close_voice_on_stream_create || state.reset_voice_on_stream_create {
         for (kind, conn) in state.voice_sockets.values() {
             if *kind == VoiceKind::Voice {
-                let _ = conn.tx.send(Control::Close(Some(
-                    crate::voice::CLOSE_SESSION_NO_LONGER_VALID,
-                )));
+                let _ = conn.tx.send(if state.reset_voice_on_stream_create {
+                    Control::Reset
+                } else {
+                    Control::Close(Some(crate::voice::CLOSE_SESSION_NO_LONGER_VALID))
+                });
             }
         }
         return;
@@ -635,4 +649,57 @@ pub(crate) fn guild_payload(config: &MockConfig, guild: &MockGuild) -> Value {
         "nsfw_level": 0,
         "lazy": true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::{accept_async, connect_async};
+
+    /// The peer's write after the close frame arrives, with the peer's earlier frame left unread by the closer.
+    async fn write_after_close(drain: bool) -> (bool, Option<u16>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if drain {
+                close(&mut ws, crate::voice::CLOSE_SESSION_NO_LONGER_VALID).await;
+            } else {
+                let _ = ws
+                    .close(Some(CloseFrame {
+                        code: CloseCode::from(crate::voice::CLOSE_SESSION_NO_LONGER_VALID),
+                        reason: "".into(),
+                    }))
+                    .await;
+            }
+        });
+        let (mut ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+        ws.send(Message::Text("unread".into())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let wrote = ws.send(Message::Text("after".into())).await.is_ok();
+        let code = match ws.next().await {
+            Some(Ok(Message::Close(Some(f)))) => Some(u16::from(f.code)),
+            _ => None,
+        };
+        drop(ws);
+        server.await.unwrap();
+        (wrote, code)
+    }
+
+    #[tokio::test]
+    #[ignore = "measures the host's TCP stack; observed on Linux"]
+    async fn an_undrained_close_fails_the_peers_next_write_and_a_drained_one_does_not() {
+        for _ in 0..10 {
+            assert_eq!(
+                write_after_close(false).await,
+                (false, Some(crate::voice::CLOSE_SESSION_NO_LONGER_VALID))
+            );
+            assert_eq!(
+                write_after_close(true).await,
+                (true, Some(crate::voice::CLOSE_SESSION_NO_LONGER_VALID))
+            );
+        }
+    }
 }
