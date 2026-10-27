@@ -323,6 +323,7 @@ mod tests {
             connection,
             guild_id: "g".into(),
             channel_id: "c".into(),
+            instance: None,
         }
     }
 

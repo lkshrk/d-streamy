@@ -23,6 +23,14 @@ pub struct Named {
     pub name: String,
 }
 
+/// One run of `dstreamy serve`, told apart by its socket file, which every serve binds anew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Instance {
+    pub dev: u64,
+    pub ino: u64,
+    pub mtime_ns: i128,
+}
+
 /// The session this plugin started, kept in the module config so a relaunched OBS still stops it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ownership {
@@ -30,6 +38,8 @@ pub struct Ownership {
     pub connection: u64,
     pub guild_id: String,
     pub channel_id: String,
+    #[serde(default)]
+    pub instance: Option<Instance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +74,8 @@ pub struct Live {
     pub channel_name: Option<String>,
     pub target: String,
     pub started_by: Option<u64>,
+    /// The serve that reported this session; `from_status` leaves it to the caller.
+    pub instance: Option<Instance>,
 }
 
 impl Live {
@@ -78,8 +90,15 @@ impl Live {
                 "status without a session state: {status}"
             ))));
         };
-        if !matches!(state, "connecting" | "streaming" | "reconnecting") {
-            return Ok(None);
+        match state {
+            "connecting" | "streaming" | "reconnecting" => {}
+            "idle" | "stopped" => return Ok(None),
+            "stopping" => return Err(ControlError::Stopping),
+            other => {
+                return Err(ControlError::Protocol(service_text(&format!(
+                    "unknown session state {other}"
+                ))));
+            }
         }
         let text = |key: &str| session[key].as_str().map(str::to_owned);
         let (Some(guild_id), Some(channel_id), Some(target)) =
@@ -93,6 +112,7 @@ impl Live {
             channel_name: text("channel_name"),
             target,
             started_by: status["started_by"].as_u64(),
+            instance: None,
         }))
     }
 
@@ -104,9 +124,12 @@ impl Live {
         self.guild_id == guild_id && self.channel_id == channel_id
     }
 
-    /// Connection ids restart with serve, so the guild must match too; the channel may have moved since.
+    /// Connection ids restart with serve, hence the instance; the channel may have moved since.
     pub fn owned_by(&self, ownership: &Ownership) -> bool {
-        self.started_by == Some(ownership.connection) && self.guild_id == ownership.guild_id
+        self.started_by == Some(ownership.connection)
+            && self.guild_id == ownership.guild_id
+            && self.instance.is_some()
+            && self.instance == ownership.instance
     }
 }
 
@@ -176,6 +199,9 @@ pub enum ControlError {
     Outdated {
         feature: &'static str,
     },
+    Stopping,
+    /// The service restarted between two looks at its socket.
+    Restarted,
     /// A live session without a place, as serve reports after a 2 s catch-up timeout.
     NoPlace,
     Refused {
@@ -238,6 +264,10 @@ impl fmt::Display for ControlError {
                 f,
                 "The D-Streamy service is too old for this plugin (it lacks {feature}): update and restart it"
             ),
+            Self::Stopping => f.write_str("D-Streamy is still stopping; try again"),
+            Self::Restarted => {
+                f.write_str("The D-Streamy service restarted while connecting; try again")
+            }
             Self::NoPlace => f.write_str(
                 "The D-Streamy service doesn't know where its session streams: stop it and start again",
             ),
@@ -277,6 +307,15 @@ mod tests {
             channel_name: Some(format!("#{channel_id}")),
             target: target.into(),
             started_by,
+            instance: Some(instance(1)),
+        }
+    }
+
+    fn instance(ino: u64) -> Instance {
+        Instance {
+            dev: 1,
+            ino,
+            mtime_ns: 5,
         }
     }
 
@@ -285,6 +324,7 @@ mod tests {
             connection,
             guild_id: "g".into(),
             channel_id: "c".into(),
+            instance: Some(instance(1)),
         }
     }
 
@@ -344,6 +384,25 @@ mod tests {
     }
 
     #[test]
+    fn a_restarted_service_reusing_the_connection_id_is_not_owned() {
+        let r = request();
+        let mut restarted = live("c", "external", Some(3));
+        restarted.instance = Some(instance(2));
+        assert_eq!(
+            decide(&r, Some(&restarted), Some(&owned(3))),
+            Ok(Decision::Attach { owned: None })
+        );
+        let unknown = Ownership {
+            instance: None,
+            ..owned(3)
+        };
+        assert!(!live("c", "external", Some(3)).owned_by(&unknown));
+        let mut unseen = live("c", "external", Some(3));
+        unseen.instance = None;
+        assert!(!unseen.owned_by(&unknown));
+    }
+
+    #[test]
     fn another_channel_is_named() {
         let err = decide(&request(), Some(&live("d", "external", None)), None).unwrap_err();
         assert_eq!(err.to_string(), "D-Streamy is already live in #d");
@@ -385,6 +444,7 @@ mod tests {
                 channel_name: Some("General".into()),
                 target: "external".into(),
                 started_by: Some(5),
+                instance: None,
             }))
         );
         for state in ["idle", "stopped"] {
@@ -392,6 +452,14 @@ mod tests {
             assert_eq!(Live::from_status(&s), Ok(None), "{state}");
         }
         assert_eq!(Live::from_status(&json!({"session": null})), Ok(None));
+        assert_eq!(
+            Live::from_status(&json!({"session": {"state": "stopping"}})),
+            Err(ControlError::Stopping)
+        );
+        assert!(matches!(
+            Live::from_status(&json!({"session": {"state": "paused"}})),
+            Err(ControlError::Protocol(_))
+        ));
         assert_eq!(
             Live::from_status(&json!({"session": {"state": "streaming"}})),
             Err(ControlError::NoPlace)
@@ -432,8 +500,20 @@ mod tests {
         let v = serde_json::to_value(&o).unwrap();
         assert_eq!(
             v,
-            json!({"connection": 9, "guild_id": "g", "channel_id": "c"})
+            json!({"connection": 9, "guild_id": "g", "channel_id": "c",
+                   "instance": {"dev": 1, "ino": 1, "mtime_ns": 5}})
         );
         assert_eq!(serde_json::from_value::<Ownership>(v).unwrap(), o);
+        let older: Ownership =
+            serde_json::from_value(json!({"connection": 9, "guild_id": "g", "channel_id": "c"}))
+                .unwrap();
+        assert_eq!(older.instance, None);
+    }
+
+    #[test]
+    fn a_stopping_session_blocks_a_start_with_a_retryable_error() {
+        let status = json!({"session": {"state": "stopping"}, "started_by": null});
+        let err = Live::from_status(&status).unwrap_err();
+        assert_eq!(err.to_string(), "D-Streamy is still stopping; try again");
     }
 }

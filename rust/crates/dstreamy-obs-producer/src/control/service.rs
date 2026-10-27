@@ -1,3 +1,4 @@
+use std::os::unix::fs::MetadataExt;
 use std::time::Duration;
 
 use dstreamy_ipc::{ControlCodec, Endpoint, IpcError};
@@ -7,8 +8,8 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use super::{
-    ControlError, Decision, Live, Named, Ownership, START_GRACE_SECS, STATUS_PLACE, StartRequest,
-    Started, Stopped, decide,
+    ControlError, Decision, Instance, Live, Named, Ownership, START_GRACE_SECS, STATUS_PLACE,
+    StartRequest, Started, Stopped, decide,
 };
 use crate::client::REPLY_TIMEOUT;
 use crate::types::service_text;
@@ -26,6 +27,7 @@ struct Connection {
     lines: FramedRead<ReadHalf<dstreamy_ipc::Stream>, ControlCodec>,
     writer: FramedWrite<WriteHalf<dstreamy_ipc::Stream>, ControlCodec>,
     hello: Value,
+    instance: Instance,
     next_id: u64,
 }
 
@@ -56,7 +58,7 @@ impl ObsControl {
 
     pub async fn status(&self) -> Result<Option<Live>, ControlError> {
         let c = self.open().await?;
-        Live::from_status(&c.hello["status"])
+        c.hello_live()
     }
 
     /// Starts the session, or attaches to it when it is already live in the requested channel.
@@ -69,7 +71,7 @@ impl ObsControl {
         if request.grace_secs.is_some() {
             c.require(START_GRACE_SECS)?;
         }
-        let live = Live::from_status(&c.hello["status"])?;
+        let live = c.hello_live()?;
         match decide(request, live.as_ref(), persisted)? {
             Decision::Attach { owned } => Ok(Started {
                 ownership: owned,
@@ -96,6 +98,7 @@ impl ObsControl {
                         connection,
                         guild_id: request.guild_id.clone(),
                         channel_id: request.channel_id.clone(),
+                        instance: Some(c.instance),
                     }),
                     channel,
                 })
@@ -109,7 +112,7 @@ impl ObsControl {
             return Ok(Stopped::LeftRunning);
         };
         let mut c = self.open().await?;
-        match Live::from_status(&c.hello["status"])? {
+        match c.hello_live()? {
             None => return Ok(Stopped::NotRunning),
             Some(live) if !live.owned_by(ownership) => return Ok(Stopped::LeftRunning),
             Some(_) => {}
@@ -124,17 +127,20 @@ impl ObsControl {
     }
 
     async fn open(&self) -> Result<Connection, ControlError> {
+        let before = self.instance();
         let stream = dstreamy_ipc::connect(&self.endpoint)
             .await
             .map_err(|e| match e {
                 IpcError::NotRunning(_) => ControlError::NotRunning(service_text(&e.to_string())),
                 e => ControlError::Connect(service_text(&e.to_string())),
             })?;
+        let before = before.ok_or(ControlError::Restarted)?;
         let (read, write) = tokio::io::split(stream);
         let mut c = Connection {
             lines: FramedRead::new(read, ControlCodec::new()),
             writer: FramedWrite::new(write, ControlCodec::new()),
             hello: Value::Null,
+            instance: before,
             next_id: 0,
         };
         c.hello = c
@@ -145,7 +151,20 @@ impl ObsControl {
             )
             .await?;
         c.require(STATUS_PLACE)?;
+        // The path names whichever serve bound it last, so it must be the same file on both sides of the hello.
+        if self.instance() != Some(before) {
+            return Err(ControlError::Restarted);
+        }
         Ok(c)
+    }
+
+    fn instance(&self) -> Option<Instance> {
+        let meta = std::fs::symlink_metadata(self.endpoint.as_path()).ok()?;
+        Some(Instance {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+        })
     }
 }
 
@@ -153,6 +172,17 @@ impl Connection {
     fn id(&mut self) -> String {
         self.next_id += 1;
         self.next_id.to_string()
+    }
+
+    fn hello_live(&self) -> Result<Option<Live>, ControlError> {
+        Ok(self.with_instance(Live::from_status(&self.hello["status"])?))
+    }
+
+    fn with_instance(&self, live: Option<Live>) -> Option<Live> {
+        live.map(|live| Live {
+            instance: Some(self.instance),
+            ..live
+        })
     }
 
     fn require(&self, feature: &'static str) -> Result<(), ControlError> {
@@ -249,7 +279,7 @@ impl Connection {
         let status = self
             .call(json!({"cmd": "status"}), "status", REPLY_TIMEOUT)
             .await?;
-        Live::from_status(&status)
+        Ok(self.with_instance(Live::from_status(&status)?))
     }
 
     /// Another client's start won the race, or another process holds the session lock.

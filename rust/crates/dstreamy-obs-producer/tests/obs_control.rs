@@ -54,9 +54,35 @@ fn two_guilds() -> MockConfig {
     config
 }
 
+async fn spawn(bin: &Path, config: &Path, mock: &MockDiscord, run: &Path) -> Child {
+    let endpoint = run.join("d").join("s.sock");
+    let mut child = Command::new(bin)
+        .env_remove("DSTREAMY_TOKEN")
+        .env_remove("DSTREAMY_CONFIG_DIR")
+        .arg("--config-dir")
+        .arg(config)
+        .arg("--gateway-url")
+        .arg(mock.gateway_url())
+        .args(["serve", "--skip-platform", "--endpoint"])
+        .arg(&endpoint)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + T;
+    while StdUnixStream::connect(&endpoint).is_err() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("serve exited with {status} before listening; {BIN_HINT}");
+        }
+        assert!(Instant::now() < deadline, "serve never listened");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    child
+}
+
 struct Serve {
+    bin: PathBuf,
     mock: MockDiscord,
-    _config: TempDir,
+    config: TempDir,
     run: TempDir,
     child: Child,
 }
@@ -72,33 +98,21 @@ impl Serve {
         }
         std::fs::write(config.path().join("config.toml"), "").unwrap();
         let run = tempfile::Builder::new().prefix("ds").tempdir().unwrap();
-        let endpoint = run.path().join("d").join("s.sock");
-        let mut child = Command::new(bin)
-            .env_remove("DSTREAMY_TOKEN")
-            .env_remove("DSTREAMY_CONFIG_DIR")
-            .arg("--config-dir")
-            .arg(config.path())
-            .arg("--gateway-url")
-            .arg(mock.gateway_url())
-            .args(["serve", "--skip-platform", "--endpoint"])
-            .arg(&endpoint)
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + T;
-        while StdUnixStream::connect(&endpoint).is_err() {
-            if let Some(status) = child.try_wait().unwrap() {
-                panic!("serve exited with {status} before listening; {BIN_HINT}");
-            }
-            assert!(Instant::now() < deadline, "serve never listened");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let child = spawn(bin, config.path(), &mock, run.path()).await;
         Self {
+            bin: bin.to_owned(),
             mock,
-            _config: config,
+            config,
             run,
             child,
         }
+    }
+
+    /// Kills serve and starts another on the same endpoint and config.
+    async fn restart(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        self.child = spawn(&self.bin, self.config.path(), &self.mock, self.run.path()).await;
     }
 
     fn endpoint(&self) -> Endpoint {
@@ -339,6 +353,7 @@ async fn a_session_another_client_started_is_attached_and_left_running() {
         connection: 999,
         guild_id: MOCK_GUILD_ID.into(),
         channel_id: MOCK_VOICE_CHANNEL_ID.into(),
+        instance: None,
     };
     assert_eq!(control.stop(Some(&foreign)).await, Ok(Stopped::LeftRunning));
     assert!(control.status().await.unwrap().is_some());
@@ -422,6 +437,36 @@ async fn a_stale_ownership_never_stops_a_newer_session() {
     client.stop().await;
     client.start_external(MOCK_VOICE_CHANNEL_ID).await;
 
+    let started = control
+        .start(&request(MOCK_VOICE_CHANNEL_ID), Some(&old))
+        .await
+        .unwrap();
+    assert_eq!(started.ownership, None);
+    assert_eq!(control.stop(Some(&old)).await, Ok(Stopped::LeftRunning));
+    assert!(control.status().await.unwrap().is_some());
+    client.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ownership_from_before_a_serve_restart_is_ignored() {
+    let mut serve = serve!(true);
+    let old = serve
+        .control()
+        .start(&request(MOCK_VOICE_CHANNEL_ID), None)
+        .await
+        .unwrap()
+        .ownership
+        .unwrap();
+    serve.restart().await;
+    let mut client = serve.client().await;
+    client.start_external(MOCK_VOICE_CHANNEL_ID).await;
+    let control = serve.control();
+    let live = control.status().await.unwrap().expect("live");
+    assert_eq!(
+        live.started_by,
+        Some(old.connection),
+        "the new serve reuses the connection id, which is what the instance guards against"
+    );
     let started = control
         .start(&request(MOCK_VOICE_CHANNEL_ID), Some(&old))
         .await
