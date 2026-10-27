@@ -8,6 +8,10 @@ use crate::settings::{fit_1080p, target_fps};
 
 pub const DEFAULT_VIDEO_ENCODER: &str = "obs_x264";
 pub const DEFAULT_BITRATE_KBPS: i64 = 6000;
+/// The range the output's bitrate property offers.
+pub const BITRATE_KBPS: std::ops::RangeInclusive<i64> = 500..=50_000;
+/// serve refuses a longer per-start grace (ADR 0004).
+pub const MAX_GRACE_SECS: u64 = 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,9 +54,44 @@ impl Default for DockSettings {
 }
 
 impl DockSettings {
-    /// Reads the module config; anything unreadable falls back to the defaults.
+    /// Reads the module config field by field, so one unreadable field falls back alone and never takes `owned` along.
     pub fn from_json(text: &str) -> Self {
-        serde_json::from_str(text).unwrap_or_default()
+        let d = Self::default();
+        let Ok(Value::Object(map)) = serde_json::from_str::<Value>(text) else {
+            return d;
+        };
+        fn field<T: serde::de::DeserializeOwned>(
+            map: &serde_json::Map<String, Value>,
+            key: &str,
+        ) -> Option<T> {
+            map.get(key)
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+        }
+        let bitrate = map
+            .get("bitrate_kbps")
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
+        Self {
+            guild_id: field(&map, "guild_id"),
+            channel_id: field(&map, "channel_id"),
+            grace_secs: field::<u64>(&map, "grace_secs").filter(|s| *s <= MAX_GRACE_SECS),
+            mode: field(&map, "mode").unwrap_or(d.mode),
+            video_encoder: field(&map, "video_encoder").unwrap_or(d.video_encoder),
+            bitrate_kbps: bitrate.unwrap_or(d.bitrate_kbps),
+            share_fallback: field(&map, "share_fallback").unwrap_or(d.share_fallback),
+            start_with_stream: field(&map, "start_with_stream").unwrap_or(d.start_with_stream),
+            owned: field(&map, "owned"),
+        }
+        .clamped()
+    }
+
+    fn clamped(self) -> Self {
+        Self {
+            bitrate_kbps: self
+                .bitrate_kbps
+                .clamp(*BITRATE_KBPS.start(), *BITRATE_KBPS.end()),
+            grace_secs: self.grace_secs.filter(|s| *s <= MAX_GRACE_SECS),
+            ..self
+        }
     }
 
     pub fn to_json(&self) -> String {
@@ -84,7 +123,11 @@ pub struct Canvas {
 pub enum DockState {
     Idle,
     Starting,
-    Live { channel: String },
+    Live {
+        channel: String,
+        /// `None` when attached to a session another client started, which rules out share mode.
+        session_fps: Option<u32>,
+    },
     Stopping,
 }
 
@@ -128,14 +171,38 @@ impl DockModel {
         &self.channels
     }
 
-    /// Replaces every setting but the session ownership, which only starts and stops change.
-    pub fn set_settings(&mut self, settings: DockSettings) {
-        let owned = self.settings.owned.take();
-        let guild_changed = settings.guild_id != self.settings.guild_id;
-        self.settings = DockSettings { owned, ..settings };
-        if guild_changed {
-            self.channels.clear();
+    /// Replaces every setting but the ownership, and the guild and channel unless idle; returns a guild to load.
+    pub fn set_settings(&mut self, settings: DockSettings) -> Option<String> {
+        let settings = settings.clamped();
+        let (guild_id, channel_id) = if self.state == DockState::Idle {
+            (settings.guild_id, settings.channel_id)
+        } else {
+            (
+                self.settings.guild_id.clone(),
+                self.settings.channel_id.clone(),
+            )
+        };
+        let guild_changed = guild_id != self.settings.guild_id;
+        let known = |id: &String| self.channels.iter().any(|c| &c.id == id);
+        let channel_id = if guild_changed
+            || self.channels.is_empty()
+            || channel_id.as_ref().is_some_and(known)
+        {
+            channel_id
+        } else {
+            None
+        };
+        self.settings = DockSettings {
+            guild_id,
+            channel_id,
+            owned: self.settings.owned.take(),
+            ..settings
+        };
+        if !guild_changed {
+            return None;
         }
+        self.channels.clear();
+        self.settings.guild_id.clone()
     }
 
     /// Returns the guild whose channels to load next.
@@ -169,6 +236,7 @@ impl DockModel {
         self.settings.guild_id = Some(guild_id.to_owned());
         self.settings.channel_id = None;
         self.channels.clear();
+        self.error = None;
         Some(guild_id.to_owned())
     }
 
@@ -195,6 +263,7 @@ impl DockModel {
 
     pub fn select_channel(&mut self, channel_id: &str) {
         self.settings.channel_id = Some(channel_id.to_owned());
+        self.error = None;
     }
 
     /// Moves to `Starting` and returns what to send, or the reason the dock can't start.
@@ -243,14 +312,19 @@ impl DockModel {
             return;
         }
         match result {
-            Ok(Started { ownership, channel }) => {
+            Ok(started) => {
+                let session_fps = started.session_fps();
+                let Started { ownership, channel } = started;
                 self.settings.owned = ownership;
                 let channel = self
                     .channels
                     .iter()
                     .find(|c| c.id == channel)
                     .map_or(channel, |c| c.name.clone());
-                self.state = DockState::Live { channel };
+                self.state = DockState::Live {
+                    channel,
+                    session_fps,
+                };
             }
             Err(failed) => {
                 if let Some(provisional) = failed.ownership {
@@ -286,13 +360,21 @@ impl DockModel {
         }
     }
 
-    /// The output ended without a stop from the dock, for example because the session ended.
+    /// The output ended on its own; while starting or stopping, the pending reply decides instead.
     pub fn ended(&mut self, message: Option<String>) {
-        if matches!(self.state, DockState::Idle) {
+        if !matches!(self.state, DockState::Live { .. }) {
             return;
         }
         self.state = DockState::Idle;
         self.error = message;
+    }
+
+    /// The session's fps for share mode's check, while live.
+    pub fn session_fps(&self) -> Option<u32> {
+        match self.state {
+            DockState::Live { session_fps, .. } => session_fps,
+            _ => None,
+        }
     }
 
     /// Everything the dock and the `status` vendor request show.
@@ -333,6 +415,7 @@ mod tests {
             guild_id: "g".into(),
             channel_id: "c".into(),
             instance: None,
+            fps: None,
         }
     }
 
@@ -361,12 +444,57 @@ mod tests {
         assert_eq!(DockSettings::from_json(&d.to_json()), d);
         assert_eq!(DockSettings::from_json("{}"), d);
         assert_eq!(DockSettings::from_json("not json"), d);
-        let partial = DockSettings::from_json(
-            r#"{"mode":"share","owned":{"connection":4,"guild_id":"g","channel_id":"c"}}"#,
+        assert_eq!(DockSettings::from_json("[1]"), d);
+    }
+
+    const OWNED: &str = r#""owned":{"connection":4,"guild_id":"g","channel_id":"c"}"#;
+
+    fn with_owned(fields: &str) -> DockSettings {
+        let s = DockSettings::from_json(&format!("{{{fields},{OWNED}}}"));
+        assert_eq!(s.owned, Some(ownership(4)), "{fields}");
+        s
+    }
+
+    #[test]
+    fn a_bad_field_falls_back_alone_and_keeps_the_ownership() {
+        let d = DockSettings::default();
+        assert_eq!(with_owned(r#""mode":"hybrid""#).mode, d.mode);
+        assert_eq!(with_owned(r#""mode":"share""#).mode, VideoMode::Share);
+        assert_eq!(with_owned(r#""bitrate_kbps":6000.0"#).bitrate_kbps, 6000);
+        assert_eq!(
+            with_owned(r#""bitrate_kbps":"fast""#).bitrate_kbps,
+            d.bitrate_kbps
         );
-        assert_eq!(partial.mode, VideoMode::Share);
-        assert_eq!(partial.owned, Some(ownership(4)));
-        assert_eq!(partial.bitrate_kbps, DEFAULT_BITRATE_KBPS);
+        assert_eq!(with_owned(r#""grace_secs":-5"#).grace_secs, None);
+        assert_eq!(with_owned(r#""grace_secs":3601"#).grace_secs, None);
+        assert_eq!(with_owned(r#""grace_secs":120"#).grace_secs, Some(120));
+        assert_eq!(
+            with_owned(r#""share_fallback":"no""#).share_fallback,
+            d.share_fallback
+        );
+        assert_eq!(
+            with_owned(r#""video_encoder":7"#).video_encoder,
+            d.video_encoder
+        );
+        assert_eq!(with_owned(r#""guild_id":5"#).guild_id, None);
+        let kept = with_owned(r#""guild_id":"g","channel_id":"c","mode":7"#);
+        assert_eq!(kept.guild_id.as_deref(), Some("g"));
+        assert_eq!(kept.channel_id.as_deref(), Some("c"));
+        let bad_owned = DockSettings::from_json(r#"{"guild_id":"g","owned":{"connection":"x"}}"#);
+        assert_eq!(bad_owned.owned, None);
+        assert_eq!(bad_owned.guild_id.as_deref(), Some("g"));
+    }
+
+    #[test]
+    fn bitrate_is_clamped_to_the_property_range() {
+        assert_eq!(with_owned(r#""bitrate_kbps":100"#).bitrate_kbps, 500);
+        assert_eq!(with_owned(r#""bitrate_kbps":90000"#).bitrate_kbps, 50_000);
+        let mut m = DockModel::new(DockSettings::default());
+        m.set_settings(DockSettings {
+            bitrate_kbps: 0,
+            ..DockSettings::default()
+        });
+        assert_eq!(m.settings().bitrate_kbps, 500);
     }
 
     #[test]
@@ -420,6 +548,79 @@ mod tests {
     }
 
     #[test]
+    fn a_channel_load_error_clears_the_list() {
+        let mut m = picked();
+        m.channels_loaded("g", Err(ControlError::GuildUnavailable));
+        assert!(m.channels().is_empty());
+        assert!(m.error().is_some());
+    }
+
+    #[test]
+    fn picking_clears_a_stale_error() {
+        let mut m = picked();
+        m.channels_loaded("g", Err(ControlError::GuildUnavailable));
+        m.select_channel("d");
+        assert_eq!(m.error(), None);
+        m.channels_loaded("g", Err(ControlError::GuildUnavailable));
+        m.select_guild("h");
+        assert_eq!(m.error(), None);
+    }
+
+    #[test]
+    fn a_settings_guild_change_clears_the_list_and_asks_for_channels() {
+        let mut m = picked();
+        let next = DockSettings {
+            guild_id: Some("h".into()),
+            channel_id: Some("e".into()),
+            ..m.settings().clone()
+        };
+        assert_eq!(m.set_settings(next), Some("h".into()));
+        assert!(m.channels().is_empty());
+        assert_eq!(m.settings().channel_id.as_deref(), Some("e"));
+        m.channels_loaded("h", Ok(vec![named("f")]));
+        assert_eq!(
+            m.settings().channel_id,
+            None,
+            "validated once the list loads"
+        );
+        assert_eq!(m.set_settings(m.settings().clone()), None);
+    }
+
+    #[test]
+    fn a_settings_channel_change_is_validated_against_the_list() {
+        let mut m = picked();
+        let pick = |channel: &str| DockSettings {
+            channel_id: Some(channel.into()),
+            ..picked().settings().clone()
+        };
+        assert_eq!(m.set_settings(pick("d")), None);
+        assert_eq!(m.settings().channel_id.as_deref(), Some("d"));
+        m.set_settings(pick("zz"));
+        assert_eq!(m.settings().channel_id, None);
+        assert_eq!(m.channels().len(), 2);
+    }
+
+    #[test]
+    fn guild_and_channel_stay_while_the_dock_is_busy() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        let next = DockSettings {
+            guild_id: Some("h".into()),
+            channel_id: Some("e".into()),
+            bitrate_kbps: 2500,
+            ..m.settings().clone()
+        };
+        assert_eq!(m.set_settings(next.clone()), None);
+        assert_eq!(m.settings().guild_id.as_deref(), Some("g"));
+        assert_eq!(m.settings().channel_id.as_deref(), Some("c"));
+        assert_eq!(m.settings().bitrate_kbps, 2500);
+        assert_eq!(m.channels().len(), 2);
+        m.started(Ok(started(None)));
+        assert_eq!(m.set_settings(next), None);
+        assert_eq!(m.settings().guild_id.as_deref(), Some("g"));
+    }
+
+    #[test]
     fn start_takes_the_rate_and_size_from_the_canvas() {
         let mut m = picked();
         m.set_settings(DockSettings {
@@ -469,10 +670,12 @@ mod tests {
         assert_eq!(
             m.state(),
             &DockState::Live {
-                channel: "General".into()
+                channel: "General".into(),
+                session_fps: None,
             }
         );
         assert_eq!(m.persisted(), Some(&ownership(3)));
+        assert!(m.start(canvas()).is_err(), "no start while live");
         assert_eq!(m.stop(), Some(Some(ownership(3))));
         m.stopped(Ok(()));
         assert_eq!(m.state(), &DockState::Idle);
@@ -546,7 +749,8 @@ mod tests {
         assert_eq!(
             m.state(),
             &DockState::Live {
-                channel: "C".into()
+                channel: "C".into(),
+                session_fps: None,
             }
         );
     }
@@ -562,6 +766,57 @@ mod tests {
             ..DockSettings::default()
         });
         assert_eq!(m.settings().bitrate_kbps, 2500);
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+    }
+
+    #[test]
+    fn the_session_fps_is_known_only_for_our_own_session() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(Ownership {
+            fps: Some(60),
+            ..ownership(3)
+        }))));
+        assert_eq!(m.session_fps(), Some(60));
+        m.stop();
+        assert_eq!(m.session_fps(), None);
+        m.stopped(Ok(()));
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(None)));
+        assert_eq!(m.session_fps(), None);
+    }
+
+    #[test]
+    fn replies_count_only_in_the_state_that_waits_for_them() {
+        let mut m = picked();
+        m.started(Ok(started(Some(ownership(3)))));
+        assert_eq!(m.state(), &DockState::Idle);
+        assert_eq!(m.persisted(), None);
+        m.stopped(Ok(()));
+        assert_eq!(m.state(), &DockState::Idle);
+        m.start(canvas()).unwrap();
+        m.stopped(Err("late".into()));
+        assert_eq!(m.state(), &DockState::Starting);
+        m.started(Ok(started(Some(ownership(3)))));
+        m.started(Err(ControlError::Stopping.into()));
+        assert!(matches!(m.state(), DockState::Live { .. }));
+        assert_eq!(m.error(), None);
+    }
+
+    #[test]
+    fn ended_while_starting_or_stopping_leaves_the_reply_to_decide() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.ended(Some("output stopped".into()));
+        assert_eq!(m.state(), &DockState::Starting);
+        m.started(Ok(started(Some(ownership(3)))));
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+        m.stop();
+        m.ended(Some("output stopped".into()));
+        assert_eq!(m.state(), &DockState::Stopping);
+        m.stopped(Err("timed out".into()));
+        assert_eq!(m.state(), &DockState::Idle);
+        assert_eq!(m.error(), Some("timed out"));
         assert_eq!(m.persisted(), Some(&ownership(3)));
     }
 

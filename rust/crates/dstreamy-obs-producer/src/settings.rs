@@ -152,6 +152,7 @@ pub enum Problem {
     StreamNotRunning,
     ColorFormat { format: String },
     SessionFps { num: u32, den: u32, session: u32 },
+    SessionFpsUnknown,
 }
 
 impl Problem {
@@ -193,6 +194,9 @@ impl Problem {
                 "D-Streamy can share the stream's encoder only at the session's {session} FPS, not {}: {VIDEO_PATH} › Common FPS Values, or use D-Streamy's own encoder",
                 rate(*num, *den)
             ),
+            Self::SessionFpsUnknown => {
+                "D-Streamy can share the stream's encoder only with a session it started, since only then is the session's frame rate known: stop the session and start it from OBS, or use D-Streamy's own encoder".into()
+            }
             Self::StreamNotRunning => {
                 "D-Streamy can share the stream's encoder only while streaming: start streaming first, or use D-Streamy's own encoder".into()
             }
@@ -416,8 +420,15 @@ pub fn target_fps(canvas_num: u32, canvas_den: u32) -> Result<(u32, u32), Proble
         .ok_or(too_odd)
 }
 
-/// A shared stream encoder must run at the frame rate the session announced when it started.
-pub fn check_share_fps(fps_num: u32, fps_den: u32, session_fps: u32) -> Result<(), Problem> {
+/// A shared encoder must match the session's announced fps; `None` (a foreign session, fps unknown) refuses sharing.
+pub fn check_share_fps(
+    fps_num: u32,
+    fps_den: u32,
+    session_fps: Option<u32>,
+) -> Result<(), Problem> {
+    let Some(session_fps) = session_fps else {
+        return Err(Problem::SessionFpsUnknown);
+    };
     if fps_den != 0 && u64::from(fps_num) == u64::from(fps_den) * u64::from(session_fps) {
         Ok(())
     } else {
@@ -797,20 +808,25 @@ mod tests {
 
     #[test]
     fn a_shared_encoder_must_match_the_session_fps() {
-        assert_eq!(check_share_fps(30, 1, 30), Ok(()));
-        assert_eq!(check_share_fps(60_000, 1000, 60), Ok(()));
+        assert_eq!(check_share_fps(30, 1, Some(30)), Ok(()));
+        assert_eq!(check_share_fps(60_000, 1000, Some(60)), Ok(()));
         assert_eq!(
-            check_share_fps(60, 1, 30),
+            check_share_fps(60, 1, Some(30)),
             Err(Problem::SessionFps {
                 num: 60,
                 den: 1,
                 session: 30
             })
         );
-        assert!(check_share_fps(30, 0, 30).is_err());
-        assert!(check_share_fps(30000, 1001, 30).is_err());
+        assert!(check_share_fps(30, 0, Some(30)).is_err());
+        assert!(check_share_fps(30000, 1001, Some(30)).is_err());
+        assert!(check_share_fps(30001, 1000, Some(30)).is_err());
         assert_eq!(
-            check_share_fps(60, 1, 30).unwrap_err().message(),
+            check_share_fps(30, 1, None),
+            Err(Problem::SessionFpsUnknown)
+        );
+        assert_eq!(
+            check_share_fps(60, 1, Some(30)).unwrap_err().message(),
             "D-Streamy can share the stream's encoder only at the session's 30 FPS, not 60: Settings › Video › Common FPS Values, or use D-Streamy's own encoder"
         );
     }

@@ -107,6 +107,7 @@ impl ObsControl {
                     guild_id: request.guild_id.clone(),
                     channel_id: request.channel_id.clone(),
                     instance: Some(c.instance),
+                    fps: Some(request.fps),
                 };
                 // serve finishes a start whose connection went away, so from here on the start may still land.
                 let unconfirmed = |error| StartFailed {

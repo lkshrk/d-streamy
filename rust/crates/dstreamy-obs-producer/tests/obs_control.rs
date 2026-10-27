@@ -285,6 +285,7 @@ async fn a_start_from_obs_owns_the_session_and_its_stop_ends_it() {
         .await
         .unwrap();
     assert_eq!(started.channel, "General");
+    assert_eq!(started.session_fps(), Some(30));
     let ownership = started.ownership.clone().expect("owned");
     assert_eq!(ownership.channel_id, MOCK_VOICE_CHANNEL_ID);
     serve.voice_channel(Some(MOCK_VOICE_CHANNEL_ID)).await;
@@ -437,6 +438,7 @@ async fn a_session_another_client_started_is_attached_and_left_running() {
         guild_id: MOCK_GUILD_ID.into(),
         channel_id: MOCK_VOICE_CHANNEL_ID.into(),
         instance: None,
+        fps: None,
     };
     assert_eq!(control.stop(Some(&foreign)).await, Ok(Stopped::LeftRunning));
     assert!(control.status().await.unwrap().is_some());
@@ -499,6 +501,11 @@ async fn ownership_persisted_across_a_relaunch_still_stops_the_session() {
         .await
         .unwrap();
     assert_eq!(started.ownership, Some(ownership.clone()));
+    assert_eq!(
+        started.session_fps(),
+        Some(30),
+        "the fps survives the relaunch"
+    );
     assert_eq!(
         control.stop(started.ownership.as_ref()).await,
         Ok(Stopped::Stopped)

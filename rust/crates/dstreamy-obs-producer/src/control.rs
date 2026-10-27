@@ -42,6 +42,9 @@ pub struct Ownership {
     pub channel_id: String,
     #[serde(default)]
     pub instance: Option<Instance>,
+    /// The fps the start announced; serve's status doesn't report it, and share mode needs it.
+    #[serde(default)]
+    pub fps: Option<u32>,
 }
 
 impl Ownership {
@@ -162,6 +165,13 @@ pub struct Started {
     /// `Some` when this plugin started the session, or started it before a relaunch.
     pub ownership: Option<Ownership>,
     pub channel: String,
+}
+
+impl Started {
+    /// Known only for a session this plugin started; see [`crate::settings::check_share_fps`].
+    pub fn session_fps(&self) -> Option<u32> {
+        self.ownership.as_ref().and_then(|o| o.fps)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,6 +389,7 @@ mod tests {
             guild_id: "g".into(),
             channel_id: "c".into(),
             instance: Some(instance(1)),
+            fps: Some(30),
         }
     }
 
@@ -587,7 +598,7 @@ mod tests {
         assert_eq!(
             v,
             json!({"connection": 9, "guild_id": "g", "channel_id": "c",
-                   "instance": {"dev": 1, "ino": 1, "mtime": 5, "mtime_nsec": 6}})
+                   "instance": {"dev": 1, "ino": 1, "mtime": 5, "mtime_nsec": 6}, "fps": 30})
         );
         assert_eq!(serde_json::from_value::<Ownership>(v).unwrap(), o);
         let older: Ownership =
