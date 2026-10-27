@@ -151,6 +151,7 @@ pub enum Problem {
     Audio { detail: String },
     StreamNotRunning,
     ColorFormat { format: String },
+    SessionFps { num: u32, den: u32, session: u32 },
 }
 
 impl Problem {
@@ -180,24 +181,30 @@ impl Problem {
             Self::Size { width, height } => format!(
                 "D-Streamy needs an output size of at most 1920×1080 with even sides, not {width}×{height}: {VIDEO_PATH} › Output (Scaled) Resolution"
             ),
-            Self::Fps { num, den } => {
-                let rate = if *den == 1 {
-                    num.to_string()
-                } else {
-                    format!("{num}/{den}")
-                };
-                format!(
-                    "D-Streamy needs 15, 30 or 60 FPS, not {rate}: {VIDEO_PATH} › Common FPS Values"
-                )
-            }
+            Self::Fps { num, den } => format!(
+                "D-Streamy needs 15, 30 or 60 FPS, not {}: {VIDEO_PATH} › Common FPS Values",
+                rate(*num, *den)
+            ),
             Self::Audio { detail } => format!("D-Streamy's audio encoder {detail}"),
             Self::ColorFormat { format } => format!(
                 "D-Streamy needs an 8-bit 4:2:0 color format (NV12 or I420), not {format}: Settings › Advanced › Color Format"
+            ),
+            Self::SessionFps { num, den, session } => format!(
+                "D-Streamy can share the stream's encoder only at the session's {session} FPS, not {}: {VIDEO_PATH} › Common FPS Values, or use D-Streamy's own encoder",
+                rate(*num, *den)
             ),
             Self::StreamNotRunning => {
                 "D-Streamy can share the stream's encoder only while streaming: start streaming first, or use D-Streamy's own encoder".into()
             }
         }
+    }
+}
+
+fn rate(num: u32, den: u32) -> String {
+    if den == 1 {
+        num.to_string()
+    } else {
+        format!("{num}/{den}")
     }
 }
 
@@ -407,6 +414,19 @@ pub fn target_fps(canvas_num: u32, canvas_den: u32) -> Result<(u32, u32), Proble
         .find(|&fps| fps <= canvas && canvas.is_multiple_of(fps))
         .map(|fps| (fps, canvas / fps))
         .ok_or(too_odd)
+}
+
+/// A shared stream encoder must run at the frame rate the session announced when it started.
+pub fn check_share_fps(fps_num: u32, fps_den: u32, session_fps: u32) -> Result<(), Problem> {
+    if fps_den != 0 && u64::from(fps_num) == u64::from(fps_den) * u64::from(session_fps) {
+        Ok(())
+    } else {
+        Err(Problem::SessionFps {
+            num: fps_num,
+            den: fps_den,
+            session: session_fps,
+        })
+    }
 }
 
 /// The canvas scaled to fit within 1920×1080, keeping its aspect ratio, with even sides.
@@ -773,6 +793,26 @@ mod tests {
         for (num, den) in [(24, 1), (25, 1), (50, 1), (30000, 1001), (10, 1)] {
             assert!(target_fps(num, den).is_err(), "{num}/{den}");
         }
+    }
+
+    #[test]
+    fn a_shared_encoder_must_match_the_session_fps() {
+        assert_eq!(check_share_fps(30, 1, 30), Ok(()));
+        assert_eq!(check_share_fps(60_000, 1000, 60), Ok(()));
+        assert_eq!(
+            check_share_fps(60, 1, 30),
+            Err(Problem::SessionFps {
+                num: 60,
+                den: 1,
+                session: 30
+            })
+        );
+        assert!(check_share_fps(30, 0, 30).is_err());
+        assert!(check_share_fps(30000, 1001, 30).is_err());
+        assert_eq!(
+            check_share_fps(60, 1, 30).unwrap_err().message(),
+            "D-Streamy can share the stream's encoder only at the session's 30 FPS, not 60: Settings › Video › Common FPS Values, or use D-Streamy's own encoder"
+        );
     }
 
     #[test]
