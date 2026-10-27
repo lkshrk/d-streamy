@@ -596,6 +596,10 @@ jobs:
           cargo fmt --all --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo clippy --workspace --all-targets --locked --features test-hooks -- -D warnings
+          $runtime = Join-Path $env:OBS_PREFIX 'bin\64bit'
+          if (-not (Test-Path -LiteralPath $runtime -PathType Container)) { throw "no OBS runtime at $runtime" }
+          if (-not (Test-Path -LiteralPath (Join-Path $runtime 'obs.dll') -PathType Leaf)) { throw "no obs.dll in $runtime" }
+          $env:PATH = "$runtime;$env:PATH"
           cargo test --workspace --locked
 
       - name: Locate dumpbin
