@@ -1289,6 +1289,7 @@ dependencies = [
  "dstreamy-test-producer",
  "futures-util",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

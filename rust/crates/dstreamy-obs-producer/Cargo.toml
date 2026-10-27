@@ -1,6 +1,6 @@
 [package]
 name = "dstreamy-obs-producer"
-description = "The OBS plugin's libobs-free half: the packet ring and the producer connection to `dstreamy serve`"
+description = "The OBS plugin's libobs-free half: the packet ring, the producer connection and the control logic for `dstreamy serve`"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 dstreamy-obs-packet = { path = "../dstreamy-obs-packet" }
+serde.workspace = true
 serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
 
