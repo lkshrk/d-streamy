@@ -411,7 +411,7 @@ mod tests {
 
     fn ownership(connection: u64) -> Ownership {
         Ownership {
-            connection,
+            connections: vec![connection],
             guild_id: "g".into(),
             channel_id: "c".into(),
             instance: None,

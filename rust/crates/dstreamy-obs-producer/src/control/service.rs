@@ -25,6 +25,7 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct ObsControl {
     endpoint: Endpoint,
     start_timeout: Duration,
+    settle_timeout: Duration,
 }
 
 struct Connection {
@@ -40,6 +41,15 @@ impl ObsControl {
         Self {
             endpoint,
             start_timeout: REPLY_TIMEOUT,
+            settle_timeout: REPLY_TIMEOUT,
+        }
+    }
+
+    /// How long a start or stop waits for serve to name the starter of a start in flight; [`REPLY_TIMEOUT`] by default.
+    pub fn with_settle_timeout(self, settle_timeout: Duration) -> Self {
+        Self {
+            settle_timeout,
+            ..self
         }
     }
 
@@ -86,12 +96,14 @@ impl ObsControl {
         if request.grace_secs.is_some() {
             c.require(START_GRACE_SECS)?;
         }
-        let status = c.settled(c.hello["status"].clone(), persisted).await?;
+        let status = c
+            .settled(c.hello["status"].clone(), persisted, self.settle_timeout)
+            .await?;
         match resolve(request, &status, persisted, c.instance)? {
             Resolution::Attach(started) => Ok(started),
             Resolution::Start => {
                 let provisional = Ownership {
-                    connection: c.connection()?,
+                    connections: vec![c.connection()?],
                     guild_id: request.guild_id.clone(),
                     channel_id: request.channel_id.clone(),
                     instance: Some(c.instance),
@@ -100,7 +112,10 @@ impl ObsControl {
                 // serve finishes a start whose connection went away, so from here on the start may still land.
                 let unconfirmed = |error| StartFailed {
                     error,
-                    ownership: Some(Box::new(provisional.clone())),
+                    ownership: Some(Box::new(Ownership::with_candidate(
+                        persisted,
+                        provisional.clone(),
+                    ))),
                 };
                 let id = c.id();
                 c.send(request.command(&id)).await.map_err(unconfirmed)?;
@@ -111,7 +126,9 @@ impl ObsControl {
                 {
                     Ok(_) => {}
                     Err(e @ ControlError::Locked(_)) => {
-                        return Ok(c.attach_after_race(request, persisted, e).await?);
+                        return Ok(c
+                            .attach_after_race(request, persisted, e, self.settle_timeout)
+                            .await?);
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -138,7 +155,11 @@ impl ObsControl {
             Err(e) => return stop_without_connection(e),
         };
         let status = c
-            .settled(c.hello["status"].clone(), Some(ownership))
+            .settled(
+                c.hello["status"].clone(),
+                Some(ownership),
+                self.settle_timeout,
+            )
             .await?;
         match owns(&status, ownership, c.instance)? {
             None => return Ok(Stopped::NotRunning),
@@ -309,16 +330,22 @@ impl Connection {
         &mut self,
         mut status: Value,
         persisted: Option<&Ownership>,
+        timeout: Duration,
     ) -> Result<Value, ControlError> {
-        let deadline = tokio::time::Instant::now() + REPLY_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + timeout;
         while start_in_flight(&status, persisted, self.instance)? {
-            if tokio::time::Instant::now() >= deadline {
+            tokio::time::sleep(
+                SETTLE_POLL.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
                 return Err(ControlError::StillStarting);
             }
-            tokio::time::sleep(SETTLE_POLL).await;
-            status = self
-                .call(json!({"cmd": "status"}), "status", REPLY_TIMEOUT)
-                .await?;
+            status = match self.call(json!({"cmd": "status"}), "status", left).await {
+                Err(ControlError::Timeout { .. }) => return Err(ControlError::StillStarting),
+                other => other?,
+            };
         }
         Ok(status)
     }
@@ -336,11 +363,12 @@ impl Connection {
         request: &StartRequest,
         persisted: Option<&Ownership>,
         refused: ControlError,
+        settle_timeout: Duration,
     ) -> Result<Started, ControlError> {
         let status = self
             .call(json!({"cmd": "status"}), "status", REPLY_TIMEOUT)
             .await?;
-        let status = self.settled(status, persisted).await?;
+        let status = self.settled(status, persisted, settle_timeout).await?;
         match resolve(request, &status, persisted, self.instance)? {
             Resolution::Attach(started) => Ok(started),
             Resolution::Start => Err(refused),

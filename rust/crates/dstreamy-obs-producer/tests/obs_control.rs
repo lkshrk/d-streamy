@@ -1,6 +1,7 @@
 //! The dock's control logic against a real `dstreamy serve` from `DSTREAMY_BIN`, with mock Discord in process.
 #![cfg(unix)]
 
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,7 +14,8 @@ use dstreamy_mock_discord::{
 };
 use dstreamy_obs_producer::Endpoint;
 use dstreamy_obs_producer::control::{
-    ControlError, Named, ObsControl, Ownership, StartFailed, StartRequest, Started, Stopped,
+    ControlError, Instance, Named, ObsControl, Ownership, StartFailed, StartRequest, Started,
+    Stopped,
 };
 use dstreamy_obs_producer::dock::{DockModel, DockSettings};
 use serde_json::{Value, json};
@@ -290,7 +292,7 @@ async fn a_start_from_obs_owns_the_session_and_its_stop_ends_it() {
     assert_eq!(ownership.channel_id, MOCK_VOICE_CHANNEL_ID);
     serve.voice_channel(Some(MOCK_VOICE_CHANNEL_ID)).await;
     let live = control.status().await.unwrap().expect("live");
-    assert_eq!(live.started_by, Some(ownership.connection));
+    assert_eq!(live.started_by, Some(ownership.connections[0]));
     assert_eq!(live.target, "external");
 
     assert_eq!(control.stop(Some(&ownership)).await, Ok(Stopped::Stopped));
@@ -372,7 +374,7 @@ async fn a_start_whose_reply_is_lost_is_still_stopped_by_its_starter() {
     loop {
         let live = control.status().await.unwrap();
         if live.as_ref().is_some_and(|l| l.started_by.is_some()) {
-            assert_eq!(live.unwrap().started_by, Some(provisional.connection));
+            assert_eq!(live.unwrap().started_by, Some(provisional.connections[0]));
             break;
         }
         assert!(Instant::now() < deadline, "the start never landed");
@@ -405,6 +407,73 @@ async fn a_retry_after_a_lost_start_reply_keeps_the_ownership() {
         );
         serve.voice_channel(None).await;
         serve.restart().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_lost_starts_in_a_row_still_own_the_session() {
+    let mut serve = serve!(true);
+    let mut second_lost = 0;
+    for round in 0..8 {
+        let first = lost_start_without_reading(&serve).await;
+        let second = serve
+            .control()
+            .with_start_timeout(Duration::from_millis(1))
+            .start(&request(MOCK_VOICE_CHANNEL_ID), Some(&first))
+            .await;
+        let ownership = match second {
+            Err(failed) => {
+                second_lost += 1;
+                *failed.ownership.expect("a provisional ownership")
+            }
+            Ok(started) => started.ownership.expect("our own session"),
+        };
+        // A stop now could still run before either start reaches serve, so the dock's next step is another start.
+        let third = serve
+            .control()
+            .start(&request(MOCK_VOICE_CHANNEL_ID), Some(&ownership))
+            .await
+            .unwrap();
+        let confirmed = third.ownership.expect("still ours");
+        assert_eq!(confirmed.connections.len(), 1, "round {round}");
+        assert_eq!(
+            serve.control().stop(Some(&confirmed)).await,
+            Ok(Stopped::Stopped),
+            "round {round}"
+        );
+        serve.voice_channel(None).await;
+        serve.restart().await;
+    }
+    assert!(
+        second_lost > 0,
+        "the second start was never lost behind the first"
+    );
+}
+
+/// Sends a start and hangs up without its reply, as a timed-out start does, and returns the ownership it left.
+async fn lost_start_without_reading(serve: &Serve) -> Ownership {
+    let mut client = serve.client().await;
+    let hello = client
+        .call(json!({"id": "h2", "cmd": "hello", "role": "control", "protocol": 2}))
+        .await;
+    let meta = std::fs::metadata(serve.endpoint().as_path()).unwrap();
+    client
+        .write
+        .write_all(format!("{}\n", request(MOCK_VOICE_CHANNEL_ID).command("lost")).as_bytes())
+        .await
+        .unwrap();
+    drop(client);
+    Ownership {
+        connections: vec![hello["data"]["connection"].as_u64().unwrap()],
+        guild_id: MOCK_GUILD_ID.into(),
+        channel_id: MOCK_VOICE_CHANNEL_ID.into(),
+        instance: Some(Instance {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        }),
+        fps: Some(30),
     }
 }
 
@@ -474,7 +543,7 @@ async fn a_session_another_client_started_is_attached_and_left_running() {
     );
     assert_eq!(control.stop(None).await, Ok(Stopped::LeftRunning));
     let foreign = Ownership {
-        connection: 999,
+        connections: vec![999],
         guild_id: MOCK_GUILD_ID.into(),
         channel_id: MOCK_VOICE_CHANNEL_ID.into(),
         instance: None,
@@ -594,7 +663,7 @@ async fn an_ownership_from_before_a_serve_restart_is_ignored() {
     let live = control.status().await.unwrap().expect("live");
     assert_eq!(
         live.started_by,
-        Some(old.connection),
+        Some(old.connections[0]),
         "the new serve reuses the connection id, which is what the instance guards against"
     );
     let started = control

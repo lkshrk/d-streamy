@@ -32,11 +32,15 @@ pub struct Instance {
     pub mtime_nsec: i64,
 }
 
+/// How many lost starts of one serve run an ownership remembers.
+pub const MAX_CANDIDATES: usize = 8;
+
 /// The session this plugin started, kept in the module config so a relaunched OBS still stops it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredOwnership")]
 pub struct Ownership {
-    /// The control connection whose `start` began the session, as serve's `started_by` names it.
-    pub connection: u64,
+    /// Connections whose `start` may have begun the session (serve's `started_by`); one once confirmed.
+    pub connections: Vec<u64>,
     /// Where the start asked to stream; the session may have moved since.
     pub guild_id: String,
     pub channel_id: String,
@@ -47,10 +51,72 @@ pub struct Ownership {
     pub fps: Option<u32>,
 }
 
+/// The persisted form, which also reads the single `connection` of earlier builds.
+#[derive(Deserialize)]
+struct StoredOwnership {
+    #[serde(default)]
+    connection: Option<u64>,
+    #[serde(default)]
+    connections: Vec<u64>,
+    guild_id: String,
+    channel_id: String,
+    #[serde(default)]
+    instance: Option<Instance>,
+    #[serde(default)]
+    fps: Option<u32>,
+}
+
+impl From<StoredOwnership> for Ownership {
+    fn from(s: StoredOwnership) -> Self {
+        let mut connections = s.connections;
+        connections.extend(s.connection);
+        connections.dedup();
+        Self {
+            connections,
+            guild_id: s.guild_id,
+            channel_id: s.channel_id,
+            instance: s.instance,
+            fps: s.fps,
+        }
+    }
+}
+
 impl Ownership {
-    /// Connection ids restart with serve, so only the same serve run's id names the same start.
+    /// Connection ids restart with serve, so only the same serve run's ids name the same start.
     pub fn matches(&self, started_by: Option<u64>, instance: Option<Instance>) -> bool {
-        started_by == Some(self.connection) && instance.is_some() && instance == self.instance
+        started_by.is_some_and(|id| self.connections.contains(&id))
+            && instance.is_some()
+            && instance == self.instance
+    }
+
+    /// A lost start joins the candidates of the same serve run; on another run it starts over.
+    pub fn with_candidate(persisted: Option<&Ownership>, lost: Ownership) -> Ownership {
+        match persisted {
+            Some(p) if p.instance.is_some() && p.instance == lost.instance => {
+                let mut connections: Vec<u64> = p
+                    .connections
+                    .iter()
+                    .copied()
+                    .filter(|id| !lost.connections.contains(id))
+                    .chain(lost.connections.iter().copied())
+                    .collect();
+                let excess = connections.len().saturating_sub(MAX_CANDIDATES);
+                connections.drain(..excess);
+                Ownership {
+                    connections,
+                    ..lost
+                }
+            }
+            _ => lost,
+        }
+    }
+
+    /// The ownership once serve names the start that won.
+    pub fn confirmed(&self, started_by: u64) -> Ownership {
+        Ownership {
+            connections: vec![started_by],
+            ..self.clone()
+        }
     }
 }
 
@@ -207,9 +273,11 @@ pub fn decide(
     let Some(live) = live else {
         return Ok(Decision::Start);
     };
-    if let Some(owned) = persisted.filter(|o| live.owned_by(o)) {
+    if let (Some(owned), Some(started_by)) =
+        (persisted.filter(|o| live.owned_by(o)), live.started_by)
+    {
         return Ok(Decision::Attach {
-            owned: Some(owned.clone()),
+            owned: Some(owned.confirmed(started_by)),
         });
     }
     if !live.is_in(&request.guild_id, &request.channel_id) {
@@ -254,8 +322,9 @@ pub fn resolve(
             Ok(Some(live)) => live.channel(),
             _ => ours.channel_id.clone(),
         };
+        let started_by = status["started_by"].as_u64().unwrap_or_default();
         return Ok(Resolution::Attach(Started {
-            ownership: Some(ours.clone()),
+            ownership: Some(ours.confirmed(started_by)),
             channel,
         }));
     }
@@ -441,7 +510,7 @@ mod tests {
 
     fn owned(connection: u64) -> Ownership {
         Ownership {
-            connection,
+            connections: vec![connection],
             guild_id: "g".into(),
             channel_id: "c".into(),
             instance: Some(instance(1)),
@@ -711,14 +780,80 @@ mod tests {
         let v = serde_json::to_value(&o).unwrap();
         assert_eq!(
             v,
-            json!({"connection": 9, "guild_id": "g", "channel_id": "c",
+            json!({"connections": [9], "guild_id": "g", "channel_id": "c",
                    "instance": {"dev": 1, "ino": 1, "mtime": 5, "mtime_nsec": 6}, "fps": 30})
         );
         assert_eq!(serde_json::from_value::<Ownership>(v).unwrap(), o);
         let older: Ownership =
             serde_json::from_value(json!({"connection": 9, "guild_id": "g", "channel_id": "c"}))
                 .unwrap();
+        assert_eq!(older.connections, [9]);
         assert_eq!(older.instance, None);
+    }
+
+    fn candidates(ids: &[u64], ino: u64) -> Ownership {
+        Ownership {
+            connections: ids.to_vec(),
+            instance: Some(instance(ino)),
+            ..owned(0)
+        }
+    }
+
+    #[test]
+    fn lost_starts_of_one_serve_run_all_stay_candidates() {
+        let merged = Ownership::with_candidate(Some(&candidates(&[3], 1)), candidates(&[5], 1));
+        assert_eq!(merged.connections, [3, 5]);
+        assert!(merged.matches(Some(3), Some(instance(1))));
+        assert!(merged.matches(Some(5), Some(instance(1))));
+        assert!(!merged.matches(Some(4), Some(instance(1))));
+        assert!(!merged.matches(Some(3), Some(instance(2))));
+        let again = Ownership::with_candidate(Some(&merged), candidates(&[3], 1));
+        assert_eq!(again.connections, [5, 3]);
+        let other_run = Ownership::with_candidate(Some(&merged), candidates(&[7], 2));
+        assert_eq!(other_run.connections, [7]);
+        assert_eq!(
+            Ownership::with_candidate(None, candidates(&[7], 1)).connections,
+            [7]
+        );
+        let unknown_run = Ownership {
+            instance: None,
+            ..candidates(&[3], 1)
+        };
+        assert_eq!(
+            Ownership::with_candidate(Some(&unknown_run), candidates(&[7], 1)).connections,
+            [7]
+        );
+    }
+
+    #[test]
+    fn the_candidates_are_bounded_and_keep_the_newest() {
+        let mut o = candidates(&[1], 1);
+        for id in 2..=12 {
+            o = Ownership::with_candidate(Some(&o), candidates(&[id], 1));
+        }
+        assert_eq!(o.connections, (5..=12).collect::<Vec<_>>());
+        assert_eq!(o.connections.len(), MAX_CANDIDATES);
+    }
+
+    #[test]
+    fn an_owned_attach_collapses_to_the_winning_start() {
+        let set = candidates(&[3, 5], 1);
+        let mut live = live("c", "external", Some(5));
+        live.instance = Some(instance(1));
+        assert_eq!(
+            decide(&request(), Some(&live), Some(&set)),
+            Ok(Decision::Attach {
+                owned: Some(candidates(&[5], 1))
+            })
+        );
+        let placeless = json!({"session": {"state": "streaming"}, "started_by": 3});
+        assert_eq!(
+            resolve(&request(), &placeless, Some(&set), instance(1)),
+            Ok(Resolution::Attach(Started {
+                ownership: Some(candidates(&[3], 1)),
+                channel: "c".into(),
+            }))
+        );
     }
 
     #[test]
