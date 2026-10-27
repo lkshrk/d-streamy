@@ -188,6 +188,7 @@ pub struct DockModel {
     settings: DockSettings,
     guilds: Vec<Named>,
     channels: Vec<Named>,
+    channels_of: Option<String>,
     state: DockState,
     error: Option<String>,
 }
@@ -198,6 +199,7 @@ impl DockModel {
             settings,
             guilds: Vec::new(),
             channels: Vec::new(),
+            channels_of: None,
             state: DockState::Idle,
             error: None,
         }
@@ -236,10 +238,8 @@ impl DockModel {
         };
         let guild_changed = guild_id != self.settings.guild_id;
         let known = |id: &String| self.channels.iter().any(|c| &c.id == id);
-        let channel_id = if guild_changed
-            || self.channels.is_empty()
-            || channel_id.as_ref().is_some_and(known)
-        {
+        let listed = !self.channels.is_empty() && self.channels_of == guild_id;
+        let channel_id = if guild_changed || !listed || channel_id.as_ref().is_some_and(known) {
             channel_id
         } else {
             None
@@ -253,7 +253,7 @@ impl DockModel {
         if !guild_changed {
             return None;
         }
-        self.channels.clear();
+        self.clear_channels();
         self.settings.guild_id.clone()
     }
 
@@ -269,7 +269,7 @@ impl DockModel {
                 } else {
                     self.settings.guild_id = None;
                     self.settings.channel_id = None;
-                    self.channels.clear();
+                    self.clear_channels();
                     None
                 }
             }
@@ -287,7 +287,7 @@ impl DockModel {
         }
         self.settings.guild_id = Some(guild_id.to_owned());
         self.settings.channel_id = None;
-        self.channels.clear();
+        self.clear_channels();
         self.error = None;
         Some(guild_id.to_owned())
     }
@@ -300,6 +300,7 @@ impl DockModel {
         match result {
             Ok(channels) => {
                 self.channels = channels;
+                self.channels_of = Some(guild_id.to_owned());
                 self.error = None;
                 let known = |id: &String| self.channels.iter().any(|c| &c.id == id);
                 if !self.settings.channel_id.as_ref().is_some_and(known) {
@@ -307,10 +308,34 @@ impl DockModel {
                 }
             }
             Err(e) => {
-                self.channels.clear();
+                self.clear_channels();
                 self.error = Some(e.to_string());
             }
         }
+    }
+
+    /// Shows a guild's channels without selecting it.
+    pub fn channels_listed(&mut self, guild_id: &str, result: Result<Vec<Named>, ControlError>) {
+        match result {
+            Ok(channels) => {
+                self.channels = channels;
+                self.channels_of = Some(guild_id.to_owned());
+                self.error = None;
+            }
+            Err(e) => {
+                self.clear_channels();
+                self.error = Some(e.to_string());
+            }
+        }
+    }
+
+    pub fn report_error(&mut self, error: String) {
+        self.error = Some(error);
+    }
+
+    fn clear_channels(&mut self) {
+        self.channels.clear();
+        self.channels_of = None;
     }
 
     pub fn select_channel(&mut self, channel_id: &str) {
@@ -1009,5 +1034,63 @@ mod tests {
         assert_eq!(m.state(), &DockState::Idle);
         assert_eq!(m.error(), Some("the session ended"));
         assert_eq!(m.view()["state"]["state"], "idle");
+    }
+
+    #[test]
+    fn browsing_another_guild_lists_it_and_keeps_the_saved_channel() {
+        let mut m = picked();
+        m.settings.owned = Some(ownership(4));
+        let settings = m.settings().clone();
+        m.report_error("old".into());
+        m.channels_listed("h", Ok(vec![named("x")]));
+        assert_eq!(m.channels(), [named("x")]);
+        assert_eq!(m.settings(), &settings);
+        assert_eq!(m.error(), None);
+        m.set_settings(DockSettings {
+            bitrate_kbps: 7000,
+            ..settings.clone()
+        });
+        assert_eq!(m.settings().guild_id.as_deref(), Some("g"));
+        assert_eq!(m.settings().channel_id.as_deref(), Some("c"));
+        assert_eq!(m.settings().owned, Some(ownership(4)));
+        assert_eq!(m.settings().bitrate_kbps, 7000);
+    }
+
+    #[test]
+    fn a_failed_browse_clears_the_list_and_keeps_the_settings() {
+        let mut m = picked();
+        let settings = m.settings().clone();
+        m.channels_listed("h", Err(ControlError::NotRunning("down".into())));
+        assert!(m.channels().is_empty());
+        assert_eq!(m.settings(), &settings);
+        assert!(
+            m.error().is_some_and(|e| e.contains("down")),
+            "{:?}",
+            m.error()
+        );
+    }
+
+    #[test]
+    fn a_stale_list_is_still_dropped_and_the_selected_one_still_checks() {
+        let mut m = picked();
+        m.channels_listed("h", Ok(vec![named("x")]));
+        m.channels_loaded("h", Ok(vec![named("y")]));
+        assert_eq!(m.channels(), [named("x")]);
+        m.channels_loaded("g", Ok(vec![named("c")]));
+        assert_eq!(m.channels(), [named("c")]);
+        m.set_settings(DockSettings {
+            channel_id: Some("z".into()),
+            ..m.settings().clone()
+        });
+        assert_eq!(m.settings().channel_id, None);
+    }
+
+    #[test]
+    fn report_error_changes_only_the_error() {
+        let mut m = picked();
+        let mut expected = m.view();
+        m.report_error("boom".into());
+        expected["error"] = "boom".into();
+        assert_eq!(m.view(), expected);
     }
 }

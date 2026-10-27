@@ -58,6 +58,8 @@ struct harness_args {
 	const char *dump_encoder_settings;
 	const char *restart_video_settings;
 	const char *format;
+	const char *module_config;
+	const char *control;
 	bool no_encoders;
 	bool stream_output;
 	int seconds;
@@ -579,7 +581,191 @@ static void usage(void)
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
-		"  [--modules a,b,c] [--plugin-bin DIR --plugin-data DIR] [--note TEXT] [--x264opts OPTS] [--verbose]\n");
+		"  [--modules a,b,c] [--plugin-bin DIR --plugin-data DIR] [--note TEXT] [--x264opts OPTS] [--verbose]\n"
+		"  [--module-config DIR (libobs module config folder)]\n"
+		"  [--control SCRIPT.json (call the D-Streamy procs as the script says instead of running an output)]\n");
+}
+
+#define CONTROL_RECORDS 256
+
+static struct {
+	pthread_mutex_t mutex;
+	os_event_t *event;
+	char *records[CONTROL_RECORDS];
+	size_t count;
+	bool overflow;
+} control;
+
+static void on_dstreamy_state(void *param, calldata_t *cd)
+{
+	UNUSED_PARAMETER(param);
+	const char *json = calldata_string(cd, "json");
+	pthread_mutex_lock(&control.mutex);
+	if (control.count == CONTROL_RECORDS)
+		control.overflow = true;
+	else
+		control.records[control.count++] = bstrdup(json ? json : "");
+	pthread_mutex_unlock(&control.mutex);
+	os_event_signal(control.event);
+}
+
+static bool record_matches(const char *json, long long id, const char *operation)
+{
+	obs_data_t *d = obs_data_create_from_json(json);
+	if (!d)
+		return false;
+	bool matches = obs_data_get_int(d, "request_id") == id && strcmp(obs_data_get_string(d, "operation"), operation) == 0;
+	obs_data_release(d);
+	return matches;
+}
+
+static char *find_record(long long id, const char *operation, bool *overflow)
+{
+	char *found = NULL;
+	pthread_mutex_lock(&control.mutex);
+	for (size_t i = 0; i < control.count && !found; i++) {
+		if (record_matches(control.records[i], id, operation))
+			found = bstrdup(control.records[i]);
+	}
+	*overflow = control.overflow;
+	pthread_mutex_unlock(&control.mutex);
+	return found;
+}
+
+/* Scans what is already buffered before every wait, so a record that arrived first is never missed. */
+static char *wait_record(long long id, const char *operation, long long timeout_ms)
+{
+	uint64_t deadline = os_gettime_ns() + (uint64_t)timeout_ms * 1000000ULL;
+	for (;;) {
+		os_event_reset(control.event);
+		bool overflow;
+		char *found = find_record(id, operation, &overflow);
+		if (overflow) {
+			harness_error("more than %d dstreamy_state records", CONTROL_RECORDS);
+			bfree(found);
+			return NULL;
+		}
+		if (found || os_gettime_ns() >= deadline)
+			return found;
+		os_event_timedwait(control.event, 50);
+	}
+}
+
+static bool control_call(obs_data_t *step, obs_output_t *output, size_t n)
+{
+	static const char *ints[] = {"request_id", "generation"};
+	static const char *strings[] = {"guild_id", "json", "classification"};
+	const char *name = obs_data_get_string(step, "call");
+	calldata_t cd;
+	calldata_init(&cd);
+	for (size_t i = 0; i < sizeof(ints) / sizeof(ints[0]); i++) {
+		if (obs_data_has_user_value(step, ints[i]))
+			calldata_set_int(&cd, ints[i], obs_data_get_int(step, ints[i]));
+	}
+	for (size_t i = 0; i < sizeof(strings) / sizeof(strings[0]); i++) {
+		if (obs_data_has_user_value(step, strings[i]))
+			calldata_set_string(&cd, strings[i], obs_data_get_string(step, strings[i]));
+	}
+	if (obs_data_has_user_value(step, "output"))
+		calldata_set_ptr(&cd, "output", obs_data_get_bool(step, "output") ? output : NULL);
+	bool found = proc_handler_call(obs_get_proc_handler(), name, &cd);
+	bool accepted = calldata_bool(&cd, "accepted");
+	const char *error = calldata_string(&cd, "error");
+	bool want = !obs_data_has_user_value(step, "accepted") || obs_data_get_bool(step, "accepted");
+	const char *want_error = obs_data_get_string(step, "error");
+	bool ok = found && accepted == want && (!*want_error || (error && strstr(error, want_error)));
+	printf("HARNESS control step %zu %s found=%d accepted=%d error=%s\n", n, name, found, accepted,
+	       error ? error : "-");
+	if (!ok)
+		harness_error("control step %zu: %s did not answer as expected", n, name);
+	calldata_free(&cd);
+	return ok;
+}
+
+static bool control_wait(obs_data_t *step, size_t n)
+{
+	const char *operation = obs_data_get_string(step, "wait");
+	long long id = obs_data_get_int(step, "request_id");
+	long long timeout_ms = obs_data_has_user_value(step, "timeout_ms") ? obs_data_get_int(step, "timeout_ms") : 10000;
+	char *record = wait_record(id, operation, timeout_ms);
+	if (!record) {
+		harness_error("control step %zu: no %s record for request %lld", n, operation, id);
+		return false;
+	}
+	printf("HARNESS control step %zu %s %lld: %s\n", n, operation, id, record);
+	bool ok = true;
+	if (obs_data_has_user_value(step, "ok")) {
+		obs_data_t *d = obs_data_create_from_json(record);
+		ok = d && obs_data_get_bool(d, "ok") == obs_data_get_bool(step, "ok");
+		obs_data_release(d);
+	}
+	const char *contains = obs_data_get_string(step, "contains");
+	if (*contains && !strstr(record, contains))
+		ok = false;
+	if (!ok)
+		harness_error("control step %zu: the %s record does not match", n, operation);
+	bfree(record);
+	return ok;
+}
+
+static bool control_config(obs_data_t *step, size_t n)
+{
+	obs_module_t *module = obs_get_module("obs-dstreamy");
+	char *path = module ? obs_module_get_config_path(module, "config.json") : NULL;
+	char *text = path ? os_quick_read_utf8_file(path) : NULL;
+	const char *want = obs_data_get_string(step, "config_contains");
+	bool ok = text && strstr(text, want);
+	if (!ok)
+		harness_error("control step %zu: %s does not contain %s", n, path ? path : "the module config", want);
+	bfree(text);
+	bfree(path);
+	return ok;
+}
+
+static bool run_control(const char *path)
+{
+	obs_data_t *script = obs_data_create_from_json_file(path);
+	obs_data_array_t *steps = script ? obs_data_get_array(script, "steps") : NULL;
+	size_t count = steps ? obs_data_array_count(steps) : 0;
+	if (!count) {
+		harness_error("--control %s has no steps", path);
+		obs_data_array_release(steps);
+		obs_data_release(script);
+		return false;
+	}
+	obs_register_output(&stream_output_info);
+	obs_output_t *output = obs_output_create(STREAM_OUTPUT_ID, "harness control output", NULL, NULL);
+	pthread_mutex_init(&control.mutex, NULL);
+	bool ok = output && os_event_init(&control.event, OS_EVENT_TYPE_MANUAL) == 0;
+	if (ok)
+		signal_handler_connect(obs_get_signal_handler(), "dstreamy_state", on_dstreamy_state, NULL);
+	for (size_t i = 0; ok && i < count; i++) {
+		obs_data_t *step = obs_data_array_item(steps, i);
+		if (obs_data_has_user_value(step, "call"))
+			ok = control_call(step, output, i);
+		else if (obs_data_has_user_value(step, "wait"))
+			ok = control_wait(step, i);
+		else if (obs_data_has_user_value(step, "config_contains"))
+			ok = control_config(step, i);
+		else if (obs_data_has_user_value(step, "sleep_ms"))
+			os_sleep_ms((uint32_t)obs_data_get_int(step, "sleep_ms"));
+		else {
+			harness_error("control step %zu has no call, wait, config_contains or sleep_ms", i);
+			ok = false;
+		}
+		obs_data_release(step);
+	}
+	if (control.event) {
+		signal_handler_disconnect(obs_get_signal_handler(), "dstreamy_state", on_dstreamy_state, NULL);
+		os_event_destroy(control.event);
+	}
+	for (size_t i = 0; i < control.count; i++)
+		bfree(control.records[i]);
+	pthread_mutex_destroy(&control.mutex);
+	obs_output_release(output);
+	obs_data_array_release(steps);
+	obs_data_release(script);
+	return ok;
 }
 
 static bool parse_int(const char *flag, const char *v, int min, int *out)
@@ -668,6 +854,10 @@ static int parse_args(int argc, char **argv)
 			args.plugin_bin = v;
 		else if (strcmp(a, "--plugin-data") == 0)
 			args.plugin_data = v;
+		else if (strcmp(a, "--module-config") == 0)
+			args.module_config = v;
+		else if (strcmp(a, "--control") == 0)
+			args.control = v;
 		else if (strcmp(a, "--modules") == 0)
 			args.modules = v;
 		else if (strcmp(a, "--profile") == 0)
@@ -1071,7 +1261,7 @@ int main(int argc, char **argv)
 		goto cleanup;                  \
 	} while (0)
 
-	if (!obs_startup("en-US", NULL, NULL))
+	if (!obs_startup("en-US", args.module_config, NULL))
 		FAIL("obs_startup failed (Linux needs an X display, e.g. xvfb-run)");
 	initialized = true;
 	printf("HARNESS libobs %s\n", obs_get_version_string());
@@ -1123,6 +1313,11 @@ int main(int argc, char **argv)
 		FAIL("%zu module(s) failed to load", failed);
 	obs_post_load_modules();
 	obs_log_loaded_modules();
+
+	if (args.control) {
+		rc = run_control(args.control) ? 0 : 1;
+		goto cleanup;
+	}
 
 	if (args.dump_encoder_settings) {
 		rc = dump_encoder_settings(args.dump_encoder_settings);

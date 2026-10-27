@@ -26,8 +26,14 @@ if(OS_LINUX)
       "${BASH_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/rust-plugin.sh" "$<TARGET_FILE:obs-harness>" "${plugin_rundir}"
       "${CMAKE_CURRENT_BINARY_DIR}/plugin-data" "${CMAKE_CURRENT_BINARY_DIR}/rust-plugin"
   )
+  add_test(
+    NAME rust-plugin-control
+    COMMAND
+      "${BASH_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/control.sh" "$<TARGET_FILE:obs-harness>" "${plugin_rundir}"
+      "${CMAKE_CURRENT_BINARY_DIR}/plugin-data" "${CMAKE_CURRENT_BINARY_DIR}/rust-plugin-control"
+  )
   set_tests_properties(
-    harness-trace rust-plugin
+    harness-trace rust-plugin rust-plugin-control
     PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:OBS::libobs>" TIMEOUT 120
   )
 endif()
