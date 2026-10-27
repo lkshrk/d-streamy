@@ -73,7 +73,7 @@ impl DockSettings {
         Self {
             guild_id: field(&map, "guild_id"),
             channel_id: field(&map, "channel_id"),
-            grace_secs: field::<u64>(&map, "grace_secs").filter(|s| *s <= MAX_GRACE_SECS),
+            grace_secs: field(&map, "grace_secs"),
             mode: field(&map, "mode").unwrap_or(d.mode),
             video_encoder: field(&map, "video_encoder").unwrap_or(d.video_encoder),
             bitrate_kbps: bitrate.unwrap_or(d.bitrate_kbps),
@@ -89,7 +89,7 @@ impl DockSettings {
             bitrate_kbps: self
                 .bitrate_kbps
                 .clamp(*BITRATE_KBPS.start(), *BITRATE_KBPS.end()),
-            grace_secs: self.grace_secs.filter(|s| *s <= MAX_GRACE_SECS),
+            grace_secs: self.grace_secs.map(|s| s.min(MAX_GRACE_SECS)),
             ..self
         }
     }
@@ -466,7 +466,8 @@ mod tests {
             d.bitrate_kbps
         );
         assert_eq!(with_owned(r#""grace_secs":-5"#).grace_secs, None);
-        assert_eq!(with_owned(r#""grace_secs":3601"#).grace_secs, None);
+        assert_eq!(with_owned(r#""grace_secs":3601"#).grace_secs, Some(3600));
+        assert_eq!(with_owned(r#""grace_secs":"long""#).grace_secs, None);
         assert_eq!(with_owned(r#""grace_secs":120"#).grace_secs, Some(120));
         assert_eq!(
             with_owned(r#""share_fallback":"no""#).share_fallback,

@@ -365,36 +365,76 @@ async fn a_session_moved_to_another_guild_is_still_stopped_by_its_starter() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_start_whose_reply_is_lost_is_still_stopped_by_its_starter() {
-    let serve = serve!(true);
-    let failed = serve
-        .control()
-        .with_start_timeout(Duration::ZERO)
-        .start(&request(MOCK_VOICE_CHANNEL_ID), None)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            failed.error,
-            ControlError::Timeout {
-                command: "start",
-                ..
-            }
-        ),
-        "{failed:?}"
-    );
-    let provisional = *failed.ownership.expect("a provisional ownership");
+    let mut serve = serve!(true);
+    let provisional = lost_start(&mut serve).await;
     let control = serve.control();
     let deadline = Instant::now() + T;
-    let live = loop {
-        if let Some(live) = control.status().await.unwrap() {
-            break live;
+    loop {
+        let live = control.status().await.unwrap();
+        if live.as_ref().is_some_and(|l| l.started_by.is_some()) {
+            assert_eq!(live.unwrap().started_by, Some(provisional.connection));
+            break;
         }
         assert!(Instant::now() < deadline, "the start never landed");
         tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-    assert_eq!(live.started_by, Some(provisional.connection));
+    }
     assert_eq!(control.stop(Some(&provisional)).await, Ok(Stopped::Stopped));
     serve.voice_channel(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_after_a_lost_start_reply_keeps_the_ownership() {
+    let mut serve = serve!(true);
+    // The retry meets the first start queued, in flight or done, depending on timing; each round takes one.
+    for round in 0..5 {
+        let provisional = lost_start(&mut serve).await;
+        let control = serve.control();
+        let started = control
+            .start(&request(MOCK_VOICE_CHANNEL_ID), Some(&provisional))
+            .await
+            .unwrap();
+        assert_eq!(
+            started.ownership,
+            Some(provisional.clone()),
+            "round {round}"
+        );
+        assert_eq!(
+            control.stop(Some(&provisional)).await,
+            Ok(Stopped::Stopped),
+            "round {round}"
+        );
+        serve.voice_channel(None).await;
+        serve.restart().await;
+    }
+}
+
+/// A start whose reply times out after it was sent; a serve fast enough to answer within 1 ms is restarted and asked again.
+async fn lost_start(serve: &mut Serve) -> Ownership {
+    for _ in 0..5 {
+        let control = serve.control().with_start_timeout(Duration::from_millis(1));
+        match control.start(&request(MOCK_VOICE_CHANNEL_ID), None).await {
+            Err(failed) => {
+                assert!(
+                    matches!(
+                        failed.error,
+                        ControlError::Timeout {
+                            command: "start",
+                            ..
+                        }
+                    ),
+                    "{failed:?}"
+                );
+                return *failed.ownership.expect("a provisional ownership");
+            }
+            Ok(started) => {
+                let stopped = serve.control().stop(started.ownership.as_ref()).await;
+                assert_eq!(stopped, Ok(Stopped::Stopped));
+                serve.voice_channel(None).await;
+                serve.restart().await;
+            }
+        }
+    }
+    panic!("serve answered every start within 1 ms");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

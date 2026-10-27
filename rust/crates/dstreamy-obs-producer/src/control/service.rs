@@ -8,11 +8,14 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use super::{
-    ControlError, Decision, Instance, Live, Named, Ownership, START_GRACE_SECS, STATUS_PLACE,
-    StartFailed, StartRequest, Started, Stopped, decide, owns,
+    ControlError, Instance, Live, Named, Ownership, Resolution, START_GRACE_SECS, STATUS_PLACE,
+    StartFailed, StartRequest, Started, Stopped, owns, resolve, start_in_flight,
 };
 use crate::client::REPLY_TIMEOUT;
 use crate::types::service_text;
+
+/// How often a start in flight is looked at again until serve names its starter.
+const SETTLE_POLL: Duration = Duration::from_millis(50);
 
 /// How long a `stop` this plugin sends waits for its reply.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -83,25 +86,10 @@ impl ObsControl {
         if request.grace_secs.is_some() {
             c.require(START_GRACE_SECS)?;
         }
-        if let Some(ours) = persisted
-            && owns(&c.hello["status"], ours, c.instance)? == Some(true)
-        {
-            let channel = match c.hello_live() {
-                Ok(Some(live)) => live.channel(),
-                _ => ours.channel_id.clone(),
-            };
-            return Ok(Started {
-                ownership: Some(ours.clone()),
-                channel,
-            });
-        }
-        let live = c.hello_live()?;
-        match decide(request, live.as_ref(), persisted)? {
-            Decision::Attach { owned } => Ok(Started {
-                ownership: owned,
-                channel: live.map(|l| l.channel()).unwrap_or_default(),
-            }),
-            Decision::Start => {
+        let status = c.settled(c.hello["status"].clone(), persisted).await?;
+        match resolve(request, &status, persisted, c.instance)? {
+            Resolution::Attach(started) => Ok(started),
+            Resolution::Start => {
                 let provisional = Ownership {
                     connection: c.connection()?,
                     guild_id: request.guild_id.clone(),
@@ -123,7 +111,7 @@ impl ObsControl {
                 {
                     Ok(_) => {}
                     Err(e @ ControlError::Locked(_)) => {
-                        return Ok(c.attach_after_race(request, e).await?);
+                        return Ok(c.attach_after_race(request, persisted, e).await?);
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -145,17 +133,14 @@ impl ObsControl {
         let Some(ownership) = ownership else {
             return Ok(Stopped::LeftRunning);
         };
-        // Our session can't outlive its serve, and a restarted one never matches the ownership again.
         let mut c = match self.open().await {
             Ok(c) => c,
-            Err(
-                ControlError::NotRunning(_) | ControlError::Connect(_) | ControlError::Restarted,
-            ) => {
-                return Ok(Stopped::NotRunning);
-            }
-            Err(e) => return Err(e),
+            Err(e) => return stop_without_connection(e),
         };
-        match owns(&c.hello["status"], ownership, c.instance)? {
+        let status = c
+            .settled(c.hello["status"].clone(), Some(ownership))
+            .await?;
+        match owns(&status, ownership, c.instance)? {
             None => return Ok(Stopped::NotRunning),
             Some(false) => return Ok(Stopped::LeftRunning),
             Some(true) => {}
@@ -319,6 +304,25 @@ impl Connection {
             })?
     }
 
+    /// Waits out a start in flight, which may be our own whose reply was lost, until serve names its starter.
+    async fn settled(
+        &mut self,
+        mut status: Value,
+        persisted: Option<&Ownership>,
+    ) -> Result<Value, ControlError> {
+        let deadline = tokio::time::Instant::now() + REPLY_TIMEOUT;
+        while start_in_flight(&status, persisted, self.instance)? {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ControlError::StillStarting);
+            }
+            tokio::time::sleep(SETTLE_POLL).await;
+            status = self
+                .call(json!({"cmd": "status"}), "status", REPLY_TIMEOUT)
+                .await?;
+        }
+        Ok(status)
+    }
+
     async fn live(&mut self) -> Result<Option<Live>, ControlError> {
         let status = self
             .call(json!({"cmd": "status"}), "status", REPLY_TIMEOUT)
@@ -326,22 +330,29 @@ impl Connection {
         Ok(self.with_instance(Live::from_status(&status)?))
     }
 
-    /// Another client's start won the race, or another process holds the session lock.
+    /// Another start won the race, maybe our own earlier one, or another process holds the session lock.
     async fn attach_after_race(
         &mut self,
         request: &StartRequest,
+        persisted: Option<&Ownership>,
         refused: ControlError,
     ) -> Result<Started, ControlError> {
-        let Some(live) = self.live().await? else {
-            return Err(refused);
-        };
-        match decide(request, Some(&live), None)? {
-            Decision::Attach { .. } => Ok(Started {
-                ownership: None,
-                channel: live.channel(),
-            }),
-            Decision::Start => Err(refused),
+        let status = self
+            .call(json!({"cmd": "status"}), "status", REPLY_TIMEOUT)
+            .await?;
+        let status = self.settled(status, persisted).await?;
+        match resolve(request, &status, persisted, self.instance)? {
+            Resolution::Attach(started) => Ok(started),
+            Resolution::Start => Err(refused),
         }
+    }
+}
+
+/// Only a missing or replaced serve proves our session is gone; any other failure keeps the ownership for a retry.
+fn stop_without_connection(e: ControlError) -> Result<Stopped, ControlError> {
+    match e {
+        ControlError::NotRunning(_) | ControlError::Restarted => Ok(Stopped::NotRunning),
+        e => Err(e),
     }
 }
 
@@ -356,4 +367,27 @@ fn named(data: Value) -> Result<Vec<Named>, ControlError> {
                 .collect()
         })
         .map_err(|e| ControlError::Protocol(service_text(&format!("{e}: {data}"))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_missing_or_restarted_serve_ends_the_session() {
+        assert_eq!(
+            stop_without_connection(ControlError::NotRunning("gone".into())),
+            Ok(Stopped::NotRunning)
+        );
+        assert_eq!(
+            stop_without_connection(ControlError::Restarted),
+            Ok(Stopped::NotRunning)
+        );
+        let impostor = ControlError::Connect("the service runs as uid 7".into());
+        assert_eq!(stop_without_connection(impostor.clone()), Err(impostor));
+        assert_eq!(
+            stop_without_connection(ControlError::Stopping),
+            Err(ControlError::Stopping)
+        );
+    }
 }

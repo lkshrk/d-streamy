@@ -73,6 +73,16 @@ fn is_live(status: &Value) -> Result<bool, ControlError> {
     }
 }
 
+/// A live session without `started_by` is a start still in flight (serve sets it once `start` returns), possibly ours.
+pub fn start_in_flight(
+    status: &Value,
+    persisted: Option<&Ownership>,
+    instance: Instance,
+) -> Result<bool, ControlError> {
+    let ours = persisted.is_some_and(|o| o.instance == Some(instance));
+    Ok(ours && status["started_by"].is_null() && is_live(status)?)
+}
+
 /// `Some(true)` when `status` shows a live session that `ownership` started, even one without a place.
 pub fn owns(
     status: &Value,
@@ -215,6 +225,50 @@ pub fn decide(
     Ok(Decision::Attach { owned: None })
 }
 
+/// What a start does after reading serve's `status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    Start,
+    Attach(Started),
+}
+
+/// Our own session wins wherever it is and even without a place; otherwise [`decide`] on the live session.
+pub fn resolve(
+    request: &StartRequest,
+    status: &Value,
+    persisted: Option<&Ownership>,
+    instance: Instance,
+) -> Result<Resolution, ControlError> {
+    let placed = || {
+        Live::from_status(status).map(|live| {
+            live.map(|live| Live {
+                instance: Some(instance),
+                ..live
+            })
+        })
+    };
+    if let Some(ours) = persisted
+        && owns(status, ours, instance)? == Some(true)
+    {
+        let channel = match placed() {
+            Ok(Some(live)) => live.channel(),
+            _ => ours.channel_id.clone(),
+        };
+        return Ok(Resolution::Attach(Started {
+            ownership: Some(ours.clone()),
+            channel,
+        }));
+    }
+    let live = placed()?;
+    Ok(match decide(request, live.as_ref(), persisted)? {
+        Decision::Start => Resolution::Start,
+        Decision::Attach { owned } => Resolution::Attach(Started {
+            ownership: owned,
+            channel: live.map(|l| l.channel()).unwrap_or_default(),
+        }),
+    })
+}
+
 /// A start that failed; `ownership` is set once the start was sent, since serve may still carry it out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartFailed {
@@ -260,6 +314,7 @@ pub enum ControlError {
         feature: &'static str,
     },
     Stopping,
+    StillStarting,
     /// The service restarted between two looks at its socket.
     Restarted,
     /// A live session without a place, as serve reports after a 2 s catch-up timeout.
@@ -328,6 +383,7 @@ impl fmt::Display for ControlError {
                 "The D-Streamy service is too old for this plugin (it lacks {feature}): update and restart it"
             ),
             Self::Stopping => f.write_str("D-Streamy is still stopping; try again"),
+            Self::StillStarting => f.write_str("D-Streamy is still starting; try again"),
             Self::Restarted => {
                 f.write_str("The D-Streamy service restarted while connecting; try again")
             }
@@ -450,6 +506,64 @@ mod tests {
             decide(&r, Some(&moved), Some(&owned(4))),
             Err(ControlError::Busy { .. })
         ));
+    }
+
+    #[test]
+    fn our_session_without_a_place_is_attached_and_kept() {
+        let r = request();
+        let placeless = json!({"session": {"state": "streaming"}, "started_by": 3});
+        assert_eq!(
+            resolve(&r, &placeless, Some(&owned(3)), instance(1)),
+            Ok(Resolution::Attach(Started {
+                ownership: Some(owned(3)),
+                channel: "c".into(),
+            }))
+        );
+        assert_eq!(
+            resolve(&r, &placeless, Some(&owned(4)), instance(1)),
+            Err(ControlError::NoPlace)
+        );
+        assert_eq!(
+            resolve(&r, &placeless, Some(&owned(3)), instance(2)),
+            Err(ControlError::NoPlace)
+        );
+        let placed = json!({"session": {"state": "streaming", "guild_id": "g", "channel_id": "d",
+            "channel_name": "Gaming", "target": "external"}, "started_by": 3});
+        assert_eq!(
+            resolve(&r, &placed, Some(&owned(3)), instance(1)),
+            Ok(Resolution::Attach(Started {
+                ownership: Some(owned(3)),
+                channel: "Gaming".into(),
+            }))
+        );
+        assert_eq!(
+            resolve(&r, &json!({"session": null}), Some(&owned(3)), instance(1)),
+            Ok(Resolution::Start)
+        );
+    }
+
+    #[test]
+    fn a_live_session_without_a_starter_is_in_flight_for_the_same_serve_only() {
+        let in_flight = json!({"session": {"state": "connecting"}, "started_by": null});
+        assert_eq!(
+            start_in_flight(&in_flight, Some(&owned(3)), instance(1)),
+            Ok(true)
+        );
+        assert_eq!(
+            start_in_flight(&in_flight, Some(&owned(3)), instance(2)),
+            Ok(false)
+        );
+        assert_eq!(start_in_flight(&in_flight, None, instance(1)), Ok(false));
+        let started = json!({"session": {"state": "connecting"}, "started_by": 3});
+        assert_eq!(
+            start_in_flight(&started, Some(&owned(3)), instance(1)),
+            Ok(false)
+        );
+        let idle = json!({"session": {"state": "idle"}, "started_by": null});
+        assert_eq!(
+            start_in_flight(&idle, Some(&owned(3)), instance(1)),
+            Ok(false)
+        );
     }
 
     #[test]
