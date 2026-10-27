@@ -118,7 +118,9 @@ impl Ownership {
                     .collect();
                 // serve queues starts in arrival order, so the oldest lost start is the one most likely to land.
                 let excess = connections.len().saturating_sub(MAX_CANDIDATES);
-                connections.drain(1..1 + excess);
+                if excess > 0 {
+                    connections.drain(1..=excess);
+                }
                 Ownership {
                     connections,
                     ..lost
@@ -884,6 +886,15 @@ mod tests {
             Ownership::with_candidate(Some(&o), candidates(&[id], 1))
         });
         assert_eq!(ids(&nine), [1, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn empty_candidate_lists_merge_without_panicking() {
+        let merged = Ownership::with_candidate(Some(&candidates(&[], 1)), candidates(&[], 1));
+        assert!(merged.connections.is_empty());
+        assert!(!merged.matches(Some(1), Some(instance(1))));
+        let one = Ownership::with_candidate(Some(&candidates(&[], 1)), candidates(&[4], 1));
+        assert_eq!(ids(&one), [4]);
     }
 
     #[test]
