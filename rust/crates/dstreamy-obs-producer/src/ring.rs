@@ -46,7 +46,7 @@ pub struct RingStats {
     pub dropped_audio: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Inner {
     queue: VecDeque<Packet>,
     bytes: usize,
@@ -55,6 +55,20 @@ struct Inner {
     dropped_audio: u64,
     oversized: Option<Oversized>,
     closed: bool,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            bytes: 0,
+            awaiting_keyframe: true,
+            dropped_video: 0,
+            dropped_audio: 0,
+            oversized: None,
+            closed: false,
+        }
+    }
 }
 
 impl Inner {
@@ -287,6 +301,22 @@ mod tests {
             [(Track::Video, 0), (Track::Audio, 0), (Track::Video, 1)]
         );
         assert_eq!(ring.stats(), RingStats::default());
+    }
+
+    #[test]
+    fn waits_for_a_keyframe_after_creation_and_reopen() {
+        let ring = Ring::new(8, 1 << 20);
+        ring.push(video(0, false));
+        ring.push(audio(0));
+        ring.push(video(1, true));
+        assert_eq!(drain(&ring), [(Track::Audio, 0), (Track::Video, 1)]);
+
+        ring.close();
+        ring.reopen();
+        ring.push(video(2, false));
+        ring.push(audio(1));
+        ring.push(video(3, true));
+        assert_eq!(drain(&ring), [(Track::Audio, 1), (Track::Video, 3)]);
     }
 
     #[test]
