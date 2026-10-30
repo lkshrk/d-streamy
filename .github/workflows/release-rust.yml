@@ -137,7 +137,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "dist/$ARCHIVE"
-          cp "target/${{ matrix.target }}/release/dstreamy" ../README.md "dist/$ARCHIVE/"
+          cp "target/${{ matrix.target }}/release/dstreamy" ../README.md ../LICENSE "dist/$ARCHIVE/"
+          python3 ../scripts/third-party-notices.py --manifest Cargo.toml \
+            --target ${{ matrix.target }} --output "dist/$ARCHIVE/THIRD_PARTY_NOTICES.txt"
           tar -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
           (cd dist && shasum -a 256 "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256")
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

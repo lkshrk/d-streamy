@@ -28,6 +28,15 @@ cp "$(swift build "${SWIFT_FLAGS[@]}" --show-bin-path)/D-Streamy" "$APP/Contents
 cp "$DSTREAMY_DAEMON" "$APP/Contents/MacOS/dstreamy"
 chmod +x "$APP/Contents/MacOS/dstreamy"
 
+if [ "${UNIVERSAL:-0}" = "1" ]; then
+    NOTICE_TARGETS=(--target aarch64-apple-darwin --target x86_64-apple-darwin)
+else
+    NOTICE_TARGETS=(--target "$(rustc -vV | sed -n 's/^host: //p')")
+fi
+cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE"
+python3 "$SCRIPT_DIR/third-party-notices.py" --manifest "$ROOT/rust/Cargo.toml" \
+    "${NOTICE_TARGETS[@]}" --output "$APP/Contents/Resources/THIRD_PARTY_NOTICES.txt"
+
 # Compile and copy app icon
 echo "==> Compiling asset catalog..."
 xcrun actool "$ROOT/App/Assets.xcassets" \
