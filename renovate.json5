@@ -1,5 +1,8 @@
 {
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
-  extends: ["github>lkshrk/gh-ops//renovate/presets/github-actions.json5"],
-  enabledManagers: ["github-actions", "custom.regex"],
+  extends: [
+    "github>lkshrk/gh-ops//renovate/presets/app-library.json5",
+    "github>lkshrk/gh-ops//renovate/presets/automerge-major.json5",
+    "helpers:pinGitHubActionDigests",
+  ],
 }
