@@ -450,25 +450,19 @@ mod tests {
         assert_eq!(consumer.await.unwrap(), [7, 8]);
     }
 
-    /// One thread pushes as `encoded_packet` does while another drains: no packet is lost or reordered beyond the policy.
-    #[test]
-    fn two_threads_keep_order_and_account_for_every_packet() {
-        const N: i64 = 200_000;
-        let ring = Arc::new(Ring::new(32, 1 << 20));
-        let producer = std::thread::spawn({
-            let ring = ring.clone();
-            move || {
-                for i in 0..N {
-                    ring.push(video(i, i % 30 == 0));
-                    ring.push(audio(i));
-                }
-                ring.close();
-            }
-        });
+    fn produce(ring: &Ring, n: i64) {
+        for i in 0..n {
+            ring.push(video(i, i % 30 == 0));
+            ring.push(audio(i));
+        }
+        ring.close();
+    }
+
+    fn consume(ring: &Ring) -> Vec<(Track, i64, bool)> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let got = runtime.block_on(async {
+        runtime.block_on(async {
             let mut got = Vec::new();
             while let Some(p) = ring.next().await {
                 let p = p.unwrap();
@@ -478,18 +472,19 @@ mod tests {
                 }
             }
             got
-        });
-        producer.join().unwrap();
-        let stats = ring.stats();
+        })
+    }
+
+    fn assert_stream_follows_the_policy(got: &[(Track, i64, bool)], stats: RingStats, n: i64) {
         let videos: Vec<_> = got.iter().filter(|p| p.0 == Track::Video).collect();
         let audios: Vec<_> = got.iter().filter(|p| p.0 == Track::Audio).collect();
-        assert_eq!(videos.len() as u64 + stats.dropped_video, N as u64);
-        assert_eq!(audios.len() as u64 + stats.dropped_audio, N as u64);
+        assert_eq!(videos.len() as u64 + stats.dropped_video, n as u64);
+        assert_eq!(audios.len() as u64 + stats.dropped_audio, n as u64);
         for track in [&videos, &audios] {
             assert!(track.windows(2).all(|w| w[0].1 < w[1].1), "out of order");
         }
         assert!(
-            videos.first().is_some_and(|v| v.2),
+            videos.first().is_none_or(|v| v.2),
             "first video is a keyframe"
         );
         for w in videos.windows(2) {
@@ -507,5 +502,32 @@ mod tests {
             stats.dropped_video + stats.dropped_audio > 0,
             "the consumer never fell behind, so the drop policy was not exercised"
         );
+    }
+
+    /// One thread pushes as `encoded_packet` does while another drains: no packet is lost or reordered beyond the policy.
+    #[test]
+    fn two_threads_keep_order_and_account_for_every_packet() {
+        const N: i64 = 200_000;
+        let ring = Arc::new(Ring::new(32, 1 << 20));
+        let producer = std::thread::spawn({
+            let ring = ring.clone();
+            move || produce(&ring, N)
+        });
+        let got = consume(&ring);
+        producer.join().unwrap();
+        assert_stream_follows_the_policy(&got, ring.stats(), N);
+    }
+
+    #[test]
+    fn a_consumer_that_starts_after_the_producer_closes_follows_the_policy() {
+        const N: i64 = 1_000;
+        let ring = Ring::new(32, 1 << 20);
+        produce(&ring, N);
+        let got = consume(&ring);
+        assert!(
+            got.iter().all(|p| p.0 == Track::Audio),
+            "every queued keyframe was evicted by the delta after it"
+        );
+        assert_stream_follows_the_policy(&got, ring.stats(), N);
     }
 }
