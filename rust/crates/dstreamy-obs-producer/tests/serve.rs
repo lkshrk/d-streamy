@@ -413,7 +413,7 @@ fn a_service_shutdown_detaches_the_producer() {
     }
 }
 
-/// serve refuses an IDR without the keyframe flag (tests/fake_service.rs forces the failed-write path).
+/// serve admits a flagged keyframe, then refuses an IDR without the flag (tests/fake_service.rs forces the failed-write path).
 #[test]
 fn an_ingest_refusal_surfaces_as_detached() {
     let Some(bin) = dstreamy_bin() else { return };
@@ -428,17 +428,19 @@ fn an_ingest_refusal_surfaces_as_detached() {
     let idr = trace.video().find(|p| p.keyframe).unwrap();
     let mut extra = trace.video_extra.clone();
     extra.extend_from_slice(&idr.data);
-    for i in 0..50 {
+    for (pts, keyframe) in [(0, true), (1, false)] {
         ring.push(Packet {
             track: Track::Video,
-            keyframe: false,
-            pts: i,
-            dts: i,
+            keyframe,
+            pts,
+            dts: pts,
             timebase: (1, 30),
             data: extra.clone(),
             arrived: Instant::now(),
         });
     }
+    assert_eq!(ring.stats().queued, 2);
+    assert_eq!(ring.stats().dropped_video, 0);
     let end = within(
         &serve.rt,
         run(
@@ -452,7 +454,12 @@ fn an_ingest_refusal_surfaces_as_detached() {
     match end {
         End::Detached { reason, message } => {
             assert_eq!(reason, "incompatible", "{message}");
+            assert!(
+                message.contains("IDR slice in a frame not flagged as a keyframe"),
+                "{message}"
+            );
         }
         other => panic!("{other:?}"),
     }
+    assert_eq!(ring.stats().queued, 0, "both frames reached the service");
 }
