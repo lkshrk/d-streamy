@@ -65,6 +65,8 @@ Requirements:
     gstreamer1.0-plugins-ugly gstreamer1.0-pipewire gstreamer1.0-pulseaudio
   ```
 
+  Desktop release builds include browser login (`dstreamy login --browser`), which on Linux also needs the WebKitGTK 4.1 runtime (Debian/Ubuntu: `sudo apt-get install libwebkit2gtk-4.1-0 libgtk-3-0 libsoup-3.0-0`). Without it the binary fails to start; QR login (`dstreamy login`) remains the normal path, and a build without the feature needs none of these.
+
   Hardware encoding is used when available: VA-API needs a VA driver for your GPU (and `gstreamer1.0-vaapi` for the older elements), NVENC needs the NVIDIA driver. Otherwise `x264enc` encodes in software.
 
 ### Build from source
@@ -92,7 +94,7 @@ Or build the Linux binary in Docker from any host (the output lands in the `dstr
 rust/ci/linux.sh cargo build --release -p dstreamy-cli
 ```
 
-Browser login (`dstreamy login --browser`) is an opt-in build feature, so the default binary needs no webview. On Linux it needs WebKitGTK 4.1 (`libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev` to build) and links against it:
+Browser login (`dstreamy login --browser`) is included in the desktop release tarballs (Linux and macOS) but is an opt-in build feature, so a source build without `--features browser-login` needs no webview. On Linux it needs WebKitGTK 4.1 (`libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev` to build) and links against it:
 
 ```bash
 cargo build --release -p dstreamy-cli --features browser-login

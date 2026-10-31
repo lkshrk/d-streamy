@@ -108,7 +108,7 @@ jobs:
           apt=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120)
           args=(-y --no-install-recommends clang libclang-dev pkg-config \
             libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libopus-dev)
+            libopus-dev libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev)
           retry sudo apt-get "${apt[@]}" update
           # Only fetches are retried: killing an install mid-unpack leaves dpkg broken.
           retry sudo apt-get "${apt[@]}" install --download-only "${args[@]}"
@@ -121,13 +121,16 @@ jobs:
         run: |
           set -euo pipefail
           out=$(for c in dstreamy-cli dstreamy-discord discord-stream-rs dstreamy-ipc; do
-            cargo tree --locked -p dstreamy-cli -e features,normal --target ${{ matrix.target }} -i "$c"
+            cargo tree --locked -p dstreamy-cli --features browser-login -e features,normal --target ${{ matrix.target }} -i "$c"
           done)
           if grep -E 'feature "(test-hooks|test-rtp-start|test-support)"' <<<"$out"; then
             echo "a test-only feature reaches the release binary" >&2
             exit 1
           fi
-      - run: cargo build --release --locked -p dstreamy-cli --target ${{ matrix.target }}
+      - run: cargo build --release --locked -p dstreamy-cli --features browser-login --target ${{ matrix.target }}
+      - name: Linux binary links WebKitGTK
+        if: runner.os == 'Linux'
+        run: ldd target/${{ matrix.target }}/release/dstreamy | grep -F libwebkit2gtk-4.1
       - name: Install Rosetta
         if: matrix.rosetta
         run: sudo softwareupdate --install-rosetta --agree-to-license
