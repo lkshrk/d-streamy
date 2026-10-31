@@ -38,6 +38,8 @@ jobs:
           key: xcode-27.1
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy with browser-login
+        run: cargo clippy -p dstreamy-cli --features browser-login --all-targets --locked -- -D warnings
       - name: Install cargo-nextest
         run: |
           set -euo pipefail

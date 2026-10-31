@@ -71,6 +71,14 @@ jobs:
       - run: cargo test --workspace --locked
         env:
           DSTREAMY_BIN: ${{ github.workspace }}/rust/target/debug/dstreamy
+      - name: Clippy with browser-login for both macOS targets
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            rustup target add "$target"
+            cargo clippy -p dstreamy-cli --features browser-login --all-targets --locked --target "$target" -- -D warnings
+          done
 
   build:
     needs: [version, check]
