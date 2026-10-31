@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Candidate(String);
@@ -52,6 +53,31 @@ impl SeenCandidates {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Validation<T> {
+    Pending,
+    Rejected,
+    Accepted(T),
+}
+
+pub async fn validate_candidate<T, E, F, Fut>(
+    seen: &mut SeenCandidates,
+    candidate: Candidate,
+    validator: F,
+) -> Validation<T>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    if !seen.insert(&candidate) {
+        return Validation::Pending;
+    }
+    match validator(candidate.into_string()).await {
+        Ok(value) => Validation::Accepted(value),
+        Err(_) => Validation::Rejected,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,6 +119,61 @@ mod tests {
         assert!(seen.insert(&a));
         assert!(!seen.insert(&a));
         assert!(seen.insert(&b));
+    }
+
+    #[tokio::test]
+    async fn invalid_candidate_does_not_end_login_and_later_valid_candidate_wins() {
+        let mut seen = SeenCandidates::default();
+        let validator = |token: String| async move {
+            if token == "good.tok.en" {
+                Ok(token)
+            } else {
+                Err("rejected")
+            }
+        };
+        let bad = parse_candidate("candidate:bad.tok.en").unwrap();
+        let good = parse_candidate("candidate:good.tok.en").unwrap();
+        assert_eq!(
+            validate_candidate(&mut seen, bad, validator).await,
+            Validation::Rejected
+        );
+        assert_eq!(
+            validate_candidate(&mut seen, good, validator).await,
+            Validation::Accepted("good.tok.en".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_candidate_is_not_revalidated() {
+        let mut seen = SeenCandidates::default();
+        let calls = std::cell::Cell::new(0);
+        let validator = |_: String| {
+            calls.set(calls.get() + 1);
+            async { Err::<(), _>("rejected") }
+        };
+        let c = parse_candidate("candidate:aaa.bbb.ccc").unwrap();
+        assert_eq!(
+            validate_candidate(&mut seen, c.clone(), validator).await,
+            Validation::Rejected
+        );
+        assert_eq!(
+            validate_candidate(&mut seen, c, validator).await,
+            Validation::Pending
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn control_character_candidate_parses_and_rejection_is_recoverable() {
+        let mut seen = SeenCandidates::default();
+        let weird = parse_candidate("candidate:abc\u{7}.def.ghi").unwrap();
+        let rejected =
+            validate_candidate(&mut seen, weird, |_| async { Err::<String, _>("no") }).await;
+        assert_eq!(rejected, Validation::Rejected);
+        assert!(!format!("{rejected:?}").contains("abc"));
+        let good = parse_candidate("candidate:good.tok.en").unwrap();
+        let accepted = validate_candidate(&mut seen, good, |t| async move { Ok::<_, ()>(t) }).await;
+        assert_eq!(accepted, Validation::Accepted("good.tok.en".to_owned()));
     }
 
     #[test]
