@@ -142,7 +142,10 @@ fn main() -> ExitCode {
         _ => (None, true),
     };
     init_logging(&out, cli.verbose, log_file, to_stderr);
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(
+        feature = "browser-login",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     if let Command::Login { browser: true, .. } = cli.command {
         dstreamy_cli::browser_login::prepare_environment();
     }
@@ -160,10 +163,18 @@ fn main() -> ExitCode {
         Command::Login { token, browser } => {
             let mode = login_mode(token, browser, std::io::stdin().is_terminal());
             let read = match mode {
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(all(
+                    feature = "browser-login",
+                    any(target_os = "linux", target_os = "macos")
+                ))]
                 LoginMode::Browser => browser_token(&ctx, runtime.handle()),
+                #[cfg(not(all(
+                    feature = "browser-login",
+                    any(target_os = "linux", target_os = "macos")
+                )))]
+                LoginMode::Browser => Err(CliError::BrowserLoginUnavailable),
                 LoginMode::Token => read_token().map(Some),
-                _ => Ok(None),
+                LoginMode::Qr => Ok(None),
             };
             match read {
                 Ok(token) => token,
@@ -292,7 +303,10 @@ async fn run(
 }
 
 /// `None` means the QR login runs next.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    feature = "browser-login",
+    any(target_os = "linux", target_os = "macos")
+))]
 fn browser_token(ctx: &Ctx, runtime: &tokio::runtime::Handle) -> Result<Option<String>, CliError> {
     use dstreamy_cli::login_capture::{FollowUp, follow_up};
     match follow_up(dstreamy_cli::browser_login::run(ctx, runtime)?)? {

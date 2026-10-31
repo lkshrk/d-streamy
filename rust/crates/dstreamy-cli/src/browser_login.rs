@@ -101,7 +101,8 @@ const CAPTURE_SCRIPT: &str = r##"
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") window.ipc.postMessage("close");
   }, true);
-  if (!location.hostname.endsWith("discord.com")) return;
+  const host = location.hostname;
+  if (host !== "discord.com" && !host.endsWith(".discord.com")) return;
   const post = (message) => {
     try { window.ipc.postMessage(message); } catch (_) {}
   };
@@ -485,6 +486,16 @@ mod tests {
         assert!(!CAPTURE_SCRIPT.contains("app-mount"));
         assert_eq!(CAPTURE_SCRIPT.matches("post(\"page_loaded\")").count(), 1);
         assert!(CAPTURE_SCRIPT.contains("document.body"));
+    }
+
+    #[test]
+    fn capture_script_only_runs_on_discord_com_and_its_subdomains() {
+        assert!(!CAPTURE_SCRIPT.contains("endsWith(\"discord.com\")"));
+        assert!(
+            CAPTURE_SCRIPT.contains(
+                "if (host !== \"discord.com\" && !host.endsWith(\".discord.com\")) return;"
+            )
+        );
     }
 
     #[cfg(target_os = "linux")]

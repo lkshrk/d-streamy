@@ -205,6 +205,30 @@ fn login_browser_and_token_flags_conflict() {
     assert!(err.contains("cannot be used with"), "{err}");
 }
 
+#[cfg(not(all(
+    feature = "browser-login",
+    any(target_os = "linux", target_os = "macos")
+)))]
+#[test]
+fn login_browser_without_browser_support_points_to_qr_and_token_login() {
+    let h = Harness::new();
+    let output = h
+        .cmd()
+        .args(["login", "--browser"])
+        .write_stdin(MOCK_TOKEN)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let err = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        err.contains("browser login is not included in this build"),
+        "{err}"
+    );
+    assert!(err.contains("`dstreamy login`"), "{err}");
+    assert!(err.contains("`dstreamy login --token`"), "{err}");
+    assert!(!h.config_dir().join("token").exists());
+}
+
 #[test]
 fn login_help_lists_the_browser_and_token_flags() {
     let text = stdout(bare_cmd().args(["login", "--help"]));

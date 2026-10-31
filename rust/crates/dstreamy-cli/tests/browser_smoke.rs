@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(all(feature = "browser-login", target_os = "linux"))]
 
 use std::time::Duration;
 

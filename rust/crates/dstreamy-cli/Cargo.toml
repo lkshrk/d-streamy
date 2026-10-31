@@ -27,15 +27,15 @@ url = "2"
 webrtc = "0.14"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-tao = "0.37"
-wry = "0.57"
+tao = { version = "0.37", optional = true }
+wry = { version = "0.57", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-muda = { version = "0.21", default-features = false }
+muda = { version = "0.21", default-features = false, optional = true }
 dstreamy-capture-macos = { path = "../dstreamy-capture-macos" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-webkit2gtk = "2.0.2"
+webkit2gtk = { version = "2.0.2", optional = true }
 async-trait = "0.1"
 dstreamy-capture-linux = { path = "../dstreamy-capture-linux" }
 
@@ -54,6 +54,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 libc = "0.2"
 
 [features]
+# Pulls in a system webview (WebKitGTK on Linux), so default builds leave it out.
+browser-login = ["dep:tao", "dep:wry", "dep:muda", "dep:webkit2gtk"]
 test-hooks = ["dstreamy-discord/test-rtp-start"]
 
 [lints]
