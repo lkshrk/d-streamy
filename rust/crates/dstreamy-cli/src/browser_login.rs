@@ -188,7 +188,7 @@ const CAPTURE_SCRIPT: &str = r##"
   let loaded = false;
   const checkLoaded = () => {
     if (loaded) return;
-    if (document.getElementById("app-mount")) {
+    if (document.readyState !== "loading" && document.body) {
       loaded = true;
       clearInterval(loadTimer);
       post("page_loaded");
@@ -198,6 +198,13 @@ const CAPTURE_SCRIPT: &str = r##"
   checkLoaded();
 })();
 "##;
+
+#[cfg(target_os = "linux")]
+fn genuine_load_failure(error: &webkit2gtk::glib::Error) -> bool {
+    use webkit2gtk::{NetworkError, PolicyError};
+    !(error.matches(NetworkError::Cancelled)
+        || error.matches(PolicyError::FrameLoadInterruptedByPolicyChange))
+}
 
 /// Must run on the main thread before any other thread, including the async runtime, starts.
 pub fn prepare_environment() {
@@ -250,10 +257,15 @@ pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError>
         if let Ok(webview) = &webview {
             use webkit2gtk::WebViewExt;
             use wry::WebViewExtUnix;
-            webview.webview().connect_load_failed(move |_, _, _, _| {
-                let _ = load_proxy.send_event(Msg::LoadFailed);
-                true
-            });
+            webview
+                .webview()
+                .connect_load_failed(move |_, _, _, error| {
+                    if !genuine_load_failure(error) {
+                        return false;
+                    }
+                    let _ = load_proxy.send_event(Msg::LoadFailed);
+                    true
+                });
         }
         webview
     };
@@ -462,4 +474,37 @@ fn edit_menu() -> Result<muda::Menu, CliError> {
     let menu = Menu::with_items(&[&app, &edit]).map_err(err)?;
     menu.init_for_nsapp();
     Ok(menu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_script_reports_the_page_load_without_discord_selectors() {
+        assert!(!CAPTURE_SCRIPT.contains("app-mount"));
+        assert_eq!(CAPTURE_SCRIPT.matches("post(\"page_loaded\")").count(), 1);
+        assert!(CAPTURE_SCRIPT.contains("document.body"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_genuine_load_failures_are_recovered() {
+        use webkit2gtk::glib::Error;
+        use webkit2gtk::{NetworkError, PolicyError};
+        assert!(!genuine_load_failure(&Error::new(
+            NetworkError::Cancelled,
+            "x"
+        )));
+        assert!(!genuine_load_failure(&Error::new(
+            PolicyError::FrameLoadInterruptedByPolicyChange,
+            "x"
+        )));
+        assert!(genuine_load_failure(&Error::new(NetworkError::Failed, "x")));
+        assert!(genuine_load_failure(&Error::new(
+            NetworkError::Transport,
+            "x"
+        )));
+        assert!(genuine_load_failure(&Error::new(PolicyError::Failed, "x")));
+    }
 }
