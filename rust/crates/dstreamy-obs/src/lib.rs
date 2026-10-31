@@ -1,10 +1,12 @@
 //! D-Streamy OBS plugin module: the entry points libobs looks up (`libobs/obs-module.c:40-50`).
 
 mod encoders;
+mod frontend;
 mod guard;
 mod hooks;
 mod log;
 mod output;
+mod settings_source;
 mod worker;
 
 use std::ptr;
@@ -42,6 +44,8 @@ pub extern "C" fn obs_module_load() -> bool {
             return false;
         }
         output::register();
+        settings_source::register();
+        frontend::install();
         log::info(&format!("loaded (version {})", env!("CARGO_PKG_VERSION")));
         true
     })

@@ -15,6 +15,13 @@ elseif(OS_MACOS)
 endif()
 
 if(OS_LINUX)
+  # Stands in for libobs-frontend-api; only --fake-frontend dlopens it, nothing links it.
+  add_library(obs-harness-frontend MODULE fake-frontend.c)
+  target_link_libraries(obs-harness-frontend PRIVATE OBS::libobs)
+  set_target_properties(obs-harness-frontend PROPERTIES PREFIX "" C_EXTENSIONS ON)
+  add_dependencies(obs-harness obs-harness-frontend)
+  target_link_libraries(obs-harness PRIVATE ${CMAKE_DL_LIBS})
+
   add_test(
     NAME harness-trace
     COMMAND obs-harness --seconds 2 --trace-dir "${CMAKE_CURRENT_BINARY_DIR}/ctest-trace"

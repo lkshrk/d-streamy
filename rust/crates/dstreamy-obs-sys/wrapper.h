@@ -12,3 +12,19 @@ static const int DSTREAMY_LOG_ERROR = LOG_ERROR;
 static const int DSTREAMY_LOG_WARNING = LOG_WARNING;
 static const int DSTREAMY_LOG_INFO = LOG_INFO;
 static const int DSTREAMY_LOG_DEBUG = LOG_DEBUG;
+
+/* obs-frontend-api is resolved at runtime, never linked: a libobs-only host lacks it. */
+typedef void (*dstreamy_frontend_cb)(void *private_data);
+typedef void (*dstreamy_frontend_add_tools_menu_item)(const char *name, dstreamy_frontend_cb callback,
+						      void *private_data);
+typedef void (*dstreamy_frontend_open_source_properties)(obs_source_t *source);
+
+#if __has_include(<obs-frontend-api.h>)
+#include <obs-frontend-api.h>
+_Static_assert(__builtin_types_compatible_p(__typeof__(&obs_frontend_add_tools_menu_item),
+					    dstreamy_frontend_add_tools_menu_item),
+	       "obs_frontend_add_tools_menu_item changed");
+_Static_assert(__builtin_types_compatible_p(__typeof__(&obs_frontend_open_source_properties),
+					    dstreamy_frontend_open_source_properties),
+	       "obs_frontend_open_source_properties changed");
+#endif

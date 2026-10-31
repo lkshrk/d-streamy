@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 dstreamy-obs-producer = { path = "../dstreamy-obs-producer" }
 dstreamy-obs-sys = { path = "../dstreamy-obs-sys" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+libloading = "0.8"
 tokio = { version = "1", features = ["macros", "rt", "sync"] }
 
 [features]

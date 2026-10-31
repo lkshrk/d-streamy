@@ -13,8 +13,6 @@ pub const BITRATE_KBPS: std::ops::RangeInclusive<i64> = 500..=50_000;
 /// OBS's mixer tracks, one-based.
 pub const AUDIO_TRACKS: std::ops::RangeInclusive<u8> = 1..=6;
 pub const DEFAULT_AUDIO_TRACK: u8 = 1;
-pub const AUDIO_TRACK_TITLE: &str = "Discord audio track";
-pub const AUDIO_TRACK_HELP: &str = "Track 1 is OBS's first mixer track. It may differ from the track used by OBS streaming or recording. Configure which sources feed this track in OBS's Advanced Audio Properties. The label is used only by D-Streamy. Changes apply on the next Go Live.";
 /// serve refuses a longer per-start grace (ADR 0004).
 pub const MAX_GRACE_SECS: u64 = 3600;
 
@@ -41,8 +39,6 @@ pub struct DockSettings {
     pub start_with_stream: bool,
     /// The OBS mixer track sent to Discord, one-based.
     pub audio_track: u8,
-    /// A D-Streamy-only name for the track; never reaches OBS.
-    pub audio_track_label: Option<String>,
     pub owned: Option<Ownership>,
 }
 
@@ -58,7 +54,6 @@ impl Default for DockSettings {
             share_fallback: true,
             start_with_stream: false,
             audio_track: DEFAULT_AUDIO_TRACK,
-            audio_track_label: None,
             owned: None,
         }
     }
@@ -98,7 +93,6 @@ impl DockSettings {
                 })
                 .and_then(|n| u8::try_from(n).ok())
                 .unwrap_or(d.audio_track),
-            audio_track_label: field(&map, "audio_track_label"),
             owned: field(&map, "owned"),
         }
         .clamped()
@@ -548,7 +542,6 @@ mod tests {
     fn audio_track_defaults_to_one_and_round_trips() {
         let d = DockSettings::default();
         assert_eq!(d.audio_track, 1);
-        assert_eq!(d.audio_track_label, None);
         assert_eq!(DockSettings::from_json("{}").audio_track, 1);
         for track in 1..=6u8 {
             let s = DockSettings {
@@ -579,20 +572,6 @@ mod tests {
     }
 
     #[test]
-    fn audio_track_help_covers_the_user_facing_rules() {
-        for part in [
-            "Track 1 is OBS's first mixer track",
-            "may differ from the track used by OBS streaming or recording",
-            "Advanced Audio Properties",
-            "label is used only by D-Streamy",
-            "next Go Live",
-        ] {
-            assert!(AUDIO_TRACK_HELP.contains(part), "{part}");
-        }
-        assert_eq!((AUDIO_TRACKS.start(), AUDIO_TRACKS.end()), (&1, &6));
-    }
-
-    #[test]
     fn a_track_changed_while_live_is_kept_for_the_next_start() {
         let mut m = picked();
         m.start(canvas()).unwrap();
@@ -607,18 +586,11 @@ mod tests {
     }
 
     #[test]
-    fn audio_track_label_is_metadata_only() {
-        let s = DockSettings {
-            audio_track: 3,
-            audio_track_label: Some("Music".into()),
-            ..DockSettings::default()
-        };
-        let back = DockSettings::from_json(&s.to_json());
-        assert_eq!(back.audio_track, 3);
-        assert_eq!(back.audio_track_label.as_deref(), Some("Music"));
+    fn a_stored_audio_track_label_is_dropped() {
+        let s = with_owned(r#""audio_track":3,"audio_track_label":"Music""#);
+        assert_eq!(s.audio_track, 3);
+        assert!(!s.to_json().contains("label"), "{}", s.to_json());
         assert!(s.output_settings().get("audio_track_label").is_none());
-        let bad = with_owned(r#""audio_track":2,"audio_track_label":5"#);
-        assert_eq!((bad.audio_track, bad.audio_track_label), (2, None));
     }
 
     #[test]

@@ -10,6 +10,9 @@
 #ifndef _WIN32
 #include <sys/utsname.h>
 #endif
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 
 #include <obs.h>
 #include <util/base.h>
@@ -21,6 +24,7 @@
 
 #define TRACE_OUTPUT_ID "dstreamy_trace_recorder"
 #define AUDIO_SOURCE_ID "dstreamy_harness_audio"
+#define SETTINGS_SOURCE_ID "dstreamy_settings"
 #define TRACE_MAGIC "DSTRACE1"
 #define PLUGIN_PANIC_LOG "[obs-dstreamy] panic caught in "
 
@@ -61,7 +65,8 @@ const char *restart_output_settings;
 	const char *format;
 	bool no_encoders;
 	bool stream_output;
-	bool report_output_properties;
+	bool report_ui;
+	const char *fake_frontend;
 	const char *update_output_while_active;
 	int seconds;
 	int fps;
@@ -580,7 +585,8 @@ static void usage(void)
 		"  [--stream-output (start a stand-in stream output on the harness encoders first, so they are active)]\n"
 		"  [--restart-video-settings JSON (after a passing run, stop everything, update the video encoder, run again)]\n"
 		"  [--restart-output-settings JSON (like --restart-video-settings, but updates the output's settings)]\n"
-		"  [--report-output-properties (print the output's own get_properties and the audio_track setting before it starts)]\n"
+		"  [--report-ui (print the output's property names, its audio_track default and the settings source's type)]\n"
+		"  [--fake-frontend LIB (Linux: load LIB's obs_frontend_* globally before the modules, then click its Tools items)]\n"
 		"  [--update-output-while-active JSON (once the output is active, update its settings and report the bound mixer)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
@@ -634,8 +640,8 @@ static int parse_args(int argc, char **argv)
 			args.stream_output = true;
 			continue;
 		}
-		if (strcmp(a, "--report-output-properties") == 0) {
-			args.report_output_properties = true;
+		if (strcmp(a, "--report-ui") == 0) {
+			args.report_ui = true;
 			continue;
 		}
 		if (strcmp(a, "--verbose") == 0) {
@@ -670,6 +676,8 @@ static int parse_args(int argc, char **argv)
 		args.restart_output_settings = v;
 		else if (strcmp(a, "--update-output-while-active") == 0)
 			args.update_output_while_active = v;
+		else if (strcmp(a, "--fake-frontend") == 0)
+			args.fake_frontend = v;
 	else if (strcmp(a, "--dump-encoder-settings") == 0)
 			args.dump_encoder_settings = v;
 		else if (strcmp(a, "--release-after-start") == 0)
@@ -772,26 +780,73 @@ static void report_audio_mixer(obs_output_t *output, const char *when)
 		printf("HARNESS audio_mixer when=%s none dstreamy_audio_encoders=%d\n", when, encoders);
 }
 
-static void report_output_properties(obs_output_t *output)
+static void report_output_ui(obs_output_t *output)
 {
 	obs_properties_t *props = obs_output_properties(output);
-	if (!props) {
-		printf("HARNESS output_properties none\n");
-		return;
-	}
-	for (obs_property_t *p = obs_properties_first(props); p; obs_property_next(&p)) {
-		const char *long_desc = obs_property_long_description(p);
-		printf("HARNESS output_property name=%s type=%d", obs_property_name(p), (int)obs_property_get_type(p));
-		if (obs_property_get_type(p) == OBS_PROPERTY_INT)
-			printf(" min=%d max=%d step=%d", obs_property_int_min(p), obs_property_int_max(p),
-			       obs_property_int_step(p));
-		printf(" description=%s long=%s\n", obs_property_description(p), long_desc ? long_desc : "");
-	}
+	for (obs_property_t *p = obs_properties_first(props); p; obs_property_next(&p))
+		printf("HARNESS output_property name=%s\n", obs_property_name(p));
 	obs_properties_destroy(props);
 	obs_data_t *settings = obs_output_get_settings(output);
 	printf("HARNESS output_setting audio_track=%lld\n", obs_data_get_int(settings, "audio_track"));
 	obs_data_release(settings);
 }
+
+// Mirrors the Add Source list (frontend/dialogs/OBSBasicSourceSelect.cpp), which skips OBS_SOURCE_CAP_DISABLED.
+static void report_settings_source(void)
+{
+	bool registered = false, listed = false;
+	const char *type, *unversioned;
+	for (size_t i = 0; obs_enum_input_types2(i, &type, &unversioned); i++) {
+		if (strcmp(unversioned, SETTINGS_SOURCE_ID) != 0)
+			continue;
+		registered = true;
+		listed = (obs_get_source_output_flags(type) & OBS_SOURCE_CAP_DISABLED) == 0;
+	}
+	printf("HARNESS settings_source registered=%d listed=%d flags=0x%x\n", registered, listed,
+	       obs_get_source_output_flags(SETTINGS_SOURCE_ID));
+}
+
+#ifdef __linux__
+static void *fake_frontend;
+
+static bool load_fake_frontend(void)
+{
+	fake_frontend = dlopen(args.fake_frontend, RTLD_NOW | RTLD_GLOBAL);
+	if (!fake_frontend)
+		harness_error("--fake-frontend: %s", dlerror());
+	return fake_frontend != NULL;
+}
+
+static bool click_fake_frontend(void)
+{
+	int (*items)(const char **) = (int (*)(const char **))dlsym(fake_frontend, "fake_frontend_tools_items");
+	bool (*click)(void) = (bool (*)(void))dlsym(fake_frontend, "fake_frontend_click");
+	obs_source_t *(*take)(void) = (obs_source_t * (*)(void)) dlsym(fake_frontend, "fake_frontend_take_opened");
+	if (!items || !click || !take) {
+		harness_error("--fake-frontend lacks its fake_frontend_* functions");
+		return false;
+	}
+	const char *name = NULL;
+	int count = items(&name);
+	printf("HARNESS frontend tools_items=%d name=%s\n", count, name ? name : "");
+	if (!click())
+		return true;
+	obs_source_t *source = take();
+	if (!source) {
+		printf("HARNESS frontend opened none\n");
+		return true;
+	}
+	obs_source_t *named = obs_get_source_by_name(obs_source_get_name(source));
+	printf("HARNESS frontend opened id=%s public=%d flags=0x%x\n", obs_source_get_id(source), named == source,
+	       obs_source_get_output_flags(source));
+	obs_source_release(named);
+	obs_weak_source_t *weak = obs_source_get_weak_source(source);
+	obs_source_release(source);
+	printf("HARNESS frontend closed expired=%d\n", obs_weak_source_expired(weak));
+	obs_weak_source_release(weak);
+	return true;
+}
+#endif
 
 static void report_output_audio_track(obs_output_t *output, const char *when)
 {
@@ -1170,6 +1225,15 @@ int main(int argc, char **argv)
 	if (args.plugin_bin)
 		obs_add_module_path(args.plugin_bin, args.plugin_data);
 
+	if (args.fake_frontend) {
+#ifdef __linux__
+		if (!load_fake_frontend())
+			FAIL("--fake-frontend could not be loaded");
+#else
+		FAIL("--fake-frontend is Linux-only");
+#endif
+	}
+
 	char *mods = bstrdup(args.modules);
 	for (char *m = strtok(mods, ","); m; m = strtok(NULL, ","))
 		obs_add_safe_module(m);
@@ -1185,6 +1249,13 @@ int main(int argc, char **argv)
 		FAIL("%zu module(s) failed to load", failed);
 	obs_post_load_modules();
 	obs_log_loaded_modules();
+
+	if (args.report_ui)
+		report_settings_source();
+#ifdef __linux__
+	if (fake_frontend && !click_fake_frontend())
+		FAIL("--fake-frontend click failed");
+#endif
 
 	if (args.dump_encoder_settings) {
 		rc = dump_encoder_settings(args.dump_encoder_settings);
@@ -1275,8 +1346,8 @@ int main(int argc, char **argv)
 		printf("HARNESS stream output started\n");
 	}
 
-	if (args.report_output_properties)
-		report_output_properties(output);
+	if (args.report_ui)
+		report_output_ui(output);
 
 	if (!obs_output_start(output)) {
 		const char *err = obs_output_get_last_error(output);

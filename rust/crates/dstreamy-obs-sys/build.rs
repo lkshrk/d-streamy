@@ -70,8 +70,13 @@ fn main() {
         .allowlist_function(
             "obs_.*|blog|calldata_set_data|proc_handler_add|video_output_get_info|audio_output_get_channels",
         )
-        .allowlist_type("obs_.*|encoder_packet|calldata_t|proc_handler_t|video_output_info")
-        .allowlist_var("LIBOBS_API_.*|OBS_OUTPUT_.*|OBS_ENCODER_CAP_.*|DSTREAMY_LOG_.*")
+        .allowlist_type(
+            "obs_.*|encoder_packet|calldata_t|proc_handler_t|video_output_info|dstreamy_frontend_.*",
+        )
+        .allowlist_var(
+            "LIBOBS_API_.*|OBS_OUTPUT_.*|OBS_ENCODER_CAP_.*|OBS_SOURCE_CAP_DISABLED|DSTREAMY_LOG_.*",
+        )
+        .blocklist_item("obs_frontend_.*")
         .blocklist_function(
             "obs_module_(load|unload|post_load|set_locale|free_locale|set_pointer|ver|name|description|author|get_string|text)|obs_current_module",
         )

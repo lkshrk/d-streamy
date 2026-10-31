@@ -13,11 +13,18 @@ function(add_rust_plugin target)
   set(rundir "${CMAKE_CURRENT_BINARY_DIR}/rundir")
   set(plugin_rundir "${rundir}" PARENT_SCOPE)
 
+  set(frontend_includes "")
+  if(TARGET OBS::obs-frontend-api)
+    set(frontend_includes
+        "include=$<JOIN:$<REMOVE_DUPLICATES:$<TARGET_PROPERTY:OBS::obs-frontend-api,INTERFACE_INCLUDE_DIRECTORIES>>,\ninclude=>\n"
+    )
+  endif()
+
   file(
     GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/obs-config-$<CONFIG>.txt"
     CONTENT
       "include=$<JOIN:$<REMOVE_DUPLICATES:$<TARGET_PROPERTY:OBS::libobs,INTERFACE_INCLUDE_DIRECTORIES>>,\ninclude=>
-define=$<JOIN:$<REMOVE_DUPLICATES:$<TARGET_PROPERTY:OBS::libobs,INTERFACE_COMPILE_DEFINITIONS>>,\ndefine=>
+${frontend_includes}define=$<JOIN:$<REMOVE_DUPLICATES:$<TARGET_PROPERTY:OBS::libobs,INTERFACE_COMPILE_DEFINITIONS>>,\ndefine=>
 link=$<TARGET_LINKER_FILE:OBS::libobs>
 "
   )

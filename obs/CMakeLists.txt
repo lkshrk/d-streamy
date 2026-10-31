@@ -10,6 +10,8 @@ include(helpers)
 include(rust_plugin)
 
 find_package(libobs REQUIRED)
+# Headers only, for the ABI check in dstreamy-obs-sys/wrapper.h; the plugin resolves the frontend at runtime.
+find_package(obs-frontend-api QUIET)
 
 add_rust_plugin(
   ${CMAKE_PROJECT_NAME}

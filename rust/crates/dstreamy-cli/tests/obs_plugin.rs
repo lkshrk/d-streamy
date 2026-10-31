@@ -961,65 +961,93 @@ fn an_unchanged_audio_track_keeps_the_cached_encoder_across_starts() {
     );
 }
 
+fn report_ui(extra: &[&str]) -> Vec<String> {
+    let h = Harness::new("");
+    let mut args = vec![
+        "--seconds",
+        "3",
+        "--until-video",
+        "100000",
+        "--report-ui",
+        "--expect-error",
+        "The D-Streamy service is not running",
+    ];
+    args.extend_from_slice(extra);
+    let (status, lines) = HarnessRun::start(&h, json!({}), &args).finish();
+    assert!(
+        status.success() && has_line(&lines, "HARNESS expected_error "),
+        "obs-harness failed ({status}): {lines:#?}"
+    );
+    lines
+}
+
+fn fake_frontend() -> String {
+    let harness = obs_env().harness;
+    let lib = harness.with_file_name("obs-harness-frontend.so");
+    assert!(lib.exists(), "{} is not built", lib.display());
+    lib.to_string_lossy().into_owned()
+}
+
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
-fn the_output_offers_audio_tracks_1_to_6_with_the_user_help() {
-    let h = Harness::new("");
-    let run = HarnessRun::start(
-        &h,
-        json!({}),
-        &[
-            "--seconds",
-            "3",
-            "--until-video",
-            "100000",
-            "--report-output-properties",
-            "--expect-error",
-            "The D-Streamy service is not running",
-        ],
+fn without_a_frontend_the_plugin_loads_and_offers_no_tools_entry() {
+    let lines = report_ui(&[]);
+    assert!(
+        has_plugin_line(&lines, "no OBS frontend: Tools > D-Streamy is unavailable"),
+        "{lines:#?}"
     );
-    let (status, lines) = run.finish();
-    let _ = status;
+    assert!(
+        !has_plugin_line(&lines, "added Tools > D-Streamy"),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HARNESS settings_source registered=1 listed=0 flags=0x400"),
+        "{lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn the_output_has_no_audio_track_property_but_keeps_track_1_as_its_default() {
+    let lines = report_ui(&[]);
     let props: Vec<&str> = lines
         .iter()
         .filter_map(|l| l.strip_prefix("HARNESS output_property name="))
         .collect();
-    let track = props
-        .iter()
-        .find(|p| p.starts_with("audio_track "))
-        .unwrap_or_else(|| panic!("no audio_track property: {lines:#?}"));
-    assert!(
-        track.starts_with(
-            "audio_track type=2 min=1 max=6 step=1 description=Discord audio track long="
-        ),
-        "{track}"
-    );
-    let long = track.split(" long=").nth(1).unwrap();
-    assert_eq!(
-        long,
-        "Track 1 is OBS's first mixer track. It may differ from the track used by OBS streaming or recording. Configure which sources feed this track in OBS's Advanced Audio Properties. The label is used only by D-Streamy. Changes apply on the next Go Live."
-    );
-    for part in [
-        "Track 1 is OBS's first mixer track",
-        "may differ from the track used by OBS streaming or recording",
-        "Advanced Audio Properties",
-        "label is used only by D-Streamy",
-        "next Go Live",
-    ] {
-        assert!(long.contains(part), "{part}");
-    }
+    assert!(props.contains(&"mode"), "{lines:#?}");
     assert!(
         props
             .iter()
-            .all(|p| !p.split(' ').next().unwrap().contains("label")),
-        "a label must never be an output property: {props:#?}"
+            .all(|p| !p.contains("audio_track") && !p.contains("label")),
+        "{props:#?}"
     );
     assert!(
         lines
             .iter()
             .any(|l| l == "HARNESS output_setting audio_track=1"),
-        "the default is Track 1: {lines:#?}"
+        "{lines:#?}"
     );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn tools_d_streamy_opens_the_private_settings_source_through_the_frontend() {
+    let lib = fake_frontend();
+    let lines = report_ui(&["--fake-frontend", lib.as_str()]);
+    assert!(
+        has_plugin_line(&lines, "added Tools > D-Streamy"),
+        "{lines:#?}"
+    );
+    for want in [
+        "HARNESS frontend tools_items=1 name=D-Streamy\u{2026}",
+        "HARNESS frontend opened id=dstreamy_settings public=0 flags=0x400",
+        "HARNESS frontend closed expired=1",
+        "HARNESS settings_source registered=1 listed=0 flags=0x400",
+    ] {
+        assert!(lines.iter().any(|l| l == want), "{want}: {lines:#?}");
+    }
 }
 
 #[test]
