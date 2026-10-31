@@ -295,12 +295,11 @@ async fn run(
 /// `None` means the QR login runs next.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn browser_token(ctx: &Ctx, runtime: &tokio::runtime::Handle) -> Result<Option<String>, CliError> {
-    use dstreamy_cli::login_capture::BrowserLoginOutcome;
-    match dstreamy_cli::browser_login::run(ctx, runtime)? {
-        BrowserLoginOutcome::Token(token) => Ok(Some(token)),
-        BrowserLoginOutcome::UseQr => Ok(None),
-        BrowserLoginOutcome::UseToken => read_token().map(Some),
-        BrowserLoginOutcome::Cancelled => Err(CliError::BrowserLogin("cancelled".into())),
+    use dstreamy_cli::login_capture::{FollowUp, follow_up};
+    match follow_up(dstreamy_cli::browser_login::run(ctx, runtime)?)? {
+        FollowUp::Login(token) => Ok(Some(token)),
+        FollowUp::Qr => Ok(None),
+        FollowUp::ReadToken => read_token().map(Some),
     }
 }
 

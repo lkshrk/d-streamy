@@ -3,6 +3,8 @@ use std::fmt;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
+use crate::CliError;
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Candidate(String);
 
@@ -136,6 +138,7 @@ where
 
 /// How long after Discord reports a signed-in page a valid candidate may still arrive.
 pub const SIGNED_IN_GRACE: Duration = Duration::from_secs(20);
+pub const PAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(PartialEq, Eq)]
 pub enum BrowserLoginOutcome {
@@ -161,6 +164,23 @@ pub enum Failure {
     NoCandidate,
     Rejected,
     Unreachable,
+    PageNotLoaded,
+}
+
+/// What the `login` command does after the browser window has closed.
+pub enum FollowUp {
+    Login(String),
+    Qr,
+    ReadToken,
+}
+
+pub fn follow_up(outcome: BrowserLoginOutcome) -> Result<FollowUp, CliError> {
+    match outcome {
+        BrowserLoginOutcome::Token(token) => Ok(FollowUp::Login(token)),
+        BrowserLoginOutcome::UseQr => Ok(FollowUp::Qr),
+        BrowserLoginOutcome::UseToken => Ok(FollowUp::ReadToken),
+        BrowserLoginOutcome::Cancelled => Err(CliError::BrowserLogin("cancelled".into())),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,27 +208,33 @@ pub struct BrowserState {
     generation: u64,
     queue: VecDeque<Candidate>,
     signed_in: bool,
-    deadline: Option<Instant>,
+    load_deadline: Option<Instant>,
+    capture_deadline: Option<Instant>,
+    load_expired: bool,
+    capture_expired: bool,
+    last_failure: Option<Failure>,
     exit_after_validation: Option<BrowserLoginOutcome>,
     finished: bool,
 }
 
-impl Default for BrowserState {
-    fn default() -> Self {
+impl BrowserState {
+    pub fn new(now: Instant) -> Self {
         Self {
             view: View::Discord,
             seen: Some(SeenCandidates::default()),
             generation: 0,
             queue: VecDeque::new(),
             signed_in: false,
-            deadline: None,
+            load_deadline: Some(now + PAGE_LOAD_TIMEOUT),
+            capture_deadline: None,
+            load_expired: false,
+            capture_expired: false,
+            last_failure: None,
             exit_after_validation: None,
             finished: false,
         }
     }
-}
 
-impl BrowserState {
     pub fn view(&self) -> View {
         self.view
     }
@@ -228,8 +254,27 @@ impl BrowserState {
         }
     }
 
+    /// Never in the past after `tick`, so the event loop can always wait until it.
     pub fn deadline(&self) -> Option<Instant> {
-        self.deadline
+        match (self.load_deadline, self.capture_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    pub fn verifying(&self) -> bool {
+        self.view == View::Discord && self.is_validating()
+    }
+
+    pub fn ipc(&mut self, message: &str, now: Instant) -> Option<Command> {
+        let event = parse_event(message)?;
+        self.event(event, now)
+    }
+
+    pub fn page_loaded(&mut self) {
+        if self.view == View::Discord {
+            self.load_deadline = None;
+        }
     }
 
     pub fn event(&mut self, event: Event, now: Instant) -> Option<Command> {
@@ -237,20 +282,24 @@ impl BrowserState {
             return None;
         }
         match event {
-            Event::Candidate(candidate) => self.candidate(candidate),
+            Event::Candidate(candidate) => {
+                self.page_loaded();
+                self.candidate(candidate)
+            }
             Event::SignedIn => {
+                self.page_loaded();
                 if !self.signed_in && self.view == View::Discord {
                     self.signed_in = true;
-                    self.deadline = Some(now + SIGNED_IN_GRACE);
+                    self.capture_deadline = Some(now + SIGNED_IN_GRACE);
                 }
                 None
             }
             Event::Close => self.close(),
-            Event::Action(action) => self.action(action),
+            Event::Action(action) => self.action(action, now),
         }
     }
 
-    pub fn action(&mut self, action: Action) -> Option<Command> {
+    pub fn action(&mut self, action: Action, now: Instant) -> Option<Command> {
         if self.finished {
             return None;
         }
@@ -268,7 +317,9 @@ impl BrowserState {
                 }
                 self.queue.clear();
                 self.signed_in = false;
-                self.deadline = None;
+                self.clear_deadlines();
+                self.load_deadline = Some(now + PAGE_LOAD_TIMEOUT);
+                self.last_failure = None;
                 self.view = View::Discord;
                 None
             }
@@ -286,11 +337,18 @@ impl BrowserState {
     }
 
     pub fn tick(&mut self, now: Instant) {
-        let expired = self.deadline.is_some_and(|d| now >= d);
-        if expired && !self.finished && !self.is_validating() && self.queue.is_empty() {
-            self.deadline = None;
-            self.view = View::Recovery(Failure::NoCandidate);
+        if self.finished {
+            return;
         }
+        if self.load_deadline.is_some_and(|d| now >= d) {
+            self.load_deadline = None;
+            self.load_expired = true;
+        }
+        if self.capture_deadline.is_some_and(|d| now >= d) {
+            self.capture_deadline = None;
+            self.capture_expired = true;
+        }
+        self.settle();
     }
 
     pub fn validated(
@@ -311,23 +369,18 @@ impl BrowserState {
         if let Some(outcome) = self.exit_after_validation.take() {
             return Some(self.exit(outcome));
         }
-        if stale {
-            return self.next();
-        }
         match result {
-            Validation::Accepted(token) => Some(self.exit(BrowserLoginOutcome::Token(token))),
-            Validation::Pending => self.next(),
-            Validation::Rejected => self.next().or_else(|| {
-                if self.signed_in {
-                    self.fail(Failure::Rejected);
-                }
-                None
-            }),
-            Validation::Transient => self.next().or_else(|| {
-                self.fail(Failure::Unreachable);
-                None
-            }),
+            Validation::Accepted(token) if !stale => {
+                return Some(self.exit(BrowserLoginOutcome::Token(token)));
+            }
+            Validation::Rejected if !stale => self.last_failure = Some(Failure::Rejected),
+            Validation::Transient if !stale => self.last_failure = Some(Failure::Unreachable),
+            _ => {}
         }
+        self.next().or_else(|| {
+            self.settle();
+            None
+        })
     }
 
     fn candidate(&mut self, candidate: Candidate) -> Option<Command> {
@@ -351,12 +404,35 @@ impl BrowserState {
         }))
     }
 
-    fn fail(&mut self, failure: Failure) {
-        self.deadline = None;
+    /// Shows recovery for an expired deadline once no candidate check is left.
+    fn settle(&mut self) {
+        if self.view != View::Discord
+            || self.is_validating()
+            || !self.queue.is_empty()
+            || self.exit_after_validation.is_some()
+        {
+            return;
+        }
+        let failure = if self.load_expired {
+            Failure::PageNotLoaded
+        } else if self.capture_expired {
+            self.last_failure.unwrap_or(Failure::NoCandidate)
+        } else {
+            return;
+        };
+        self.clear_deadlines();
         self.view = View::Recovery(failure);
     }
 
+    fn clear_deadlines(&mut self) {
+        self.load_deadline = None;
+        self.capture_deadline = None;
+        self.load_expired = false;
+        self.capture_expired = false;
+    }
+
     fn request_exit(&mut self, outcome: BrowserLoginOutcome) -> Option<Command> {
+        self.clear_deadlines();
         if self.is_validating() {
             self.queue.clear();
             self.exit_after_validation = Some(outcome);
@@ -368,7 +444,7 @@ impl BrowserState {
 
     fn exit(&mut self, outcome: BrowserLoginOutcome) -> Command {
         self.finished = true;
-        self.deadline = None;
+        self.clear_deadlines();
         Command::Exit(outcome)
     }
 }

@@ -8,7 +8,7 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::{Window, WindowBuilder};
 use tokio::runtime::Handle;
-use wry::{WebView, WebViewBuilder};
+use wry::{PageLoadEvent, WebView, WebViewBuilder};
 
 use crate::discord::{self, Persistence};
 use crate::login_capture::{
@@ -18,12 +18,14 @@ use crate::login_capture::{
 use crate::{CliError, Ctx};
 
 const LOGIN_URL: &str = "https://discord.com/login";
+const DISCORD_ORIGIN: &str = "https://discord.com/";
 // A fixed size makes tiling window managers float the window as a dialog.
 const WINDOW_SIZE: tao::dpi::LogicalSize<f64> = tao::dpi::LogicalSize::new(520.0, 760.0);
 const BACKGROUND: (u8, u8, u8, u8) = (0x31, 0x33, 0x38, 0xff);
 
 enum Msg {
-    Ipc(login_capture::Event),
+    Ipc(String),
+    PageLoaded,
     Validated {
         generation: u64,
         seen: SeenCandidates,
@@ -91,6 +93,26 @@ const CAPTURE_SCRIPT: &str = r##"
   const post = (message) => {
     try { window.ipc.postMessage(message); } catch (_) {}
   };
+  const status = (on) => {
+    try {
+      let el = document.getElementById("dstreamy-status");
+      if (!on) {
+        if (el) el.remove();
+        return;
+      }
+      if (el) return;
+      el = document.createElement("div");
+      el.id = "dstreamy-status";
+      el.setAttribute("role", "status");
+      el.textContent = "Signed in — verifying…";
+      el.style.cssText = "position:fixed;left:50%;bottom:16px;transform:translateX(-50%);" +
+        "z-index:2147483647;padding:8px 14px;border-radius:6px;background:#1e1f22;" +
+        "color:#dbdee1;font:14px/1.4 system-ui,sans-serif;" +
+        "box-shadow:0 2px 10px rgba(0,0,0,.45);pointer-events:none";
+      document.documentElement.appendChild(el);
+    } catch (_) {}
+  };
+  Object.defineProperty(window, "__dstreamyStatus", { value: status });
   const posted = new Set();
   const send = (value) => {
     try {
@@ -172,6 +194,7 @@ pub fn prepare_environment() {
 pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError> {
     let mut event_loop = EventLoopBuilder::<Msg>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let load_proxy = event_loop.create_proxy();
     let validation_proxy = event_loop.create_proxy();
     #[cfg(target_os = "macos")]
     let _menu = edit_menu()?;
@@ -190,8 +213,11 @@ pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError>
         .with_url(LOGIN_URL)
         .with_initialization_script(CAPTURE_SCRIPT)
         .with_ipc_handler(move |request| {
-            if let Some(event) = login_capture::parse_event(request.body()) {
-                let _ = proxy.send_event(Msg::Ipc(event));
+            let _ = proxy.send_event(Msg::Ipc(request.body().clone()));
+        })
+        .with_on_page_load_handler(move |event, url| {
+            if matches!(event, PageLoadEvent::Finished) && url.starts_with(DISCORD_ORIGIN) {
+                let _ = load_proxy.send_event(Msg::PageLoaded);
             }
         });
     #[cfg(target_os = "linux")]
@@ -207,7 +233,7 @@ pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError>
     let webview = builder.build(&window);
     let webview = webview.map_err(|e| CliError::BrowserLogin(e.to_string()))?;
 
-    let mut state = BrowserState::default();
+    let mut state = BrowserState::new(Instant::now());
     let mut shown = (View::Discord, false);
     let mut outcome = None;
     event_loop.run_return(|event, _, flow| {
@@ -217,7 +243,11 @@ pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError>
         }
         let now = Instant::now();
         let command = match event {
-            Event::UserEvent(Msg::Ipc(event)) => state.event(event, now),
+            Event::UserEvent(Msg::Ipc(message)) => state.ipc(&message, now),
+            Event::UserEvent(Msg::PageLoaded) => {
+                state.page_loaded();
+                None
+            }
             Event::UserEvent(Msg::Validated {
                 generation,
                 seen,
@@ -241,9 +271,9 @@ pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError>
             }
             None => {}
         }
-        let current = (state.view(), state.is_validating());
+        let current = (state.view(), state.verifying());
         if current != shown {
-            render(&webview, &window, shown.0, current);
+            render(&webview, &window, shown, current);
             shown = current;
         }
         *flow = match state.deadline() {
@@ -292,15 +322,28 @@ async fn check_token(ctx: Ctx, token: String) -> Result<String, ValidationError<
     }
 }
 
-fn render(webview: &WebView, window: &Window, previous: View, (view, validating): (View, bool)) {
+fn render(
+    webview: &WebView,
+    window: &Window,
+    (previous, _): (View, bool),
+    (view, verifying): (View, bool),
+) {
     let title = match view {
-        View::Discord if validating => "D-Streamy: verifying the login…",
+        View::Discord if verifying => "D-Streamy: verifying the login…",
         View::Discord => "D-Streamy: log in to Discord",
         View::Recovery(_) => "D-Streamy: login not completed",
         View::Closing => "D-Streamy: closing…",
     };
     window.set_title(title);
     if view == previous {
+        let script = if verifying {
+            "window.__dstreamyStatus && window.__dstreamyStatus(true)"
+        } else {
+            "window.__dstreamyStatus && window.__dstreamyStatus(false)"
+        };
+        if let Err(e) = webview.evaluate_script(script) {
+            tracing::warn!("updating the browser login status failed: {e}");
+        }
         return;
     }
     let loaded = match view {
@@ -319,15 +362,26 @@ fn render(webview: &WebView, window: &Window, previous: View, (view, validating)
 }
 
 fn recovery_page(failure: Failure) -> String {
-    let message = match failure {
-        Failure::NoCandidate => {
-            "Discord shows you as signed in, but D-Streamy could not read the session."
-        }
-        Failure::Rejected => "Discord did not accept the session D-Streamy read from the page.",
-        Failure::Unreachable => "D-Streamy could not reach Discord to check the login.",
+    let (title, message) = match failure {
+        Failure::NoCandidate => (
+            "Login not completed",
+            "Discord shows you as signed in, but D-Streamy could not read the session.",
+        ),
+        Failure::Rejected => (
+            "Login not completed",
+            "Discord did not accept the session D-Streamy read from the page.",
+        ),
+        Failure::Unreachable => (
+            "Login not completed",
+            "D-Streamy could not reach Discord to check the login.",
+        ),
+        Failure::PageNotLoaded => (
+            "Could not load Discord",
+            "Discord's login page did not finish loading. Check the network connection.",
+        ),
     };
     page(
-        "Login not completed",
+        title,
         message,
         "Nothing was saved. Try again, scan a QR code with the Discord app, or paste a token.",
         RECOVERY_BUTTONS,
