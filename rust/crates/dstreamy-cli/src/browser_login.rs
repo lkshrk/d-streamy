@@ -7,6 +7,7 @@ use tao::window::WindowBuilder;
 use wry::WebViewBuilder;
 
 use crate::CliError;
+use crate::login_capture::{self, Candidate};
 
 const LOGIN_URL: &str = "https://discord.com/login";
 // A fixed size makes tiling window managers float the window as a dialog.
@@ -15,7 +16,8 @@ const BACKGROUND: (u8, u8, u8, u8) = (0x31, 0x33, 0x38, 0xff);
 
 enum Msg {
     Close,
-    Token(String),
+    Candidate(Candidate),
+    SignedIn,
 }
 
 const CAPTURE_SCRIPT: &str = r##"
@@ -25,25 +27,69 @@ const CAPTURE_SCRIPT: &str = r##"
     if (e.key === "Escape") window.ipc.postMessage("close");
   }, true);
   if (!location.hostname.endsWith("discord.com")) return;
-  let sent = false;
+  const post = (message) => {
+    try { window.ipc.postMessage(message); } catch (_) {}
+  };
+  const posted = new Set();
   const send = (value) => {
-    if (sent || typeof value !== "string" || value.length < 20 || value.includes(" ")) return;
-    sent = true;
-    window.ipc.postMessage("token:" + value);
+    try {
+      if (typeof value !== "string") return;
+      let v = value.trim();
+      if (v.length > 1 && v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+      const shaped = v.startsWith("mfa.")
+        ? /^mfa\.[\w-]{20,}$/.test(v)
+        : v.length >= 30 && /^[\w-]+\.[\w-]+\.[\w-]+$/.test(v);
+      if (!shaped || posted.has(v)) return;
+      posted.add(v);
+      post("candidate:" + v);
+    } catch (_) {}
+  };
+  const fromHeaders = (source) => {
+    try {
+      if (source) send(new Headers(source).get("authorization"));
+    } catch (_) {}
   };
   const setHeader = XMLHttpRequest.prototype.setRequestHeader;
   XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
-    if (String(name).toLowerCase() === "authorization") send(value);
+    try {
+      if (String(name).toLowerCase() === "authorization") send(value);
+    } catch (_) {}
     return setHeader.apply(this, arguments);
   };
-  const fetch = window.fetch;
+  const origFetch = window.fetch;
   window.fetch = function (input, init) {
     try {
-      const headers = new Headers((init && init.headers) || (input instanceof Request ? input.headers : undefined));
-      send(headers.get("authorization"));
+      fromHeaders(init && init.headers);
+      if (input instanceof Request) fromHeaders(input.headers);
     } catch (_) {}
-    return fetch.apply(this, arguments);
+    return origFetch.apply(this, arguments);
   };
+  const isTokenKey = (key) => String(key).toLowerCase().includes("token");
+  const getItem = Storage.prototype.getItem;
+  Storage.prototype.getItem = function (key) {
+    const value = getItem.apply(this, arguments);
+    try {
+      if (isTokenKey(key)) send(value);
+    } catch (_) {}
+    return value;
+  };
+  const setItem = Storage.prototype.setItem;
+  Storage.prototype.setItem = function (key, value) {
+    try {
+      if (isTokenKey(key)) send(value);
+    } catch (_) {}
+    return setItem.apply(this, arguments);
+  };
+  let signedIn = false;
+  const checkSignedIn = () => {
+    if (signedIn) return;
+    if (location.pathname.startsWith("/channels") || location.pathname.startsWith("/app")) {
+      signedIn = true;
+      post("signed_in");
+    }
+  };
+  checkSignedIn();
+  setInterval(checkSignedIn, 500);
 })();
 "##;
 
@@ -76,10 +122,10 @@ pub fn run() -> Result<String, CliError> {
         .with_url(LOGIN_URL)
         .with_initialization_script(CAPTURE_SCRIPT)
         .with_ipc_handler(move |request| {
-            let body = request.body();
-            let msg = match body.strip_prefix("token:") {
-                Some(token) => Msg::Token(token.to_owned()),
-                None if body == "close" => Msg::Close,
+            let msg = match login_capture::parse_event(request.body()) {
+                Some(login_capture::Event::Candidate(c)) => Msg::Candidate(c),
+                Some(login_capture::Event::SignedIn) => Msg::SignedIn,
+                Some(login_capture::Event::Close) => Msg::Close,
                 None => return,
             };
             let _ = proxy.send_event(msg);
@@ -101,8 +147,8 @@ pub fn run() -> Result<String, CliError> {
     event_loop.run_return(|event, _, flow| {
         *flow = ControlFlow::Wait;
         match event {
-            Event::UserEvent(Msg::Token(value)) => {
-                token = Some(value);
+            Event::UserEvent(Msg::Candidate(candidate)) => {
+                token = Some(candidate.into_string());
                 *flow = ControlFlow::Exit;
             }
             Event::UserEvent(Msg::Close)

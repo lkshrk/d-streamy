@@ -7,6 +7,7 @@ pub mod daemon;
 pub mod discord;
 pub mod engine;
 pub mod lock;
+pub mod login_capture;
 pub mod output;
 pub mod serve;
 pub mod service;
