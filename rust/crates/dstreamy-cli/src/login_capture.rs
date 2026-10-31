@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Candidate(String);
@@ -26,7 +27,23 @@ pub enum Event {
     Candidate(Candidate),
     SignedIn,
     Close,
+    Action(Action),
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Retry,
+    UseQr,
+    UseToken,
+    Cancel,
+}
+
+pub const RECOVERY_ACTIONS: [Action; 4] = [
+    Action::Retry,
+    Action::UseQr,
+    Action::UseToken,
+    Action::Cancel,
+];
 
 pub fn parse_candidate(message: &str) -> Option<Candidate> {
     let value = message.strip_prefix("candidate:")?;
@@ -40,6 +57,10 @@ pub fn parse_event(message: &str) -> Option<Event> {
     match message {
         "signed_in" => Some(Event::SignedIn),
         "close" => Some(Event::Close),
+        "action:retry" => Some(Event::Action(Action::Retry)),
+        "action:qr" => Some(Event::Action(Action::UseQr)),
+        "action:token" => Some(Event::Action(Action::UseToken)),
+        "action:cancel" => Some(Event::Action(Action::Cancel)),
         _ => parse_candidate(message).map(Event::Candidate),
     }
 }
@@ -110,6 +131,245 @@ where
             seen.forget(&candidate);
             Validation::Transient
         }
+    }
+}
+
+/// How long after Discord reports a signed-in page a valid candidate may still arrive.
+pub const SIGNED_IN_GRACE: Duration = Duration::from_secs(20);
+
+#[derive(PartialEq, Eq)]
+pub enum BrowserLoginOutcome {
+    Token(String),
+    Cancelled,
+    UseQr,
+    UseToken,
+}
+
+impl fmt::Debug for BrowserLoginOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Token(_) => "BrowserLoginOutcome::Token(<redacted>)",
+            Self::Cancelled => "BrowserLoginOutcome::Cancelled",
+            Self::UseQr => "BrowserLoginOutcome::UseQr",
+            Self::UseToken => "BrowserLoginOutcome::UseToken",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    NoCandidate,
+    Rejected,
+    Unreachable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Discord,
+    Recovery(Failure),
+    Closing,
+}
+
+/// One candidate check; `seen` travels with it so no other check can run meanwhile.
+pub struct Job {
+    pub generation: u64,
+    pub seen: SeenCandidates,
+    pub candidate: Candidate,
+}
+
+pub enum Command {
+    Validate(Job),
+    Exit(BrowserLoginOutcome),
+}
+
+pub struct BrowserState {
+    view: View,
+    seen: Option<SeenCandidates>,
+    generation: u64,
+    queue: VecDeque<Candidate>,
+    signed_in: bool,
+    deadline: Option<Instant>,
+    exit_after_validation: Option<BrowserLoginOutcome>,
+    finished: bool,
+}
+
+impl Default for BrowserState {
+    fn default() -> Self {
+        Self {
+            view: View::Discord,
+            seen: Some(SeenCandidates::default()),
+            generation: 0,
+            queue: VecDeque::new(),
+            signed_in: false,
+            deadline: None,
+            exit_after_validation: None,
+            finished: false,
+        }
+    }
+}
+
+impl BrowserState {
+    pub fn view(&self) -> View {
+        self.view
+    }
+
+    pub fn is_open(&self) -> bool {
+        !self.finished
+    }
+
+    pub fn is_validating(&self) -> bool {
+        self.seen.is_none()
+    }
+
+    pub fn actions(&self) -> &'static [Action] {
+        match self.view {
+            View::Recovery(_) => &RECOVERY_ACTIONS,
+            View::Discord | View::Closing => &[],
+        }
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub fn event(&mut self, event: Event, now: Instant) -> Option<Command> {
+        if self.finished {
+            return None;
+        }
+        match event {
+            Event::Candidate(candidate) => self.candidate(candidate),
+            Event::SignedIn => {
+                if !self.signed_in && self.view == View::Discord {
+                    self.signed_in = true;
+                    self.deadline = Some(now + SIGNED_IN_GRACE);
+                }
+                None
+            }
+            Event::Close => self.close(),
+            Event::Action(action) => self.action(action),
+        }
+    }
+
+    pub fn action(&mut self, action: Action) -> Option<Command> {
+        if self.finished {
+            return None;
+        }
+        if action == Action::Cancel {
+            return self.close();
+        }
+        if !matches!(self.view, View::Recovery(_)) {
+            return None;
+        }
+        match action {
+            Action::Retry => {
+                self.generation += 1;
+                if self.seen.is_some() {
+                    self.seen = Some(SeenCandidates::default());
+                }
+                self.queue.clear();
+                self.signed_in = false;
+                self.deadline = None;
+                self.view = View::Discord;
+                None
+            }
+            Action::UseQr => self.request_exit(BrowserLoginOutcome::UseQr),
+            Action::UseToken => self.request_exit(BrowserLoginOutcome::UseToken),
+            Action::Cancel => self.close(),
+        }
+    }
+
+    pub fn close(&mut self) -> Option<Command> {
+        if self.finished {
+            return None;
+        }
+        self.request_exit(BrowserLoginOutcome::Cancelled)
+    }
+
+    pub fn tick(&mut self, now: Instant) {
+        let expired = self.deadline.is_some_and(|d| now >= d);
+        if expired && !self.finished && !self.is_validating() && self.queue.is_empty() {
+            self.deadline = None;
+            self.view = View::Recovery(Failure::NoCandidate);
+        }
+    }
+
+    pub fn validated(
+        &mut self,
+        generation: u64,
+        seen: SeenCandidates,
+        result: Validation<String>,
+    ) -> Option<Command> {
+        if self.finished {
+            return None;
+        }
+        let stale = generation != self.generation;
+        self.seen = Some(if stale {
+            SeenCandidates::default()
+        } else {
+            seen
+        });
+        if let Some(outcome) = self.exit_after_validation.take() {
+            return Some(self.exit(outcome));
+        }
+        if stale {
+            return self.next();
+        }
+        match result {
+            Validation::Accepted(token) => Some(self.exit(BrowserLoginOutcome::Token(token))),
+            Validation::Pending => self.next(),
+            Validation::Rejected => self.next().or_else(|| {
+                if self.signed_in {
+                    self.fail(Failure::Rejected);
+                }
+                None
+            }),
+            Validation::Transient => self.next().or_else(|| {
+                self.fail(Failure::Unreachable);
+                None
+            }),
+        }
+    }
+
+    fn candidate(&mut self, candidate: Candidate) -> Option<Command> {
+        if self.exit_after_validation.is_some() {
+            return None;
+        }
+        self.queue.push_back(candidate);
+        if self.is_validating() {
+            return None;
+        }
+        self.next()
+    }
+
+    fn next(&mut self) -> Option<Command> {
+        let candidate = self.queue.pop_front()?;
+        let seen = self.seen.take()?;
+        Some(Command::Validate(Job {
+            generation: self.generation,
+            seen,
+            candidate,
+        }))
+    }
+
+    fn fail(&mut self, failure: Failure) {
+        self.deadline = None;
+        self.view = View::Recovery(failure);
+    }
+
+    fn request_exit(&mut self, outcome: BrowserLoginOutcome) -> Option<Command> {
+        if self.is_validating() {
+            self.queue.clear();
+            self.exit_after_validation = Some(outcome);
+            self.view = View::Closing;
+            return None;
+        }
+        Some(self.exit(outcome))
+    }
+
+    fn exit(&mut self, outcome: BrowserLoginOutcome) -> Command {
+        self.finished = true;
+        self.deadline = None;
+        Command::Exit(outcome)
     }
 }
 

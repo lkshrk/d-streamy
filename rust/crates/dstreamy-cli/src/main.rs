@@ -141,10 +141,24 @@ fn main() -> ExitCode {
         _ => (None, true),
     };
     init_logging(&out, cli.verbose, log_file, to_stderr);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Command::Login { browser: true, .. } = cli.command {
+        dstreamy_cli::browser_login::prepare_environment();
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            out.error(format_args!("starting the async runtime: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
     let token = match cli.command {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        Command::Login { browser: true, .. } => match dstreamy_cli::browser_login::run() {
-            Ok(token) => Some(token),
+        Command::Login { browser: true, .. } => match browser_token(&ctx, runtime.handle()) {
+            Ok(token) => token,
             Err(e) => {
                 out.error(e);
                 return ExitCode::FAILURE;
@@ -161,16 +175,6 @@ fn main() -> ExitCode {
             }
         }
         _ => None,
-    };
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(e) => {
-            out.error(format_args!("starting the async runtime: {e}"));
-            return ExitCode::FAILURE;
-        }
     };
     let result = runtime.block_on(run(cli.command, token, &ctx, &out));
     // Background tasks (webrtc, the gateway) must not keep the process alive after the command.
@@ -288,6 +292,18 @@ async fn run(
     }
 }
 
+/// `None` means the QR login runs next.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn browser_token(ctx: &Ctx, runtime: &tokio::runtime::Handle) -> Result<Option<String>, CliError> {
+    use dstreamy_cli::login_capture::BrowserLoginOutcome;
+    match dstreamy_cli::browser_login::run(ctx, runtime)? {
+        BrowserLoginOutcome::Token(token) => Ok(Some(token)),
+        BrowserLoginOutcome::UseQr => Ok(None),
+        BrowserLoginOutcome::UseToken => read_token().map(Some),
+        BrowserLoginOutcome::Cancelled => Err(CliError::BrowserLogin("cancelled".into())),
+    }
+}
+
 fn read_token() -> Result<String, CliError> {
     let stdin = std::io::stdin();
     let text = if stdin.is_terminal() {
@@ -327,10 +343,14 @@ async fn qr_token(out: &Out) -> Result<String, CliError> {
             ));
         }
         remote_auth::Progress::Scanned { username } if out.json => {
-            out.json_line(&QrRow::Scanned { username: &username });
+            out.json_line(&QrRow::Scanned {
+                username: &username,
+            });
         }
         remote_auth::Progress::Scanned { username } => {
-            out.line(format_args!("scanned by {username}; confirm the login on the phone"));
+            out.line(format_args!(
+                "scanned by {username}; confirm the login on the phone"
+            ));
         }
     })
     .await?;
