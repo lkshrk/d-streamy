@@ -70,6 +70,7 @@ impl Drop for WeakEncoder {
 #[derive(Default)]
 pub struct Owned {
     audio: Option<EncoderRef>,
+    audio_mixer: usize,
     video: Option<EncoderRef>,
     /// The last stream encoder attached in share mode, kept so a start after a fallback checks it again.
     share: Option<WeakEncoder>,
@@ -80,6 +81,7 @@ struct Config {
     video_encoder: String,
     bitrate_kbps: i64,
     fallback: bool,
+    audio_track: i64,
 }
 
 impl Config {
@@ -92,6 +94,7 @@ impl Config {
                 video_encoder: text(sys::obs_data_get_string(s, c"video_encoder".as_ptr())),
                 bitrate_kbps: sys::obs_data_get_int(s, c"bitrate".as_ptr()),
                 fallback: sys::obs_data_get_bool(s, c"share_fallback".as_ptr()),
+                audio_track: sys::obs_data_get_int(s, c"audio_track".as_ptr()),
             };
             sys::obs_data_release(s);
             config
@@ -212,7 +215,7 @@ fn registered(id: &CStr) -> bool {
     !unsafe { sys::obs_get_encoder_codec(id.as_ptr()) }.is_null()
 }
 
-fn create_audio() -> Result<EncoderRef, String> {
+fn create_audio(mixer_idx: usize) -> Result<EncoderRef, String> {
     if !registered(AUDIO_ENCODER) {
         return Err(
             "D-Streamy needs the FFmpeg Opus audio encoder (ffmpeg_opus, from the obs-ffmpeg module)".into(),
@@ -224,7 +227,7 @@ fn create_audio() -> Result<EncoderRef, String> {
             AUDIO_ENCODER.as_ptr(),
             c"D-Streamy audio".as_ptr(),
             ptr::null_mut(),
-            0,
+            mixer_idx,
             ptr::null_mut(),
         );
         if encoder.is_null() {
@@ -340,9 +343,18 @@ fn lock(owned: &Mutex<Owned>) -> MutexGuard<'_, Owned> {
 /// Sets this start's encoders on the output, which is inactive; runs on the thread that called start.
 pub fn prepare(output: OutputPtr, owned: &Mutex<Owned>) -> Result<(), String> {
     let config = Config::read(output);
+    let mixer = settings::mixer_index(config.audio_track).map_err(|p| p.message())?;
     let mut owned = lock(owned);
-    if owned.audio.is_none() {
-        owned.audio = Some(create_audio()?);
+    // SAFETY: the cached encoder is live while we hold its reference.
+    let active = owned
+        .audio
+        .as_ref()
+        .is_some_and(|a| unsafe { sys::obs_encoder_active(a.get()) });
+    let bound = owned.audio.is_some().then_some(owned.audio_mixer);
+    if settings::audio_plan(bound, mixer, active) != settings::AudioPlan::Keep {
+        // The output still references the old encoder until set_audio_encoder below; it is inactive, so dropping ours is safe.
+        owned.audio = Some(create_audio(mixer)?);
+        owned.audio_mixer = mixer;
     }
     let audio = owned
         .audio
@@ -428,6 +440,7 @@ pub extern "C" fn get_defaults(settings: *mut sys::obs_data_t) {
             );
             sys::obs_data_set_default_int(settings, c"bitrate".as_ptr(), DEFAULT_BITRATE_KBPS);
             sys::obs_data_set_default_bool(settings, c"share_fallback".as_ptr(), true);
+            sys::obs_data_set_default_int(settings, c"audio_track".as_ptr(), 1);
         }
     });
 }

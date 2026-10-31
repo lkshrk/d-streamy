@@ -149,6 +149,7 @@ pub enum Problem {
     Size { width: u32, height: u32 },
     Fps { num: u32, den: u32 },
     Audio { detail: String },
+    AudioTrack { track: i64 },
     StreamNotRunning,
     ColorFormat { format: String },
     SessionFps { num: u32, den: u32, session: u32 },
@@ -187,6 +188,9 @@ impl Problem {
                 rate(*num, *den)
             ),
             Self::Audio { detail } => format!("D-Streamy's audio encoder {detail}"),
+            Self::AudioTrack { track } => format!(
+                "D-Streamy's audio track must be 1 to 6, not {track}: choose a track in D-Streamy's output settings"
+            ),
             Self::ColorFormat { format } => format!(
                 "D-Streamy needs an 8-bit 4:2:0 color format (NV12 or I420), not {format}: Settings › Advanced › Color Format"
             ),
@@ -373,6 +377,30 @@ pub fn check_shape(width: u32, height: u32, fps_num: u32, fps_den: u32) -> Vec<P
     problems
 }
 
+/// The zero-based libobs mixer index of a one-based audio track; the only place the two are converted.
+pub fn mixer_index(track: i64) -> Result<usize, Problem> {
+    match usize::try_from(track) {
+        Ok(t) if (1..=6).contains(&t) => Ok(t - 1),
+        _ => Err(Problem::AudioTrack { track }),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioPlan {
+    Keep,
+    Create,
+    Replace,
+}
+
+/// What to do with the cached audio encoder bound to `bound` when `wanted` is the configured mixer; an active one is never touched.
+pub fn audio_plan(bound: Option<usize>, wanted: usize, active: bool) -> AudioPlan {
+    match bound {
+        None => AudioPlan::Create,
+        Some(b) if b == wanted || active => AudioPlan::Keep,
+        Some(_) => AudioPlan::Replace,
+    }
+}
+
 pub fn check_audio(
     codec: &str,
     sample_rate: u32,
@@ -465,6 +493,24 @@ mod tests {
             panic!("objects")
         };
         EncoderSettings::new(id, "h264", values, user)
+    }
+
+    #[test]
+    fn mixer_index_is_the_only_one_based_conversion() {
+        assert_eq!(mixer_index(1), Ok(0));
+        assert_eq!(mixer_index(6), Ok(5));
+        for bad in [0, 7, -1, i64::MAX] {
+            assert_eq!(mixer_index(bad), Err(Problem::AudioTrack { track: bad }));
+        }
+    }
+
+    #[test]
+    fn cached_audio_encoder_is_replaced_only_while_inactive() {
+        assert_eq!(audio_plan(None, 0, false), AudioPlan::Create);
+        assert_eq!(audio_plan(Some(0), 0, false), AudioPlan::Keep);
+        assert_eq!(audio_plan(Some(0), 1, false), AudioPlan::Replace);
+        assert_eq!(audio_plan(Some(0), 1, true), AudioPlan::Keep);
+        assert_eq!(audio_plan(Some(5), 0, false), AudioPlan::Replace);
     }
 
     #[test]
