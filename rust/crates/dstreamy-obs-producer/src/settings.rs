@@ -379,8 +379,8 @@ pub fn check_shape(width: u32, height: u32, fps_num: u32, fps_den: u32) -> Vec<P
 
 /// The zero-based libobs mixer index of a one-based audio track; the only place the two are converted.
 pub fn mixer_index(track: i64) -> Result<usize, Problem> {
-    match usize::try_from(track) {
-        Ok(t) if (1..=6).contains(&t) => Ok(t - 1),
+    match u8::try_from(track) {
+        Ok(t) if crate::dock::AUDIO_TRACKS.contains(&t) => Ok(usize::from(t) - 1),
         _ => Err(Problem::AudioTrack { track }),
     }
 }

@@ -846,6 +846,121 @@ fn the_own_encoder_restarts_on_the_same_output() {
     assert_eq!(own, 2, "{lines:#?}");
 }
 
+fn mixer_reports(lines: &[String]) -> Vec<(String, Option<u64>, u64)> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let rest = l.strip_prefix("HARNESS audio_mixer when=")?;
+            let (when, rest) = rest.split_once(' ')?;
+            let idx = rest
+                .strip_prefix("idx=")
+                .and_then(|r| r.split_whitespace().next()?.parse().ok());
+            let count = rest
+                .split("dstreamy_audio_encoders=")
+                .nth(1)?
+                .trim()
+                .parse()
+                .ok()?;
+            Some((when.to_owned(), idx, count))
+        })
+        .collect()
+}
+
+fn mixer_for_track(track: i64) -> u64 {
+    let (lines, _) = stream(json!({"audio_track": track}), &[], 60);
+    let reports = mixer_reports(&lines);
+    assert_eq!(reports.len(), 1, "{lines:#?}");
+    assert_eq!(reports[0].0, "start");
+    assert_eq!(reports[0].2, 1, "{lines:#?}");
+    reports[0].1.expect("an audio encoder is attached")
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn audio_track_1_binds_mixer_0() {
+    assert_eq!(mixer_for_track(1), 0);
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn audio_track_6_binds_mixer_5() {
+    assert_eq!(mixer_for_track(6), 5);
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn an_invalid_audio_track_fails_before_any_audio_encoder_exists() {
+    for track in [0, 7] {
+        let h = Harness::new("");
+        let run = HarnessRun::start(
+            &h,
+            json!({"audio_track": track}),
+            &[
+                "--seconds",
+                "3",
+                "--until-video",
+                "100000",
+                "--expect-error",
+                "audio track must be 1 to 6",
+            ],
+        );
+        let (status, lines) = run.finish();
+        passed(status, &lines);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("HARNESS expected_error start: ")
+                    && l.contains(&format!("not {track}"))),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            mixer_reports(&lines),
+            vec![("start_failed".to_owned(), None, 0)],
+            "{lines:#?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn changing_the_audio_track_while_inactive_recreates_the_encoder_on_the_next_start() {
+    let (lines, _) = stream(
+        json!({"audio_track": 1}),
+        &["--restart-output-settings", r#"{"audio_track": 2}"#],
+        60,
+    );
+    let reports = mixer_reports(&lines);
+    assert_eq!(
+        reports
+            .iter()
+            .map(|r| (r.0.as_str(), r.1, r.2))
+            .collect::<Vec<_>>(),
+        vec![("start", Some(0), 1), ("restart", Some(1), 1)],
+        "{lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn an_unchanged_audio_track_keeps_the_cached_encoder_across_starts() {
+    let (lines, _) = stream(
+        json!({"audio_track": 3}),
+        &["--restart-output-settings", "{}"],
+        60,
+    );
+    let ptrs: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.starts_with("HARNESS audio_mixer when="))
+        .filter_map(|l| l.split("encoder=").nth(1)?.split_whitespace().next())
+        .collect();
+    assert_eq!(ptrs.len(), 2, "{lines:#?}");
+    assert_eq!(ptrs[0], ptrs[1], "{lines:#?}");
+    assert!(
+        mixer_reports(&lines).iter().all(|r| r.1 == Some(2)),
+        "{lines:#?}"
+    );
+}
+
 /// profile_idc, the byte after the SPS NAL header (H.264 7.3.2.1.1).
 fn sps_profile(video: &[&RecordedVideoFrame]) -> u8 {
     video

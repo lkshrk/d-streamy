@@ -57,6 +57,7 @@ struct harness_args {
 	const char *expect_error;
 	const char *dump_encoder_settings;
 	const char *restart_video_settings;
+const char *restart_output_settings;
 	const char *format;
 	bool no_encoders;
 	bool stream_output;
@@ -576,6 +577,7 @@ static void usage(void)
 		"  [--format NV12|I420|I444|P010 (canvas color format)]\n"
 		"  [--stream-output (start a stand-in stream output on the harness encoders first, so they are active)]\n"
 		"  [--restart-video-settings JSON (after a passing run, stop everything, update the video encoder, run again)]\n"
+		"  [--restart-output-settings JSON (like --restart-video-settings, but updates the output's settings)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
@@ -656,7 +658,9 @@ static int parse_args(int argc, char **argv)
 			args.format = v;
 		else if (strcmp(a, "--restart-video-settings") == 0)
 			args.restart_video_settings = v;
-		else if (strcmp(a, "--dump-encoder-settings") == 0)
+		else if (strcmp(a, "--restart-output-settings") == 0)
+		args.restart_output_settings = v;
+	else if (strcmp(a, "--dump-encoder-settings") == 0)
 			args.dump_encoder_settings = v;
 		else if (strcmp(a, "--release-after-start") == 0)
 			ok = parse_int(a, v, 0, &args.release_after_start_ms);
@@ -737,6 +741,25 @@ static bool output_stats(obs_output_t *output, struct output_stats *out)
 	out->panics = calldata_int(&cd, "panics");
 	calldata_free(&cd);
 	return ok;
+}
+
+static bool count_dstreamy_audio(void *param, obs_encoder_t *encoder)
+{
+	if (obs_encoder_get_type(encoder) == OBS_ENCODER_AUDIO && strcmp(obs_encoder_get_name(encoder), "D-Streamy audio") == 0)
+		++*(int *)param;
+	return true;
+}
+
+static void report_audio_mixer(obs_output_t *output, const char *when)
+{
+	int encoders = 0;
+	obs_enum_encoders(count_dstreamy_audio, &encoders);
+	obs_encoder_t *aenc = obs_output_get_audio_encoder(output, 0);
+	if (aenc)
+		printf("HARNESS audio_mixer when=%s idx=%zu encoder=%p dstreamy_audio_encoders=%d\n", when,
+		       obs_encoder_get_mixer_index(aenc), (void *)aenc, encoders);
+	else
+		printf("HARNESS audio_mixer when=%s none dstreamy_audio_encoders=%d\n", when, encoders);
 }
 
 static bool wait_for_plugin_video(obs_output_t *output)
@@ -1217,6 +1240,7 @@ int main(int argc, char **argv)
 		const char *err = obs_output_get_last_error(output);
 		if (contains_expected_error(err)) {
 			printf("HARNESS expected_error start: %s\n", err);
+			report_audio_mixer(output, "start_failed");
 			goto cleanup;
 		}
 		const char *verr = venc ? obs_encoder_get_last_error(venc) : NULL;
@@ -1227,6 +1251,7 @@ int main(int argc, char **argv)
 	started = true;
 	uint64_t start_ns = os_gettime_ns();
 	printf("HARNESS obs_output_start=ok\n");
+	report_audio_mixer(output, "start");
 	struct frame_counts at_start = frame_counts();
 
 	if (args.release_after_start_ms) {
@@ -1279,15 +1304,21 @@ int main(int argc, char **argv)
 	if (!recording) {
 		if (!check_output_stats(output, obs_output_get_audio_encoder(output, 0)))
 			rc = 1;
-		if (rc || !args.restart_video_settings)
+		if (rc || (!args.restart_video_settings && !args.restart_output_settings))
 			goto cleanup;
-		obs_data_t *update = obs_data_create_from_json(args.restart_video_settings);
+		const char *update_json = args.restart_video_settings ? args.restart_video_settings
+								       : args.restart_output_settings;
+		obs_data_t *update = obs_data_create_from_json(update_json);
 		if (!update)
-			FAIL("--restart-video-settings is not a JSON object");
+			FAIL("--restart-*-settings is not a JSON object");
 		if (stream && !stop_and_wait(stream))
 			FAIL("stream output did not stop for the restart");
-		if (venc)
-			obs_encoder_update(venc, update);
+		if (args.restart_video_settings) {
+			if (venc)
+				obs_encoder_update(venc, update);
+		} else {
+			obs_output_update(output, update);
+		}
 		obs_data_release(update);
 		if (stream && !obs_output_start(stream))
 			FAIL("stream output restart failed");
@@ -1297,6 +1328,7 @@ int main(int argc, char **argv)
 		if (!obs_output_start(output))
 			FAIL("obs_output_start on restart: %s", obs_output_get_last_error(output));
 		started = true;
+		report_audio_mixer(output, "restart");
 		if (!wait_for_plugin_video(output))
 			rc = 1;
 		obs_output_stop(output);
