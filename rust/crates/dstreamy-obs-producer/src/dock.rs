@@ -10,6 +10,9 @@ pub const DEFAULT_VIDEO_ENCODER: &str = "obs_x264";
 pub const DEFAULT_BITRATE_KBPS: i64 = 6000;
 /// The range the output's bitrate property offers.
 pub const BITRATE_KBPS: std::ops::RangeInclusive<i64> = 500..=50_000;
+/// OBS's mixer tracks, one-based.
+pub const AUDIO_TRACKS: std::ops::RangeInclusive<u8> = 1..=6;
+pub const DEFAULT_AUDIO_TRACK: u8 = 1;
 /// serve refuses a longer per-start grace (ADR 0004).
 pub const MAX_GRACE_SECS: u64 = 3600;
 
@@ -34,6 +37,10 @@ pub struct DockSettings {
     pub bitrate_kbps: i64,
     pub share_fallback: bool,
     pub start_with_stream: bool,
+    /// The OBS mixer track sent to Discord, one-based.
+    pub audio_track: u8,
+    /// A D-Streamy-only name for the track; never reaches OBS.
+    pub audio_track_label: Option<String>,
     pub owned: Option<Ownership>,
 }
 
@@ -48,6 +55,8 @@ impl Default for DockSettings {
             bitrate_kbps: DEFAULT_BITRATE_KBPS,
             share_fallback: true,
             start_with_stream: false,
+            audio_track: DEFAULT_AUDIO_TRACK,
+            audio_track_label: None,
             owned: None,
         }
     }
@@ -79,6 +88,15 @@ impl DockSettings {
             bitrate_kbps: bitrate.unwrap_or(d.bitrate_kbps),
             share_fallback: field(&map, "share_fallback").unwrap_or(d.share_fallback),
             start_with_stream: field(&map, "start_with_stream").unwrap_or(d.start_with_stream),
+            audio_track: map
+                .get("audio_track")
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))
+                })
+                .and_then(|n| u8::try_from(n).ok())
+                .unwrap_or(d.audio_track),
+            audio_track_label: field(&map, "audio_track_label"),
             owned: field(&map, "owned"),
         }
         .clamped()
@@ -90,6 +108,11 @@ impl DockSettings {
                 .bitrate_kbps
                 .clamp(*BITRATE_KBPS.start(), *BITRATE_KBPS.end()),
             grace_secs: self.grace_secs.map(|s| s.min(MAX_GRACE_SECS)),
+            audio_track: if AUDIO_TRACKS.contains(&self.audio_track) {
+                self.audio_track
+            } else {
+                DEFAULT_AUDIO_TRACK
+            },
             ..self
         }
     }
@@ -105,6 +128,7 @@ impl DockSettings {
             "video_encoder": self.video_encoder,
             "bitrate": self.bitrate_kbps,
             "share_fallback": self.share_fallback,
+            "audio_track": self.audio_track,
         })
     }
 }
@@ -514,8 +538,57 @@ mod tests {
         };
         assert_eq!(
             s.output_settings(),
-            json!({"mode": "share", "video_encoder": "obs_x264", "bitrate": 6000, "share_fallback": false})
+            json!({"mode": "share", "video_encoder": "obs_x264", "bitrate": 6000, "share_fallback": false, "audio_track": 1})
         );
+    }
+
+    #[test]
+    fn audio_track_defaults_to_one_and_round_trips() {
+        let d = DockSettings::default();
+        assert_eq!(d.audio_track, 1);
+        assert_eq!(d.audio_track_label, None);
+        assert_eq!(DockSettings::from_json("{}").audio_track, 1);
+        for track in 1..=6u8 {
+            let s = DockSettings {
+                audio_track: track,
+                ..DockSettings::default()
+            };
+            let back = DockSettings::from_json(&s.to_json());
+            assert_eq!(back.audio_track, track);
+            assert_eq!(s.output_settings()["audio_track"], json!(track));
+        }
+    }
+
+    #[test]
+    fn invalid_audio_track_falls_back_to_one() {
+        for bad in ["0", "7", "-1", "256", "2.5", "\"2\"", "null", "true"] {
+            let s = with_owned(&format!(r#""audio_track":{bad}"#));
+            assert_eq!(s.audio_track, 1, "{bad}");
+        }
+        assert_eq!(with_owned(r#""audio_track":3.0"#).audio_track, 3);
+        let mut m = DockModel::new(DockSettings::default());
+        for bad in [0u8, 7, 255] {
+            m.set_settings(DockSettings {
+                audio_track: bad,
+                ..DockSettings::default()
+            });
+            assert_eq!(m.settings().audio_track, 1, "{bad}");
+        }
+    }
+
+    #[test]
+    fn audio_track_label_is_metadata_only() {
+        let s = DockSettings {
+            audio_track: 3,
+            audio_track_label: Some("Music".into()),
+            ..DockSettings::default()
+        };
+        let back = DockSettings::from_json(&s.to_json());
+        assert_eq!(back.audio_track, 3);
+        assert_eq!(back.audio_track_label.as_deref(), Some("Music"));
+        assert!(s.output_settings().get("audio_track_label").is_none());
+        let bad = with_owned(r#""audio_track":2,"audio_track_label":5"#);
+        assert_eq!((bad.audio_track, bad.audio_track_label), (2, None));
     }
 
     #[test]
