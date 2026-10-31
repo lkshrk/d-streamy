@@ -51,13 +51,44 @@ impl SeenCandidates {
     pub fn insert(&mut self, candidate: &Candidate) -> bool {
         self.0.insert(candidate.0.clone())
     }
+
+    fn forget(&mut self, candidate: &Candidate) {
+        self.0.remove(&candidate.0);
+    }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+pub enum ValidationError<E> {
+    Rejected,
+    Transient(E),
+}
+
+impl<E> fmt::Debug for ValidationError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected => f.write_str("ValidationError::Rejected"),
+            Self::Transient(_) => f.write_str("ValidationError::Transient(<redacted>)"),
+        }
+    }
+}
+
+#[must_use]
+#[derive(PartialEq, Eq)]
 pub enum Validation<T> {
     Pending,
     Rejected,
+    Transient,
     Accepted(T),
+}
+
+impl<T> fmt::Debug for Validation<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => f.write_str("Validation::Pending"),
+            Self::Rejected => f.write_str("Validation::Rejected"),
+            Self::Transient => f.write_str("Validation::Transient"),
+            Self::Accepted(_) => f.write_str("Validation::Accepted(<redacted>)"),
+        }
+    }
 }
 
 pub async fn validate_candidate<T, E, F, Fut>(
@@ -67,14 +98,18 @@ pub async fn validate_candidate<T, E, F, Fut>(
 ) -> Validation<T>
 where
     F: FnOnce(String) -> Fut,
-    Fut: Future<Output = Result<T, E>>,
+    Fut: Future<Output = Result<T, ValidationError<E>>>,
 {
     if !seen.insert(&candidate) {
         return Validation::Pending;
     }
-    match validator(candidate.into_string()).await {
+    match validator(candidate.as_str().to_owned()).await {
         Ok(value) => Validation::Accepted(value),
-        Err(_) => Validation::Rejected,
+        Err(ValidationError::Rejected) => Validation::Rejected,
+        Err(ValidationError::Transient(_)) => {
+            seen.forget(&candidate);
+            Validation::Transient
+        }
     }
 }
 
@@ -128,7 +163,7 @@ mod tests {
             if token == "good.tok.en" {
                 Ok(token)
             } else {
-                Err("rejected")
+                Err(ValidationError::<()>::Rejected)
             }
         };
         let bad = parse_candidate("candidate:bad.tok.en").unwrap();
@@ -144,12 +179,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_candidate_is_not_revalidated() {
+    async fn permanent_rejection_is_deduplicated() {
         let mut seen = SeenCandidates::default();
         let calls = std::cell::Cell::new(0);
         let validator = |_: String| {
             calls.set(calls.get() + 1);
-            async { Err::<(), _>("rejected") }
+            async { Err::<String, ValidationError<()>>(ValidationError::Rejected) }
         };
         let c = parse_candidate("candidate:aaa.bbb.ccc").unwrap();
         assert_eq!(
@@ -164,16 +199,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_character_candidate_parses_and_rejection_is_recoverable() {
+    async fn accepted_candidate_is_deduplicated() {
         let mut seen = SeenCandidates::default();
+        let c = parse_candidate("candidate:aaa.bbb.ccc").unwrap();
+        let ok = |t: String| async move { Ok::<_, ValidationError<()>>(t) };
+        assert!(matches!(
+            validate_candidate(&mut seen, c.clone(), ok).await,
+            Validation::Accepted(_)
+        ));
+        assert_eq!(
+            validate_candidate(&mut seen, c, ok).await,
+            Validation::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_failure_is_retryable_with_the_same_candidate() {
+        let mut seen = SeenCandidates::default();
+        let calls = std::cell::Cell::new(0);
+        let validator = |token: String| {
+            calls.set(calls.get() + 1);
+            let first = calls.get() == 1;
+            async move {
+                if first {
+                    Err(ValidationError::Transient("network down"))
+                } else {
+                    Ok(token)
+                }
+            }
+        };
+        let c = parse_candidate("candidate:good.tok.en").unwrap();
+        let first: Validation<String> = validate_candidate(&mut seen, c.clone(), validator).await;
+        assert_eq!(first, Validation::Transient);
+        assert_eq!(
+            validate_candidate(&mut seen, c, validator).await,
+            Validation::Accepted("good.tok.en".to_owned())
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn control_character_candidate_reaches_validator_and_stays_recoverable() {
+        let mut seen = SeenCandidates::default();
+        let received = std::cell::RefCell::new(String::new());
         let weird = parse_candidate("candidate:abc\u{7}.def.ghi").unwrap();
-        let rejected =
-            validate_candidate(&mut seen, weird, |_| async { Err::<String, _>("no") }).await;
+        let rejected = validate_candidate(&mut seen, weird, |t| {
+            *received.borrow_mut() = t;
+            async { Err::<String, ValidationError<()>>(ValidationError::Rejected) }
+        })
+        .await;
         assert_eq!(rejected, Validation::Rejected);
-        assert!(!format!("{rejected:?}").contains("abc"));
+        assert_eq!(*received.borrow(), "abc\u{7}.def.ghi");
         let good = parse_candidate("candidate:good.tok.en").unwrap();
-        let accepted = validate_candidate(&mut seen, good, |t| async move { Ok::<_, ()>(t) }).await;
+        let accepted = validate_candidate(&mut seen, good, |t| async move {
+            Ok::<_, ValidationError<()>>(t)
+        })
+        .await;
         assert_eq!(accepted, Validation::Accepted("good.tok.en".to_owned()));
+    }
+
+    #[test]
+    fn validation_and_error_debug_never_show_payloads() {
+        let accepted = Validation::Accepted("secret.tok.en".to_owned());
+        assert_eq!(format!("{accepted:?}"), "Validation::Accepted(<redacted>)");
+        let err: ValidationError<&str> = ValidationError::Transient("secret.tok.en");
+        assert!(!format!("{err:?}").contains("secret"));
     }
 
     #[test]
