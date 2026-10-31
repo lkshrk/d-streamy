@@ -4,6 +4,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
 use std::sync::{Mutex, MutexGuard};
 
+use dstreamy_obs_producer::dock;
 use dstreamy_obs_producer::settings::{self, EncoderSettings, Family, Problem};
 use dstreamy_obs_sys as sys;
 
@@ -505,6 +506,17 @@ pub extern "C" fn get_properties(_data: *mut c_void) -> *mut sys::obs_properties
                 c"share_fallback".as_ptr(),
                 c"Use the own encoder when the stream's can't be shared".as_ptr(),
             );
+            let title = CString::new(dock::AUDIO_TRACK_TITLE).unwrap_or_default();
+            let help = CString::new(dock::AUDIO_TRACK_HELP).unwrap_or_default();
+            let track = sys::obs_properties_add_int(
+                props,
+                c"audio_track".as_ptr(),
+                title.as_ptr(),
+                i32::from(*dock::AUDIO_TRACKS.start()),
+                i32::from(*dock::AUDIO_TRACKS.end()),
+                1,
+            );
+            sys::obs_property_set_long_description(track, help.as_ptr());
             props
         }
     })

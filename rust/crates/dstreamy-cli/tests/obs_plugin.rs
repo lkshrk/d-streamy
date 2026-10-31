@@ -961,6 +961,117 @@ fn an_unchanged_audio_track_keeps_the_cached_encoder_across_starts() {
     );
 }
 
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn the_output_offers_audio_tracks_1_to_6_with_the_user_help() {
+    let h = Harness::new("");
+    let run = HarnessRun::start(
+        &h,
+        json!({}),
+        &[
+            "--seconds",
+            "3",
+            "--until-video",
+            "100000",
+            "--report-output-properties",
+            "--expect-error",
+            "The D-Streamy service is not running",
+        ],
+    );
+    let (status, lines) = run.finish();
+    let _ = status;
+    let props: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("HARNESS output_property name="))
+        .collect();
+    let track = props
+        .iter()
+        .find(|p| p.starts_with("audio_track "))
+        .unwrap_or_else(|| panic!("no audio_track property: {lines:#?}"));
+    assert!(
+        track.starts_with(
+            "audio_track type=2 min=1 max=6 step=1 description=Discord audio track long="
+        ),
+        "{track}"
+    );
+    let long = track.split(" long=").nth(1).unwrap();
+    assert_eq!(
+        long,
+        "Track 1 is OBS's first mixer track. It may differ from the track used by OBS streaming or recording. Configure which sources feed this track in OBS's Advanced Audio Properties. The label is used only by D-Streamy. Changes apply on the next Go Live."
+    );
+    for part in [
+        "Track 1 is OBS's first mixer track",
+        "may differ from the track used by OBS streaming or recording",
+        "Advanced Audio Properties",
+        "label is used only by D-Streamy",
+        "next Go Live",
+    ] {
+        assert!(long.contains(part), "{part}");
+    }
+    assert!(
+        props
+            .iter()
+            .all(|p| !p.split(' ').next().unwrap().contains("label")),
+        "a label must never be an output property: {props:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HARNESS output_setting audio_track=1"),
+        "the default is Track 1: {lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_track_changed_on_an_active_output_is_kept_and_applies_on_the_next_start() {
+    let (lines, _) = stream(
+        json!({"audio_track": 1}),
+        &[
+            "--update-output-while-active",
+            r#"{"audio_track": 4}"#,
+            "--restart-output-settings",
+            "{}",
+        ],
+        60,
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HARNESS output_audio_track when=after_active_update active=1 track=4"),
+        "{lines:#?}"
+    );
+    let ptrs: Vec<(&str, &str)> = lines
+        .iter()
+        .filter(|l| l.starts_with("HARNESS audio_mixer when="))
+        .filter_map(|l| {
+            let when = l
+                .strip_prefix("HARNESS audio_mixer when=")?
+                .split(' ')
+                .next()?;
+            Some((when, l.split("encoder=").nth(1)?.split_whitespace().next()?))
+        })
+        .collect();
+    assert_eq!(
+        ptrs.iter().map(|p| p.0).collect::<Vec<_>>(),
+        ["start", "after_active_update", "restart"],
+        "{lines:#?}"
+    );
+    assert_eq!(ptrs[0].1, ptrs[1].1, "the active encoder is untouched");
+    assert_eq!(
+        mixer_reports(&lines)
+            .iter()
+            .map(|r| (r.0.as_str(), r.1))
+            .collect::<Vec<_>>(),
+        [
+            ("start", Some(0)),
+            ("after_active_update", Some(0)),
+            ("restart", Some(3))
+        ],
+        "{lines:#?}"
+    );
+}
+
 /// profile_idc, the byte after the SPS NAL header (H.264 7.3.2.1.1).
 fn sps_profile(video: &[&RecordedVideoFrame]) -> u8 {
     video

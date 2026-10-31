@@ -13,6 +13,8 @@ pub const BITRATE_KBPS: std::ops::RangeInclusive<i64> = 500..=50_000;
 /// OBS's mixer tracks, one-based.
 pub const AUDIO_TRACKS: std::ops::RangeInclusive<u8> = 1..=6;
 pub const DEFAULT_AUDIO_TRACK: u8 = 1;
+pub const AUDIO_TRACK_TITLE: &str = "Discord audio track";
+pub const AUDIO_TRACK_HELP: &str = "Track 1 is OBS's first mixer track. It may differ from the track used by OBS streaming or recording. Configure which sources feed this track in OBS's Advanced Audio Properties. The label is used only by D-Streamy. Changes apply on the next Go Live.";
 /// serve refuses a longer per-start grace (ADR 0004).
 pub const MAX_GRACE_SECS: u64 = 3600;
 
@@ -574,6 +576,34 @@ mod tests {
             });
             assert_eq!(m.settings().audio_track, 1, "{bad}");
         }
+    }
+
+    #[test]
+    fn audio_track_help_covers_the_user_facing_rules() {
+        for part in [
+            "Track 1 is OBS's first mixer track",
+            "may differ from the track used by OBS streaming or recording",
+            "Advanced Audio Properties",
+            "label is used only by D-Streamy",
+            "next Go Live",
+        ] {
+            assert!(AUDIO_TRACK_HELP.contains(part), "{part}");
+        }
+        assert_eq!((AUDIO_TRACKS.start(), AUDIO_TRACKS.end()), (&1, &6));
+    }
+
+    #[test]
+    fn a_track_changed_while_live_is_kept_for_the_next_start() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(None)));
+        assert!(matches!(m.state(), DockState::Live { .. }));
+        let mut s = m.settings().clone();
+        s.audio_track = 4;
+        m.set_settings(s);
+        assert!(matches!(m.state(), DockState::Live { .. }));
+        assert_eq!(m.settings().audio_track, 4);
+        assert_eq!(m.settings().output_settings()["audio_track"], json!(4));
     }
 
     #[test]

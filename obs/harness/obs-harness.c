@@ -61,6 +61,8 @@ const char *restart_output_settings;
 	const char *format;
 	bool no_encoders;
 	bool stream_output;
+	bool report_output_properties;
+	const char *update_output_while_active;
 	int seconds;
 	int fps;
 	int width;
@@ -578,6 +580,8 @@ static void usage(void)
 		"  [--stream-output (start a stand-in stream output on the harness encoders first, so they are active)]\n"
 		"  [--restart-video-settings JSON (after a passing run, stop everything, update the video encoder, run again)]\n"
 		"  [--restart-output-settings JSON (like --restart-video-settings, but updates the output's settings)]\n"
+		"  [--report-output-properties (print the output's own get_properties and the audio_track setting before it starts)]\n"
+		"  [--update-output-while-active JSON (once the output is active, update its settings and report the bound mixer)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
@@ -630,6 +634,10 @@ static int parse_args(int argc, char **argv)
 			args.stream_output = true;
 			continue;
 		}
+		if (strcmp(a, "--report-output-properties") == 0) {
+			args.report_output_properties = true;
+			continue;
+		}
 		if (strcmp(a, "--verbose") == 0) {
 			log_max_level = LOG_DEBUG;
 			continue;
@@ -660,6 +668,8 @@ static int parse_args(int argc, char **argv)
 			args.restart_video_settings = v;
 		else if (strcmp(a, "--restart-output-settings") == 0)
 		args.restart_output_settings = v;
+		else if (strcmp(a, "--update-output-while-active") == 0)
+			args.update_output_while_active = v;
 	else if (strcmp(a, "--dump-encoder-settings") == 0)
 			args.dump_encoder_settings = v;
 		else if (strcmp(a, "--release-after-start") == 0)
@@ -760,6 +770,35 @@ static void report_audio_mixer(obs_output_t *output, const char *when)
 		       obs_encoder_get_mixer_index(aenc), (void *)aenc, encoders);
 	else
 		printf("HARNESS audio_mixer when=%s none dstreamy_audio_encoders=%d\n", when, encoders);
+}
+
+static void report_output_properties(obs_output_t *output)
+{
+	obs_properties_t *props = obs_output_properties(output);
+	if (!props) {
+		printf("HARNESS output_properties none\n");
+		return;
+	}
+	for (obs_property_t *p = obs_properties_first(props); p; obs_property_next(&p)) {
+		const char *long_desc = obs_property_long_description(p);
+		printf("HARNESS output_property name=%s type=%d", obs_property_name(p), (int)obs_property_get_type(p));
+		if (obs_property_get_type(p) == OBS_PROPERTY_INT)
+			printf(" min=%d max=%d step=%d", obs_property_int_min(p), obs_property_int_max(p),
+			       obs_property_int_step(p));
+		printf(" description=%s long=%s\n", obs_property_description(p), long_desc ? long_desc : "");
+	}
+	obs_properties_destroy(props);
+	obs_data_t *settings = obs_output_get_settings(output);
+	printf("HARNESS output_setting audio_track=%lld\n", obs_data_get_int(settings, "audio_track"));
+	obs_data_release(settings);
+}
+
+static void report_output_audio_track(obs_output_t *output, const char *when)
+{
+	obs_data_t *settings = obs_output_get_settings(output);
+	printf("HARNESS output_audio_track when=%s active=%d track=%lld\n", when, obs_output_active(output) ? 1 : 0,
+	       obs_data_get_int(settings, "audio_track"));
+	obs_data_release(settings);
 }
 
 static bool wait_for_plugin_video(obs_output_t *output)
@@ -1236,6 +1275,9 @@ int main(int argc, char **argv)
 		printf("HARNESS stream output started\n");
 	}
 
+	if (args.report_output_properties)
+		report_output_properties(output);
+
 	if (!obs_output_start(output)) {
 		const char *err = obs_output_get_last_error(output);
 		if (contains_expected_error(err)) {
@@ -1252,6 +1294,20 @@ int main(int argc, char **argv)
 	uint64_t start_ns = os_gettime_ns();
 	printf("HARNESS obs_output_start=ok\n");
 	report_audio_mixer(output, "start");
+	if (args.update_output_while_active) {
+		for (int i = 0; !obs_output_active(output); i++) {
+			if (i == 1000)
+				FAIL("output not active 10 s after its start");
+			os_sleep_ms(10);
+		}
+		obs_data_t *live = obs_data_create_from_json(args.update_output_while_active);
+		if (!live)
+			FAIL("--update-output-while-active is not a JSON object");
+		obs_output_update(output, live);
+		obs_data_release(live);
+		report_output_audio_track(output, "after_active_update");
+		report_audio_mixer(output, "after_active_update");
+	}
 	struct frame_counts at_start = frame_counts();
 
 	if (args.release_after_start_ms) {
