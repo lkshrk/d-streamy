@@ -32,4 +32,5 @@ fn unresolvable_host_shows_recovery_in_a_fixed_dark_popup() {
     );
     assert!(err.contains("smoke: view=Recovery(PageNotLoaded)"), "{err}");
     assert!(!dir.path().join("token").exists());
+    eprintln!("browser smoke: ran with a display");
 }

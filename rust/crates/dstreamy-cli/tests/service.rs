@@ -799,8 +799,10 @@ fn status_finds_the_socket_under_the_services_runtime_directory() {
     assert_eq!(v["installed"], true, "{v}");
     assert_eq!(v["enabled"], true, "{v}");
     assert_eq!(v["hello"], true, "{v}");
-    let reported = fs::canonicalize(v["endpoint"].as_str().unwrap()).unwrap();
-    assert_eq!(reported, fs::canonicalize(&endpoint).unwrap(), "{v}");
+    let reported = fs::canonicalize(v["endpoint"].as_str().unwrap_or_else(|| panic!("{v}")))
+        .unwrap_or_else(|e| panic!("{e}: {v}"));
+    let expected = fs::canonicalize(&endpoint).unwrap_or_else(|e| panic!("{e}: {v}"));
+    assert_eq!(reported, expected, "{v}");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"), "{v}");
     assert_eq!(
         v["manager"],

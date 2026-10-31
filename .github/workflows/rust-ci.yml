@@ -261,12 +261,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          xvfb-run -a cargo test -p dstreamy-cli --features browser-login --locked \
-            --test browser_smoke -- --nocapture 2>&1 | tee "$RUNNER_TEMP/browser-smoke.log"
-          if grep -Fq 'skipped: no display' "$RUNNER_TEMP/browser-smoke.log"; then
-            echo "the browser smoke test was skipped under xvfb-run" >&2
-            exit 1
-          fi
+          log="$RUNNER_TEMP/browser-smoke.log"
+          xvfb-run -a -s "-screen 0 1280x720x24" \
+            cargo test -p dstreamy-cli --features browser-login --locked \
+            --test browser_smoke -- --nocapture 2>&1 | tee "$log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored' "$log" \
+            || { echo "the browser smoke test did not pass exactly once" >&2; exit 1; }
+          grep -Fq 'browser smoke: ran with a display' "$log" \
+            || { echo "the browser smoke test did not run with a display" >&2; exit 1; }
       - name: Feature binary links WebKitGTK
         shell: bash
         run: ldd target/debug/dstreamy | grep -F libwebkit2gtk-4.1
