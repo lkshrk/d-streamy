@@ -35,6 +35,7 @@ muda = { version = "0.21", default-features = false }
 dstreamy-capture-macos = { path = "../dstreamy-capture-macos" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = "2.0.2"
 async-trait = "0.1"
 dstreamy-capture-linux = { path = "../dstreamy-capture-linux" }
 

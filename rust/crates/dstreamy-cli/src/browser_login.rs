@@ -8,7 +8,7 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::{Window, WindowBuilder};
 use tokio::runtime::Handle;
-use wry::{PageLoadEvent, WebView, WebViewBuilder};
+use wry::{WebView, WebViewBuilder};
 
 use crate::discord::{self, Persistence};
 use crate::login_capture::{
@@ -18,14 +18,26 @@ use crate::login_capture::{
 use crate::{CliError, Ctx};
 
 const LOGIN_URL: &str = "https://discord.com/login";
-const DISCORD_ORIGIN: &str = "https://discord.com/";
 // A fixed size makes tiling window managers float the window as a dialog.
 const WINDOW_SIZE: tao::dpi::LogicalSize<f64> = tao::dpi::LogicalSize::new(520.0, 760.0);
+#[cfg(feature = "test-hooks")]
+fn smoke() -> bool {
+    std::env::var_os("DSTREAMY_LOGIN_SMOKE").is_some()
+}
+
+fn login_url() -> String {
+    #[cfg(feature = "test-hooks")]
+    if let Ok(url) = std::env::var("DSTREAMY_LOGIN_URL") {
+        return url;
+    }
+    LOGIN_URL.to_owned()
+}
+
 const BACKGROUND: (u8, u8, u8, u8) = (0x31, 0x33, 0x38, 0xff);
 
 enum Msg {
     Ipc(String),
-    PageLoaded,
+    LoadFailed,
     Validated {
         generation: u64,
         seen: SeenCandidates,
@@ -173,6 +185,17 @@ const CAPTURE_SCRIPT: &str = r##"
   };
   checkSignedIn();
   setInterval(checkSignedIn, 500);
+  let loaded = false;
+  const checkLoaded = () => {
+    if (loaded) return;
+    if (document.getElementById("app-mount")) {
+      loaded = true;
+      clearInterval(loadTimer);
+      post("page_loaded");
+    }
+  };
+  const loadTimer = setInterval(checkLoaded, 250);
+  checkLoaded();
 })();
 "##;
 
@@ -194,8 +217,9 @@ pub fn prepare_environment() {
 pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError> {
     let mut event_loop = EventLoopBuilder::<Msg>::with_user_event().build();
     let proxy = event_loop.create_proxy();
-    let load_proxy = event_loop.create_proxy();
     let validation_proxy = event_loop.create_proxy();
+    #[cfg(target_os = "linux")]
+    let load_proxy = event_loop.create_proxy();
     #[cfg(target_os = "macos")]
     let _menu = edit_menu()?;
     let window = WindowBuilder::new()
@@ -210,15 +234,10 @@ pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError>
         .with_incognito(true)
         .with_clipboard(true)
         .with_background_color(BACKGROUND)
-        .with_url(LOGIN_URL)
+        .with_url(login_url())
         .with_initialization_script(CAPTURE_SCRIPT)
         .with_ipc_handler(move |request| {
             let _ = proxy.send_event(Msg::Ipc(request.body().clone()));
-        })
-        .with_on_page_load_handler(move |event, url| {
-            if matches!(event, PageLoadEvent::Finished) && url.starts_with(DISCORD_ORIGIN) {
-                let _ = load_proxy.send_event(Msg::PageLoaded);
-            }
         });
     #[cfg(target_os = "linux")]
     let webview = {
@@ -227,12 +246,29 @@ pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError>
         let vbox = window
             .default_vbox()
             .ok_or_else(|| CliError::BrowserLogin("no GTK container".into()))?;
-        builder.build_gtk(vbox)
+        let webview = builder.build_gtk(vbox);
+        if let Ok(webview) = &webview {
+            use webkit2gtk::WebViewExt;
+            use wry::WebViewExtUnix;
+            webview.webview().connect_load_failed(move |_, _, _, _| {
+                let _ = load_proxy.send_event(Msg::LoadFailed);
+                true
+            });
+        }
+        webview
     };
     #[cfg(not(target_os = "linux"))]
     let webview = builder.build(&window);
     let webview = webview.map_err(|e| CliError::BrowserLogin(e.to_string()))?;
 
+    #[cfg(feature = "test-hooks")]
+    if smoke() {
+        let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+        eprintln!(
+            "smoke: size={}x{} background={:?}",
+            size.width, size.height, BACKGROUND
+        );
+    }
     let mut state = BrowserState::new(Instant::now());
     let mut shown = (View::Discord, false);
     let mut outcome = None;
@@ -244,10 +280,7 @@ pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError>
         let now = Instant::now();
         let command = match event {
             Event::UserEvent(Msg::Ipc(message)) => state.ipc(&message, now),
-            Event::UserEvent(Msg::PageLoaded) => {
-                state.page_loaded();
-                None
-            }
+            Event::UserEvent(Msg::LoadFailed) => state.event(login_capture::Event::LoadFailed, now),
             Event::UserEvent(Msg::Validated {
                 generation,
                 seen,
@@ -275,6 +308,15 @@ pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError>
         if current != shown {
             render(&webview, &window, shown, current);
             shown = current;
+            #[cfg(feature = "test-hooks")]
+            if smoke() {
+                eprintln!("smoke: view={:?}", current.0);
+                if matches!(current.0, View::Recovery(_)) {
+                    outcome = Some(BrowserLoginOutcome::Cancelled);
+                    *flow = ControlFlow::Exit;
+                    return;
+                }
+            }
         }
         *flow = match state.deadline() {
             Some(deadline) => ControlFlow::WaitUntil(deadline),
@@ -347,7 +389,7 @@ fn render(
         return;
     }
     let loaded = match view {
-        View::Discord => webview.load_url(LOGIN_URL),
+        View::Discord => webview.load_url(&login_url()),
         View::Recovery(failure) => webview.load_html(&recovery_page(failure)),
         View::Closing => webview.load_html(&page(
             "Closing…",

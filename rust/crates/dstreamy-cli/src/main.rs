@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 use clap::{ArgAction, Parser, Subcommand};
 use dstreamy_cli::discord::{self, Persistence};
+use dstreamy_cli::login_capture::{LoginMode, login_mode};
 use dstreamy_cli::output::{Out, table};
 use dstreamy_cli::{CliError, Ctx, capture, daemon, serve, service, stream, tui};
 use dstreamy_core::{ConfigPaths, RotatingFileWriter};
@@ -156,18 +157,16 @@ fn main() -> ExitCode {
         }
     };
     let token = match cli.command {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        Command::Login { browser: true, .. } => match browser_token(&ctx, runtime.handle()) {
-            Ok(token) => token,
-            Err(e) => {
-                out.error(e);
-                return ExitCode::FAILURE;
-            }
-        },
-        Command::Login { token, .. } if token || !std::io::stdin().is_terminal() => {
-            match read_token() {
-                Ok(token) => Some(token),
-                Err(CliError::EmptyToken) if !token => None,
+        Command::Login { token, browser } => {
+            let mode = login_mode(token, browser, std::io::stdin().is_terminal());
+            let read = match mode {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                LoginMode::Browser => browser_token(&ctx, runtime.handle()),
+                LoginMode::Token => read_token().map(Some),
+                _ => Ok(None),
+            };
+            match read {
+                Ok(token) => token,
                 Err(e) => {
                     out.error(e);
                     return ExitCode::FAILURE;

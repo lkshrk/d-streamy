@@ -146,7 +146,8 @@ fn malformed_and_unknown_ipc_leave_the_state_waiting() {
         "action:",
         "action:nope",
         "signed_in:1",
-        "page_loaded",
+        "page_loaded:1",
+        "page_loaded ",
     ] {
         assert!(parse_event(message).is_none(), "{message:?} must not parse");
         assert!(state.ipc(message, start + MS).is_none(), "{message:?}");
@@ -393,6 +394,35 @@ fn page_that_never_loads_shows_recovery_after_the_load_timeout() {
 }
 
 #[test]
+fn page_loaded_ipc_message_clears_the_load_timeout() {
+    let start = Instant::now();
+    let mut state = BrowserState::new(start);
+    assert!(matches!(
+        parse_event("page_loaded"),
+        Some(Event::PageLoaded)
+    ));
+    assert!(state.ipc("page_loaded", start + MS).is_none());
+    assert_eq!(state.deadline(), None);
+    state.tick(start + PAGE_LOAD_TIMEOUT * 2);
+    assert_eq!(state.view(), View::Discord);
+}
+
+#[test]
+fn page_loaded_ipc_message_is_ignored_on_the_recovery_page() {
+    let start = Instant::now();
+    let mut state = BrowserState::new(start);
+    state.tick(start + PAGE_LOAD_TIMEOUT + MS);
+    let view = state.view();
+    assert!(matches!(view, View::Recovery(Failure::PageNotLoaded)));
+    assert!(
+        state
+            .ipc("page_loaded", start + PAGE_LOAD_TIMEOUT + MS)
+            .is_none()
+    );
+    assert_eq!(state.view(), view);
+}
+
+#[test]
 fn page_load_clears_the_load_timeout() {
     let start = Instant::now();
     let mut state = BrowserState::new(start);
@@ -511,4 +541,52 @@ fn outcome_debug_never_shows_the_token() {
         BrowserLoginOutcome::Token("secret.tok.en".to_owned())
     );
     assert!(!shown.contains("secret"));
+}
+
+#[test]
+fn load_failure_shows_recovery_immediately_without_waiting_for_the_timeout() {
+    let start = Instant::now();
+    let mut state = BrowserState::new(start);
+    assert!(state.event(Event::LoadFailed, start + MS).is_none());
+    assert_eq!(state.view(), View::Recovery(Failure::PageNotLoaded));
+    assert_eq!(state.deadline(), None);
+    assert!(!state.actions().is_empty());
+}
+
+#[test]
+fn load_failure_after_the_page_loaded_still_recovers() {
+    let start = Instant::now();
+    let mut state = loaded(start);
+    state.event(Event::LoadFailed, start + MS);
+    assert_eq!(state.view(), View::Recovery(Failure::PageNotLoaded));
+}
+
+#[test]
+fn load_failure_during_validation_waits_for_the_check_then_recovers() {
+    let start = Instant::now();
+    let mut state = loaded(start);
+    assert!(state.ipc("candidate:aaa.bbb.ccc", start).is_some());
+    state.event(Event::LoadFailed, start + MS);
+    assert_eq!(state.view(), View::Discord);
+}
+
+#[test]
+fn retry_after_a_load_failure_loads_discord_again_with_a_fresh_timeout() {
+    let start = Instant::now();
+    let mut state = BrowserState::new(start);
+    state.event(Event::LoadFailed, start + MS);
+    assert!(state.action(Action::Retry, start + 2 * MS).is_none());
+    assert_eq!(state.view(), View::Discord);
+    assert!(state.deadline().is_some());
+    state.event(Event::LoadFailed, start + 3 * MS);
+    assert_eq!(state.view(), View::Recovery(Failure::PageNotLoaded));
+}
+
+#[test]
+fn load_failure_recovery_offers_qr_and_token_fallbacks() {
+    let start = Instant::now();
+    let mut state = BrowserState::new(start);
+    state.event(Event::LoadFailed, start + MS);
+    let outcome = exit(state.action(Action::UseQr, start + 2 * MS));
+    assert!(matches!(outcome, BrowserLoginOutcome::UseQr));
 }

@@ -28,6 +28,8 @@ impl fmt::Debug for Candidate {
 pub enum Event {
     Candidate(Candidate),
     SignedIn,
+    PageLoaded,
+    LoadFailed,
     Close,
     Action(Action),
 }
@@ -58,6 +60,7 @@ pub fn parse_candidate(message: &str) -> Option<Candidate> {
 pub fn parse_event(message: &str) -> Option<Event> {
     match message {
         "signed_in" => Some(Event::SignedIn),
+        "page_loaded" => Some(Event::PageLoaded),
         "close" => Some(Event::Close),
         "action:retry" => Some(Event::Action(Action::Retry)),
         "action:qr" => Some(Event::Action(Action::UseQr)),
@@ -165,6 +168,23 @@ pub enum Failure {
     Rejected,
     Unreachable,
     PageNotLoaded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginMode {
+    Qr,
+    Browser,
+    Token,
+}
+
+pub fn login_mode(token_flag: bool, browser_flag: bool, stdin_is_terminal: bool) -> LoginMode {
+    if browser_flag {
+        LoginMode::Browser
+    } else if token_flag || !stdin_is_terminal {
+        LoginMode::Token
+    } else {
+        LoginMode::Qr
+    }
 }
 
 /// What the `login` command does after the browser window has closed.
@@ -291,6 +311,18 @@ impl BrowserState {
                 if !self.signed_in && self.view == View::Discord {
                     self.signed_in = true;
                     self.capture_deadline = Some(now + SIGNED_IN_GRACE);
+                }
+                None
+            }
+            Event::PageLoaded => {
+                self.page_loaded();
+                None
+            }
+            Event::LoadFailed => {
+                if self.view == View::Discord {
+                    self.load_deadline = None;
+                    self.load_expired = true;
+                    self.settle();
                 }
                 None
             }
@@ -452,6 +484,24 @@ impl BrowserState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_mode_defaults_to_qr_on_a_terminal() {
+        assert_eq!(login_mode(false, false, true), LoginMode::Qr);
+    }
+
+    #[test]
+    fn login_mode_browser_flag_selects_the_browser() {
+        assert_eq!(login_mode(false, true, true), LoginMode::Browser);
+        assert_eq!(login_mode(false, true, false), LoginMode::Browser);
+    }
+
+    #[test]
+    fn login_mode_token_flag_or_piped_stdin_selects_token_input() {
+        assert_eq!(login_mode(true, false, true), LoginMode::Token);
+        assert_eq!(login_mode(true, false, false), LoginMode::Token);
+        assert_eq!(login_mode(false, false, false), LoginMode::Token);
+    }
 
     #[test]
     fn candidate_protocol_accepts_authorization_values_and_rejects_controls() {
