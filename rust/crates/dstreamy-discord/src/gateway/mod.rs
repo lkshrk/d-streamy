@@ -17,6 +17,7 @@ use tokio_tungstenite::Connector;
 pub use cache::{Guild, VoiceChannel, VoiceChannelKind};
 pub use event::{CurrentUser, Dispatch, GatewayEvent, VoiceState};
 pub use options::{DEFAULT_GATEWAY_URL, GATEWAY_VERSION, GatewayOptions, IdentifyProperties};
+pub(crate) use options::USER_AGENT;
 
 const EVENT_CAPACITY: usize = 256;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -261,7 +262,7 @@ impl GatewayClient {
     }
 }
 
-fn rustls_connector() -> Result<Connector, GatewayError> {
+pub(crate) fn rustls_connector() -> Result<Connector, GatewayError> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let provider = Arc::new(rustls::crypto::ring::default_provider());

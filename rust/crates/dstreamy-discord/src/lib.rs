@@ -2,6 +2,7 @@ pub use discord_stream_rs as transport;
 
 mod client;
 pub mod gateway;
+pub mod remote_auth;
 pub mod session;
 pub mod stream;
 

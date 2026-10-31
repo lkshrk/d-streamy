@@ -11,6 +11,7 @@ dstreamy-core = { path = "../dstreamy-core" }
 dstreamy-discord = { path = "../dstreamy-discord" }
 dstreamy-ipc = { path = "../dstreamy-ipc" }
 dstreamy-media = { path = "../dstreamy-media" }
+qrcode = { version = "0.14", default-features = false }
 ratatui = "0.30"
 rpassword = "7"
 secrecy = "0.10"
@@ -25,7 +26,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 url = "2"
 webrtc = "0.14"
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+tao = "0.37"
+wry = "0.57"
+
 [target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.21", default-features = false }
 dstreamy-capture-macos = { path = "../dstreamy-capture-macos" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

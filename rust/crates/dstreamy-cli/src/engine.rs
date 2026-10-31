@@ -191,6 +191,7 @@ impl From<CliError> for Failure {
                 return Self::new("invalid_token", "Discord rejected the token");
             }
             CliError::Gateway(_) => "gateway",
+            CliError::RemoteAuth(_) | CliError::BrowserLogin(_) => "remote_auth",
             CliError::UnknownGuild(guild) => {
                 return Self::new("unknown_guild", format!("unknown guild {guild}"));
             }

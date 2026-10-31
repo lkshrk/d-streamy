@@ -1,5 +1,7 @@
 //! Shared pieces of the `dstreamy` command line and its terminal UI.
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod browser_login;
 pub mod capture;
 pub mod daemon;
 pub mod discord;
@@ -38,6 +40,10 @@ pub enum CliError {
     ReadToken(std::io::Error),
     #[error(transparent)]
     Gateway(#[from] GatewayError),
+    #[error(transparent)]
+    RemoteAuth(#[from] dstreamy_discord::remote_auth::RemoteAuthError),
+    #[error("browser login failed: {0}")]
+    BrowserLogin(String),
     #[error("unknown guild {0}; see `dstreamy guilds`")]
     UnknownGuild(String),
     #[error("guild {0} is unavailable right now")]
