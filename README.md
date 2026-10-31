@@ -65,7 +65,7 @@ Requirements:
     gstreamer1.0-plugins-ugly gstreamer1.0-pipewire gstreamer1.0-pulseaudio
   ```
 
-  Desktop release builds include browser login (`dstreamy login --browser`), which on Linux also needs the WebKitGTK 4.1 runtime (Debian/Ubuntu: `sudo apt-get install libwebkit2gtk-4.1-0 libgtk-3-0 libsoup-3.0-0`). Without it the binary fails to start; QR login (`dstreamy login`) remains the normal path, and a build without the feature needs none of these.
+  Desktop release builds include browser login (`dstreamy login --browser`). On Linux it needs the WebKitGTK 4.1 runtime (Debian/Ubuntu: `sudo apt-get install libwebkit2gtk-4.1-0 libgtk-3-0 libsoup-3.0-0`); without it the binary fails to start. QR login (`dstreamy login`) remains the normal path, and a build without the feature needs none of these.
 
   Hardware encoding is used when available: VA-API needs a VA driver for your GPU (and `gstreamer1.0-vaapi` for the older elements), NVENC needs the NVIDIA driver. Otherwise `x264enc` encodes in software.
 
