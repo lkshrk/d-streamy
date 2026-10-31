@@ -742,10 +742,17 @@ impl Drop for KillOnDrop {
 fn status_finds_the_socket_under_the_services_runtime_directory() {
     let fake = Fake::new();
     fake.answer_show(&running(std::process::id()));
-    let runtime = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let real_parent = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let run = real_parent.path().join("run");
+    fs::create_dir(&run).unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+    let link_parent = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let link = link_parent.path().join("link");
+    std::os::unix::fs::symlink(real_parent.path(), &link).unwrap();
+    let runtime = link.join("run");
     fs::write(
         fake.dir.path().join("environment"),
-        format!("HOME=/x\nXDG_RUNTIME_DIR={}\n", runtime.path().display()),
+        format!("HOME=/x\nXDG_RUNTIME_DIR={}\n", runtime.display()),
     )
     .unwrap();
     let status = |fake: &Fake| {
@@ -770,7 +777,7 @@ fn status_finds_the_socket_under_the_services_runtime_directory() {
     assert_eq!(v["installed"], true, "{v}");
     assert_eq!(v["hello"], false, "{v}");
 
-    let endpoint = runtime.path().join("dstreamy/serve.sock");
+    let endpoint = runtime.join("dstreamy/serve.sock");
     let _serve = KillOnDrop(
         Command::new(dstreamy())
             .arg("--config-dir")
@@ -792,7 +799,8 @@ fn status_finds_the_socket_under_the_services_runtime_directory() {
     assert_eq!(v["installed"], true, "{v}");
     assert_eq!(v["enabled"], true, "{v}");
     assert_eq!(v["hello"], true, "{v}");
-    assert_eq!(v["endpoint"], json!(endpoint), "{v}");
+    let reported = fs::canonicalize(v["endpoint"].as_str().unwrap()).unwrap();
+    assert_eq!(reported, fs::canonicalize(&endpoint).unwrap(), "{v}");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"), "{v}");
     assert_eq!(
         v["manager"],
@@ -803,7 +811,7 @@ fn status_finds_the_socket_under_the_services_runtime_directory() {
         "{v}"
     );
     let note = v["runtime_dir_note"].as_str().unwrap();
-    assert!(note.contains(&runtime.path().display().to_string()), "{v}");
+    assert!(note.contains(&runtime.display().to_string()), "{v}");
     assert!(
         fake.calls().ends_with(
             "--user show --property=UnitPath\n\
