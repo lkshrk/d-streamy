@@ -21,6 +21,7 @@ const GATEWAY_URL: &str = "wss://remote-auth-gateway.discord.gg/?v=2";
 const LOGIN_URL: &str = "https://discord.com/api/v9/users/@me/remote-auth/login";
 const ORIGIN: &str = "https://discord.com";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Error)]
 pub enum RemoteAuthError {
@@ -38,6 +39,10 @@ pub enum RemoteAuthError {
     Captcha,
     #[error("exchanging the login ticket failed: {0}")]
     Exchange(String),
+    #[error(
+        "Discord did not answer the login ticket exchange in time; check the network and run `dstreamy login` again"
+    )]
+    ExchangeTimedOut,
 }
 
 /// Progress reported while waiting for the phone.
@@ -110,7 +115,11 @@ pub async fn login(mut progress: impl FnMut(Progress)) -> Result<String, RemoteA
         let packet: Value = serde_json::from_str(&text)
             .map_err(|e| RemoteAuthError::Protocol(format!("unreadable packet: {e}")))?;
         match session.handle(&packet)? {
-            Step::Hello { heartbeat: every, timeout: lifetime, reply } => {
+            Step::Hello {
+                heartbeat: every,
+                timeout: lifetime,
+                reply,
+            } => {
                 heartbeat = Some(interval_at(Instant::now() + every, every));
                 deadline = Some(Instant::now() + lifetime);
                 send(&mut sink, reply).await?;
@@ -145,14 +154,22 @@ async fn exchange(ticket: String) -> Result<String, RemoteAuthError> {
             .header("User-Agent", USER_AGENT)
             .config()
             .http_status_as_error(false)
+            .timeout_global(Some(EXCHANGE_TIMEOUT))
             .build()
             .send(body.as_str())
             .and_then(|mut r| Ok((r.status().as_u16(), r.body_mut().read_to_string()?)))
     })
     .await
     .map_err(|e| RemoteAuthError::Exchange(e.to_string()))?
-    .map_err(|e| RemoteAuthError::Exchange(e.to_string()))?;
+    .map_err(exchange_error)?;
     parse_exchange(response.0, &response.1)
+}
+
+fn exchange_error(error: ureq::Error) -> RemoteAuthError {
+    match error {
+        ureq::Error::Timeout(_) => RemoteAuthError::ExchangeTimedOut,
+        other => RemoteAuthError::Exchange(other.to_string()),
+    }
 }
 
 fn parse_exchange(status: u16, body: &str) -> Result<String, RemoteAuthError> {
@@ -165,7 +182,9 @@ fn parse_exchange(status: u16, body: &str) -> Result<String, RemoteAuthError> {
         Some(token) if (200..300).contains(&status) => Ok(token.to_owned()),
         _ => Err(RemoteAuthError::Exchange(format!(
             "HTTP {status}: {}",
-            value["message"].as_str().unwrap_or("no token in the response")
+            value["message"]
+                .as_str()
+                .unwrap_or("no token in the response")
         ))),
     }
 }
@@ -208,7 +227,11 @@ impl Keys {
 
 #[derive(Debug)]
 enum Step {
-    Hello { heartbeat: Duration, timeout: Duration, reply: Value },
+    Hello {
+        heartbeat: Duration,
+        timeout: Duration,
+        reply: Value,
+    },
     Send(Value),
     Progress(Progress),
     Ticket(String),
@@ -298,11 +321,20 @@ mod tests {
         let step = s
             .handle(&json!({"op": "hello", "heartbeat_interval": 41250, "timeout_ms": 142637}))
             .unwrap();
-        let Step::Hello { heartbeat, timeout, reply } = step else { panic!("{step:?}") };
+        let Step::Hello {
+            heartbeat,
+            timeout,
+            reply,
+        } = step
+        else {
+            panic!("{step:?}")
+        };
         assert_eq!(heartbeat, Duration::from_millis(41250));
         assert_eq!(timeout, Duration::from_millis(142637));
         assert_eq!(reply["op"], "init");
-        let key = STANDARD.decode(reply["encoded_public_key"].as_str().unwrap()).unwrap();
+        let key = STANDARD
+            .decode(reply["encoded_public_key"].as_str().unwrap())
+            .unwrap();
         assert!(RsaPublicKey::from_public_key_der(&key).is_ok());
     }
 
@@ -327,7 +359,9 @@ mod tests {
         let step = s
             .handle(&json!({"op": "pending_remote_init", "fingerprint": fp}))
             .unwrap();
-        let Step::Progress(Progress::Qr(url)) = step else { panic!("{step:?}") };
+        let Step::Progress(Progress::Qr(url)) = step else {
+            panic!("{step:?}")
+        };
         assert_eq!(url, format!("https://discord.com/ra/{fp}"));
     }
 
@@ -343,13 +377,13 @@ mod tests {
     #[test]
     fn pending_ticket_reports_the_username() {
         let mut s = session();
-        let payload = encrypt_for(&s.keys, b"1505233032829997149:0:0:h_cloud_streamy");
+        let payload = encrypt_for(&s.keys, b"100000000000000001:0:0:example_user");
         let step = s
             .handle(&json!({"op": "pending_ticket", "encrypted_user_payload": payload}))
             .unwrap();
         assert!(matches!(
             step,
-            Step::Progress(Progress::Scanned { username }) if username == "h_cloud_streamy"
+            Step::Progress(Progress::Scanned { username }) if username == "example_user"
         ));
     }
 
@@ -386,6 +420,26 @@ mod tests {
         assert!(matches!(
             parse_exchange(401, r#"{"message":"Unauthorized"}"#),
             Err(RemoteAuthError::Exchange(m)) if m.contains("Unauthorized")
+        ));
+    }
+
+    #[test]
+    fn exchange_timeouts_are_actionable() {
+        for timeout in [
+            ureq::Timeout::Global,
+            ureq::Timeout::Connect,
+            ureq::Timeout::Resolve,
+        ] {
+            let err = exchange_error(ureq::Error::Timeout(timeout));
+            assert!(matches!(err, RemoteAuthError::ExchangeTimedOut), "{err:?}");
+            assert!(
+                err.to_string().contains("run `dstreamy login` again"),
+                "{err}"
+            );
+        }
+        assert!(matches!(
+            exchange_error(ureq::Error::HostNotFound),
+            RemoteAuthError::Exchange(_)
         ));
     }
 }
