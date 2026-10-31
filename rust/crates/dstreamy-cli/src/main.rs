@@ -6,10 +6,11 @@ use std::process::ExitCode;
 
 use clap::{ArgAction, Parser, Subcommand};
 use dstreamy_cli::discord::{self, Persistence};
+use dstreamy_cli::login_capture::{LoginMode, login_mode};
 use dstreamy_cli::output::{Out, table};
 use dstreamy_cli::{CliError, Ctx, capture, daemon, serve, service, stream, tui};
 use dstreamy_core::{ConfigPaths, RotatingFileWriter};
-use dstreamy_discord::{DEFAULT_GATEWAY_URL, VoiceChannelKind};
+use dstreamy_discord::{DEFAULT_GATEWAY_URL, VoiceChannelKind, remote_auth};
 use serde::Serialize;
 use tracing::Level;
 use tracing_subscriber::filter::Targets;
@@ -47,8 +48,17 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Check a Discord user token (read from stdin) and store it
-    Login,
+    /// Log in by scanning a QR code with the Discord mobile app and store the token
+    ///
+    /// A token piped on stdin is used instead of the QR code.
+    Login {
+        /// Type or paste a token instead of scanning a QR code
+        #[arg(long, conflicts_with = "browser")]
+        token: bool,
+        /// Log in on Discord's login page in a window instead of scanning a QR code
+        #[arg(long)]
+        browser: bool,
+    },
     /// List the account's guilds
     Guilds,
     /// List the voice channels of a guild
@@ -132,16 +142,13 @@ fn main() -> ExitCode {
         _ => (None, true),
     };
     init_logging(&out, cli.verbose, log_file, to_stderr);
-    let token = match cli.command {
-        Command::Login => match read_token() {
-            Ok(token) => Some(token),
-            Err(e) => {
-                out.error(e);
-                return ExitCode::FAILURE;
-            }
-        },
-        _ => None,
-    };
+    #[cfg(all(
+        feature = "browser-login",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    if let Command::Login { browser: true, .. } = cli.command {
+        dstreamy_cli::browser_login::prepare_environment();
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -151,6 +158,33 @@ fn main() -> ExitCode {
             out.error(format_args!("starting the async runtime: {e}"));
             return ExitCode::FAILURE;
         }
+    };
+    let token = match cli.command {
+        Command::Login { token, browser } => {
+            let mode = login_mode(token, browser, std::io::stdin().is_terminal());
+            let read = match mode {
+                #[cfg(all(
+                    feature = "browser-login",
+                    any(target_os = "linux", target_os = "macos")
+                ))]
+                LoginMode::Browser => browser_token(&ctx, runtime.handle()),
+                #[cfg(not(all(
+                    feature = "browser-login",
+                    any(target_os = "linux", target_os = "macos")
+                )))]
+                LoginMode::Browser => Err(CliError::BrowserLoginUnavailable),
+                LoginMode::Token => read_token().map(Some),
+                LoginMode::Qr => Ok(None),
+            };
+            match read {
+                Ok(token) => token,
+                Err(e) => {
+                    out.error(e);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        _ => None,
     };
     let result = runtime.block_on(run(cli.command, token, &ctx, &out));
     // Background tasks (webrtc, the gateway) must not keep the process alive after the command.
@@ -215,7 +249,13 @@ async fn run(
     out: &Out,
 ) -> Result<ExitCode, CliError> {
     match command {
-        Command::Login => login(ctx, out, token.ok_or(CliError::EmptyToken)?).await,
+        Command::Login { .. } => {
+            let token = match token {
+                Some(token) => token,
+                None => qr_token(out).await?,
+            };
+            login(ctx, out, token).await
+        }
         Command::Guilds => guilds(ctx, out).await,
         Command::Channels { guild } => channels(ctx, out, &guild).await,
         Command::Targets { skip_platform } => targets(out, !skip_platform).await,
@@ -262,6 +302,20 @@ async fn run(
     }
 }
 
+/// `None` means the QR login runs next.
+#[cfg(all(
+    feature = "browser-login",
+    any(target_os = "linux", target_os = "macos")
+))]
+fn browser_token(ctx: &Ctx, runtime: &tokio::runtime::Handle) -> Result<Option<String>, CliError> {
+    use dstreamy_cli::login_capture::{FollowUp, follow_up};
+    match follow_up(dstreamy_cli::browser_login::run(ctx, runtime)?)? {
+        FollowUp::Login(token) => Ok(Some(token)),
+        FollowUp::Qr => Ok(None),
+        FollowUp::ReadToken => read_token().map(Some),
+    }
+}
+
 fn read_token() -> Result<String, CliError> {
     let stdin = std::io::stdin();
     let text = if stdin.is_terminal() {
@@ -279,6 +333,54 @@ fn read_token() -> Result<String, CliError> {
         return Err(CliError::EmptyToken);
     }
     Ok(token.to_owned())
+}
+
+#[derive(Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum QrRow<'a> {
+    Qr { url: &'a str },
+    Scanned { username: &'a str },
+}
+
+async fn qr_token(out: &Out) -> Result<String, CliError> {
+    let token = remote_auth::login(|progress| match progress {
+        remote_auth::Progress::Qr(url) if out.json => {
+            out.json_line(&QrRow::Qr { url: &url });
+        }
+        remote_auth::Progress::Qr(url) => {
+            out.line(format_args!(
+                "Scan with the Discord mobile app (Settings → Scan QR Code).\n\
+                 The login is for the account that is active in the app.\n\n{}",
+                qr_text(&url)
+            ));
+        }
+        remote_auth::Progress::Scanned { username } if out.json => {
+            out.json_line(&QrRow::Scanned {
+                username: &username,
+            });
+        }
+        remote_auth::Progress::Scanned { username } => {
+            out.line(format_args!(
+                "scanned by {username}; confirm the login on the phone"
+            ));
+        }
+    })
+    .await?;
+    Ok(token)
+}
+
+/// Two characters per module, so the code stays square in a terminal.
+fn qr_text(url: &str) -> String {
+    match qrcode::QrCode::new(url) {
+        Ok(code) => code
+            .render::<char>()
+            .dark_color(' ')
+            .light_color('█')
+            .module_dimensions(2, 1)
+            .quiet_zone(true)
+            .build(),
+        Err(_) => String::new(),
+    }
 }
 
 #[derive(Serialize)]

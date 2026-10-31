@@ -1,10 +1,16 @@
 //! Shared pieces of the `dstreamy` command line and its terminal UI.
 
+#[cfg(all(
+    feature = "browser-login",
+    any(target_os = "linux", target_os = "macos")
+))]
+pub mod browser_login;
 pub mod capture;
 pub mod daemon;
 pub mod discord;
 pub mod engine;
 pub mod lock;
+pub mod login_capture;
 pub mod output;
 pub mod serve;
 pub mod service;
@@ -38,6 +44,14 @@ pub enum CliError {
     ReadToken(std::io::Error),
     #[error(transparent)]
     Gateway(#[from] GatewayError),
+    #[error(transparent)]
+    RemoteAuth(#[from] dstreamy_discord::remote_auth::RemoteAuthError),
+    #[error("browser login failed: {0}")]
+    BrowserLogin(String),
+    #[error(
+        "browser login is not included in this build of dstreamy; run `dstreamy login` to scan a QR code, or `dstreamy login --token` to paste a token"
+    )]
+    BrowserLoginUnavailable,
     #[error("unknown guild {0}; see `dstreamy guilds`")]
     UnknownGuild(String),
     #[error("guild {0} is unavailable right now")]

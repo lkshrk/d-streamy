@@ -65,6 +65,8 @@ Requirements:
     gstreamer1.0-plugins-ugly gstreamer1.0-pipewire gstreamer1.0-pulseaudio
   ```
 
+  Desktop release builds include browser login (`dstreamy login --browser`). On Linux it needs the WebKitGTK 4.1 runtime (Debian/Ubuntu: `sudo apt-get install libwebkit2gtk-4.1-0 libgtk-3-0 libsoup-3.0-0`); without it the binary fails to start. QR login (`dstreamy login`) remains the normal path, and a build without the feature needs none of these.
+
   Hardware encoding is used when available: VA-API needs a VA driver for your GPU (and `gstreamer1.0-vaapi` for the older elements), NVENC needs the NVIDIA driver. Otherwise `x264enc` encodes in software.
 
 ### Build from source
@@ -92,17 +94,23 @@ Or build the Linux binary in Docker from any host (the output lands in the `dstr
 rust/ci/linux.sh cargo build --release -p dstreamy-cli
 ```
 
+Browser login (`dstreamy login --browser`) is included in the desktop release tarballs (Linux and macOS) but is an opt-in build feature, so a source build without `--features browser-login` needs no webview. On Linux it needs WebKitGTK 4.1 (`libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev` to build) and links against it:
+
+```bash
+cargo build --release -p dstreamy-cli --features browser-login
+```
+
 ### Usage
 
 ```bash
-dstreamy login                      # paste the Discord user token; it is checked, then stored
+dstreamy login                      # scan the QR code with the Discord mobile app; the token is checked, then stored
 dstreamy guilds                     # list servers
 dstreamy channels <GUILD>           # list voice channels of a server
 dstreamy targets                    # list capturable displays and windows
 dstreamy stream --guild <GUILD> --channel <CHANNEL> --target display:1
 ```
 
-`DSTREAMY_TOKEN` overrides the stored token. `stream` runs until Ctrl-C and takes `--codec h264|h265` (h265 is experimental: most Discord viewers can't decode it), `--fps 15|30|60`, `--res 720p|900p|1080p|WIDTHxHEIGHT`, `--bitrate <kbps>`, `--gain <0.0-3.0>` and `--crop X,Y,W,H`; `--target test-pattern` streams a test pattern without capturing anything. Add `--json` for machine-readable output and `-v`/`-vv` for logs. On Linux, use `--target portal` and pick the window or screen in the portal dialog. See `dstreamy <command> --help` for details.
+`dstreamy login --token` prompts for a token instead, and a token piped on stdin (`dstreamy login < token.txt`) is used without a prompt. Builds with the `browser-login` feature also offer `dstreamy login --browser`, which logs in on Discord's login page in a window; other builds say so and point to the QR or token login. `DSTREAMY_TOKEN` overrides the stored token. `stream` runs until Ctrl-C and takes `--codec h264|h265` (h265 is experimental: most Discord viewers can't decode it), `--fps 15|30|60`, `--res 720p|900p|1080p|WIDTHxHEIGHT`, `--bitrate <kbps>`, `--gain <0.0-3.0>` and `--crop X,Y,W,H`; `--target test-pattern` streams a test pattern without capturing anything. Add `--json` for machine-readable output and `-v`/`-vv` for logs. On Linux, use `--target portal` and pick the window or screen in the portal dialog. See `dstreamy <command> --help` for details.
 
 ## Disclaimer
 

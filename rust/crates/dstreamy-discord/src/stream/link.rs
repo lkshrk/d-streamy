@@ -19,9 +19,16 @@ pub(crate) async fn join_voice(
     step: Duration,
 ) -> Result<(MediaConnection, Events), StreamError> {
     let mut voice = client.join_voice(guild_id, channel_id);
-    let conn = timeout(step, voice.ready())
-        .await
-        .map_err(|_| StreamError::Timeout("joining voice"))??;
+    let conn = timeout(step, async {
+        let conn = voice.ready().await?;
+        // Discord ignores Create Stream until the voice media link is connected.
+        while !conn.is_ready().await {
+            sleep(POLL).await;
+        }
+        Ok::<_, StreamError>(conn)
+    })
+    .await
+    .map_err(|_| StreamError::Timeout("joining voice"))??;
     Ok((conn, voice.events))
 }
 

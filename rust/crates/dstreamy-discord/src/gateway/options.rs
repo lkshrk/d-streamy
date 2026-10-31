@@ -9,7 +9,7 @@ use super::event::Dispatch;
 pub const DEFAULT_GATEWAY_URL: &str = "wss://gateway.discord.gg";
 pub const GATEWAY_VERSION: u8 = 9;
 
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9210 Chrome/134.0.6998.205 Electron/35.3.0 Safari/537.36";
+pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9210 Chrome/134.0.6998.205 Electron/35.3.0 Safari/537.36";
 
 #[derive(Debug, Clone)]
 pub struct GatewayOptions {
