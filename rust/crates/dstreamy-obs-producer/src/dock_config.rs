@@ -700,7 +700,7 @@ mod tests {
     }
 
     const RACED: &str = "changed while D-Streamy was saving its settings, so D-Streamy left it as it is for now. \
-         D-Streamy saves its settings again on your next change, when Tools > D-Streamy reopens, or when it saves the session it started or stopped, \
+         D-Streamy saves its settings again on your next change, when Tools > D-Streamy reopens, or on any session ownership save (successful Start, Stop, or closing while Live), \
          replacing what changed in the file";
 
     #[test]
