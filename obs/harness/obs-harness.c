@@ -962,27 +962,39 @@ static char *settings_status(obs_source_t *source)
 	return text;
 }
 
-// Like a click in the properties view: the button's callback, then a rebuild when it returns true.
-static bool click_settings_button(obs_source_t *source, const char *name)
-{
-	obs_properties_t *props = obs_source_properties(source);
-	obs_property_t *button = obs_properties_get(props, name);
-	bool enabled = button && obs_property_enabled(button);
-	bool refresh = enabled && obs_property_button_clicked(button, source);
-	obs_properties_destroy(props);
-	char *status = settings_status(source);
-	printf("HARNESS settings_clicked name=%s enabled=%d refresh=%d status=%s\n", name, enabled, refresh, status);
-	bfree(status);
-	return enabled;
-}
-
 static volatile long refreshes;
+static volatile long clicking;
+static pthread_t click_thread;
+// A real properties view rebuilds synchronously on such a signal, freeing the button the click still uses.
+static volatile long click_thread_refreshes;
 
 static void on_update_properties(void *param, calldata_t *cd)
 {
 	UNUSED_PARAMETER(param);
 	UNUSED_PARAMETER(cd);
 	os_atomic_inc_long(&refreshes);
+	if (os_atomic_load_long(&clicking) && pthread_equal(pthread_self(), click_thread))
+		os_atomic_inc_long(&click_thread_refreshes);
+}
+
+// Like a click in the properties view: the button's callback, then a rebuild when it returns true.
+static bool click_settings_button(obs_source_t *source, const char *name)
+{
+	obs_properties_t *props = obs_source_properties(source);
+	obs_property_t *button = obs_properties_get(props, name);
+	bool enabled = button && obs_property_enabled(button);
+	long before = os_atomic_load_long(&click_thread_refreshes);
+	click_thread = pthread_self();
+	os_atomic_set_long(&clicking, 1);
+	bool refresh = enabled && obs_property_button_clicked(button, source);
+	os_atomic_set_long(&clicking, 0);
+	obs_properties_destroy(props);
+	char *status = settings_status(source);
+	printf("HARNESS settings_clicked name=%s enabled=%d refresh=%d status=%s\n", name, enabled, refresh, status);
+	printf("HARNESS settings_click_sync_refreshes name=%s count=%ld\n", name,
+	       os_atomic_load_long(&click_thread_refreshes) - before);
+	bfree(status);
+	return enabled;
 }
 
 static bool starts_with(const char *text, const char *prefix)

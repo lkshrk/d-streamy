@@ -86,16 +86,29 @@ fn step<R>(f: impl FnOnce(&mut DockModel) -> R) -> R {
 }
 
 /// Ends a start or stop that can't finish with `message`; a settled state is left alone.
-fn abort_pending(message: &str) {
-    step(|m| {
-        if matches!(m.state(), DockState::Starting | DockState::Stopping) {
-            m.abort(message.to_owned());
-        }
+/// Safe in a button callback: it never refreshes, and the callback's `true` rebuilds the dialog.
+fn settle_pending(message: &str) {
+    change(|c, p| {
+        c.session(p.write(), |m| {
+            if matches!(m.state(), DockState::Starting | DockState::Stopping) {
+                m.abort(message.to_owned());
+            }
+        })
     });
+}
+
+/// [`settle_pending`] off the UI thread, where the open dialog must be asked to rebuild.
+fn abort_pending(message: &str) {
+    settle_pending(message);
+    refresh();
 }
 
 /// Starts the control thread; call from `obs_module_load`.
 pub fn install() {
+    if crate::hooks::no_control_thread() {
+        log::warn("test hook: the D-Streamy control thread is not started");
+        return;
+    }
     let (jobs, receiver) = mpsc::unbounded_channel();
     let (closing, closed) = watch::channel(false);
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -180,7 +193,7 @@ pub fn start() {
     match begun {
         Ok((request, persisted)) => {
             if !send_and_wait(|done| Job::Start(request, persisted, done)) {
-                abort_pending(GONE);
+                settle_pending(GONE);
             }
         }
         Err(e) => log::warn(&e),
@@ -193,7 +206,7 @@ pub fn stop() {
     if let Some(ownership) = change(|c, p| c.session(p.write(), |m| m.stop()))
         && !send_and_wait(|done| Job::Stop(ownership, done))
     {
-        abort_pending(GONE);
+        settle_pending(GONE);
     }
 }
 

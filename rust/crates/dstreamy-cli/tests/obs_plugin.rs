@@ -1718,8 +1718,58 @@ fn tools_start_without_the_service_says_so_and_stays_idle() {
     assert_eq!(saved.get("owned"), None, "never owned: {saved}");
 }
 
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_start_without_the_control_thread_says_so_without_rebuilding_inside_the_click() {
+    let h = Harness::new("");
+    let _serve = default_serve(&h);
+    let config = picked_config(3);
+    let gone = "D-Streamy's control thread is not running, so Start and Stop can't finish. \
+                See the OBS log and restart OBS";
+    let (status, lines) = tools_run_env(
+        &h,
+        config.path(),
+        &[
+            "--tools-expect",
+            gone,
+            "--seconds",
+            "5",
+            "--until-video",
+            "1",
+        ],
+        &[("DSTREAMY_TEST_NO_CONTROL_THREAD", std::path::Path::new("1"))],
+    )
+    .finish();
+    passed(status, &lines);
+    assert!(
+        lines.contains(&format!(
+            "HARNESS settings_clicked name=start enabled=1 refresh=1 status={gone}"
+        )),
+        "the click's own rebuild shows the error: {lines:#?}"
+    );
+    assert!(
+        lines.contains(&"HARNESS settings_click_sync_refreshes name=start count=0".to_owned()),
+        "the click never asked OBS to rebuild the dialog it is running in: {lines:#?}"
+    );
+    assert!(lines.contains(&"HARNESS tools output=0 active=0".to_owned()));
+    for want in [
+        "HARNESS settings_property when=after_stop name=start type=8 enabled=1 desc=Start",
+        "HARNESS settings_property when=after_stop name=stop type=8 enabled=0 desc=Stop",
+        "HARNESS settings_info when=after_stop name=status kind=2",
+    ] {
+        assert!(lines.contains(&want.to_owned()), "{want}: {lines:#?}");
+    }
+    assert!(lines.iter().all(|l| !l.contains("panicked")), "{lines:#?}");
+    assert!(h.mock.voice_state().is_none(), "nothing joined");
+    let session = serve_session(&h);
+    assert!(
+        session.is_null() || session == json!({"state": "idle"}),
+        "serve never started a session: {session}"
+    );
+}
+
 fn tools_run(h: &Harness, config: &std::path::Path, extra: &[&str]) -> HarnessRun {
-    tools_run_gated(h, config, extra, None)
+    tools_run_env(h, config, extra, &[])
 }
 
 /// With `gate`, the plugin's Start asks the service only once that file exists.
@@ -1727,7 +1777,16 @@ fn tools_run_gated(
     h: &Harness,
     config: &std::path::Path,
     extra: &[&str],
-    gate: Option<&std::path::Path>,
+    gate: &std::path::Path,
+) -> HarnessRun {
+    tools_run_env(h, config, extra, &[("DSTREAMY_TEST_START_GATE", gate)])
+}
+
+fn tools_run_env(
+    h: &Harness,
+    config: &std::path::Path,
+    extra: &[&str],
+    vars: &[(&str, &std::path::Path)],
 ) -> HarnessRun {
     let dir = config.to_string_lossy().into_owned();
     let lib = fake_frontend();
@@ -1739,11 +1798,7 @@ fn tools_run_gated(
         "--tools-session",
     ];
     args.extend(extra);
-    let vars: Vec<_> = gate
-        .map(|g| ("DSTREAMY_TEST_START_GATE", g))
-        .into_iter()
-        .collect();
-    HarnessRun::start_with_env(h, json!({}), &args, &vars)
+    HarnessRun::start_with_env(h, json!({}), &args, vars)
 }
 
 fn wait_for_line(run: &HarnessRun, what: &str, f: impl Fn(&str) -> bool) -> String {
@@ -1873,7 +1928,7 @@ fn a_start_slower_than_the_click_shows_live_or_its_error_without_reopening() {
         if !answered {
             extra.extend(["--tools-expect", late_error]);
         }
-        let run = tools_run_gated(&h, config.path(), &extra, Some(&gate));
+        let run = tools_run_gated(&h, config.path(), &extra, &gate);
         let clicked = wait_for_line(&run, "start click", |l| {
             l.starts_with("HARNESS settings_clicked name=start ")
         });
@@ -1889,6 +1944,14 @@ fn a_start_slower_than_the_click_shows_live_or_its_error_without_reopening() {
         std::fs::write(&gate, "").unwrap();
         let (status, lines) = run.finish();
         passed(status, &lines);
+        for name in ["start", "stop"] {
+            assert!(
+                !lines.iter().any(|l| l.starts_with(&format!(
+                    "HARNESS settings_click_sync_refreshes name={name} count="
+                )) && !l.ends_with(" count=0")),
+                "no refresh inside a click: {lines:#?}"
+            );
+        }
         let want = if answered {
             "Live on Track 4"
         } else {
@@ -2117,7 +2180,7 @@ fn closing_obs_during_a_start_never_streams_and_unloads_promptly() {
                 "--until-video",
                 "1",
             ],
-            Some(&gate),
+            &gate,
         );
         wait_for_line(&run, "the closing log", |l| {
             l.contains("OBS is closing: D-Streamy finishes its control steps")

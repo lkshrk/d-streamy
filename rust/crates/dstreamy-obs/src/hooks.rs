@@ -78,6 +78,11 @@ mod enabled {
     pub fn start_gate() -> Option<std::path::PathBuf> {
         std::env::var_os("DSTREAMY_TEST_START_GATE").map(Into::into)
     }
+
+    /// Skips starting the control thread, so every Start and Stop finds it gone.
+    pub fn no_control_thread() -> bool {
+        std::env::var_os("DSTREAMY_TEST_NO_CONTROL_THREAD").is_some()
+    }
 }
 
 #[cfg(not(feature = "test-hooks"))]
@@ -87,6 +92,10 @@ mod enabled {
     #[cfg_attr(not(unix), allow(dead_code))]
     pub fn start_gate() -> Option<std::path::PathBuf> {
         None
+    }
+
+    pub fn no_control_thread() -> bool {
+        false
     }
 
     pub struct Hooks;
@@ -108,4 +117,4 @@ mod enabled {
     }
 }
 
-pub use enabled::{Hooks, start_gate};
+pub use enabled::{Hooks, no_control_thread, start_gate};
