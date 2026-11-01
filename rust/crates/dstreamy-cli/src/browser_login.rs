@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use dstreamy_discord::GatewayError;
+use serde::Serialize;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::platform::run_return::EventLoopExtRunReturn;
@@ -18,6 +19,7 @@ use crate::login_capture::{
     self, Action, BrowserLoginOutcome, BrowserState, Command, Failure, Job, RECOVERY_ACTIONS,
     SeenCandidates, Validation, ValidationError, View,
 };
+use crate::output::Out;
 use crate::{CliError, Ctx};
 
 const LOGIN_URL: &str = "https://discord.com/login";
@@ -382,12 +384,21 @@ struct Step {
     command: Option<Command>,
     load: Option<Screen>,
     retitle: bool,
+    visible: Option<bool>,
+    notice: Option<Notice>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Notice {
+    Verifying,
+    Attention(Failure),
 }
 
 /// Everything the login window decides, apart from the window and the webviews themselves.
 struct Session {
     state: BrowserState,
     shown: Screen,
+    visible: bool,
     loads: PageLoads,
     nonces: Nonces,
     start_url: String,
@@ -399,6 +410,7 @@ impl Session {
         Self {
             state: BrowserState::new(now),
             shown: Screen::Discord { verifying: false },
+            visible: true,
             loads: PageLoads::default(),
             nonces,
             start_url,
@@ -463,10 +475,21 @@ impl Session {
         }
         let retitle = current != self.shown;
         self.shown = current;
+        let visible = self.state.window_visible();
+        let toggle = (visible != self.visible).then_some(visible);
+        self.visible = visible;
+        let notice = match (toggle, current) {
+            _ if !self.state.is_open() => None,
+            (Some(false), _) => Some(Notice::Verifying),
+            (Some(true), Screen::Recovery(failure)) => Some(Notice::Attention(failure)),
+            _ => None,
+        };
         Step {
             command,
             load,
             retitle,
+            visible: toggle,
+            notice,
         }
     }
 
@@ -714,7 +737,7 @@ struct Views {
 }
 
 /// Blocks the main thread until the user logs in or leaves; only a validated token is returned.
-pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError> {
+pub fn run(ctx: &Ctx, runtime: &Handle, out: &Out) -> Result<BrowserLoginOutcome, CliError> {
     let mut event_loop = EventLoopBuilder::<Msg>::with_user_event().build();
     let nonces = Nonces::new()?;
     let start_url = login_url();
@@ -730,13 +753,35 @@ pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError>
         .map_err(|e| CliError::BrowserLogin(e.to_string()))?;
     let views = build_views(&event_loop, &window, &nonces, &start_url)?;
     let mut session = Session::new(nonces, start_url, Instant::now());
-    let outcome = drive(&mut event_loop, &mut session, &views, &window, ctx, runtime);
+    let outcome = drive(
+        &mut event_loop,
+        &mut session,
+        &views,
+        &window,
+        ctx,
+        runtime,
+        out,
+    );
     drop(views);
     drop(window);
+    #[cfg(target_os = "linux")]
+    finish_gtk_work();
     if let Some(trouble) = session.trouble {
         return Err(trouble.error());
     }
     outcome.ok_or_else(|| CliError::BrowserLogin("the login window closed unexpectedly".into()))
+}
+
+#[cfg(target_os = "linux")]
+const GTK_FINISH_LIMIT: Duration = Duration::from_millis(500);
+
+/// GTK destroys the window only on later main-loop turns; unpumped, the compositor keeps it mapped.
+#[cfg(target_os = "linux")]
+fn finish_gtk_work() {
+    let limit = Instant::now() + GTK_FINISH_LIMIT;
+    while gtk::events_pending() && Instant::now() < limit {
+        gtk::main_iteration_do(false);
+    }
 }
 
 fn main_view<'a>(
@@ -845,6 +890,7 @@ fn drive(
     window: &Window,
     ctx: &Ctx,
     runtime: &Handle,
+    out: &Out,
 ) -> Option<BrowserLoginOutcome> {
     #[cfg(feature = "test-hooks")]
     let smoke = smoke();
@@ -875,6 +921,14 @@ fn drive(
         let now = Instant::now();
         let step = session.step(event, now);
         abort_unless_validating(&mut validation, session.state.is_validating());
+        if step.visible == Some(false) {
+            set_window_visible(window, false);
+        }
+        match step.notice {
+            Some(Notice::Verifying) => report_verifying(out),
+            Some(Notice::Attention(failure)) => report_attention(out, failure),
+            None => {}
+        }
         match step.command {
             Some(Command::Validate(job)) => start_validation(
                 &mut validation,
@@ -889,6 +943,9 @@ fn drive(
         }
         if let Some(screen) = step.load {
             show(&views.main, screen, &session.start_url, &session.nonces.app);
+        }
+        if step.visible == Some(true) {
+            set_window_visible(window, true);
         }
         if step.retitle {
             set_title(window, session.shown);
@@ -949,6 +1006,58 @@ async fn check_token(ctx: Ctx, token: String) -> Result<String, ValidationError<
     }
 }
 
+#[derive(Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum ProgressRow {
+    Verifying,
+    Attention,
+}
+
+fn report_verifying(out: &Out) {
+    if out.json {
+        out.json_line(&ProgressRow::Verifying);
+    } else {
+        out.line("Verifying the Discord login… (Ctrl+C cancels)");
+    }
+}
+
+fn attention_line(failure: Failure) -> String {
+    format!(
+        "The login needs your attention in the window: {}",
+        recovery_text(failure).1
+    )
+}
+
+fn report_attention(out: &Out, failure: Failure) {
+    if out.json {
+        out.json_line(&ProgressRow::Attention);
+    } else {
+        out.line(attention_line(failure));
+    }
+}
+
+fn set_window_visible(window: &Window, visible: bool) {
+    // tao's show_all would also reveal the hidden status view.
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::{GtkWindowExt, WidgetExt};
+        use tao::platform::unix::WindowExtUnix;
+        if visible {
+            window.gtk_window().present();
+        } else {
+            window.gtk_window().hide();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        window.set_visible(visible);
+        // Ordering the window front does not activate the app, so it could stay behind the terminal.
+        if visible {
+            window.set_focus();
+        }
+    }
+}
+
 fn set_title(window: &Window, screen: Screen) {
     let title = match screen {
         Screen::Discord { verifying: true } => "D-Streamy: verifying the login…",
@@ -969,7 +1078,16 @@ fn show(webview: &WebView, screen: Screen, start_url: &str, app_nonce: &str) {
 }
 
 fn recovery_page(failure: Failure, app_nonce: &str) -> String {
-    let (title, message) = match failure {
+    let (title, message) = recovery_text(failure);
+    RECOVERY_PAGE
+        .replace("{nonce}", app_nonce)
+        .replace("{title}", title)
+        .replace("{message}", message)
+        .replace("{actions}", &recovery_buttons())
+}
+
+fn recovery_text(failure: Failure) -> (&'static str, &'static str) {
+    match failure {
         Failure::NoCandidate => (
             "Login not completed",
             "Discord shows you as signed in, but D-Streamy could not read the session.",
@@ -990,12 +1108,7 @@ fn recovery_page(failure: Failure, app_nonce: &str) -> String {
             "That page isn't part of Discord's login",
             "D-Streamy only shows Discord's own login pages. Retry to go back to the login.",
         ),
-    };
-    RECOVERY_PAGE
-        .replace("{nonce}", app_nonce)
-        .replace("{title}", title)
-        .replace("{message}", message)
-        .replace("{actions}", &recovery_buttons())
+    }
 }
 
 /// macOS routes ⌘C/⌘V/⌘X/⌘A through the menu bar; without an Edit menu they do nothing.
@@ -1580,6 +1693,67 @@ mod tests {
             assert_eq!(commit(&mut session, url, now).load, None, "{url}");
         }
         assert_eq!(session.state.view(), View::Discord);
+    }
+
+    fn discord(session: &mut Session, message: &str, now: Instant) -> Step {
+        session.step(
+            LoopEvent::Msg(Msg::Ipc {
+                uri: "https://discord.com/app".to_owned(),
+                body: by(DISCORD_NONCE, message),
+            }),
+            now,
+        )
+    }
+
+    #[test]
+    fn the_window_hides_once_on_sign_in_and_returns_for_recovery() {
+        let now = Instant::now();
+        let mut session = session(now);
+        let step = discord(&mut session, "signed_in", now);
+        assert_eq!(step.visible, Some(false));
+        assert_eq!(step.notice, Some(Notice::Verifying));
+        let step = wake(&mut session, now);
+        assert_eq!((step.visible, step.notice), (None, None));
+        let step = discord(&mut session, "candidate:aaa.bbb.ccc", now);
+        assert!(matches!(step.command, Some(Command::Validate(_))));
+        assert_eq!((step.visible, step.notice), (None, None));
+        let late = now + BRIEF_VALIDATION_TIMEOUT;
+        let step = wake(&mut session, late);
+        assert_eq!(step.load, Some(Screen::Recovery(Failure::Unreachable)));
+        assert_eq!(step.visible, Some(true));
+        assert_eq!(step.notice, Some(Notice::Attention(Failure::Unreachable)));
+        let step = wake(&mut session, late);
+        assert_eq!((step.visible, step.notice), (None, None));
+    }
+
+    #[test]
+    fn the_attention_line_gives_the_recovery_reason() {
+        let line = attention_line(Failure::Rejected);
+        assert!(line.starts_with("The login needs your attention in the window: "));
+        assert!(line.ends_with(recovery_text(Failure::Rejected).1));
+        assert!(
+            recovery_page(Failure::Rejected, APP_NONCE)
+                .contains(recovery_text(Failure::Rejected).1)
+        );
+    }
+
+    #[test]
+    fn a_recovery_before_sign_in_needs_no_notice() {
+        let now = Instant::now();
+        let mut session = session(now);
+        let step = commit(&mut session, "https://discordstatus.com/", now);
+        assert_eq!(step.load, Some(Screen::Recovery(Failure::LeftDiscord)));
+        assert_eq!((step.visible, step.notice), (None, None));
+    }
+
+    #[test]
+    fn the_window_hides_when_the_login_ends() {
+        let now = Instant::now();
+        let mut session = session(now);
+        let step = session.step(LoopEvent::CloseRequested, now);
+        assert!(matches!(step.command, Some(Command::Exit(_))));
+        assert_eq!(step.visible, Some(false));
+        assert_eq!(step.notice, None);
     }
 
     #[test]

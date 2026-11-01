@@ -327,6 +327,11 @@ impl BrowserState {
         self.view == View::Discord && self.is_validating()
     }
 
+    /// Discord's full client after sign-in does not fit the login window, so it stays hidden.
+    pub fn window_visible(&self) -> bool {
+        !self.finished && !(self.view == View::Discord && self.signed_in)
+    }
+
     pub fn ipc(&mut self, message: &str, now: Instant) -> Option<Command> {
         let event = parse_event(message)?;
         self.event(event, now)
@@ -695,6 +700,53 @@ mod tests {
         assert_eq!(format!("{accepted:?}"), "Validation::Accepted(<redacted>)");
         let err: ValidationError<&str> = ValidationError::Transient("secret.tok.en");
         assert!(!format!("{err:?}").contains("secret"));
+    }
+
+    #[test]
+    fn the_window_hides_once_discord_reports_sign_in_and_until_recovery() {
+        let now = Instant::now();
+        let mut state = BrowserState::new(now);
+        state.page_loaded();
+        assert!(state.window_visible());
+        assert!(state.ipc("signed_in", now).is_none());
+        assert!(!state.window_visible());
+        assert!(state.ipc("candidate:aaa.bbb.ccc", now).is_some());
+        assert!(!state.window_visible());
+        state.tick(now + BRIEF_VALIDATION_TIMEOUT);
+        assert_eq!(state.view(), View::Recovery(Failure::Unreachable));
+        assert!(state.window_visible());
+        assert!(state.ipc("action:retry", now).is_none());
+        assert!(state.window_visible());
+    }
+
+    #[test]
+    fn a_check_before_sign_in_keeps_the_window_until_sign_in_is_reported() {
+        let now = Instant::now();
+        let mut state = BrowserState::new(now);
+        state.page_loaded();
+        assert!(state.ipc("candidate:aaa.bbb.ccc", now).is_some());
+        assert!(state.verifying() && state.window_visible());
+        assert!(state.ipc("signed_in", now).is_none());
+        assert!(!state.window_visible());
+    }
+
+    #[test]
+    fn sign_in_without_a_session_shows_the_window_again_after_the_grace() {
+        let now = Instant::now();
+        let mut state = BrowserState::new(now);
+        state.page_loaded();
+        assert!(state.ipc("signed_in", now).is_none());
+        state.tick(now + SIGNED_IN_GRACE);
+        assert_eq!(state.view(), View::Recovery(Failure::NoCandidate));
+        assert!(state.window_visible());
+    }
+
+    #[test]
+    fn a_finished_login_has_no_window() {
+        let now = Instant::now();
+        let mut state = BrowserState::new(now);
+        assert!(state.close().is_some());
+        assert!(!state.window_visible());
     }
 
     #[test]

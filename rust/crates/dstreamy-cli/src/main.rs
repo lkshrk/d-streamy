@@ -167,7 +167,7 @@ fn main() -> ExitCode {
                     feature = "browser-login",
                     any(target_os = "linux", target_os = "macos")
                 ))]
-                LoginMode::Browser => browser_token(&ctx, runtime.handle()),
+                LoginMode::Browser => browser_token(&ctx, runtime.handle(), &out),
                 #[cfg(not(all(
                     feature = "browser-login",
                     any(target_os = "linux", target_os = "macos")
@@ -307,9 +307,13 @@ async fn run(
     feature = "browser-login",
     any(target_os = "linux", target_os = "macos")
 ))]
-fn browser_token(ctx: &Ctx, runtime: &tokio::runtime::Handle) -> Result<Option<String>, CliError> {
+fn browser_token(
+    ctx: &Ctx,
+    runtime: &tokio::runtime::Handle,
+    out: &Out,
+) -> Result<Option<String>, CliError> {
     use dstreamy_cli::login_capture::{FollowUp, follow_up};
-    match follow_up(dstreamy_cli::browser_login::run(ctx, runtime)?)? {
+    match follow_up(dstreamy_cli::browser_login::run(ctx, runtime, out)?)? {
         FollowUp::Login(token) => Ok(Some(token)),
         FollowUp::Qr => Ok(None),
         FollowUp::ReadToken => read_token().map(Some),
