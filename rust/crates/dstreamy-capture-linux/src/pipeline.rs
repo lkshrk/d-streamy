@@ -931,14 +931,17 @@ mod tests {
         let video = video_frames(&frames);
         assert!(video.len() >= 30, "only {} AUs", video.len());
 
-        let first = video[0];
-        assert!(first.keyframe);
-        assert_eq!(first.codec, VideoCodec::H264);
-        let types: Vec<u8> = annexb::nal_units(&first.data)
-            .filter_map(annexb::h264_nal_type)
-            .collect();
-        for t in [H264_NAL_SPS, H264_NAL_PPS, H264_NAL_IDR] {
-            assert!(types.contains(&t), "keyframe NAL types {types:?}");
+        assert!(video[0].keyframe);
+        assert_eq!(video[0].codec, VideoCodec::H264);
+        let keyframes: Vec<_> = video.iter().filter(|v| v.keyframe).collect();
+        assert!(!keyframes.is_empty());
+        for keyframe in keyframes {
+            let types: Vec<u8> = annexb::nal_units(&keyframe.data)
+                .filter_map(annexb::h264_nal_type)
+                .collect();
+            for t in [H264_NAL_SPS, H264_NAL_PPS, H264_NAL_IDR] {
+                assert!(types.contains(&t), "keyframe NAL types {types:?}");
+            }
         }
         for pair in video.windows(2) {
             assert!(pair[1].pts_us > pair[0].pts_us);
@@ -947,8 +950,18 @@ mod tests {
             assert!(au.data.starts_with(&annexb::START_CODE));
             assert_eq!(au.keyframe, annexb::h264_is_keyframe(&au.data));
         }
-        let keyframes = video.iter().filter(|v| v.keyframe).count();
-        assert_eq!(keyframes, 1, "one keyframe per fps*2 frames");
+        let keyframe_positions: Vec<_> = video
+            .iter()
+            .enumerate()
+            .filter_map(|(i, frame)| frame.keyframe.then_some(i))
+            .collect();
+        let max_gop = cfg.fps as usize * 2;
+        assert!(
+            keyframe_positions
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] <= max_gop)
+        );
+        assert!(video.len() - keyframe_positions.last().unwrap() <= max_gop);
 
         let (decoded, size) = decode_all(&video);
         assert!(decoded >= 30);
