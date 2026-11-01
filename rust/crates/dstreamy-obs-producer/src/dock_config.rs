@@ -9,10 +9,10 @@ pub enum ConfigError {
     /// OBS gave the module no config folder.
     NoFolder,
     /// The file exists but is not a settings object; it is never overwritten.
-    Corrupt {
-        path: String,
-        detail: String,
-    },
+    Corrupt { path: String, detail: String },
+    /// The file exists but reading it failed; it is never overwritten either.
+    Unreadable { path: String, detail: String },
+    /// A write failed; it is retried on the next open.
     Failed(String),
 }
 
@@ -27,16 +27,20 @@ impl ConfigError {
                 "Couldn't read D-Streamy's settings from {path}: not valid JSON ({detail}). \
                  Fix or delete the file; until then {track} is used until OBS quits but is not saved"
             ),
+            Self::Unreadable { path, detail } => format!(
+                "Couldn't read D-Streamy's settings from {path}: {detail}. \
+                 Fix the file's permissions or delete it; until then {track} is used until OBS quits but is not saved"
+            ),
             Self::Failed(reason) => format!("{reason}; {track} is used until OBS quits"),
         }
     }
 }
 
-/// A config file's contents, and where it was read.
+/// A config file's raw contents, and where it was read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Saved {
     pub path: String,
-    pub text: String,
+    pub bytes: Vec<u8>,
 }
 
 /// The settings JSON as saved, or why it can't be used.
@@ -72,8 +76,12 @@ impl ConfigState {
         self.error.as_ref()
     }
 
-    fn corrupt(&self) -> bool {
-        matches!(self.error, Some(ConfigError::Corrupt { .. }))
+    /// An existing file can't be used, so nothing may replace it until it reads cleanly.
+    fn blocked(&self) -> bool {
+        matches!(
+            self.error,
+            Some(ConfigError::Corrupt { .. } | ConfigError::Unreadable { .. })
+        )
     }
 
     /// A dialog opens: unsaved settings are retried rather than replaced; otherwise the file is read.
@@ -82,12 +90,15 @@ impl ConfigState {
         read: impl FnOnce() -> Result<Option<Saved>, ConfigError>,
         write: impl FnOnce(&str) -> Result<(), ConfigError>,
     ) {
-        if self.unsaved && !self.corrupt() {
+        if self.unsaved && !self.blocked() {
             self.save(write);
             return;
         }
         match read() {
-            Ok(Some(Saved { path, text })) => match parse(&text) {
+            Ok(Some(Saved { path, bytes })) => match String::from_utf8(bytes)
+                .map_err(|e| format!("not UTF-8: {e}"))
+                .and_then(|text| parse(&text))
+            {
                 Ok(settings) => {
                     self.model.reload(settings);
                     self.error = None;
@@ -101,7 +112,7 @@ impl ConfigState {
         }
     }
 
-    /// The dialog picked a track. False when out of range; a corrupt file is left alone.
+    /// The dialog picked a track. False when out of range; a corrupt or unreadable file is left alone.
     pub fn select_audio_track(
         &mut self,
         track: u8,
@@ -110,7 +121,7 @@ impl ConfigState {
         if !self.model.select_audio_track(track) {
             return false;
         }
-        if self.corrupt() {
+        if self.blocked() {
             self.unsaved = true;
         } else {
             self.save(write);
@@ -158,7 +169,7 @@ mod tests {
             || {
                 Ok(self.text.borrow().clone().map(|text| Saved {
                     path: "/c".into(),
-                    text,
+                    bytes: text.into_bytes(),
                 }))
             }
         }
@@ -272,5 +283,74 @@ mod tests {
         s.open(|| Err(failed()), |_| unreachable!("nothing to save"));
         assert_eq!(s.model.settings().audio_track, 3);
         assert_eq!(s.error(), Some(&failed()));
+    }
+
+    fn unreadable() -> ConfigError {
+        ConfigError::Unreadable {
+            path: "/c".into(),
+            detail: "Permission denied (os error 13)".into(),
+        }
+    }
+
+    #[test]
+    fn an_existing_file_that_cant_be_read_is_never_written() {
+        let mut s = ConfigState::default();
+        s.model.select_audio_track(2);
+        s.open(|| Err(unreadable()), |_| panic!("no write on open"));
+        assert_eq!(s.error(), Some(&unreadable()));
+        assert!(s.select_audio_track(4, |_| panic!("no write while unreadable")));
+        s.open(
+            || Err(unreadable()),
+            |_| panic!("no retry while unreadable"),
+        );
+        assert_eq!(s.model.settings().audio_track, 4);
+        assert_eq!(s.error(), Some(&unreadable()));
+        let msg = s.error().unwrap().message(4);
+        assert_eq!(
+            msg,
+            "Couldn't read D-Streamy's settings from /c: Permission denied (os error 13). \
+             Fix the file's permissions or delete it; until then Track 4 is used until OBS quits but is not saved"
+        );
+        let f = File::new(Some(r#"{"audio_track":3}"#));
+        open(&mut s, &f);
+        assert_eq!(s.error(), None, "readable again");
+        assert_eq!(s.model.settings().audio_track, 3);
+    }
+
+    #[test]
+    fn a_file_that_is_not_utf8_is_corrupt_and_never_written() {
+        let mut s = ConfigState::default();
+        let bytes = vec![b'{', 0xff, 0xfe, b'}'];
+        let read = || {
+            Ok(Some(Saved {
+                path: "/c".into(),
+                bytes: bytes.clone(),
+            }))
+        };
+        s.open(read, |_| panic!("no write on open"));
+        assert!(
+            matches!(s.error(), Some(ConfigError::Corrupt { detail, .. }) if detail.starts_with("not UTF-8")),
+            "{:?}",
+            s.error()
+        );
+        assert!(s.select_audio_track(5, |_| panic!("no write while corrupt")));
+        s.open(read, |_| panic!("no retry while corrupt"));
+        assert_eq!(s.model.settings().audio_track, 5);
+    }
+
+    #[test]
+    fn a_failed_write_is_still_retried_on_open() {
+        let mut s = ConfigState::default();
+        s.select_audio_track(4, |_| Err(failed()));
+        let mut wrote = None;
+        s.open(
+            || panic!("no read over unsaved settings"),
+            |json| {
+                wrote = Some(json.to_owned());
+                Ok(())
+            },
+        );
+        assert!(wrote.unwrap().contains(r#""audio_track":4"#));
+        assert_eq!(s.error(), None);
     }
 }

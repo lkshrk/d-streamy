@@ -1247,10 +1247,17 @@ fn temp_files(dir: &std::path::Path) -> Vec<String> {
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn a_corrupt_module_config_is_reported_and_never_overwritten() {
+    let bad_json: &[u8] = b"{\"audio_track\": 3, \"owned\": oops";
+    let not_utf8: &[u8] = b"{\"audio_track\": 3, \"guild_id\": \"\xff\xfe\"}";
+    for garbage in [bad_json, not_utf8] {
+        corrupt_module_config_is_kept(garbage);
+    }
+}
+
+fn corrupt_module_config_is_kept(garbage: &[u8]) {
     let config = tempfile::tempdir().unwrap();
     let path = module_config(config.path());
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let garbage = b"{\"audio_track\": 3, \"owned\": oops";
     std::fs::write(&path, garbage).unwrap();
     let dir = config.path().to_string_lossy().into_owned();
     let lib = fake_frontend();

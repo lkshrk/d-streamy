@@ -27,19 +27,19 @@ fn path() -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
-/// The saved settings, or `None` before the first save.
+/// The saved bytes, or `None` only when no file exists yet.
 pub fn load() -> Result<Option<Saved>, ConfigError> {
     let path = path()?;
-    match fs::read_to_string(&path) {
-        Ok(text) => Ok(Some(Saved {
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Some(Saved {
             path: path.display().to_string(),
-            text,
+            bytes,
         })),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(ConfigError::Failed(format!(
-            "Couldn't read D-Streamy's settings from {}: {e}",
-            path.display()
-        ))),
+        Err(e) => Err(ConfigError::Unreadable {
+            path: path.display().to_string(),
+            detail: e.to_string(),
+        }),
     }
 }
 
