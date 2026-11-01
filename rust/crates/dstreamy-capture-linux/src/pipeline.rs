@@ -924,12 +924,13 @@ mod tests {
         let input = VideoInput::Test {
             width: 1280,
             height: 720,
-            frames: 60,
+            frames: 121,
         };
         let (encoder, frames) = run(input, None, &cfg);
         assert_eq!(encoder, "x264enc");
         let video = video_frames(&frames);
-        assert!(video.len() >= 30, "only {} AUs", video.len());
+        let max_gop = cfg.fps as usize * 2;
+        assert!(video.len() > max_gop, "only {} AUs", video.len());
 
         assert!(video[0].keyframe);
         assert_eq!(video[0].codec, VideoCodec::H264);
@@ -955,13 +956,13 @@ mod tests {
             .enumerate()
             .filter_map(|(i, frame)| frame.keyframe.then_some(i))
             .collect();
-        let max_gop = cfg.fps as usize * 2;
+        assert!(keyframe_positions.len() >= 2);
         assert!(
             keyframe_positions
                 .windows(2)
                 .all(|pair| pair[1] - pair[0] <= max_gop)
         );
-        assert!(video.len() - keyframe_positions.last().unwrap() <= max_gop);
+        assert!(video.len() - 1 - keyframe_positions.last().unwrap() <= max_gop);
 
         let (decoded, size) = decode_all(&video);
         assert!(decoded >= 30);
