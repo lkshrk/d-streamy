@@ -10,7 +10,7 @@ use dstreamy_cli::login_capture::{LoginMode, login_mode};
 use dstreamy_cli::output::{Out, table};
 use dstreamy_cli::{CliError, Ctx, capture, daemon, serve, service, stream, tui};
 use dstreamy_core::{ConfigPaths, RotatingFileWriter};
-use dstreamy_discord::{DEFAULT_GATEWAY_URL, VoiceChannelKind, remote_auth};
+use dstreamy_discord::{CurrentUser, DEFAULT_GATEWAY_URL, VoiceChannelKind, remote_auth};
 use serde::Serialize;
 use tracing::Level;
 use tracing_subscriber::filter::Targets;
@@ -159,7 +159,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let token = match cli.command {
+    let credentials = match cli.command {
         Command::Login { token, browser } => {
             let mode = login_mode(token, browser, std::io::stdin().is_terminal());
             let read = match mode {
@@ -173,11 +173,11 @@ fn main() -> ExitCode {
                     any(target_os = "linux", target_os = "macos")
                 )))]
                 LoginMode::Browser => Err(CliError::BrowserLoginUnavailable),
-                LoginMode::Token => read_token().map(Some),
+                LoginMode::Token => read_token().map(Credentials::unchecked).map(Some),
                 LoginMode::Qr => Ok(None),
             };
             match read {
-                Ok(token) => token,
+                Ok(credentials) => credentials,
                 Err(e) => {
                     out.error(e);
                     return ExitCode::FAILURE;
@@ -186,7 +186,7 @@ fn main() -> ExitCode {
         }
         _ => None,
     };
-    let result = runtime.block_on(run(cli.command, token, &ctx, &out));
+    let result = runtime.block_on(run(cli.command, credentials, &ctx, &out));
     // Background tasks (webrtc, the gateway) must not keep the process alive after the command.
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     match result {
@@ -244,17 +244,17 @@ fn context(cli: &Cli) -> Result<Ctx, CliError> {
 
 async fn run(
     command: Command,
-    token: Option<String>,
+    credentials: Option<Credentials>,
     ctx: &Ctx,
     out: &Out,
 ) -> Result<ExitCode, CliError> {
     match command {
         Command::Login { .. } => {
-            let token = match token {
-                Some(token) => token,
-                None => qr_token(out).await?,
+            let credentials = match credentials {
+                Some(credentials) => credentials,
+                None => Credentials::unchecked(qr_token(out).await?),
             };
-            login(ctx, out, token).await
+            login(ctx, out, credentials).await
         }
         Command::Guilds => guilds(ctx, out).await,
         Command::Channels { guild } => channels(ctx, out, &guild).await,
@@ -311,12 +311,15 @@ fn browser_token(
     ctx: &Ctx,
     runtime: &tokio::runtime::Handle,
     out: &Out,
-) -> Result<Option<String>, CliError> {
+) -> Result<Option<Credentials>, CliError> {
     use dstreamy_cli::login_capture::{FollowUp, follow_up};
     match follow_up(dstreamy_cli::browser_login::run(ctx, runtime, out)?)? {
-        FollowUp::Login(token) => Ok(Some(token)),
+        FollowUp::Login(verified) => Ok(Some(Credentials {
+            token: verified.token,
+            user: Some(verified.user),
+        })),
         FollowUp::Qr => Ok(None),
-        FollowUp::ReadToken => read_token().map(Some),
+        FollowUp::ReadToken => read_token().map(Credentials::unchecked).map(Some),
     }
 }
 
@@ -395,10 +398,29 @@ struct LoginRow<'a> {
     token_file: &'a std::path::Path,
 }
 
-async fn login(ctx: &Ctx, out: &Out, token: String) -> Result<ExitCode, CliError> {
-    let client = discord::connect_with(ctx, token.clone(), Persistence::Brief).await?;
-    let user = client.user().clone();
-    client.close().await;
+/// A login token; `user` is set once the gateway has accepted it.
+struct Credentials {
+    token: String,
+    user: Option<CurrentUser>,
+}
+
+impl Credentials {
+    fn unchecked(token: String) -> Self {
+        Self { token, user: None }
+    }
+}
+
+async fn login(ctx: &Ctx, out: &Out, credentials: Credentials) -> Result<ExitCode, CliError> {
+    let Credentials { token, user } = credentials;
+    let user = match user {
+        Some(user) => user,
+        None => {
+            let client = discord::connect_with(ctx, token.clone(), Persistence::Brief).await?;
+            let user = client.user().clone();
+            client.close().await;
+            user
+        }
+    };
     ctx.paths.save_token(&token)?;
     if out.json {
         out.json_line(&LoginRow {

@@ -4,6 +4,7 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
+use dstreamy_discord::CurrentUser;
 use futures_util::FutureExt;
 
 use crate::CliError;
@@ -185,9 +186,25 @@ where
 pub const SIGNED_IN_GRACE: Duration = Duration::from_secs(20);
 pub const PAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A token the gateway accepted, with the account it belongs to.
+#[derive(PartialEq, Eq)]
+pub struct VerifiedLogin {
+    pub token: String,
+    pub user: CurrentUser,
+}
+
+impl fmt::Debug for VerifiedLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VerifiedLogin")
+            .field("token", &"<redacted>")
+            .field("user", &self.user)
+            .finish()
+    }
+}
+
 #[derive(PartialEq, Eq)]
 pub enum BrowserLoginOutcome {
-    Token(String),
+    Token(VerifiedLogin),
     Cancelled,
     UseQr,
     UseToken,
@@ -232,14 +249,14 @@ pub fn login_mode(token_flag: bool, browser_flag: bool, stdin_is_terminal: bool)
 
 /// What the `login` command does after the browser window has closed.
 pub enum FollowUp {
-    Login(String),
+    Login(VerifiedLogin),
     Qr,
     ReadToken,
 }
 
 pub fn follow_up(outcome: BrowserLoginOutcome) -> Result<FollowUp, CliError> {
     match outcome {
-        BrowserLoginOutcome::Token(token) => Ok(FollowUp::Login(token)),
+        BrowserLoginOutcome::Token(verified) => Ok(FollowUp::Login(verified)),
         BrowserLoginOutcome::UseQr => Ok(FollowUp::Qr),
         BrowserLoginOutcome::UseToken => Ok(FollowUp::ReadToken),
         BrowserLoginOutcome::Cancelled => Err(CliError::BrowserLogin("cancelled".into())),
@@ -441,7 +458,7 @@ impl BrowserState {
         &mut self,
         generation: u64,
         seen: SeenCandidates,
-        result: Validation<String>,
+        result: Validation<VerifiedLogin>,
         now: Instant,
     ) -> Option<Command> {
         if self.finished {
@@ -453,8 +470,8 @@ impl BrowserState {
         self.validation_deadline = None;
         self.seen = Some(seen);
         match result {
-            Validation::Accepted(token) => {
-                return Some(self.exit(BrowserLoginOutcome::Token(token)));
+            Validation::Accepted(verified) => {
+                return Some(self.exit(BrowserLoginOutcome::Token(verified)));
             }
             Validation::Rejected => self.last_failure = Some(Failure::Rejected),
             Validation::Transient => self.last_failure = Some(Failure::Unreachable),

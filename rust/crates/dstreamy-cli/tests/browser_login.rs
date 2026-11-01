@@ -4,12 +4,24 @@ use dstreamy_cli::CliError;
 use dstreamy_cli::discord::BRIEF_VALIDATION_TIMEOUT as VALIDATION_TIMEOUT;
 use dstreamy_cli::login_capture::{
     Action, BrowserLoginOutcome, BrowserState, Command, Event, Failure, FollowUp, Job,
-    PAGE_LOAD_TIMEOUT, SIGNED_IN_GRACE, SeenCandidates, Validation, ValidationError, View,
-    follow_up, parse_event, validate_job,
+    PAGE_LOAD_TIMEOUT, SIGNED_IN_GRACE, SeenCandidates, Validation, ValidationError, VerifiedLogin,
+    View, follow_up, parse_event, validate_job,
 };
+use dstreamy_discord::CurrentUser;
 use futures_util::FutureExt;
 
 const MS: Duration = Duration::from_millis(1);
+
+fn verified(token: &str) -> VerifiedLogin {
+    VerifiedLogin {
+        token: token.to_owned(),
+        user: CurrentUser {
+            id: "42".to_owned(),
+            username: "burner".to_owned(),
+            global_name: Some("Burner".to_owned()),
+        },
+    }
+}
 
 fn loaded(now: Instant) -> BrowserState {
     let mut state = BrowserState::new(now);
@@ -31,14 +43,18 @@ fn exit(command: Option<Command>) -> BrowserLoginOutcome {
     }
 }
 
-fn finish(state: &mut BrowserState, job: Job, result: Validation<String>) -> Option<Command> {
+fn finish(
+    state: &mut BrowserState,
+    job: Job,
+    result: Validation<VerifiedLogin>,
+) -> Option<Command> {
     finish_at(state, job, result, Instant::now())
 }
 
 fn finish_at(
     state: &mut BrowserState,
     job: Job,
-    result: Validation<String>,
+    result: Validation<VerifiedLogin>,
     now: Instant,
 ) -> Option<Command> {
     let Job {
@@ -48,7 +64,7 @@ fn finish_at(
     } = job;
     let checked = validate_job(seen, candidate, |_| async move {
         match result {
-            Validation::Accepted(token) => Ok(token),
+            Validation::Accepted(verified) => Ok(verified),
             Validation::Rejected => Err(ValidationError::Rejected),
             Validation::Transient => Err(ValidationError::Transient(())),
         }
@@ -58,9 +74,8 @@ fn finish_at(
 }
 
 fn run_validation(state: &mut BrowserState, job: Job, accept: bool) -> Option<Command> {
-    let token = job.candidate.as_str().to_owned();
     let result = if accept {
-        Validation::Accepted(token)
+        Validation::Accepted(verified(job.candidate.as_str()))
     } else {
         Validation::Rejected
     };
@@ -132,8 +147,8 @@ fn cancelled_outcome_never_reaches_the_saving_login() {
         _ => panic!("cancel must end the command with an error"),
     }
     assert!(matches!(
-        follow_up(BrowserLoginOutcome::Token("good.tok.en".to_owned())),
-        Ok(FollowUp::Login(token)) if token == "good.tok.en"
+        follow_up(BrowserLoginOutcome::Token(verified("good.tok.en"))),
+        Ok(FollowUp::Login(s)) if s == verified("good.tok.en")
     ));
     assert!(matches!(
         follow_up(BrowserLoginOutcome::UseQr),
@@ -221,7 +236,7 @@ fn later_valid_candidate_wins_after_a_rejection() {
     let good = job(state.ipc("candidate:good.tok.en", start + MS));
     assert_eq!(
         exit(run_validation(&mut state, good, true)),
-        BrowserLoginOutcome::Token("good.tok.en".to_owned())
+        BrowserLoginOutcome::Token(verified("good.tok.en"))
     );
 }
 
@@ -255,7 +270,7 @@ fn accepted_candidate_becomes_the_token() {
     let j = job(state.ipc("candidate:good.tok.en", now));
     assert_eq!(
         exit(run_validation(&mut state, j, true)),
-        BrowserLoginOutcome::Token("good.tok.en".to_owned())
+        BrowserLoginOutcome::Token(verified("good.tok.en"))
     );
     assert!(!state.is_open());
 }
@@ -272,7 +287,7 @@ fn candidates_arriving_during_validation_are_queued_then_validated() {
     assert_eq!(state.view(), View::Discord);
     assert_eq!(
         exit(run_validation(&mut state, second, true)),
-        BrowserLoginOutcome::Token("good.tok.en".to_owned())
+        BrowserLoginOutcome::Token(verified("good.tok.en"))
     );
 }
 
@@ -288,7 +303,7 @@ fn expired_grace_during_validation_clears_the_deadline_and_still_accepts() {
     assert_eq!(state.view(), View::Discord);
     assert_eq!(
         exit(run_validation(&mut state, j, true)),
-        BrowserLoginOutcome::Token("slow.tok.en".to_owned())
+        BrowserLoginOutcome::Token(verified("slow.tok.en"))
     );
 }
 
@@ -360,7 +375,7 @@ fn close_during_validation_exits_immediately_and_discards_a_stale_success() {
             .validated(
                 j.generation,
                 j.seen,
-                Validation::Accepted("good.tok.en".to_owned()),
+                Validation::Accepted(verified("good.tok.en")),
                 now
             )
             .is_none()
@@ -510,7 +525,7 @@ fn timeout_then_retry_gives_the_next_candidate_its_own_timeout() {
             .validated(
                 stale.generation,
                 stale.seen,
-                Validation::Accepted("slow.tok.en".to_owned()),
+                Validation::Accepted(verified("slow.tok.en")),
                 candidate_at
             )
             .is_none()
@@ -519,7 +534,7 @@ fn timeout_then_retry_gives_the_next_candidate_its_own_timeout() {
     assert_eq!(state.deadline(), Some(candidate_at + VALIDATION_TIMEOUT));
     assert_eq!(
         exit(run_validation(&mut state, next, true)),
-        BrowserLoginOutcome::Token("next.tok.en".to_owned())
+        BrowserLoginOutcome::Token(verified("next.tok.en"))
     );
 }
 
@@ -561,9 +576,12 @@ fn lost_validation_restores_a_usable_state() {
 fn outcome_debug_never_shows_the_token() {
     let shown = format!(
         "{:?}",
-        BrowserLoginOutcome::Token("secret.tok.en".to_owned())
+        BrowserLoginOutcome::Token(verified("secret.tok.en"))
     );
     assert!(!shown.contains("secret"));
+    let shown = format!("{:?}", verified("secret.tok.en"));
+    assert!(!shown.contains("secret"));
+    assert!(shown.contains("burner"));
 }
 
 #[test]
@@ -624,7 +642,7 @@ fn a_late_result_from_a_timed_out_check_is_ignored() {
         finish_at(
             &mut state,
             stale,
-            Validation::Accepted("slow.tok.en".to_owned()),
+            Validation::Accepted(verified("slow.tok.en")),
             expired + MS
         )
         .is_none()
@@ -675,7 +693,7 @@ fn a_reposted_rejected_value_never_starts_a_job() {
     let good = job(state.ipc("candidate:good.tok.en", start + 3 * MS));
     assert_eq!(
         exit(run_validation(&mut state, good, true)),
-        BrowserLoginOutcome::Token("good.tok.en".to_owned())
+        BrowserLoginOutcome::Token(verified("good.tok.en"))
     );
 }
 

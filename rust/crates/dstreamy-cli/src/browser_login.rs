@@ -17,7 +17,7 @@ use wry::{NewWindowResponse, PageLoadEvent, WebView, WebViewBuilder};
 use crate::discord::{self, Persistence};
 use crate::login_capture::{
     self, Action, BrowserLoginOutcome, BrowserState, Command, Failure, Job, RECOVERY_ACTIONS,
-    SeenCandidates, Validation, ValidationError, View,
+    SeenCandidates, Validation, ValidationError, VerifiedLogin, View,
 };
 use crate::output::Out;
 use crate::{CliError, Ctx};
@@ -370,7 +370,7 @@ enum Msg {
     Validated {
         generation: u64,
         seen: SeenCandidates,
-        result: Validation<String>,
+        result: Validation<VerifiedLogin>,
     },
 }
 
@@ -995,11 +995,12 @@ fn spawn_validation(
     })
 }
 
-async fn check_token(ctx: Ctx, token: String) -> Result<String, ValidationError<()>> {
+async fn check_token(ctx: Ctx, token: String) -> Result<VerifiedLogin, ValidationError<()>> {
     match discord::connect_with(&ctx, token.clone(), Persistence::Brief).await {
         Ok(client) => {
+            let user = client.user().clone();
             client.close().await;
-            Ok(token)
+            Ok(VerifiedLogin { token, user })
         }
         Err(CliError::Gateway(GatewayError::Rejected(_))) => Err(ValidationError::Rejected),
         Err(_) => Err(ValidationError::Transient(())),
@@ -1250,7 +1251,14 @@ mod tests {
         let _ = state.validated(
             stale.generation,
             stale.seen,
-            Validation::Accepted("aaa.bbb.ccc".to_owned()),
+            Validation::Accepted(VerifiedLogin {
+                token: "aaa.bbb.ccc".to_owned(),
+                user: dstreamy_discord::CurrentUser {
+                    id: "1".to_owned(),
+                    username: "user".to_owned(),
+                    global_name: None,
+                },
+            }),
             now,
         );
         abort_unless_validating(&mut validation, state.is_validating());
