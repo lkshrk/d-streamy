@@ -679,6 +679,15 @@ fn stream(
     stream_with_minimum_mock_video(settings, args, video, video * 9 / 10)
 }
 
+/// A GPU rescale can lag OBS's render loop, so only half of the plugin's frames must reach the mock.
+fn rescaled_stream(
+    settings: Value,
+    args: &[&str],
+    video: usize,
+) -> (Vec<String>, dstreamy_mock_discord::Recorded) {
+    stream_with_minimum_mock_video(settings, args, video, video.div_ceil(2))
+}
+
 fn stream_with_minimum_mock_video(
     settings: Value,
     args: &[&str],
@@ -750,7 +759,7 @@ fn share_mode_falls_back_to_the_own_encoder_when_b_frames_are_on() {
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn the_own_encoder_scales_a_1440p_canvas_to_1080p() {
     let (lines, recorded) =
-        stream_with_minimum_mock_video(json!({}), &["--width", "2560", "--height", "1440"], 60, 1);
+        rescaled_stream(json!({}), &["--width", "2560", "--height", "1440"], 60);
     assert!(
         has_plugin_line(&lines, "own video encoder obs_x264 at 1920×1080")
             && has_plugin_line(&lines, "from a GPU mix in NV12"),
@@ -2487,7 +2496,7 @@ fn share_mode_falls_back_from_an_i444_stream_encoder() {
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn the_own_encoder_resizes_an_i420_canvas_in_nv12() {
-    let (lines, recorded) = stream(
+    let (lines, recorded) = rescaled_stream(
         json!({}),
         &["--format", "I420", "--width", "2560", "--height", "1440"],
         60,
