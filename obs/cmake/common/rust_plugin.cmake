@@ -115,7 +115,7 @@ link=$<TARGET_LINKER_FILE:OBS::libobs>
       COMMAND ${cargo_build}
       COMMAND "${CMAKE_COMMAND}" -E make_directory "${rundir}"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${built}" "${rundir}/${target}.dll"
-      COMMAND ${check_hooks} "-DLIBRARY=${rundir}/${target}.dll" -P "${hooks_script}"
+      COMMAND ${check_hooks} -DWINDOWS=ON "-DLIBRARY=${rundir}/${target}.dll" -P "${hooks_script}"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${pdb}" "${rundir}/${_ARP_LIB_NAME}.pdb"
       WORKING_DIRECTORY "${_ARP_CRATE_DIR}"
       BYPRODUCTS "${rundir}/${target}.dll"

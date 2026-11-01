@@ -1,13 +1,19 @@
-# cmake -DLIBRARY=<built plugin> -DTEST_HOOKS=<ON|OFF> -P check_test_hooks.cmake
+# cmake -DLIBRARY=<built plugin> -DTEST_HOOKS=<ON|OFF> [-DWINDOWS=ON] -P check_test_hooks.cmake
 set(hooks
     test_destroy_delay_ms
     panic_at_packet
-    DSTREAMY_TEST_START_GATE
     DSTREAMY_TEST_NO_CONTROL_THREAD
-    DSTREAMY_TEST_PANIC_AFTER_OUTPUT_START
     DSTREAMY_TEST_OPEN_DIALOG
+)
+# Read only from #[cfg(unix)] code, so a Windows build has none of these strings.
+set(unix_hooks
+    DSTREAMY_TEST_START_GATE
+    DSTREAMY_TEST_PANIC_AFTER_OUTPUT_START
     DSTREAMY_TEST_LISTS_GATE
 )
+if(NOT WINDOWS OR NOT TEST_HOOKS)
+  list(APPEND hooks ${unix_hooks})
+endif()
 foreach(hook IN LISTS hooks)
   file(STRINGS "${LIBRARY}" found REGEX "${hook}" LIMIT_COUNT 1)
   if(TEST_HOOKS AND NOT found)

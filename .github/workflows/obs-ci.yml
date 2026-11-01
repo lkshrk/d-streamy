@@ -671,7 +671,8 @@ jobs:
           set -o pipefail
           ws="$GITHUB_WORKSPACE"
           cfg="$(cygpath -u "$APPDATA")/obs-studio"
-          plugin="$cfg/plugins/obs-dstreamy"
+          # Windows OBS looks for plugins under CSIDL_COMMON_APPDATA (35), not %APPDATA% (frontend/widgets/OBSBasic.cpp:149).
+          plugin="$(cygpath -u -F 35)/obs-studio/plugins/obs-dstreamy"
           mkdir -p "$plugin/bin/64bit" "$plugin/data"
           cp "$ws/obs/build_x64/rundir/obs-dstreamy.dll" "$plugin/bin/64bit/"
           export EXPECT_LOG_LINE="[obs-dstreamy] added Tools > D-Streamy"
