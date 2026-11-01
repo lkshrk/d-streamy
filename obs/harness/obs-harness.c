@@ -70,6 +70,7 @@ const char *restart_output_settings;
 	const char *module_config;
 	const char *settings_update;
 	const char *settings_update_while_active;
+	const char *replace_before_update;
 	const char *update_output_while_active;
 	int seconds;
 	int fps;
@@ -593,6 +594,7 @@ static void usage(void)
 		"  [--module-config DIR (libobs's module config directory; without it modules have none)]\n"
 		"  [--settings-update JSON (with --fake-frontend: update the opened settings source, then reopen it)]\n"
 		"  [--settings-update-while-active JSON (like --settings-update, but once the output is active)]\n"
+		"  [--replace-before-update PATH (move PATH to PATH.saved and put an empty file there before the update)]\n"
 		"  [--update-output-while-active JSON (once the output is active, update its settings and report the bound mixer)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
@@ -690,6 +692,8 @@ static int parse_args(int argc, char **argv)
 			args.settings_update = v;
 		else if (strcmp(a, "--settings-update-while-active") == 0)
 			args.settings_update_while_active = v;
+		else if (strcmp(a, "--replace-before-update") == 0)
+			args.replace_before_update = v;
 	else if (strcmp(a, "--dump-encoder-settings") == 0)
 			args.dump_encoder_settings = v;
 		else if (strcmp(a, "--release-after-start") == 0)
@@ -873,6 +877,21 @@ static void close_settings_dialog(obs_source_t *source)
 	obs_weak_source_release(weak);
 }
 
+// Makes writes under PATH fail even for root, which ignores permissions.
+static bool replace_with_file(const char *path)
+{
+	struct dstr saved = {0};
+	dstr_printf(&saved, "%s.saved", path);
+	bool ok = os_rename(path, saved.array) == 0;
+	FILE *f = ok ? fopen(path, "w") : NULL;
+	if (f)
+		fclose(f);
+	else
+		harness_error("--replace-before-update could not replace %s", path);
+	dstr_free(&saved);
+	return f != NULL;
+}
+
 // Runs the dialog like a user would: open, change settings as the properties view does, close, reopen.
 static bool settings_dialog(const char *update)
 {
@@ -887,6 +906,10 @@ static bool settings_dialog(const char *update)
 	obs_source_release(named);
 	if (args.report_ui || update)
 		report_settings_properties(source, "open");
+	if (update && args.replace_before_update && !replace_with_file(args.replace_before_update)) {
+		obs_source_release(source);
+		return false;
+	}
 	if (update) {
 		obs_data_t *data = obs_data_create_from_json(update);
 		if (!data) {

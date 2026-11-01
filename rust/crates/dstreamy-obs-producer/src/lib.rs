@@ -4,6 +4,7 @@
 pub mod client;
 pub mod control;
 pub mod dock;
+pub mod dock_config;
 pub mod ring;
 pub mod settings;
 mod types;

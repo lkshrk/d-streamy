@@ -1224,6 +1224,145 @@ fn an_out_of_range_track_from_the_dialog_is_refused_and_not_saved() {
     assert_eq!(read_module_config(config.path())["audio_track"], 3);
 }
 
+fn status_line<'a>(lines: &'a [String], when: &str) -> &'a str {
+    let prefix =
+        format!("HARNESS settings_property when={when} name=status type=4 enabled=1 desc=");
+    lines
+        .iter()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no {when} status: {lines:#?}"))
+}
+
+fn temp_files(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.ends_with(".tmp"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_corrupt_module_config_is_reported_and_never_overwritten() {
+    let config = tempfile::tempdir().unwrap();
+    let path = module_config(config.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let garbage = b"{\"audio_track\": 3, \"owned\": oops";
+    std::fs::write(&path, garbage).unwrap();
+    let dir = config.path().to_string_lossy().into_owned();
+    let lib = fake_frontend();
+    let lines = report_ui(&[
+        "--fake-frontend",
+        lib.as_str(),
+        "--module-config",
+        dir.as_str(),
+        "--settings-update",
+        r#"{"audio_track": 5}"#,
+    ]);
+    let read_error = format!(
+        "Couldn't read D-Streamy's settings from {}: not valid JSON (",
+        path.display()
+    );
+    for when in ["open", "updated", "reopened"] {
+        let status = status_line(&lines, when);
+        assert!(status.starts_with(&read_error), "{when}: {status}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| *l == format!("HARNESS settings_info when={when} name=status kind=2")),
+            "{when}: {lines:#?}"
+        );
+    }
+    assert!(
+        status_line(&lines, "reopened").ends_with(
+            "Fix or delete the file; until then Track 5 is used until OBS quits but is not saved"
+        ),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HARNESS settings_source when=reopened audio_track=5"),
+        "{lines:#?}"
+    );
+    assert!(has_plugin_line(&lines, &read_error), "{lines:#?}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        garbage,
+        "the file is untouched"
+    );
+    assert_eq!(temp_files(path.parent().unwrap()), Vec::<String>::new());
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_track_that_could_not_be_saved_survives_reopening_with_its_error() {
+    for saved in [Some(json!({"audio_track": 1, "guild_id": "g"})), None] {
+        let config = tempfile::tempdir().unwrap();
+        let folder = config.path().join("obs-dstreamy");
+        std::fs::create_dir_all(&folder).unwrap();
+        if let Some(saved) = &saved {
+            write_module_config(config.path(), saved.clone());
+        }
+        let dir = config.path().to_string_lossy().into_owned();
+        let folder_arg = folder.to_string_lossy().into_owned();
+        let lib = fake_frontend();
+        let lines = report_ui(&[
+            "--fake-frontend",
+            lib.as_str(),
+            "--module-config",
+            dir.as_str(),
+            "--replace-before-update",
+            folder_arg.as_str(),
+            "--settings-update",
+            r#"{"audio_track": 4}"#,
+        ]);
+        let save_error = format!(
+            "Couldn't save D-Streamy's settings to {}: ",
+            module_config(config.path()).display()
+        );
+        for when in ["updated", "reopened"] {
+            let status = status_line(&lines, when);
+            assert!(
+                status.starts_with(&save_error),
+                "{saved:?} {when}: {status}"
+            );
+            assert!(
+                status.ends_with("; Track 4 is used until OBS quits"),
+                "{saved:?} {when}: {status}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| *l == format!("HARNESS settings_info when={when} name=status kind=2")),
+                "{when}: {lines:#?}"
+            );
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "HARNESS settings_source when=reopened audio_track=4"),
+            "{saved:?}: {lines:#?}"
+        );
+        assert!(has_plugin_line(&lines, &save_error), "{lines:#?}");
+        let moved = config.path().join("obs-dstreamy.saved");
+        match &saved {
+            Some(saved) => assert_eq!(
+                &serde_json::from_str::<Value>(
+                    &std::fs::read_to_string(moved.join("config.json")).unwrap()
+                )
+                .unwrap(),
+                saved
+            ),
+            None => assert!(!moved.join("config.json").exists()),
+        }
+        assert_eq!(temp_files(&moved), Vec::<String>::new());
+    }
+}
+
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn without_a_module_config_folder_the_dialog_says_the_track_is_not_saved() {

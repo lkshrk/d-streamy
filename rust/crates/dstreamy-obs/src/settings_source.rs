@@ -3,15 +3,15 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem;
 use std::ptr;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, PoisonError};
 
 use dstreamy_obs_producer::dock::{
-    AUDIO_TRACK_HELP, AUDIO_TRACK_TITLE, AUDIO_TRACKS, DockModel, DockSettings, TrackStatus,
-    track_name,
+    AUDIO_TRACK_HELP, AUDIO_TRACK_TITLE, AUDIO_TRACKS, TrackStatus, track_name,
 };
+use dstreamy_obs_producer::dock_config::ConfigState;
 use dstreamy_obs_sys as sys;
 
-use crate::config::{self, ConfigError};
+use crate::config;
 use crate::guard::guard;
 use crate::log;
 
@@ -24,46 +24,20 @@ const STATUS: &CStr = c"status";
 /// Whether the dialog's Start and Stop drive a real session; until they do they stay disabled.
 const START_CONTROLS: bool = false;
 
-/// The producer model behind every dialog, and why its settings could not be read or saved.
-struct Controls {
-    model: DockModel,
-    config_error: Option<ConfigError>,
+/// The producer model behind every dialog; it outlives each dialog's source.
+static CONTROLS: Mutex<Option<ConfigState>> = Mutex::new(None);
+
+fn with_controls<R>(f: impl FnOnce(&mut ConfigState) -> R) -> R {
+    let mut guard = CONTROLS.lock().unwrap_or_else(PoisonError::into_inner);
+    f(guard.get_or_insert_with(ConfigState::default))
 }
 
-static CONTROLS: Mutex<Option<Controls>> = Mutex::new(None);
-
-fn controls() -> MutexGuard<'static, Option<Controls>> {
-    CONTROLS.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn with_controls<R>(f: impl FnOnce(&mut Controls) -> R) -> R {
-    let mut guard = controls();
-    let controls = guard.get_or_insert_with(|| Controls {
-        model: DockModel::new(DockSettings::default()),
-        config_error: None,
-    });
-    f(controls)
-}
-
-/// Reloads the module config into the model, keeping the in-memory settings when there is none.
-fn load(controls: &mut Controls) {
-    match config::load() {
-        Ok(Some(text)) => {
-            controls.model.reload(DockSettings::from_json(&text));
-            controls.config_error = None;
-        }
-        Ok(None) => controls.config_error = None,
-        Err(e) => controls.config_error = Some(e),
-    }
-}
-
-fn save(controls: &mut Controls) {
-    match config::save(&controls.model.settings().to_json()) {
-        Ok(()) => controls.config_error = None,
-        Err(e) => {
-            log::warn(&e.message(controls.model.settings().audio_track));
-            controls.config_error = Some(e);
-        }
+/// Runs a config step and logs its config error: every time for a change, only when new on open.
+fn config_step(c: &mut ConfigState, change: bool, step: impl FnOnce(&mut ConfigState)) {
+    let before = c.error().cloned();
+    step(c);
+    if let Some(e) = c.error().filter(|e| change || Some(*e) != before.as_ref()) {
+        log::warn(&e.message(c.model.settings().audio_track));
     }
 }
 
@@ -80,7 +54,7 @@ fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type) {
         if let Some(track) = selected {
             preview.select_audio_track(track);
         }
-        if let Some(e) = &c.config_error {
+        if let Some(e) = c.error() {
             return (
                 e.message(preview.settings().audio_track),
                 sys::OBS_TEXT_INFO_ERROR,
@@ -109,7 +83,7 @@ extern "C" fn create(
 ) -> *mut c_void {
     guard("settings create", source.cast(), || {
         let track = with_controls(|c| {
-            load(c);
+            config_step(c, false, |c| c.open(config::load, config::save));
             c.model.settings().audio_track
         });
         // SAFETY: libobs passes the new source's settings, which it owns.
@@ -132,10 +106,9 @@ extern "C" fn get_defaults(settings: *mut sys::obs_data_t) {
 extern "C" fn update(_data: *mut c_void, settings: *mut sys::obs_data_t) {
     guard("settings update", (), || {
         with_controls(|c| match selected_track(settings) {
-            Some(track) => {
-                c.model.select_audio_track(track);
-                save(c);
-            }
+            Some(track) => config_step(c, true, |c| {
+                c.select_audio_track(track, config::save);
+            }),
             None => {
                 // SAFETY: libobs passes the source's own settings.
                 let raw = unsafe { sys::obs_data_get_int(settings, AUDIO_TRACK.as_ptr()) };

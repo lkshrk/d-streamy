@@ -1,32 +1,13 @@
 //! The module config file: the dock settings JSON in libobs's per-module config folder.
 
 use std::ffi::CStr;
-use std::fs;
-use std::io;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use dstreamy_obs_producer::dock::track_name;
+use dstreamy_obs_producer::dock_config::{ConfigError, Saved};
 use dstreamy_obs_sys as sys;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConfigError {
-    NoFolder,
-    Failed(String),
-}
-
-impl ConfigError {
-    pub fn message(&self, track: u8) -> String {
-        match self {
-            Self::NoFolder => format!(
-                "OBS gave D-Streamy no settings folder, so {} is used until OBS quits but is not saved",
-                track_name(track)
-            ),
-            Self::Failed(reason) => {
-                format!("{reason}; {} is used until OBS quits", track_name(track))
-            }
-        }
-    }
-}
 
 fn path() -> Result<PathBuf, ConfigError> {
     // SAFETY: the module pointer is set before load; libobs returns a bmalloc'd string that is freed below.
@@ -46,17 +27,26 @@ fn path() -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
-/// The saved settings JSON, or `None` before the first save.
-pub fn load() -> Result<Option<String>, ConfigError> {
+/// The saved settings, or `None` before the first save.
+pub fn load() -> Result<Option<Saved>, ConfigError> {
     let path = path()?;
     match fs::read_to_string(&path) {
-        Ok(text) => Ok(Some(text)),
+        Ok(text) => Ok(Some(Saved {
+            path: path.display().to_string(),
+            text,
+        })),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(ConfigError::Failed(format!(
             "Couldn't read D-Streamy's settings from {}: {e}",
             path.display()
         ))),
     }
+}
+
+fn write_synced(tmp: &Path, json: &str) -> io::Result<()> {
+    let mut file = File::create(tmp)?;
+    file.write_all(json.as_bytes())?;
+    file.sync_all()
 }
 
 pub fn save(json: &str) -> Result<(), ConfigError> {
@@ -70,7 +60,14 @@ pub fn save(json: &str) -> Result<(), ConfigError> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(failed)?;
     }
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json).map_err(failed)?;
-    fs::rename(&tmp, &path).map_err(failed)
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    // Unique per process and call, so two OBS instances never share a temp file.
+    let tmp = path.with_extension(format!("json.{}.{nanos}.tmp", std::process::id()));
+    let result = write_synced(&tmp, json).and_then(|()| fs::rename(&tmp, &path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(failed)
 }
