@@ -37,6 +37,7 @@ const BACKGROUND: (u8, u8, u8, u8) = (0x31, 0x33, 0x38, 0xff);
 
 enum Msg {
     Ipc(String),
+    #[cfg(target_os = "linux")]
     LoadFailed,
     Validated {
         generation: u64,
@@ -293,6 +294,7 @@ pub fn run(ctx: &Ctx, runtime: &Handle) -> Result<BrowserLoginOutcome, CliError>
         let now = Instant::now();
         let command = match event {
             Event::UserEvent(Msg::Ipc(message)) => state.ipc(&message, now),
+            #[cfg(target_os = "linux")]
             Event::UserEvent(Msg::LoadFailed) => state.event(login_capture::Event::LoadFailed, now),
             Event::UserEvent(Msg::Validated {
                 generation,
