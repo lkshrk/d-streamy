@@ -176,8 +176,10 @@ pub struct DockModel {
     channels: Vec<Named>,
     state: DockState,
     error: Option<String>,
-    /// The track the running output was started with; set by `start`, cleared when the session ends.
+    /// The track the running output was started with; set once its start is accepted, cleared when the session ends.
     live_track: Option<u8>,
+    /// The track written to the output's settings for the start in progress.
+    applying: Option<u8>,
 }
 
 impl DockModel {
@@ -189,6 +191,7 @@ impl DockModel {
             state: DockState::Idle,
             error: None,
             live_track: None,
+            applying: None,
         }
     }
 
@@ -232,7 +235,10 @@ impl DockModel {
                 (None, true) => "Idle".into(),
                 (None, false) => "Idle — start controls are unavailable".into(),
             },
-            DockState::Starting => format!("Starting on {live}…{pending}"),
+            DockState::Starting => format!(
+                "Starting on {}…",
+                track_name(self.applying.unwrap_or(self.settings.audio_track))
+            ),
             DockState::Live { .. } => format!("Live on {live}{pending}"),
             DockState::Stopping => "Stopping…".into(),
         }
@@ -373,7 +379,7 @@ impl DockModel {
             Ok(_) => {
                 self.state = DockState::Starting;
                 self.error = None;
-                self.live_track = Some(self.settings.audio_track);
+                self.applying = None;
             }
             Err(e) => self.error = Some(e.clone()),
         }
@@ -403,12 +409,24 @@ impl DockModel {
         self.settings.owned.as_ref()
     }
 
-    /// A start's outcome: `ownership` replaces what was persisted, since it says whether the live session is ours.
+    /// The service session is up and `ownership` says whose it is; returns the output settings to start with.
+    pub fn claim(&mut self, ownership: Option<Ownership>) -> Option<Value> {
+        if self.state != DockState::Starting {
+            return None;
+        }
+        self.settings.owned = ownership;
+        self.applying = Some(self.settings.audio_track);
+        Some(self.settings.output_settings())
+    }
+
+    /// A start's outcome, `Ok` once the output accepted its start: `ownership` replaces what was persisted,
+    /// since it says whether the live session is ours.
     /// A start that failed after it was sent keeps its provisional ownership, in case serve still carried it out.
     pub fn started(&mut self, result: Result<Started, StartFailed>) {
         if self.state != DockState::Starting {
             return;
         }
+        let applied = self.applying.take();
         match result {
             Ok(started) => {
                 let session_fps = started.session_fps();
@@ -423,6 +441,7 @@ impl DockModel {
                     channel,
                     session_fps,
                 };
+                self.live_track = Some(applied.unwrap_or(self.settings.audio_track));
             }
             Err(failed) => {
                 if let Some(provisional) = failed.ownership {
@@ -432,6 +451,20 @@ impl DockModel {
                 self.live_track = None;
                 self.error = Some(failed.error.to_string());
             }
+        }
+    }
+
+    /// The output refused its start after the service session came up; `session_ended` says whether that session is gone.
+    pub fn output_failed(&mut self, message: String, session_ended: bool) {
+        if self.state != DockState::Starting {
+            return;
+        }
+        self.state = DockState::Idle;
+        self.applying = None;
+        self.live_track = None;
+        self.error = Some(message);
+        if session_ended {
+            self.settings.owned = None;
         }
     }
 
@@ -709,11 +742,56 @@ mod tests {
         with_track(&mut m, 3);
         assert_eq!(m.track_status(), TrackStatus::Idle { selected: 3 });
         m.start(canvas()).unwrap();
-        assert_eq!(m.live_track(), Some(3));
+        assert_eq!(m.live_track(), None, "not bound until the output accepts");
         assert_eq!(m.status_text(true), "Starting on Track 3…");
         m.started(Ok(started(None)));
         assert_eq!(m.track_status(), TrackStatus::Live { track: 3 });
         assert_eq!(m.status_text(true), "Live on Track 3");
+    }
+
+    #[test]
+    fn the_track_applied_to_the_output_is_the_one_recorded_live() {
+        let mut m = picked();
+        with_track(&mut m, 3);
+        m.start(canvas()).unwrap();
+        with_track(&mut m, 4);
+        let output = m.claim(Some(ownership(7))).expect("starting");
+        assert_eq!(output["audio_track"], json!(4));
+        assert_eq!(
+            m.persisted(),
+            Some(&ownership(7)),
+            "claimed before the output starts"
+        );
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.status_text(true), "Starting on Track 4…");
+        with_track(&mut m, 6);
+        m.started(Ok(started(Some(ownership(7)))));
+        assert_eq!(m.live_track(), Some(4));
+        assert_eq!(m.track_status(), TrackStatus::Pending { live: 4, next: 6 });
+        assert_eq!(m.claim(None), None, "only while starting");
+    }
+
+    #[test]
+    fn an_output_that_refuses_its_start_returns_to_idle_with_its_error() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.claim(Some(ownership(7)));
+        m.output_failed("no encoder".into(), false);
+        assert_eq!(m.state(), &DockState::Idle);
+        assert_eq!(m.error(), Some("no encoder"));
+        assert_eq!(m.live_track(), None);
+        assert_eq!(
+            m.persisted(),
+            Some(&ownership(7)),
+            "the session may still run"
+        );
+
+        m.start(canvas()).unwrap();
+        m.claim(Some(ownership(8)));
+        m.output_failed("no encoder".into(), true);
+        assert_eq!(m.persisted(), None, "its session was stopped");
+        m.output_failed("late".into(), true);
+        assert_eq!(m.error(), Some("no encoder"), "ignored once idle");
     }
 
     #[test]
@@ -768,9 +846,14 @@ mod tests {
 
         let mut m = picked();
         m.start(canvas()).unwrap();
+        m.claim(None);
         m.started(Err(ControlError::Stopping.into()));
         assert_eq!(m.live_track(), None);
         assert_eq!(m.view()["live_track"], Value::Null);
+        assert_eq!(
+            m.status_text(true),
+            "D-Streamy is still stopping; try again"
+        );
     }
 
     #[test]

@@ -68,10 +68,10 @@ fn main() {
         .header("wrapper.h")
         .rust_edition(bindgen::RustEdition::Edition2024)
         .allowlist_function(
-            "obs_.*|blog|bfree|calldata_set_data|proc_handler_add|video_output_get_info|audio_output_get_channels",
+            "obs_.*|blog|bfree|calldata_set_data|calldata_get_data|signal_handler_connect|signal_handler_disconnect|proc_handler_add|video_output_get_info|audio_output_get_channels",
         )
         .allowlist_type(
-            "obs_.*|encoder_packet|calldata_t|proc_handler_t|video_output_info|dstreamy_frontend_.*",
+            "obs_.*|encoder_packet|calldata_t|proc_handler_t|signal_handler_t|signal_callback_t|video_output_info|dstreamy_frontend_.*",
         )
         .allowlist_var(
             "LIBOBS_API_.*|OBS_OUTPUT_.*|OBS_ENCODER_CAP_.*|OBS_SOURCE_CAP_DISABLED|DSTREAMY_LOG_.*",

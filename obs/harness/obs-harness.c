@@ -72,6 +72,7 @@ const char *restart_output_settings;
 	const char *settings_update_while_active;
 	const char *replace_before_update;
 	const char *update_output_while_active;
+	bool tools_session;
 	int seconds;
 	int fps;
 	int width;
@@ -596,6 +597,8 @@ static void usage(void)
 		"  [--settings-update-while-active JSON (like --settings-update, but once the output is active)]\n"
 		"  [--replace-before-update PATH (move PATH to PATH.saved and put an empty file there before the update)]\n"
 		"  [--update-output-while-active JSON (once the output is active, update its settings and report the bound mixer)]\n"
+		"  [--tools-session (with --fake-frontend: instead of --output, Start from the dialog after --settings-update,\n"
+		"   wait for Live and --until-video packets, apply --settings-update-while-active, Stop, then reopen)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
@@ -646,6 +649,10 @@ static int parse_args(int argc, char **argv)
 		}
 		if (strcmp(a, "--stream-output") == 0) {
 			args.stream_output = true;
+			continue;
+		}
+		if (strcmp(a, "--tools-session") == 0) {
+			args.tools_session = true;
 			continue;
 		}
 		if (strcmp(a, "--report-ui") == 0) {
@@ -892,6 +899,72 @@ static bool replace_with_file(const char *path)
 	return f != NULL;
 }
 
+// Like OBSPropertiesView::ControlChanged: edit the source's settings in place, update, then call modified.
+static bool apply_settings_update(obs_source_t *source, const char *update)
+{
+	obs_data_t *data = obs_data_create_from_json(update);
+	if (!data) {
+		harness_error("--settings-update is not a JSON object");
+		return false;
+	}
+	obs_properties_t *props = obs_source_properties(source);
+	obs_data_t *settings = obs_source_get_settings(source);
+	obs_data_apply(settings, data);
+	obs_source_update(source, settings);
+	bool refresh = false;
+	for (obs_data_item_t *item = obs_data_first(data); item; obs_data_item_next(&item)) {
+		obs_property_t *p = obs_properties_get(props, obs_data_item_get_name(item));
+		refresh = (p && obs_property_modified(p, settings)) || refresh;
+	}
+	obs_data_release(data);
+	obs_property_t *status = obs_properties_get(props, "status");
+	printf("HARNESS settings_modified refresh=%d status=%s\n", refresh,
+	       status ? obs_property_description(status) : "");
+	obs_data_release(settings);
+	obs_properties_destroy(props);
+	return true;
+}
+
+static char *settings_status(obs_source_t *source)
+{
+	obs_properties_t *props = obs_source_properties(source);
+	obs_property_t *status = obs_properties_get(props, "status");
+	char *text = bstrdup(status ? obs_property_description(status) : "");
+	obs_properties_destroy(props);
+	return text;
+}
+
+// Like a click in the properties view: the button's callback, then a rebuild when it returns true.
+static bool click_settings_button(obs_source_t *source, const char *name)
+{
+	obs_properties_t *props = obs_source_properties(source);
+	obs_property_t *button = obs_properties_get(props, name);
+	bool enabled = button && obs_property_enabled(button);
+	bool refresh = enabled && obs_property_button_clicked(button, source);
+	obs_properties_destroy(props);
+	char *status = settings_status(source);
+	printf("HARNESS settings_clicked name=%s enabled=%d refresh=%d status=%s\n", name, enabled, refresh, status);
+	bfree(status);
+	return enabled;
+}
+
+// Polls the dialog's status, as reopening or clicking it would, until it starts with `prefix`.
+static bool wait_for_status(obs_source_t *source, const char *prefix, const char *when)
+{
+	char *status = NULL;
+	for (int i = 0; i < 300; i++) {
+		bfree(status);
+		status = settings_status(source);
+		if (strncmp(status, prefix, strlen(prefix)) == 0)
+			break;
+		os_sleep_ms(100);
+	}
+	bool reached = strncmp(status, prefix, strlen(prefix)) == 0;
+	printf("HARNESS settings_status when=%s reached=%d status=%s\n", when, reached, status);
+	bfree(status);
+	return reached;
+}
+
 // Runs the dialog like a user would: open, change settings as the properties view does, close, reopen.
 static bool settings_dialog(const char *update)
 {
@@ -911,25 +984,10 @@ static bool settings_dialog(const char *update)
 		return false;
 	}
 	if (update) {
-		obs_data_t *data = obs_data_create_from_json(update);
-		if (!data) {
-			harness_error("--settings-update is not a JSON object");
+		if (!apply_settings_update(source, update)) {
 			obs_source_release(source);
 			return false;
 		}
-		// Like OBSPropertiesView::ControlChanged: edit the source's settings in place, update, then call modified.
-		obs_properties_t *props = obs_source_properties(source);
-		obs_data_t *settings = obs_source_get_settings(source);
-		obs_data_apply(settings, data);
-		obs_data_release(data);
-		obs_source_update(source, settings);
-		obs_property_t *track = obs_properties_get(props, "audio_track");
-		bool refresh = track && obs_property_modified(track, settings);
-		obs_property_t *status = obs_properties_get(props, "status");
-		printf("HARNESS settings_modified refresh=%d status=%s\n", refresh,
-		       status ? obs_property_description(status) : "");
-		obs_data_release(settings);
-		obs_properties_destroy(props);
 		report_settings_properties(source, "updated");
 	}
 	close_settings_dialog(source);
@@ -957,7 +1015,7 @@ static bool click_fake_frontend(void)
 	const char *name = NULL;
 	int count = items(&name);
 	printf("HARNESS frontend tools_items=%d name=%s\n", count, name ? name : "");
-	if (args.settings_update_while_active)
+	if (args.settings_update_while_active || args.tools_session)
 		return true;
 	return settings_dialog(args.settings_update);
 }
@@ -999,6 +1057,74 @@ static bool wait_for_plugin_video(obs_output_t *output)
 	harness_error("plugin counted %lld of %d video packets within %d s", st.video, args.until_video, args.seconds);
 	return false;
 }
+
+#ifdef __linux__
+static bool wait_for_dialog_video(obs_output_t *output)
+{
+	struct output_stats st = {0};
+	uint64_t deadline = os_gettime_ns() + (uint64_t)args.seconds * 1000000000ULL;
+	while (os_gettime_ns() < deadline) {
+		if (!output_stats(output, &st))
+			return false;
+		if (st.video >= args.until_video) {
+			printf("HARNESS tools video=%lld audio=%lld\n", st.video, st.audio);
+			return true;
+		}
+		os_sleep_ms(50);
+	}
+	harness_error("the dialog's output counted %lld of %d video packets within %d s", st.video, args.until_video,
+		      args.seconds);
+	return false;
+}
+
+// Tools > D-Streamy… as a user drives it: pick, Start, watch it go live, change the track, Stop, reopen.
+static bool tools_session(void)
+{
+	obs_source_t *source = open_settings_dialog();
+	if (!source) {
+		harness_error("--tools-session: the dialog did not open");
+		return false;
+	}
+	report_settings_properties(source, "open");
+	bool ok = !args.settings_update || apply_settings_update(source, args.settings_update);
+	if (ok && args.settings_update)
+		report_settings_properties(source, "updated");
+	ok = ok && click_settings_button(source, "start");
+	bool live = ok && wait_for_status(source, "Live on", "live");
+	obs_output_t *output = obs_get_output_by_name("D-Streamy");
+	printf("HARNESS tools output=%d\n", output != NULL);
+	for (int i = 0; live && output && !obs_output_active(output) && i < 1000; i++)
+		os_sleep_ms(10);
+	if (live && output) {
+		report_output_audio_track(output, "tools_live");
+		report_audio_mixer(output, "tools_live");
+		ok = wait_for_dialog_video(output);
+		report_settings_properties(source, "live");
+		if (ok && args.settings_update_while_active) {
+			ok = apply_settings_update(source, args.settings_update_while_active);
+			report_settings_properties(source, "live_updated");
+			report_output_audio_track(output, "after_settings_update");
+			report_audio_mixer(output, "after_settings_update");
+		}
+		ok = click_settings_button(source, "stop") && ok;
+		ok = wait_for_status(source, "Idle", "stopped") && ok;
+		printf("HARNESS tools stopped active=%d\n", obs_output_active(output) ? 1 : 0);
+	} else {
+		ok = false;
+	}
+	obs_output_release(output);
+	report_settings_properties(source, "after_stop");
+	close_settings_dialog(source);
+	source = open_settings_dialog();
+	if (!source) {
+		harness_error("the settings source did not reopen");
+		return false;
+	}
+	report_settings_properties(source, "reopened");
+	close_settings_dialog(source);
+	return ok;
+}
+#endif
 
 static bool contains_expected_error(const char *err)
 {
@@ -1410,6 +1536,18 @@ int main(int argc, char **argv)
 
 	obs_add_tick_callback(flash_tick, &flash);
 	tick_added = true;
+
+	if (args.tools_session) {
+#ifdef __linux__
+		if (!fake_frontend)
+			FAIL("--tools-session needs --fake-frontend");
+		if (!tools_session())
+			rc = 1;
+		goto cleanup;
+#else
+		FAIL("--tools-session is Linux-only");
+#endif
+	}
 
 	if (!args.no_encoders) {
 		obs_data_t *vs = video_settings();

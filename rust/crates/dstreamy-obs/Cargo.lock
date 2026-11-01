@@ -89,6 +89,7 @@ dependencies = [
  "dstreamy-obs-sys",
  "futures-util",
  "libloading",
+ "serde_json",
  "tokio",
 ]
 

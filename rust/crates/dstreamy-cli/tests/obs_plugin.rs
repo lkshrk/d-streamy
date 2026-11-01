@@ -77,6 +77,7 @@ impl HarnessRun {
             (false, _) => &["--no-encoders"],
         };
         let mut child = Command::new(&env.harness)
+            .env("XDG_RUNTIME_DIR", runtime_dir(h))
             .args(["--output", "dstreamy_output", "--modules", MODULES])
             .args(encoders)
             .arg("--plugin-bin")
@@ -142,6 +143,21 @@ impl Drop for HarnessRun {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// The harness's runtime directory, so the plugin's default service endpoint is known and private to the test.
+/// Not under /tmp: the endpoint's folders must be writable by no one else.
+fn runtime_dir(h: &Harness) -> PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(h.run.path().file_name().unwrap());
+    if !dir.exists() {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&dir)
+            .unwrap();
+    }
+    dir
 }
 
 fn passed(status: ExitStatus, lines: &[String]) {
@@ -1076,7 +1092,8 @@ fn a_frontend_without_a_properties_dialog_offers_no_tools_entry() {
     );
 }
 
-const IDLE_STATUS: &str = "Idle \u{2014} start controls are unavailable";
+/// The status while no service runs at the harness's default endpoint.
+const NO_SERVICE: &str = "The D-Streamy service is not running (no service is listening at ";
 const ROUTING_HELP: &str = "D-Streamy sends this OBS mixer track to Discord. New OBS sources feed all tracks \
      until you change them in Edit \u{203a} Advanced Audio Properties \u{203a} Tracks. This does not \
      change OBS's stream or recording. A change applies on the next Go Live.";
@@ -1108,7 +1125,7 @@ fn settings_lines<'a>(lines: &'a [String], when: &str) -> Vec<&'a str> {
 
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
-fn the_settings_dialog_offers_tracks_1_to_6_routing_help_and_no_working_start() {
+fn the_settings_dialog_offers_a_server_a_channel_tracks_1_to_6_and_start_while_idle() {
     let config = tempfile::tempdir().unwrap();
     let dir = config.path().to_string_lossy().into_owned();
     let lib = fake_frontend();
@@ -1118,9 +1135,18 @@ fn the_settings_dialog_offers_tracks_1_to_6_routing_help_and_no_working_start() 
         "--module-config",
         dir.as_str(),
     ]);
+    let status = status_line(&lines, "open");
+    assert!(status.starts_with(NO_SERVICE), "{status}");
     let mut want = vec![
-        format!("HARNESS settings_property when=open name=status type=4 enabled=1 desc={IDLE_STATUS}"),
-        "HARNESS settings_info when=open name=status kind=0".to_owned(),
+        format!("HARNESS settings_property when=open name=status type=4 enabled=1 desc={status}"),
+        "HARNESS settings_info when=open name=status kind=2".to_owned(),
+        "HARNESS settings_property when=open name=guild_id type=6 enabled=1 desc=Discord server"
+            .to_owned(),
+        "HARNESS settings_item when=open name=guild_id value=0 text=Pick a server".to_owned(),
+        "HARNESS settings_property when=open name=channel_id type=6 enabled=1 desc=Voice channel"
+            .to_owned(),
+        "HARNESS settings_item when=open name=channel_id value=0 text=Pick a voice channel"
+            .to_owned(),
         "HARNESS settings_property when=open name=audio_track type=6 enabled=1 desc=Discord audio track"
             .to_owned(),
     ];
@@ -1134,7 +1160,7 @@ fn the_settings_dialog_offers_tracks_1_to_6_routing_help_and_no_working_start() 
             "HARNESS settings_property when=open name=routing type=4 enabled=1 desc={ROUTING_HELP}"
         ),
         "HARNESS settings_info when=open name=routing kind=0".to_owned(),
-        "HARNESS settings_property when=open name=start type=8 enabled=0 desc=Start".to_owned(),
+        "HARNESS settings_property when=open name=start type=8 enabled=1 desc=Start".to_owned(),
         "HARNESS settings_property when=open name=stop type=8 enabled=0 desc=Stop".to_owned(),
         "HARNESS settings_source when=open audio_track=1".to_owned(),
     ]);
@@ -1172,9 +1198,9 @@ fn a_track_chosen_in_the_dialog_is_saved_to_the_module_config_and_reopens() {
         assert!(lines.iter().any(|l| l == want), "{want}: {lines:#?}");
     }
     assert!(
-        lines
-            .iter()
-            .any(|l| *l == format!("HARNESS settings_modified refresh=1 status={IDLE_STATUS}")),
+        lines.iter().any(|l| l
+            .strip_prefix("HARNESS settings_modified refresh=1 status=")
+            .is_some_and(|s| s.starts_with(NO_SERVICE))),
         "{lines:#?}"
     );
     assert_eq!(
@@ -1331,16 +1357,23 @@ fn a_track_that_could_not_be_saved_survives_reopening_with_its_error() {
             "Couldn't save D-Streamy's settings to {}: ",
             module_config(config.path()).display()
         );
+        let status = status_line(&lines, "updated");
+        assert!(status.starts_with(&save_error), "{saved:?}: {status}");
+        assert!(
+            status.ends_with("; Track 4 is used until OBS quits"),
+            "{saved:?}: {status}"
+        );
+        let reopened = status_line(&lines, "reopened");
+        let read_error = format!(
+            "Couldn't read D-Streamy's settings from {}: Not a directory (os error 20). \
+             Fix or delete the file; until then Track 4 is used until OBS quits but is not saved",
+            module_config(config.path()).display()
+        );
+        assert_eq!(
+            reopened, read_error,
+            "{saved:?}: the retry re-reads first and is blocked"
+        );
         for when in ["updated", "reopened"] {
-            let status = status_line(&lines, when);
-            assert!(
-                status.starts_with(&save_error),
-                "{saved:?} {when}: {status}"
-            );
-            assert!(
-                status.ends_with("; Track 4 is used until OBS quits"),
-                "{saved:?} {when}: {status}"
-            );
             assert!(
                 lines
                     .iter()
@@ -1402,6 +1435,254 @@ fn without_a_module_config_folder_the_dialog_says_the_track_is_not_saved() {
         "{lines:#?}"
     );
     assert!(lines.iter().all(|l| !l.contains("relative")), "{lines:#?}");
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_folder_in_place_of_the_module_config_is_reported_and_never_replaced() {
+    let config = tempfile::tempdir().unwrap();
+    let path = module_config(config.path());
+    std::fs::create_dir_all(path.join("keep")).unwrap();
+    std::fs::write(path.join("keep").join("note"), "user data").unwrap();
+    let dir = config.path().to_string_lossy().into_owned();
+    let lib = fake_frontend();
+    let lines = report_ui(&[
+        "--fake-frontend",
+        lib.as_str(),
+        "--module-config",
+        dir.as_str(),
+        "--settings-update",
+        r#"{"audio_track": 5}"#,
+    ]);
+    let read_error = format!(
+        "Couldn't read D-Streamy's settings from {}: Is a directory (os error 21). Fix or delete the file; \
+         until then Track",
+        path.display()
+    );
+    for (when, track) in [("open", 1), ("updated", 5), ("reopened", 5)] {
+        assert_eq!(
+            status_line(&lines, when),
+            format!("{read_error} {track} is used until OBS quits but is not saved"),
+            "{when}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| *l == format!("HARNESS settings_info when={when} name=status kind=2")),
+            "{when}: {lines:#?}"
+        );
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HARNESS settings_source when=reopened audio_track=5"),
+        "{lines:#?}"
+    );
+    assert!(path.is_dir(), "the folder is kept");
+    assert_eq!(
+        std::fs::read_to_string(path.join("keep").join("note")).unwrap(),
+        "user data"
+    );
+    assert_eq!(temp_files(path.parent().unwrap()), Vec::<String>::new());
+}
+
+/// `dstreamy serve` at the plugin's default endpoint under [`runtime_dir`].
+fn default_serve(h: &Harness) -> Proc {
+    let endpoint = runtime_dir(h).join("dstreamy").join("serve.sock");
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("dstreamy"));
+    cmd.env_remove("DSTREAMY_TOKEN")
+        .env_remove("DSTREAMY_CONFIG_DIR")
+        .arg("--config-dir")
+        .arg(h.dir.path())
+        .arg("--gateway-url")
+        .arg(h.mock.gateway_url())
+        .args(["-v", "serve", "--skip-platform", "--endpoint"])
+        .arg(&endpoint);
+    let p = Proc::spawn(&mut cmd);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::os::unix::net::UnixStream::connect(&endpoint).is_err() {
+        assert!(Instant::now() < deadline, "serve never listened");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    p
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn tools_start_binds_the_chosen_track_and_stop_ends_the_session() {
+    let h = Harness::new("");
+    let _serve = default_serve(&h);
+    let config = tempfile::tempdir().unwrap();
+    let stale = json!({"connections": [{"id": 3, "fps": 30}], "guild_id": "g", "channel_id": "c",
+        "instance": {"dev": 1, "ino": 1, "mtime": 1, "mtime_nsec": 1}});
+    write_module_config(
+        config.path(),
+        json!({"audio_track": 1, "bitrate_kbps": 2500, "owned": stale}),
+    );
+    let dir = config.path().to_string_lossy().into_owned();
+    let lib = fake_frontend();
+    let pick =
+        json!({"guild_id": MOCK_GUILD_ID, "channel_id": MOCK_VOICE_CHANNEL_ID, "audio_track": 3})
+            .to_string();
+    let run = HarnessRun::start(
+        &h,
+        json!({}),
+        &[
+            "--fake-frontend",
+            lib.as_str(),
+            "--module-config",
+            dir.as_str(),
+            "--tools-session",
+            "--settings-update",
+            pick.as_str(),
+            "--settings-update-while-active",
+            r#"{"audio_track": 5}"#,
+            "--seconds",
+            "60",
+            "--until-video",
+            "60",
+        ],
+    );
+    let (status, lines) = run.finish();
+    passed(status, &lines);
+
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HARNESS settings_item when=open name=guild_id value=0 text=Mock Guild"),
+        "the dialog lists the service's servers: {lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "HARNESS settings_item when=updated name=channel_id value=0 text=General"),
+        "{lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l
+            == "HARNESS settings_clicked name=start enabled=1 refresh=1 status=Live on Track 3"
+            || l.starts_with(
+                "HARNESS settings_clicked name=start enabled=1 refresh=1 status=Starting on Track 3"
+            )),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HARNESS settings_status when=live reached=1 status=Live on Track 3"),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HARNESS output_audio_track when=tools_live active=1 track=3"),
+        "{lines:#?}"
+    );
+    assert_eq!(
+        status_line(&lines, "live_updated"),
+        "Live on Track 3 \u{2014} Track 5 applies on next Go Live"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HARNESS output_audio_track when=after_settings_update active=1 track=3"),
+        "a live change never touches the output: {lines:#?}"
+    );
+    assert_eq!(
+        mixer_reports(&lines)
+            .iter()
+            .map(|r| (r.0.as_str(), r.1))
+            .collect::<Vec<_>>(),
+        [("tools_live", Some(2)), ("after_settings_update", Some(2))],
+        "{lines:#?}"
+    );
+    for want in [
+        "HARNESS settings_status when=stopped reached=1 status=Idle",
+        "HARNESS tools stopped active=0",
+        "HARNESS settings_source when=reopened audio_track=5",
+        "HARNESS settings_property when=reopened name=start type=8 enabled=1 desc=Start",
+        "HARNESS settings_property when=reopened name=stop type=8 enabled=0 desc=Stop",
+    ] {
+        assert!(lines.iter().any(|l| l == want), "{want}: {lines:#?}");
+    }
+    assert!(
+        has_plugin_line(&lines, "started from Tools > D-Streamy on Track 3"),
+        "{lines:#?}"
+    );
+
+    let recorded = h.mock.recorded();
+    assert!(
+        stream_video(&recorded).len() >= 30,
+        "the dialog's session reached Discord"
+    );
+    let mut control = Client::connect(&runtime_dir(&h).join("dstreamy").join("serve.sock"));
+    control.send(&json!({"id": "h", "cmd": "hello", "role": "control", "protocol": 2}));
+    let hello = control.reply("h");
+    let session = &hello["data"]["status"]["session"];
+    assert_eq!(
+        session["state"], "stopped",
+        "Stop ended the service session: {hello}"
+    );
+    assert_eq!(session["reason"]["reason"], "requested", "{hello}");
+
+    let saved = read_module_config(config.path());
+    assert_eq!(
+        saved["owned"],
+        Value::Null,
+        "the stopped session is no longer owned: {saved}"
+    );
+    assert_eq!(saved["audio_track"], 5, "{saved}");
+    assert_eq!(saved["guild_id"], MOCK_GUILD_ID, "{saved}");
+    assert_eq!(saved["channel_id"], MOCK_VOICE_CHANNEL_ID, "{saved}");
+    assert_eq!(saved["bitrate_kbps"], 2500, "{saved}");
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn tools_start_without_the_service_says_so_and_stays_idle() {
+    let h = Harness::new("");
+    let config = tempfile::tempdir().unwrap();
+    write_module_config(
+        config.path(),
+        json!({"guild_id": MOCK_GUILD_ID, "channel_id": MOCK_VOICE_CHANNEL_ID, "audio_track": 2}),
+    );
+    let dir = config.path().to_string_lossy().into_owned();
+    let lib = fake_frontend();
+    let (status, lines) = HarnessRun::start(
+        &h,
+        json!({}),
+        &[
+            "--fake-frontend",
+            lib.as_str(),
+            "--module-config",
+            dir.as_str(),
+            "--tools-session",
+            "--seconds",
+            "5",
+            "--until-video",
+            "1",
+        ],
+    )
+    .finish();
+    assert!(!status.success(), "never live: {lines:#?}");
+    let clicked = lines
+        .iter()
+        .find_map(|l| {
+            l.strip_prefix("HARNESS settings_clicked name=start enabled=1 refresh=1 status=")
+        })
+        .unwrap_or_else(|| panic!("no start click: {lines:#?}"));
+    assert!(clicked.starts_with(NO_SERVICE), "{clicked}");
+    assert!(
+        lines.iter().any(|l| l == "HARNESS tools output=0"),
+        "no output is created without a session: {lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l
+            == "HARNESS settings_property when=reopened name=start type=8 enabled=1 desc=Start"),
+        "{lines:#?}"
+    );
+    assert!(lines.iter().all(|l| !l.contains("panicked")), "{lines:#?}");
+    let saved = read_module_config(config.path());
+    assert_eq!(saved["audio_track"], 2, "{saved}");
+    assert_eq!(saved.get("owned"), None, "never owned: {saved}");
 }
 
 #[test]

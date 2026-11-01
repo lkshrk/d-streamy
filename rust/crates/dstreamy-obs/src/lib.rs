@@ -7,6 +7,7 @@ mod guard;
 mod hooks;
 mod log;
 mod output;
+mod session;
 mod settings_source;
 mod worker;
 
@@ -46,6 +47,7 @@ pub extern "C" fn obs_module_load() -> bool {
         }
         output::register();
         settings_source::register();
+        session::install();
         frontend::install();
         log::info(&format!("loaded (version {})", env!("CARGO_PKG_VERSION")));
         true
@@ -54,5 +56,8 @@ pub extern "C" fn obs_module_load() -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn obs_module_unload() {
-    guard("obs_module_unload", (), || log::info("unloaded"));
+    guard("obs_module_unload", (), || {
+        session::shutdown();
+        log::info("unloaded");
+    });
 }
