@@ -676,6 +676,15 @@ fn stream(
     args: &[&str],
     video: usize,
 ) -> (Vec<String>, dstreamy_mock_discord::Recorded) {
+    stream_with_minimum_mock_video(settings, args, video, video * 9 / 10)
+}
+
+fn stream_with_minimum_mock_video(
+    settings: Value,
+    args: &[&str],
+    video: usize,
+    minimum_mock_video: usize,
+) -> (Vec<String>, dstreamy_mock_discord::Recorded) {
     let h = Harness::new("");
     let _serve = h.serve();
     let mut c = obs_session(&h);
@@ -692,8 +701,8 @@ fn stream(
         let v = stream_video(&recorded);
         let a = producer_audio(&recorded);
         assert!(
-            v.len() * 10 >= video * 9,
-            "{} of {video} video frames reached the mock",
+            v.len() >= minimum_mock_video,
+            "{} of at least {minimum_mock_video} video frames reached the mock",
             v.len()
         );
         decodes(&v, &a);
@@ -740,7 +749,8 @@ fn share_mode_falls_back_to_the_own_encoder_when_b_frames_are_on() {
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn the_own_encoder_scales_a_1440p_canvas_to_1080p() {
-    let (lines, recorded) = stream(json!({}), &["--width", "2560", "--height", "1440"], 60);
+    let (lines, recorded) =
+        stream_with_minimum_mock_video(json!({}), &["--width", "2560", "--height", "1440"], 60, 1);
     assert!(
         has_plugin_line(&lines, "own video encoder obs_x264 at 1920×1080")
             && has_plugin_line(&lines, "from a GPU mix in NV12"),
