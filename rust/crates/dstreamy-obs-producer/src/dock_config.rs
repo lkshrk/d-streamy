@@ -133,7 +133,9 @@ fn save_file_checked(
         hook(Stage::AfterCheck);
         if identity(&fs::metadata(path)).as_ref() != checked.as_ref() {
             return Err(ConfigError::Failed(format!(
-                "{} changed while D-Streamy was saving its settings, so it was kept; reopen Tools > D-Streamy",
+                "{} changed while D-Streamy was saving its settings, so D-Streamy left it as it is for now. \
+                 D-Streamy saves its settings again on your next change or when Tools > D-Streamy reopens, \
+                 replacing what changed in the file",
                 path.display()
             )));
         }
@@ -691,15 +693,43 @@ mod tests {
             let ConfigError::Failed(message) = &e else {
                 panic!("{existing:?}: {e:?}");
             };
-            assert!(
-                message.ends_with(
-                    "changed while D-Streamy was saving its settings, so it was kept; reopen Tools > D-Streamy"
-                ),
-                "{message}"
-            );
+            assert!(message.ends_with(RACED), "{message}");
             assert_eq!(fs::read_to_string(&path).unwrap(), external);
             assert!(leftovers(dir.path()).is_empty());
         }
+    }
+
+    const RACED: &str = "changed while D-Streamy was saving its settings, so D-Streamy left it as it is for now. \
+         D-Streamy saves its settings again on your next change or when Tools > D-Streamy reopens, \
+         replacing what changed in the file";
+
+    #[test]
+    fn a_save_lost_to_an_outside_edit_is_retried_over_it_as_its_message_says() {
+        let dir = scratch();
+        let path = dir.path().join("config.json");
+        fs::write(&path, r#"{"audio_track":2}"#).unwrap();
+        let external = r#"{"audio_track":6,"guild_id":"edited elsewhere"}"#;
+        let mut s = ConfigState::default();
+        s.open(|| load_file(&path), |json| save_file(&path, json));
+        s.select_audio_track(5, |json| {
+            save_file_checked(&path, json, |stage| {
+                if stage == Stage::AfterCheck {
+                    let other = dir.path().join("other.json");
+                    fs::write(&other, external).unwrap();
+                    fs::rename(&other, &path).unwrap();
+                }
+            })
+        });
+        let Some(ConfigError::Failed(message)) = s.error() else {
+            panic!("{:?}", s.error());
+        };
+        assert!(message.ends_with(RACED), "{message}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
+        s.open(|| load_file(&path), |json| save_file(&path, json));
+        assert_eq!(s.error(), None);
+        let saved = DockSettings::from_json(&fs::read_to_string(&path).unwrap());
+        assert_eq!(saved.audio_track, 5);
+        assert_eq!(saved.guild_id, None, "the outside edit was replaced");
     }
 
     #[cfg(unix)]

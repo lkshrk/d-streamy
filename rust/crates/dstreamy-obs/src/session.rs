@@ -26,7 +26,7 @@ use crate::log;
 use crate::output::{OutputPtr, text};
 use crate::settings_source::{change, refresh, with_controls};
 
-/// How long a dialog click waits for the service before it shows the state reached so far.
+/// How long the UI thread waits for a dialog job (Start, Stop, server lists) before it shows the state reached so far.
 pub const UI_WAIT: Duration = Duration::from_secs(3);
 /// How long Stop waits for the output to end before it still stops the service session.
 const OUTPUT_STOP_WAIT: Duration = Duration::from_secs(10);
@@ -178,7 +178,7 @@ pub fn install() {
 
 /// Ends the control thread and releases the output; call from `obs_module_unload`, before libobs unmaps the plugin.
 /// Service calls in flight get [`CLOSING_GRACE`] to finish, a session they brought up is stopped, not streamed,
-/// and every step is over within [`CLOSING_LIMIT`].
+/// a live session is stopped like Stop does, and every step is over within [`CLOSING_LIMIT`].
 pub fn shutdown() {
     let session = SESSION
         .lock()
@@ -408,6 +408,13 @@ fn run(
     runtime.block_on(async {
         while let Some(job) = jobs.recv().await {
             if matches!(job, Job::Shutdown) {
+                let close = AssertUnwindSafe(stop_on_close(&output, closing.clone()));
+                if let Err(payload) = close.catch_unwind().await {
+                    let message = crate::guard::record_panic("control close", payload.as_ref());
+                    log::warn(&format!(
+                        "stopping D-Streamy as OBS closes failed: {message}"
+                    ));
+                }
                 break;
             }
             let mut brought: Brought = None;
@@ -525,7 +532,7 @@ async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &m
         }
         #[cfg(unix)]
         Job::Stop(ownership, done) => {
-            stop_session(output, ownership.as_ref(), &mut closing).await;
+            let _ = stop_session(output, ownership.as_ref(), &mut closing).await;
             let _ = done.try_send(());
         }
         Job::OutputStopped(code) => {
@@ -712,8 +719,39 @@ async fn start_session(
     }
 }
 
+/// OBS closes while live: the output stops first, then the Discord session, within the closing deadlines.
 #[cfg(unix)]
-async fn stop_session(output: &Output, ownership: Option<&Ownership>, closing: &mut Closing) {
+async fn stop_on_close(output: &Output, mut closing: Closing) {
+    let Some(ownership) = step(DockModel::stop) else {
+        return;
+    };
+    log::info(
+        "OBS is closing while D-Streamy is live: it stops its output, then the Discord session",
+    );
+    match stop_session(output, ownership.as_ref(), &mut closing).await {
+        Ok(()) => log::info("OBS is closing: D-Streamy stopped its output and the Discord session"),
+        Err(SessionEnded(true)) => {
+            log::info("OBS is closing: D-Streamy stopped the Discord session")
+        }
+        Err(SessionEnded(false)) => log::warn(
+            "the Discord session D-Streamy started keeps running until the D-Streamy service's grace period \
+             ends; it stays saved, so the next Start takes it over and Stop ends it",
+        ),
+    }
+}
+
+#[cfg(not(unix))]
+async fn stop_on_close(_output: &Output, _closing: Closing) {}
+
+/// Why a stop didn't finish: whether the service still ended the Discord session.
+struct SessionEnded(bool);
+
+#[cfg(unix)]
+async fn stop_session(
+    output: &Output,
+    ownership: Option<&Ownership>,
+    closing: &mut Closing,
+) -> Result<(), SessionEnded> {
     let stopped_output = output.stop(closing);
     let service = match control() {
         Ok(control) => match closing.call(control.stop(ownership)).await {
@@ -722,6 +760,7 @@ async fn stop_session(output: &Output, ownership: Option<&Ownership>, closing: &
         },
         Err(e) => Err(e),
     };
+    let ended = SessionEnded(service.is_ok());
     let result = match (stopped_output, service) {
         (Ok(()), Ok(())) => Ok(()),
         (output, Err(service)) => {
@@ -738,7 +777,9 @@ async fn stop_session(output: &Output, ownership: Option<&Ownership>, closing: &
     if let Err(e) = &result {
         log::warn(e);
     }
+    let failed = result.is_err();
     step(|m| m.stopped(result));
+    if failed { Err(ended) } else { Ok(()) }
 }
 
 #[cfg(test)]

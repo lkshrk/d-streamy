@@ -2229,6 +2229,87 @@ fn closing_obs_during_a_start_never_streams_and_unloads_promptly() {
 
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn closing_obs_while_live_stops_the_output_then_the_session_promptly() {
+    for answered in [true, false] {
+        let h = Harness::new("");
+        let serve = default_serve(&h);
+        let config = picked_config(1);
+        let go = h.dir.path().join("exit-now");
+        let go_arg = go.to_string_lossy().into_owned();
+        let run = tools_run(
+            &h,
+            config.path(),
+            &[
+                "--tools-exit-while-live",
+                "--tools-stop-after",
+                &go_arg,
+                "--seconds",
+                "60",
+                "--until-video",
+                "30",
+            ],
+        );
+        wait_for_line(&run, "live video", |l| {
+            l.starts_with("HARNESS tools video=")
+        });
+        let pid = i32::try_from(serve.pid()).unwrap();
+        if !answered {
+            // SAFETY: signals the serve child this test spawned.
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+        }
+        std::fs::write(&go, "").unwrap();
+        let (status, lines) = run.finish();
+        if !answered {
+            // SAFETY: as above.
+            unsafe { libc::kill(pid, libc::SIGCONT) };
+        }
+        passed(status, &lines);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("HARNESS tools exiting status=Live on Track 1")),
+            "{answered}: {lines:#?}"
+        );
+        assert!(
+            has_plugin_line(
+                &lines,
+                "OBS is closing while D-Streamy is live: it stops its output, then the Discord session"
+            ),
+            "{answered}: {lines:#?}"
+        );
+        let shutdown_ms = number_after(&lines, "HARNESS obs_shutdown ms=");
+        assert!(
+            shutdown_ms < 12_000,
+            "{answered}: unload took {shutdown_ms} ms"
+        );
+        let owned = read_module_config(config.path())["owned"].clone();
+        if answered {
+            assert!(
+                has_plugin_line(
+                    &lines,
+                    "OBS is closing: D-Streamy stopped its output and the Discord session"
+                ),
+                "{lines:#?}"
+            );
+            let session = serve_session(&h);
+            assert_eq!(session["state"], "stopped", "{session}");
+            assert_eq!(session["reason"]["reason"], "requested", "{session}");
+            assert_eq!(owned, Value::Null);
+        } else {
+            assert!(
+                has_plugin_line(
+                    &lines,
+                    "the Discord session D-Streamy started keeps running until the D-Streamy service's grace period ends"
+                ),
+                "{lines:#?}"
+            );
+            assert!(owned.is_object(), "kept for the next Start: {owned}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn a_track_chosen_in_the_dialog_while_live_never_touches_the_active_output() {
     let config = tempfile::tempdir().unwrap();
     let dir = config.path().to_string_lossy().into_owned();

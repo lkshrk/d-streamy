@@ -78,6 +78,7 @@ const char *restart_output_settings;
 	const char *tools_stop_after;
 	bool tools_wait_end;
 	bool tools_exit_while_starting;
+	bool tools_exit_while_live;
 	bool settings_cancel;
 	int audio_mixers;
 	int seconds;
@@ -613,6 +614,7 @@ static void usage(void)
 		"  [--tools-stop-after PATH (with --tools-session: wait until PATH exists before clicking Stop)]\n"
 		"  [--tools-wait-end (with --tools-session: instead of Stop, wait for the session to end on its own)]\n"
 		"  [--tools-exit-while-starting (with --tools-session: close OBS right after the Start click)]\n"
+		"  [--tools-exit-while-live (with --tools-session: close OBS while Live, after --tools-stop-after, instead of Stop)]\n"
 		"  [--settings-cancel (with --settings-update: then Cancel, as OBS's properties dialog does, before reopening)]\n"
 		"  [--audio-mixers MASK (route the harness audio source to these mixer tracks only, as Advanced Audio\n"
 		"   Properties > Tracks does: bit 0 is Track 1; default all six)]\n"
@@ -678,6 +680,10 @@ static int parse_args(int argc, char **argv)
 		}
 		if (strcmp(a, "--tools-exit-while-starting") == 0) {
 			args.tools_exit_while_starting = true;
+			continue;
+		}
+		if (strcmp(a, "--tools-exit-while-live") == 0) {
+			args.tools_exit_while_live = true;
 			continue;
 		}
 		if (strcmp(a, "--settings-cancel") == 0) {
@@ -1227,6 +1233,17 @@ static bool tools_session(void)
 			report_settings_properties(source, "live_updated");
 			report_output_audio_track(output, "after_settings_update");
 			report_audio_mixer(output, "after_settings_update");
+		}
+		if (ok && args.tools_exit_while_live) {
+			if (args.tools_stop_after)
+				ok = wait_for_file(args.tools_stop_after);
+			status = settings_status(source);
+			printf("HARNESS tools exiting status=%s\n", status);
+			bfree(status);
+			obs_output_release(output);
+			signal_handler_disconnect(signals, "update_properties", on_update_properties, NULL);
+			close_settings_dialog(source);
+			return ok;
 		}
 		if (args.tools_wait_end) {
 			printf("HARNESS tools waiting for the end\n");
