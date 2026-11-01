@@ -1400,6 +1400,8 @@ dependencies = [
  "dstreamy-mock-discord",
  "dstreamy-test-producer",
  "futures-util",
+ "getrandom 0.3.4",
+ "gtk",
  "insta",
  "libc",
  "muda",

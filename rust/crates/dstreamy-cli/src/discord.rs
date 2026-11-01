@@ -14,6 +14,20 @@ use crate::{CliError, Ctx};
 
 /// READY can list guilds as unavailable; their GUILD_CREATE usually follows within moments.
 const GUILD_WAIT: Duration = Duration::from_secs(5);
+const BRIEF_MAX_FAILED_ATTEMPTS: u32 = 3;
+const BRIEF_RECONNECT_DELAY_MAX: Duration = Duration::from_secs(5);
+const BRIEF_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const BRIEF_HELLO_TIMEOUT: Duration = Duration::from_secs(20);
+const BRIEF_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const BRIEF_CONNECTION_BUDGET: Duration = Duration::from_secs(
+    (BRIEF_MAX_FAILED_ATTEMPTS as u64
+        * (BRIEF_HANDSHAKE_TIMEOUT.as_secs()
+            + BRIEF_HELLO_TIMEOUT.as_secs()
+            + BRIEF_READY_TIMEOUT.as_secs()))
+        + ((BRIEF_MAX_FAILED_ATTEMPTS - 1) as u64 * BRIEF_RECONNECT_DELAY_MAX.as_secs()),
+);
+pub const BRIEF_VALIDATION_TIMEOUT: Duration =
+    BRIEF_CONNECTION_BUDGET.saturating_add(Duration::from_secs(15));
 
 #[derive(Clone, Copy)]
 pub enum Persistence {
@@ -32,11 +46,11 @@ pub async fn connect_with(
     token: String,
     persistence: Persistence,
 ) -> Result<DiscordClient, CliError> {
-    let mut opts = GatewayOptions::new(SecretString::from(token)).with_url(&ctx.gateway_url);
-    if let Persistence::Brief = persistence {
-        opts.max_failed_attempts = 3;
-        opts.reconnect_delay_max = Duration::from_secs(5);
-    }
+    let opts = GatewayOptions::new(SecretString::from(token)).with_url(&ctx.gateway_url);
+    let opts = match persistence {
+        Persistence::Brief => brief_options(opts),
+        Persistence::Long => opts,
+    };
     let client = DiscordClient::connect(opts).await?;
     if is_loopback(&ctx.gateway_url) {
         let mut streamer = client.streamer();
@@ -44,6 +58,15 @@ pub async fn connect_with(
         streamer.set_setting_engine(loopback_settings());
     }
     Ok(client)
+}
+
+fn brief_options(mut opts: GatewayOptions) -> GatewayOptions {
+    opts.max_failed_attempts = BRIEF_MAX_FAILED_ATTEMPTS;
+    opts.reconnect_delay_max = BRIEF_RECONNECT_DELAY_MAX;
+    opts.handshake_timeout = BRIEF_HANDSHAKE_TIMEOUT;
+    opts.hello_timeout = BRIEF_HELLO_TIMEOUT;
+    opts.ready_timeout = BRIEF_READY_TIMEOUT;
+    opts
 }
 
 /// Only the Discord gateway or a loopback mock may receive the token.
@@ -121,6 +144,31 @@ pub async fn voice_channels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connection_budget(opts: &GatewayOptions) -> Duration {
+        let attempt = opts.handshake_timeout + opts.hello_timeout + opts.ready_timeout;
+        attempt * opts.max_failed_attempts
+            + opts.reconnect_delay_max * opts.max_failed_attempts.saturating_sub(1)
+    }
+
+    #[test]
+    fn brief_options_bound_the_connection_by_the_validation_timeout() {
+        let hour = Duration::from_secs(3600);
+        let mut lax = GatewayOptions::new(SecretString::from("t"));
+        lax.max_failed_attempts = 100;
+        lax.reconnect_delay_max = hour;
+        lax.handshake_timeout = hour;
+        lax.hello_timeout = hour;
+        lax.ready_timeout = hour;
+        let opts = brief_options(lax);
+        assert_eq!(opts.max_failed_attempts, BRIEF_MAX_FAILED_ATTEMPTS);
+        assert_eq!(opts.reconnect_delay_max, BRIEF_RECONNECT_DELAY_MAX);
+        assert_eq!(opts.handshake_timeout, BRIEF_HANDSHAKE_TIMEOUT);
+        assert_eq!(opts.hello_timeout, BRIEF_HELLO_TIMEOUT);
+        assert_eq!(opts.ready_timeout, BRIEF_READY_TIMEOUT);
+        assert_eq!(connection_budget(&opts), BRIEF_CONNECTION_BUDGET);
+        assert!(BRIEF_CONNECTION_BUDGET < BRIEF_VALIDATION_TIMEOUT);
+    }
 
     #[test]
     fn loopback_urls_are_detected() {

@@ -1,9 +1,13 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
+use futures_util::FutureExt;
+
 use crate::CliError;
+use crate::discord::BRIEF_VALIDATION_TIMEOUT;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Candidate(String);
@@ -30,6 +34,7 @@ pub enum Event {
     SignedIn,
     PageLoaded,
     LoadFailed,
+    LeftDiscord,
     Close,
     Action(Action),
 }
@@ -40,6 +45,17 @@ pub enum Action {
     UseQr,
     UseToken,
     Cancel,
+}
+
+impl Action {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::UseQr => "qr",
+            Self::UseToken => "token",
+            Self::Cancel => "cancel",
+        }
+    }
 }
 
 pub const RECOVERY_ACTIONS: [Action; 4] = [
@@ -62,11 +78,13 @@ pub fn parse_event(message: &str) -> Option<Event> {
         "signed_in" => Some(Event::SignedIn),
         "page_loaded" => Some(Event::PageLoaded),
         "close" => Some(Event::Close),
-        "action:retry" => Some(Event::Action(Action::Retry)),
-        "action:qr" => Some(Event::Action(Action::UseQr)),
-        "action:token" => Some(Event::Action(Action::UseToken)),
-        "action:cancel" => Some(Event::Action(Action::Cancel)),
-        _ => parse_candidate(message).map(Event::Candidate),
+        _ => match message.strip_prefix("action:") {
+            Some(name) => RECOVERY_ACTIONS
+                .into_iter()
+                .find(|action| action.name() == name)
+                .map(Event::Action),
+            None => parse_candidate(message).map(Event::Candidate),
+        },
     }
 }
 
@@ -80,6 +98,10 @@ impl SeenCandidates {
 
     fn forget(&mut self, candidate: &Candidate) {
         self.0.remove(&candidate.0);
+    }
+
+    fn contains(&self, candidate: &Candidate) -> bool {
+        self.0.contains(&candidate.0)
     }
 }
 
@@ -100,7 +122,6 @@ impl<E> fmt::Debug for ValidationError<E> {
 #[must_use]
 #[derive(PartialEq, Eq)]
 pub enum Validation<T> {
-    Pending,
     Rejected,
     Transient,
     Accepted(T),
@@ -109,7 +130,6 @@ pub enum Validation<T> {
 impl<T> fmt::Debug for Validation<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Pending => f.write_str("Validation::Pending"),
             Self::Rejected => f.write_str("Validation::Rejected"),
             Self::Transient => f.write_str("Validation::Transient"),
             Self::Accepted(_) => f.write_str("Validation::Accepted(<redacted>)"),
@@ -126,15 +146,37 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<T, ValidationError<E>>>,
 {
-    if !seen.insert(&candidate) {
-        return Validation::Pending;
-    }
+    seen.insert(&candidate);
     match validator(candidate.as_str().to_owned()).await {
         Ok(value) => Validation::Accepted(value),
         Err(ValidationError::Rejected) => Validation::Rejected,
         Err(ValidationError::Transient(_)) => {
             seen.forget(&candidate);
             Validation::Transient
+        }
+    }
+}
+
+/// Like `validate_candidate`, but a panicking validator yields a retryable `Transient` result.
+pub async fn validate_job<T, E, F, Fut>(
+    mut seen: SeenCandidates,
+    candidate: Candidate,
+    validator: F,
+) -> (SeenCandidates, Validation<T>)
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<T, ValidationError<E>>>,
+{
+    let retry = candidate.clone();
+    let checked = AssertUnwindSafe(validate_candidate(&mut seen, candidate, validator))
+        .catch_unwind()
+        .await;
+    match checked {
+        Ok(result) => (seen, result),
+        Err(_) => {
+            tracing::error!("checking the browser login session panicked");
+            seen.forget(&retry);
+            (seen, Validation::Transient)
         }
     }
 }
@@ -168,6 +210,7 @@ pub enum Failure {
     Rejected,
     Unreachable,
     PageNotLoaded,
+    LeftDiscord,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,7 +250,6 @@ pub fn follow_up(outcome: BrowserLoginOutcome) -> Result<FollowUp, CliError> {
 pub enum View {
     Discord,
     Recovery(Failure),
-    Closing,
 }
 
 /// One candidate check; `seen` travels with it so no other check can run meanwhile.
@@ -230,10 +272,11 @@ pub struct BrowserState {
     signed_in: bool,
     load_deadline: Option<Instant>,
     capture_deadline: Option<Instant>,
-    load_expired: bool,
+    validation_deadline: Option<Instant>,
+    page_failure: Option<Failure>,
     capture_expired: bool,
+    validation_expired: bool,
     last_failure: Option<Failure>,
-    exit_after_validation: Option<BrowserLoginOutcome>,
     finished: bool,
 }
 
@@ -247,10 +290,11 @@ impl BrowserState {
             signed_in: false,
             load_deadline: Some(now + PAGE_LOAD_TIMEOUT),
             capture_deadline: None,
-            load_expired: false,
+            validation_deadline: None,
+            page_failure: None,
             capture_expired: false,
+            validation_expired: false,
             last_failure: None,
-            exit_after_validation: None,
             finished: false,
         }
     }
@@ -264,22 +308,19 @@ impl BrowserState {
     }
 
     pub fn is_validating(&self) -> bool {
-        self.seen.is_none()
-    }
-
-    pub fn actions(&self) -> &'static [Action] {
-        match self.view {
-            View::Recovery(_) => &RECOVERY_ACTIONS,
-            View::Discord | View::Closing => &[],
-        }
+        !self.finished && self.seen.is_none()
     }
 
     /// Never in the past after `tick`, so the event loop can always wait until it.
     pub fn deadline(&self) -> Option<Instant> {
-        match (self.load_deadline, self.capture_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [
+            self.load_deadline,
+            self.capture_deadline,
+            self.validation_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub fn verifying(&self) -> bool {
@@ -294,6 +335,7 @@ impl BrowserState {
     pub fn page_loaded(&mut self) {
         if self.view == View::Discord {
             self.load_deadline = None;
+            self.page_failure = None;
         }
     }
 
@@ -304,7 +346,7 @@ impl BrowserState {
         match event {
             Event::Candidate(candidate) => {
                 self.page_loaded();
-                self.candidate(candidate)
+                self.candidate(candidate, now)
             }
             Event::SignedIn => {
                 self.page_loaded();
@@ -319,11 +361,11 @@ impl BrowserState {
                 None
             }
             Event::LoadFailed => {
-                if self.view == View::Discord {
-                    self.load_deadline = None;
-                    self.load_expired = true;
-                    self.settle();
-                }
+                self.page_failed(Failure::PageNotLoaded);
+                None
+            }
+            Event::LeftDiscord => {
+                self.page_failed(Failure::LeftDiscord);
                 None
             }
             Event::Close => self.close(),
@@ -331,22 +373,13 @@ impl BrowserState {
         }
     }
 
-    pub fn action(&mut self, action: Action, now: Instant) -> Option<Command> {
-        if self.finished {
-            return None;
-        }
-        if action == Action::Cancel {
-            return self.close();
-        }
-        if !matches!(self.view, View::Recovery(_)) {
-            return None;
-        }
+    fn action(&mut self, action: Action, now: Instant) -> Option<Command> {
         match action {
+            Action::Cancel => self.close(),
+            _ if self.view == View::Discord => None,
             Action::Retry => {
                 self.generation += 1;
-                if self.seen.is_some() {
-                    self.seen = Some(SeenCandidates::default());
-                }
+                self.seen = Some(SeenCandidates::default());
                 self.queue.clear();
                 self.signed_in = false;
                 self.clear_deadlines();
@@ -357,7 +390,6 @@ impl BrowserState {
             }
             Action::UseQr => self.request_exit(BrowserLoginOutcome::UseQr),
             Action::UseToken => self.request_exit(BrowserLoginOutcome::UseToken),
-            Action::Cancel => self.close(),
         }
     }
 
@@ -368,17 +400,34 @@ impl BrowserState {
         self.request_exit(BrowserLoginOutcome::Cancelled)
     }
 
+    fn page_failed(&mut self, failure: Failure) {
+        if self.view == View::Discord {
+            self.load_deadline = None;
+            self.page_failure = Some(failure);
+            self.last_failure = None;
+            self.settle();
+        }
+    }
+
     pub fn tick(&mut self, now: Instant) {
         if self.finished {
             return;
         }
         if self.load_deadline.is_some_and(|d| now >= d) {
             self.load_deadline = None;
-            self.load_expired = true;
+            self.page_failure = Some(Failure::PageNotLoaded);
         }
         if self.capture_deadline.is_some_and(|d| now >= d) {
             self.capture_deadline = None;
             self.capture_expired = true;
+        }
+        if self.validation_deadline.is_some_and(|d| now >= d) {
+            self.validation_deadline = None;
+            self.validation_expired = true;
+            self.generation += 1;
+            self.seen = Some(SeenCandidates::default());
+            self.queue.clear();
+            self.last_failure = Some(Failure::Unreachable);
         }
         self.settle();
     }
@@ -388,47 +437,55 @@ impl BrowserState {
         generation: u64,
         seen: SeenCandidates,
         result: Validation<String>,
+        now: Instant,
     ) -> Option<Command> {
         if self.finished {
             return None;
         }
-        let stale = generation != self.generation;
-        self.seen = Some(if stale {
-            SeenCandidates::default()
-        } else {
-            seen
-        });
-        if let Some(outcome) = self.exit_after_validation.take() {
-            return Some(self.exit(outcome));
+        if generation != self.generation {
+            return None;
         }
+        self.validation_deadline = None;
+        self.seen = Some(seen);
         match result {
-            Validation::Accepted(token) if !stale => {
+            Validation::Accepted(token) => {
                 return Some(self.exit(BrowserLoginOutcome::Token(token)));
             }
-            Validation::Rejected if !stale => self.last_failure = Some(Failure::Rejected),
-            Validation::Transient if !stale => self.last_failure = Some(Failure::Unreachable),
-            _ => {}
+            Validation::Rejected => self.last_failure = Some(Failure::Rejected),
+            Validation::Transient => self.last_failure = Some(Failure::Unreachable),
         }
-        self.next().or_else(|| {
+        self.start_next(now).or_else(|| {
             self.settle();
             None
         })
     }
 
-    fn candidate(&mut self, candidate: Candidate) -> Option<Command> {
-        if self.exit_after_validation.is_some() {
+    fn candidate(&mut self, candidate: Candidate, now: Instant) -> Option<Command> {
+        if self.view != View::Discord {
             return None;
         }
         self.queue.push_back(candidate);
         if self.is_validating() {
             return None;
         }
-        self.next()
+        self.start_next(now)
     }
 
-    fn next(&mut self) -> Option<Command> {
-        let candidate = self.queue.pop_front()?;
+    fn already_seen(&self, candidate: &Candidate) -> bool {
+        self.seen
+            .as_ref()
+            .is_some_and(|seen| seen.contains(candidate))
+    }
+
+    fn start_next(&mut self, now: Instant) -> Option<Command> {
+        let candidate = loop {
+            let candidate = self.queue.pop_front()?;
+            if !self.already_seen(&candidate) {
+                break candidate;
+            }
+        };
         let seen = self.seen.take()?;
+        self.validation_deadline = Some(now + BRIEF_VALIDATION_TIMEOUT);
         Some(Command::Validate(Job {
             generation: self.generation,
             seen,
@@ -438,16 +495,12 @@ impl BrowserState {
 
     /// Shows recovery for an expired deadline once no candidate check is left.
     fn settle(&mut self) {
-        if self.view != View::Discord
-            || self.is_validating()
-            || !self.queue.is_empty()
-            || self.exit_after_validation.is_some()
-        {
+        if self.view != View::Discord || self.is_validating() || !self.queue.is_empty() {
             return;
         }
-        let failure = if self.load_expired {
-            Failure::PageNotLoaded
-        } else if self.capture_expired {
+        let failure = if let Some(page_failure) = self.page_failure {
+            self.last_failure.unwrap_or(page_failure)
+        } else if self.capture_expired || self.validation_expired {
             self.last_failure.unwrap_or(Failure::NoCandidate)
         } else {
             return;
@@ -459,18 +512,15 @@ impl BrowserState {
     fn clear_deadlines(&mut self) {
         self.load_deadline = None;
         self.capture_deadline = None;
-        self.load_expired = false;
+        self.validation_deadline = None;
+        self.page_failure = None;
         self.capture_expired = false;
+        self.validation_expired = false;
     }
 
     fn request_exit(&mut self, outcome: BrowserLoginOutcome) -> Option<Command> {
-        self.clear_deadlines();
-        if self.is_validating() {
-            self.queue.clear();
-            self.exit_after_validation = Some(outcome);
-            self.view = View::Closing;
-            return None;
-        }
+        self.generation += 1;
+        self.queue.clear();
         Some(self.exit(outcome))
     }
 
@@ -565,38 +615,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permanent_rejection_is_deduplicated() {
-        let mut seen = SeenCandidates::default();
-        let calls = std::cell::Cell::new(0);
-        let validator = |_: String| {
-            calls.set(calls.get() + 1);
-            async { Err::<String, ValidationError<()>>(ValidationError::Rejected) }
-        };
+    async fn rejected_and_accepted_candidates_are_remembered_as_seen() {
         let c = parse_candidate("candidate:aaa.bbb.ccc").unwrap();
-        assert_eq!(
-            validate_candidate(&mut seen, c.clone(), validator).await,
-            Validation::Rejected
-        );
-        assert_eq!(
-            validate_candidate(&mut seen, c, validator).await,
-            Validation::Pending
-        );
-        assert_eq!(calls.get(), 1);
+        let mut seen = SeenCandidates::default();
+        let rejected = validate_candidate(&mut seen, c.clone(), |_: String| async {
+            Err::<String, ValidationError<()>>(ValidationError::Rejected)
+        })
+        .await;
+        assert_eq!(rejected, Validation::Rejected);
+        assert!(!seen.insert(&c));
+        let mut seen = SeenCandidates::default();
+        let accepted = validate_candidate(&mut seen, c.clone(), |t| async move {
+            Ok::<_, ValidationError<()>>(t)
+        })
+        .await;
+        assert!(matches!(accepted, Validation::Accepted(_)));
+        assert!(!seen.insert(&c));
     }
 
     #[tokio::test]
-    async fn accepted_candidate_is_deduplicated() {
-        let mut seen = SeenCandidates::default();
+    async fn a_panicking_check_is_a_retryable_transient_result() {
+        async fn explode(_: String) -> Result<String, ValidationError<()>> {
+            panic!("validator bug")
+        }
         let c = parse_candidate("candidate:aaa.bbb.ccc").unwrap();
-        let ok = |t: String| async move { Ok::<_, ValidationError<()>>(t) };
-        assert!(matches!(
-            validate_candidate(&mut seen, c.clone(), ok).await,
-            Validation::Accepted(_)
-        ));
-        assert_eq!(
-            validate_candidate(&mut seen, c, ok).await,
-            Validation::Pending
-        );
+        let (mut seen, result) = validate_job(SeenCandidates::default(), c.clone(), explode).await;
+        assert_eq!(result, Validation::Transient);
+        assert!(seen.insert(&c), "a panicked check must stay retryable");
     }
 
     #[tokio::test]

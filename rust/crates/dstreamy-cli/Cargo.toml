@@ -21,6 +21,7 @@ thiserror.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", features = ["sink"] }
+getrandom = { version = "0.3", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "registry"] }
 url = "2"
@@ -36,6 +37,7 @@ dstreamy-capture-macos = { path = "../dstreamy-capture-macos" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "2.0.2", optional = true }
+gtk = { version = "0.18", optional = true }
 async-trait = "0.1"
 dstreamy-capture-linux = { path = "../dstreamy-capture-linux" }
 
@@ -55,7 +57,7 @@ libc = "0.2"
 
 [features]
 # Pulls in a system webview (WebKitGTK on Linux), so default builds leave it out.
-browser-login = ["dep:tao", "dep:wry", "dep:muda", "dep:webkit2gtk"]
+browser-login = ["dep:tao", "dep:wry", "dep:muda", "dep:webkit2gtk", "dep:gtk", "dep:getrandom"]
 test-hooks = ["dstreamy-discord/test-rtp-start"]
 
 [lints]
