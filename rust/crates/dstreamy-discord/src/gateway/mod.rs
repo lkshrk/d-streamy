@@ -105,6 +105,7 @@ impl GatewayClient {
             shutdown_rx,
             ready_tx,
         );
+        // Dropping this future drops `shutdown`, which makes the runner close the socket and exit.
         let task = tokio::spawn(runner.run());
         let user = ready_rx.await.unwrap_or(Err(GatewayError::Closed))?;
         Ok(Self {
@@ -272,4 +273,34 @@ pub(crate) fn rustls_connector() -> Result<Connector, GatewayError> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(Connector::Rustls(Arc::new(config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn aborting_connect_before_ready_closes_the_gateway_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let mut opts = GatewayOptions::new(secrecy::SecretString::from("test")).with_url(url);
+        opts.compress = false;
+        let connect = tokio::spawn(GatewayClient::connect(opts));
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        connect.abort();
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            use futures_util::StreamExt;
+            loop {
+                match ws.next().await {
+                    None
+                    | Some(Err(_))
+                    | Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok());
+    }
 }
