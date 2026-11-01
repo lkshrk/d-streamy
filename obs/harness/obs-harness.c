@@ -73,6 +73,11 @@ const char *restart_output_settings;
 	const char *replace_before_update;
 	const char *update_output_while_active;
 	bool tools_session;
+	const char *then_update;
+	const char *tools_expect;
+	const char *tools_stop_after;
+	bool tools_wait_end;
+	bool tools_exit_while_starting;
 	int seconds;
 	int fps;
 	int width;
@@ -598,7 +603,14 @@ static void usage(void)
 		"  [--replace-before-update PATH (move PATH to PATH.saved and put an empty file there before the update)]\n"
 		"  [--update-output-while-active JSON (once the output is active, update its settings and report the bound mixer)]\n"
 		"  [--tools-session (with --fake-frontend: instead of --output, Start from the dialog after --settings-update,\n"
-		"   wait for Live and --until-video packets, apply --settings-update-while-active, Stop, then reopen)]\n"
+		"   wait for Live and --until-video packets, apply --settings-update-while-active, Stop, then reopen;\n"
+		"   the dialog's status is read again only when the source asks for a rebuild, as OBS's view does)]\n"
+		"  [--then-update JSON (with --tools-session: a second dialog update before Start)]\n"
+		"  [--tools-expect TEXT (with --tools-session: a Start, Stop or end that is not Live/Idle passes if its\n"
+		"   status contains TEXT)]\n"
+		"  [--tools-stop-after PATH (with --tools-session: wait until PATH exists before clicking Stop)]\n"
+		"  [--tools-wait-end (with --tools-session: instead of Stop, wait for the session to end on its own)]\n"
+		"  [--tools-exit-while-starting (with --tools-session: close OBS right after the Start click)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
@@ -655,6 +667,14 @@ static int parse_args(int argc, char **argv)
 			args.tools_session = true;
 			continue;
 		}
+		if (strcmp(a, "--tools-wait-end") == 0) {
+			args.tools_wait_end = true;
+			continue;
+		}
+		if (strcmp(a, "--tools-exit-while-starting") == 0) {
+			args.tools_exit_while_starting = true;
+			continue;
+		}
 		if (strcmp(a, "--report-ui") == 0) {
 			args.report_ui = true;
 			continue;
@@ -699,6 +719,12 @@ static int parse_args(int argc, char **argv)
 			args.settings_update = v;
 		else if (strcmp(a, "--settings-update-while-active") == 0)
 			args.settings_update_while_active = v;
+		else if (strcmp(a, "--then-update") == 0)
+			args.then_update = v;
+		else if (strcmp(a, "--tools-expect") == 0)
+			args.tools_expect = v;
+		else if (strcmp(a, "--tools-stop-after") == 0)
+			args.tools_stop_after = v;
 		else if (strcmp(a, "--replace-before-update") == 0)
 			args.replace_before_update = v;
 	else if (strcmp(a, "--dump-encoder-settings") == 0)
@@ -864,6 +890,8 @@ static void report_settings_properties(obs_source_t *source, const char *when)
 	obs_properties_destroy(props);
 	obs_data_t *settings = obs_source_get_settings(source);
 	printf("HARNESS settings_source when=%s audio_track=%lld\n", when, obs_data_get_int(settings, "audio_track"));
+	printf("HARNESS pick when=%s guild_id=%s channel_id=%s\n", when, obs_data_get_string(settings, "guild_id"),
+	       obs_data_get_string(settings, "channel_id"));
 	obs_data_release(settings);
 }
 
@@ -948,21 +976,61 @@ static bool click_settings_button(obs_source_t *source, const char *name)
 	return enabled;
 }
 
-// Polls the dialog's status, as reopening or clicking it would, until it starts with `prefix`.
-static bool wait_for_status(obs_source_t *source, const char *prefix, const char *when)
+static volatile long refreshes;
+
+static void on_update_properties(void *param, calldata_t *cd)
 {
-	char *status = NULL;
-	for (int i = 0; i < 300; i++) {
+	UNUSED_PARAMETER(param);
+	UNUSED_PARAMETER(cd);
+	os_atomic_inc_long(&refreshes);
+}
+
+static bool starts_with(const char *text, const char *prefix)
+{
+	return strncmp(text, prefix, strlen(prefix)) == 0;
+}
+
+// Like OBS's properties view: the status is read again only when the source signals update_properties,
+// until it no longer starts with `transient`. Returns the final status; the caller frees it.
+static char *wait_for_refresh(obs_source_t *source, const char *transient, const char *when)
+{
+	long seen = os_atomic_load_long(&refreshes);
+	char *status = settings_status(source);
+	uint64_t deadline = os_gettime_ns() + 60000000000ULL;
+	while (starts_with(status, transient) && os_gettime_ns() < deadline) {
+		os_sleep_ms(20);
+		long now = os_atomic_load_long(&refreshes);
+		if (now == seen)
+			continue;
+		seen = now;
 		bfree(status);
 		status = settings_status(source);
-		if (strncmp(status, prefix, strlen(prefix)) == 0)
-			break;
+		printf("HARNESS settings_refreshed when=%s status=%s\n", when, status);
+	}
+	printf("HARNESS settings_status when=%s status=%s\n", when, status);
+	return status;
+}
+
+// The status a scenario ends in: `normal`, or the error --tools-expect names.
+static bool tools_outcome(const char *status, const char *normal)
+{
+	if (starts_with(status, normal))
+		return true;
+	if (args.tools_expect && strstr(status, args.tools_expect))
+		return true;
+	harness_error("the dialog ended at \"%s\"", status);
+	return false;
+}
+
+static bool wait_for_file(const char *path)
+{
+	for (int i = 0; i < 600; i++) {
+		if (os_file_exists(path))
+			return true;
 		os_sleep_ms(100);
 	}
-	bool reached = strncmp(status, prefix, strlen(prefix)) == 0;
-	printf("HARNESS settings_status when=%s reached=%d status=%s\n", when, reached, status);
-	bfree(status);
-	return reached;
+	harness_error("%s never appeared", path);
+	return false;
 }
 
 // Runs the dialog like a user would: open, change settings as the properties view does, close, reopen.
@@ -1085,14 +1153,31 @@ static bool tools_session(void)
 		harness_error("--tools-session: the dialog did not open");
 		return false;
 	}
+	signal_handler_t *signals = obs_source_get_signal_handler(source);
+	signal_handler_connect(signals, "update_properties", on_update_properties, NULL);
 	report_settings_properties(source, "open");
 	bool ok = !args.settings_update || apply_settings_update(source, args.settings_update);
 	if (ok && args.settings_update)
 		report_settings_properties(source, "updated");
+	if (ok && args.then_update) {
+		ok = apply_settings_update(source, args.then_update);
+		report_settings_properties(source, "updated_again");
+	}
 	ok = ok && click_settings_button(source, "start");
-	bool live = ok && wait_for_status(source, "Live on", "live");
+	if (ok && args.tools_exit_while_starting) {
+		char *status = settings_status(source);
+		printf("HARNESS tools exiting status=%s\n", status);
+		bfree(status);
+		signal_handler_disconnect(signals, "update_properties", on_update_properties, NULL);
+		close_settings_dialog(source);
+		return true;
+	}
+	char *status = ok ? wait_for_refresh(source, "Starting", "live") : bstrdup("");
+	bool live = starts_with(status, "Live on");
+	ok = ok && (live || tools_outcome(status, "Live on"));
+	bfree(status);
 	obs_output_t *output = obs_get_output_by_name("D-Streamy");
-	printf("HARNESS tools output=%d\n", output != NULL);
+	printf("HARNESS tools output=%d active=%d\n", output != NULL, output && obs_output_active(output) ? 1 : 0);
 	for (int i = 0; live && output && !obs_output_active(output) && i < 1000; i++)
 		os_sleep_ms(10);
 	if (live && output) {
@@ -1106,14 +1191,24 @@ static bool tools_session(void)
 			report_output_audio_track(output, "after_settings_update");
 			report_audio_mixer(output, "after_settings_update");
 		}
-		ok = click_settings_button(source, "stop") && ok;
-		ok = wait_for_status(source, "Idle", "stopped") && ok;
+		if (args.tools_wait_end) {
+			printf("HARNESS tools waiting for the end\n");
+			status = wait_for_refresh(source, "Live on", "ended");
+		} else {
+			if (args.tools_stop_after)
+				ok = wait_for_file(args.tools_stop_after) && ok;
+			ok = click_settings_button(source, "stop") && ok;
+			status = wait_for_refresh(source, "Stopping", "stopped");
+		}
+		ok = tools_outcome(status, "Idle") && ok;
+		bfree(status);
 		printf("HARNESS tools stopped active=%d\n", obs_output_active(output) ? 1 : 0);
-	} else {
+	} else if (live) {
 		ok = false;
 	}
 	obs_output_release(output);
 	report_settings_properties(source, "after_stop");
+	signal_handler_disconnect(signals, "update_properties", on_update_properties, NULL);
 	close_settings_dialog(source);
 	source = open_settings_dialog();
 	if (!source) {
@@ -1780,7 +1875,9 @@ cleanup:
 		obs_source_release(audio);
 		while (obs_wait_for_destroy_queue())
 			;
+		uint64_t shutdown_ns = os_gettime_ns();
 		obs_shutdown();
+		printf("HARNESS obs_shutdown ms=%llu\n", (unsigned long long)((os_gettime_ns() - shutdown_ns) / 1000000));
 	}
 	os_event_destroy(stopped_event);
 	os_event_destroy(full_event);

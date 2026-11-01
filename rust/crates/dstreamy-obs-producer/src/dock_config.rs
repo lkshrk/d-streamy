@@ -82,13 +82,19 @@ pub fn load_file(path: &Path) -> Result<Option<Saved>, ConfigError> {
 
 /// Writes `json` to `path` through a synced temp file and a rename, then syncs the folder.
 pub fn save_file(path: &Path, json: &str) -> Result<(), ConfigError> {
-    save_file_checked(path, json, || {})
+    save_file_checked(path, json, |_| {})
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    BeforeCheck,
+    AfterCheck,
 }
 
 fn save_file_checked(
     path: &Path,
     json: &str,
-    before_rename: impl FnOnce(),
+    mut hook: impl FnMut(Stage),
 ) -> Result<(), ConfigError> {
     let failed = |e: io::Error| {
         ConfigError::Failed(format!(
@@ -104,10 +110,15 @@ fn save_file_checked(
     // Unique per process and call, so two OBS instances never share a temp file.
     let tmp = path.with_extension(format!("json.{}.{nanos}.tmp", std::process::id()));
     let result = write_synced(&tmp, json).map_err(failed).and_then(|()| {
-        before_rename();
-        // No lock covers files edited outside OBS, so a file broken since the last read is refused here instead.
-        if let Some(saved) = load_file(path)? {
-            decode(saved)?;
+        hook(Stage::BeforeCheck);
+        // No lock covers files edited outside OBS, so a file broken or replaced since the last read is refused here.
+        let checked = checked_identity(path)?;
+        hook(Stage::AfterCheck);
+        if identity(&fs::metadata(path)).as_ref() != checked.as_ref() {
+            return Err(ConfigError::Failed(format!(
+                "{} changed while D-Streamy was saving its settings, so it was kept; reopen Tools > D-Streamy",
+                path.display()
+            )));
         }
         fs::rename(&tmp, path).map_err(failed)
     });
@@ -118,18 +129,71 @@ fn save_file_checked(
     sync_dir(dir).map_err(failed)
 }
 
+/// The file's identity once its content reads as settings; `None` when there is no file.
+fn checked_identity(path: &Path) -> Result<Option<Identity>, ConfigError> {
+    let unreadable = |e: io::Error| ConfigError::Unreadable {
+        path: path.display().to_string(),
+        detail: e.to_string(),
+    };
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(e)),
+    };
+    let mut bytes = Vec::new();
+    io::Read::read_to_end(&mut file, &mut bytes).map_err(unreadable)?;
+    decode(Saved {
+        path: path.display().to_string(),
+        bytes,
+    })?;
+    Ok(identity(&file.metadata()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Identity {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64),
+}
+
+fn identity(meta: &io::Result<fs::Metadata>) -> Option<Identity> {
+    let meta = meta.as_ref().ok()?;
+    Some(Identity {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        #[cfg(unix)]
+        inode: {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        },
+    })
+}
+
 fn write_synced(tmp: &Path, json: &str) -> io::Result<()> {
     let mut file = File::create(tmp)?;
     file.write_all(json.as_bytes())?;
     file.sync_all()
 }
 
+/// Some filesystems (FUSE, network mounts) can't sync a folder; the rename stands there without that guarantee.
 #[cfg(unix)]
 fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
+    match File::open(dir)?.sync_all() {
+        Err(e) if folder_sync_unsupported(&e) => Ok(()),
+        other => other,
+    }
 }
 
-/// Windows can't open a folder as a file; its rename is durable once MoveFileEx returns.
+#[cfg(unix)]
+fn folder_sync_unsupported(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+    )
+}
+
+/// std can't sync a folder on Windows, and its rename doesn't write through, so a power loss may undo the rename.
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
@@ -142,6 +206,8 @@ pub struct ConfigState {
     error: Option<ConfigError>,
     /// The model holds settings the file doesn't; the file must not be read over them.
     unsaved: bool,
+    /// The model's ownership is newer than the file's, so a reload must not replace it.
+    ownership_unsaved: bool,
 }
 
 impl Default for ConfigState {
@@ -150,6 +216,7 @@ impl Default for ConfigState {
             model: DockModel::new(DockSettings::default()),
             error: None,
             unsaved: false,
+            ownership_unsaved: false,
         }
     }
 }
@@ -179,10 +246,14 @@ impl ConfigState {
             Ok(_) if self.unsaved && !was_blocked => self.save(write),
             Ok(Some(settings)) => {
                 let file_owned = settings.owned.clone();
+                let mine = self.model.persisted().cloned();
                 self.model.reload(settings);
+                if self.ownership_unsaved {
+                    self.model.restore_ownership(mine);
+                }
                 self.error = None;
                 self.unsaved = false;
-                // A running session keeps its own ownership over the file's, and the file must say so.
+                // A running session or an unsaved change keeps its own ownership over the file's, and the file must say so.
                 if self.model.persisted() != file_owned.as_ref() {
                     self.save(write);
                 }
@@ -202,6 +273,7 @@ impl ConfigState {
         let before = self.model.persisted().cloned();
         let result = step(&mut self.model);
         if self.model.persisted() != before.as_ref() {
+            self.ownership_unsaved = true;
             if self.blocked() {
                 self.unsaved = true;
             } else {
@@ -209,6 +281,13 @@ impl ConfigState {
             }
         }
         result
+    }
+
+    /// A write that `save` handed off failed later; it is retried like any failed write.
+    pub fn write_failed(&mut self, error: ConfigError) {
+        self.error = Some(error);
+        self.unsaved = true;
+        self.ownership_unsaved = true;
     }
 
     /// The dialog picked a track. False when out of range; a corrupt or unreadable file is left alone.
@@ -251,6 +330,7 @@ impl ConfigState {
             Ok(()) => {
                 self.error = None;
                 self.unsaved = false;
+                self.ownership_unsaved = false;
             }
             Err(e) => {
                 self.error = Some(e);
@@ -534,14 +614,32 @@ mod tests {
         assert!(leftovers(path.parent().unwrap()).is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn only_an_unsupported_folder_sync_is_tolerated() {
+        const EINVAL: i32 = 22;
+        assert!(folder_sync_unsupported(&io::Error::from_raw_os_error(
+            EINVAL
+        )));
+        assert!(folder_sync_unsupported(&io::Error::from(
+            io::ErrorKind::Unsupported
+        )));
+        assert!(!folder_sync_unsupported(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        assert!(!folder_sync_unsupported(&io::Error::other("EIO")));
+    }
+
     #[test]
     fn a_file_broken_between_the_read_and_the_rename_is_kept() {
         let dir = scratch();
         let path = dir.path().join("config.json");
         fs::write(&path, r#"{"audio_track":2}"#).unwrap();
         for broken in [b"garbage".as_slice(), &[0xff, 0xfe]] {
-            let e = save_file_checked(&path, r#"{"audio_track":5}"#, || {
-                fs::write(&path, broken).unwrap()
+            let e = save_file_checked(&path, r#"{"audio_track":5}"#, |stage| {
+                if stage == Stage::BeforeCheck {
+                    fs::write(&path, broken).unwrap()
+                }
             })
             .unwrap_err();
             assert!(matches!(e, ConfigError::Corrupt { .. }), "{e:?}");
@@ -551,10 +649,64 @@ mod tests {
     }
 
     #[test]
+    fn a_file_replaced_or_created_after_its_check_is_kept() {
+        let dir = scratch();
+        let path = dir.path().join("config.json");
+        let external = r#"{"audio_track":6,"guild_id":"edited elsewhere"}"#;
+        for existing in [Some(r#"{"audio_track":2}"#), None] {
+            let _ = fs::remove_file(&path);
+            if let Some(text) = existing {
+                fs::write(&path, text).unwrap();
+            }
+            let e = save_file_checked(&path, r#"{"audio_track":5}"#, |stage| {
+                if stage == Stage::AfterCheck {
+                    let other = dir.path().join("other.json");
+                    fs::write(&other, external).unwrap();
+                    fs::rename(&other, &path).unwrap();
+                }
+            })
+            .unwrap_err();
+            let ConfigError::Failed(message) = &e else {
+                panic!("{existing:?}: {e:?}");
+            };
+            assert!(
+                message.ends_with(
+                    "changed while D-Streamy was saving its settings, so it was kept; reopen Tools > D-Streamy"
+                ),
+                "{message}"
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), external);
+            assert!(leftovers(dir.path()).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_file_still_saves() {
+        let dir = scratch();
+        let target = dir.path().join("real.json");
+        let path = dir.path().join("config.json");
+        fs::write(&target, r#"{"audio_track":2}"#).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        save_file(&path, r#"{"audio_track":4}"#).unwrap();
+        assert_eq!(
+            decode(load_file(&path).unwrap().unwrap())
+                .unwrap()
+                .audio_track,
+            4
+        );
+    }
+
+    #[test]
     fn a_folder_in_place_of_the_file_is_unreadable_and_kept() {
         let dir = scratch();
         let path = dir.path().join("config.json");
-        let e = save_file_checked(&path, "{}", || fs::create_dir(&path).unwrap()).unwrap_err();
+        let e = save_file_checked(&path, "{}", |stage| {
+            if stage == Stage::BeforeCheck {
+                fs::create_dir(&path).unwrap()
+            }
+        })
+        .unwrap_err();
         assert!(matches!(e, ConfigError::Unreadable { .. }), "{e:?}");
         assert!(path.is_dir());
         let e = load_file(&path).unwrap_err();
@@ -653,6 +805,46 @@ mod tests {
         open(&mut s, &f);
         assert_eq!(owned(&f), None, "the retry saves it");
         assert_eq!(s.model.persisted(), None);
+    }
+
+    #[test]
+    fn an_idle_ownership_change_made_while_blocked_survives_the_repair() {
+        let (f, mut s) = picked(OWNED_3);
+        s.session(f.write(), |m| m.start(CANVAS)).unwrap();
+        s.session(f.write(), |m| m.claim(started(7).ownership));
+        s.session(f.write(), |m| m.started(Ok(started(7))));
+        *f.text.borrow_mut() = Some("garbage".into());
+        open(&mut s, &f);
+        s.session(|_| panic!("blocked"), |m| m.stop()).unwrap();
+        s.session(|_| panic!("blocked"), |m| m.stopped(Ok(())));
+        assert_eq!(s.model.state(), &crate::dock::DockState::Idle);
+        *f.text.borrow_mut() = Some(OWNED_3.into());
+        open(&mut s, &f);
+        assert_eq!(
+            s.model.persisted(),
+            None,
+            "the stop is newer than the repaired file's 3"
+        );
+        assert_eq!(owned(&f), None, "and is written");
+        assert_eq!(
+            f.track(),
+            Some(2),
+            "the repaired file's other settings load"
+        );
+    }
+
+    #[test]
+    fn a_write_that_failed_after_the_lock_is_retried_and_keeps_the_ownership() {
+        let (f, mut s) = picked(OWNED_3);
+        s.session(f.write(), |m| m.start(CANVAS)).unwrap();
+        s.session(|_| Ok(()), |m| m.claim(started(7).ownership));
+        s.write_failed(failed());
+        assert_eq!(s.error(), Some(&failed()));
+        s.session(|_| Ok(()), |m| m.output_failed("refused".into(), true));
+        s.write_failed(failed());
+        open(&mut s, &f);
+        assert_eq!(owned(&f), None, "retried over the file's stale 3");
+        assert_eq!(s.error(), None);
     }
 
     #[test]

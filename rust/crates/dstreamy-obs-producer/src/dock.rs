@@ -276,15 +276,6 @@ impl DockModel {
             )
         };
         let guild_changed = guild_id != self.settings.guild_id;
-        let known = |id: &String| self.channels.iter().any(|c| &c.id == id);
-        let channel_id = if guild_changed
-            || self.channels.is_empty()
-            || channel_id.as_ref().is_some_and(known)
-        {
-            channel_id
-        } else {
-            None
-        };
         self.settings = DockSettings {
             guild_id,
             channel_id,
@@ -314,12 +305,11 @@ impl DockModel {
             Ok(guilds) => {
                 self.guilds = guilds;
                 self.error = None;
+                // A saved server the list lacks stays selected and shown until the user picks another.
                 let selected = self.settings.guild_id.clone()?;
                 if self.guilds.iter().any(|g| g.id == selected) {
                     Some(selected)
                 } else {
-                    self.settings.guild_id = None;
-                    self.settings.channel_id = None;
                     self.channels.clear();
                     None
                 }
@@ -352,10 +342,6 @@ impl DockModel {
             Ok(channels) => {
                 self.channels = channels;
                 self.error = None;
-                let known = |id: &String| self.channels.iter().any(|c| &c.id == id);
-                if !self.settings.channel_id.as_ref().is_some_and(known) {
-                    self.settings.channel_id = None;
-                }
             }
             Err(e) => {
                 self.channels.clear();
@@ -364,9 +350,41 @@ impl DockModel {
         }
     }
 
+    /// Whether `channel_id` is a voice channel the service listed for the selected server.
+    pub fn lists_channel(&self, channel_id: &str) -> bool {
+        self.channels.iter().any(|c| c.id == channel_id)
+    }
+
+    /// Whether `guild_id` is a server the service listed.
+    pub fn lists_guild(&self, guild_id: &str) -> bool {
+        self.guilds.iter().any(|g| g.id == guild_id)
+    }
+
+    /// Ends a start or stop that can no longer finish, or refuses one that can't begin, with `message`.
+    pub fn abort(&mut self, message: String) {
+        self.state = DockState::Idle;
+        self.applying = None;
+        self.live_track = None;
+        self.error = Some(message);
+    }
+
+    /// Puts back an ownership a reload replaced, when the file's is older than this one.
+    pub fn restore_ownership(&mut self, owned: Option<Ownership>) {
+        self.settings.owned = owned;
+    }
+
     pub fn select_channel(&mut self, channel_id: &str) {
         self.settings.channel_id = Some(channel_id.to_owned());
         self.error = None;
+    }
+
+    /// The dialog picked a channel; taken only when the service listed it for the selected server.
+    pub fn pick_channel(&mut self, channel_id: &str) -> bool {
+        let listed = self.lists_channel(channel_id);
+        if listed {
+            self.select_channel(channel_id);
+        }
+        listed
     }
 
     /// Moves to `Starting` and returns what to send, or the reason the dock can't start.
@@ -906,9 +924,67 @@ mod tests {
         m.channels_loaded("g", Ok(vec![named("c")]));
         assert_eq!(m.settings().channel_id.as_deref(), Some("c"));
         m.channels_loaded("g", Ok(vec![named("d")]));
+        assert_eq!(
+            m.settings().channel_id.as_deref(),
+            Some("c"),
+            "kept until the user picks"
+        );
+        assert!(!m.lists_channel("c"));
+        assert_eq!(
+            m.guilds_loaded(Ok(vec![named("h")])),
+            None,
+            "no channels for an unlisted server"
+        );
+        assert_eq!(m.settings().guild_id.as_deref(), Some("g"));
+        assert!(m.channels().is_empty());
+    }
+
+    #[test]
+    fn only_listed_servers_and_channels_can_be_picked() {
+        let mut m = picked();
+        m.guilds_loaded(Ok(vec![named("g"), named("h")]));
+        m.channels_loaded("g", Ok(vec![named("c"), named("d")]));
+        assert!(m.lists_guild("h") && !m.lists_guild("x"));
+        assert!(m.lists_channel("d") && !m.lists_channel("e"));
+        m.select_guild("h");
+        assert_eq!(
+            m.settings().channel_id,
+            None,
+            "a server change clears the channel"
+        );
+        assert!(!m.lists_channel("c"), "the old server's channels are gone");
+        assert!(!m.pick_channel("c"), "the old server's channel is refused");
         assert_eq!(m.settings().channel_id, None);
-        assert_eq!(m.guilds_loaded(Ok(vec![named("h")])), None);
-        assert_eq!(m.settings().guild_id, None);
+        assert!(m.start(canvas()).is_err(), "nothing to start in");
+        m.channels_loaded("h", Ok(vec![named("e")]));
+        assert!(!m.pick_channel("c"), "still not one of h's");
+        assert!(m.pick_channel("e"));
+        let request = m.start(canvas()).unwrap();
+        assert_eq!(
+            (request.guild_id.as_str(), request.channel_id.as_str()),
+            ("h", "e")
+        );
+    }
+
+    #[test]
+    fn abort_ends_a_start_or_stop_with_its_error() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.claim(Some(ownership(7)));
+        m.abort("the control step failed".into());
+        assert_eq!(m.state(), &DockState::Idle);
+        assert_eq!(m.status_text(true), "the control step failed");
+        assert_eq!(
+            m.persisted(),
+            Some(&ownership(7)),
+            "kept so a later stop can end it"
+        );
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership(7)))));
+        m.stop();
+        m.abort("gone".into());
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.state(), &DockState::Idle);
     }
 
     #[test]
@@ -952,15 +1028,16 @@ mod tests {
         assert_eq!(m.settings().channel_id.as_deref(), Some("e"));
         m.channels_loaded("h", Ok(vec![named("f")]));
         assert_eq!(
-            m.settings().channel_id,
-            None,
-            "validated once the list loads"
+            m.settings().channel_id.as_deref(),
+            Some("e"),
+            "a saved id is kept"
         );
+        assert!(!m.lists_channel("e"));
         assert_eq!(m.set_settings(m.settings().clone()), None);
     }
 
     #[test]
-    fn a_settings_channel_change_is_validated_against_the_list() {
+    fn a_saved_channel_the_list_lacks_is_kept() {
         let mut m = picked();
         let pick = |channel: &str| DockSettings {
             channel_id: Some(channel.into()),
@@ -969,7 +1046,8 @@ mod tests {
         assert_eq!(m.set_settings(pick("d")), None);
         assert_eq!(m.settings().channel_id.as_deref(), Some("d"));
         m.set_settings(pick("zz"));
-        assert_eq!(m.settings().channel_id, None);
+        assert_eq!(m.settings().channel_id.as_deref(), Some("zz"));
+        assert!(!m.lists_channel("zz"));
         assert_eq!(m.channels().len(), 2);
     }
 

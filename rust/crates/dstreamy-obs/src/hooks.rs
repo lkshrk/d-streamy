@@ -72,11 +72,22 @@ mod enabled {
             }
         }
     }
+
+    /// A file Tools > D-Streamy's Start waits for before it asks the service, so a test decides when it answers.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn start_gate() -> Option<std::path::PathBuf> {
+        std::env::var_os("DSTREAMY_TEST_START_GATE").map(Into::into)
+    }
 }
 
 #[cfg(not(feature = "test-hooks"))]
 mod enabled {
     use dstreamy_obs_sys as sys;
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn start_gate() -> Option<std::path::PathBuf> {
+        None
+    }
 
     pub struct Hooks;
 
@@ -97,4 +108,4 @@ mod enabled {
     }
 }
 
-pub use enabled::Hooks;
+pub use enabled::{Hooks, start_gate};

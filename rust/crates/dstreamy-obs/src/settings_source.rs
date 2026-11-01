@@ -8,7 +8,7 @@ use std::sync::{Mutex, PoisonError};
 use dstreamy_obs_producer::dock::{
     AUDIO_TRACK_HELP, AUDIO_TRACK_TITLE, AUDIO_TRACKS, DockState, TrackStatus, track_name,
 };
-use dstreamy_obs_producer::dock_config::ConfigState;
+use dstreamy_obs_producer::dock_config::{ConfigError, ConfigState};
 use dstreamy_obs_sys as sys;
 
 use crate::config;
@@ -25,20 +25,162 @@ const GUILD: &CStr = c"guild_id";
 const CHANNEL: &CStr = c"channel_id";
 const STATUS: &CStr = c"status";
 
-/// The producer model behind every dialog; it outlives each dialog's source.
-static CONTROLS: Mutex<Option<ConfigState>> = Mutex::new(None);
+/// Shown instead of the session status where the plugin has no service client yet.
+const UNSUPPORTED: &str =
+    "D-Streamy for OBS is not supported on Windows yet, so Start and Stop are disabled";
 
-pub fn with_controls<R>(f: impl FnOnce(&mut ConfigState) -> R) -> R {
-    let mut guard = CONTROLS.lock().unwrap_or_else(PoisonError::into_inner);
-    f(guard.get_or_insert_with(ConfigState::default))
+/// The producer model behind every dialog; it outlives each dialog's source.
+struct Controls {
+    state: ConfigState,
+    /// Saves handed out, and saves written or superseded; they differ while a write is on its way to disk.
+    issued: u64,
+    flushed: u64,
 }
 
-/// Runs a config step and logs its config error: every time for a change, only when new on open.
-fn config_step(c: &mut ConfigState, change: bool, step: impl FnOnce(&mut ConfigState)) {
-    let before = c.error().cloned();
+static CONTROLS: Mutex<Option<Controls>> = Mutex::new(None);
+/// Serializes the config file's reads and writes; taken before `CONTROLS`, never while holding it.
+static DISK: Mutex<u64> = Mutex::new(0);
+
+fn controls<R>(f: impl FnOnce(&mut Controls) -> R) -> R {
+    let mut guard = CONTROLS.lock().unwrap_or_else(PoisonError::into_inner);
+    f(guard.get_or_insert_with(|| Controls {
+        state: ConfigState::default(),
+        issued: 0,
+        flushed: 0,
+    }))
+}
+
+/// Reads the model; never use it to change settings, since nothing it does is saved.
+pub fn with_controls<R>(f: impl FnOnce(&ConfigState) -> R) -> R {
+    controls(|c| f(&c.state))
+}
+
+/// The JSON a step asked to save, written once the model lock is released.
+#[derive(Default)]
+pub struct Pending(Option<String>);
+
+impl Pending {
+    pub fn write(&mut self) -> impl FnOnce(&str) -> Result<(), ConfigError> + '_ {
+        |json| {
+            self.0 = Some(json.to_owned());
+            Ok(())
+        }
+    }
+}
+
+/// Changes the model; a save it asks for is written to disk after the lock is released.
+pub fn change<R>(f: impl FnOnce(&mut ConfigState, &mut Pending) -> R) -> R {
+    let (result, save) = controls(|c| {
+        let mut pending = Pending::default();
+        let result = f(&mut c.state, &mut pending);
+        (result, issue(c, pending))
+    });
+    if let Some(save) = save {
+        flush(save);
+    }
+    result
+}
+
+fn issue(c: &mut Controls, pending: Pending) -> Option<(u64, String)> {
+    let json = pending.0?;
+    c.issued += 1;
+    Some((c.issued, json))
+}
+
+/// Writes save `generation` unless a newer one already reached the disk; only the newest save reports its error.
+fn flush((generation, json): (u64, String)) {
+    let mut written = DISK.lock().unwrap_or_else(PoisonError::into_inner);
+    let result = (generation > *written).then(|| config::save(&json));
+    *written = (*written).max(generation);
+    controls(|c| {
+        c.flushed = c.flushed.max(generation);
+        if let Some(Err(e)) = result {
+            log::warn(&e.message(c.state.model.settings().audio_track));
+            if generation == c.issued {
+                c.state.write_failed(e);
+            }
+        }
+    });
+}
+
+/// A dialog opens: the file is read outside the model lock, and not at all while a save is still being written.
+fn open_config() {
+    let save = {
+        let _disk = DISK.lock().unwrap_or_else(PoisonError::into_inner);
+        let read = config::load();
+        controls(|c| {
+            if c.issued != c.flushed {
+                return None;
+            }
+            let mut pending = Pending::default();
+            let before = c.state.error().cloned();
+            c.state.open(|| read, pending.write());
+            if let Some(e) = c.state.error().filter(|e| Some(*e) != before.as_ref()) {
+                log::warn(&e.message(c.state.model.settings().audio_track));
+            }
+            issue(c, pending)
+        })
+    };
+    if let Some(save) = save {
+        flush(save);
+    }
+}
+
+/// Runs a dialog change and logs the config error it leaves.
+fn config_step(c: &mut ConfigState, step: impl FnOnce(&mut ConfigState)) {
     step(c);
-    if let Some(e) = c.error().filter(|e| change || Some(*e) != before.as_ref()) {
+    if let Some(e) = c.error().filter(|e| !matches!(e, ConfigError::Failed(_))) {
         log::warn(&e.message(c.model.settings().audio_track));
+    }
+}
+
+/// The open dialog's source, so the control thread can ask OBS to rebuild it.
+struct Dialog(*mut sys::obs_weak_source_t);
+
+// SAFETY: weak source references are reference-counted by libobs and usable from any thread.
+unsafe impl Send for Dialog {}
+
+static DIALOG: Mutex<Option<Dialog>> = Mutex::new(None);
+
+fn watch_dialog(source: *mut sys::obs_source_t) {
+    // SAFETY: `source` is the source being created; the weak reference is released in `forget_dialog` or here.
+    let weak = Dialog(unsafe { sys::obs_source_get_weak_source(source) });
+    let old = DIALOG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .replace(weak);
+    if let Some(old) = old {
+        // SAFETY: the weak reference this module took.
+        unsafe { sys::obs_weak_source_release(old.0) };
+    }
+}
+
+fn forget_dialog(source: *mut sys::obs_source_t) {
+    let mut dialog = DIALOG.lock().unwrap_or_else(PoisonError::into_inner);
+    // SAFETY: both pointers are live; the weak reference is this module's own.
+    let ours = dialog
+        .as_ref()
+        .is_some_and(|d| unsafe { sys::obs_weak_source_references_source(d.0, source) });
+    if ours && let Some(old) = dialog.take() {
+        // SAFETY: as above.
+        unsafe { sys::obs_weak_source_release(old.0) };
+    }
+}
+
+/// Asks the open dialog, if any, to rebuild itself from the model; callable from any thread, without the model lock.
+pub fn refresh() {
+    let source = DIALOG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        // SAFETY: the weak reference is live while it is in DIALOG; this returns a strong reference or NULL.
+        .map(|d| unsafe { sys::obs_weak_source_get_source(d.0) });
+    if let Some(source) = source.filter(|s| !s.is_null()) {
+        // SAFETY: a strong reference taken above; OBS's properties view reloads on its own thread.
+        unsafe {
+            sys::obs_source_update_properties(source);
+            sys::obs_source_release(source);
+        }
     }
 }
 
@@ -55,10 +197,15 @@ fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type) {
         if let Some(track) = selected {
             preview.select_audio_track(track);
         }
-        let session = preview.status_text(true);
+        let quiet = preview.state() == &DockState::Idle && preview.error().is_none();
+        let session = if cfg!(unix) {
+            preview.status_text(true)
+        } else {
+            UNSUPPORTED.to_owned()
+        };
         if let Some(e) = c.error() {
             let config = e.message(preview.settings().audio_track);
-            let text = if preview.state() == &DockState::Idle {
+            let text = if quiet && cfg!(unix) {
                 config
             } else {
                 format!("{session}. {config}")
@@ -66,6 +213,7 @@ fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type) {
             return (text, sys::OBS_TEXT_INFO_ERROR);
         }
         let kind = match (preview.track_status(), preview.error()) {
+            _ if !cfg!(unix) => sys::OBS_TEXT_INFO_WARNING,
             (TrackStatus::Pending { .. }, _) => sys::OBS_TEXT_INFO_WARNING,
             (TrackStatus::Idle { .. }, Some(_)) => sys::OBS_TEXT_INFO_ERROR,
             _ => sys::OBS_TEXT_INFO_NORMAL,
@@ -87,10 +235,9 @@ extern "C" fn create(
     source: *mut sys::obs_source_t,
 ) -> *mut c_void {
     guard("settings create", source.cast(), || {
-        let guild = with_controls(|c| {
-            config_step(c, false, |c| c.open(config::load, config::save));
-            c.model.settings().guild_id.clone()
-        });
+        watch_dialog(source);
+        open_config();
+        let guild = with_controls(|c| c.model.settings().guild_id.clone());
         session::load_lists(guild);
         let picked = with_controls(|c| c.model.settings().clone());
         // SAFETY: libobs passes the new source's settings, which it owns; it copies the strings.
@@ -110,7 +257,9 @@ extern "C" fn create(
     })
 }
 
-extern "C" fn destroy(_data: *mut c_void) {}
+extern "C" fn destroy(data: *mut c_void) {
+    guard("settings destroy", (), || forget_dialog(data.cast()));
+}
 
 extern "C" fn get_defaults(settings: *mut sys::obs_data_t) {
     guard("settings get_defaults", (), || {
@@ -124,28 +273,36 @@ extern "C" fn update(_data: *mut c_void, settings: *mut sys::obs_data_t) {
     guard("settings update", (), || {
         // SAFETY: libobs passes the source's own settings.
         let (guild, channel) = unsafe { (picked(settings, GUILD), picked(settings, CHANNEL)) };
-        let load = with_controls(|c| {
+        let load = change(|c, p| {
             let guild = guild.filter(|g| c.model.settings().guild_id.as_ref() != Some(g))?;
-            config_step(c, true, |c| {
-                c.edit(config::save, |m| m.select_guild(&guild));
+            config_step(c, |c| {
+                c.edit(p.write(), |m| m.select_guild(&guild));
             });
             Some(guild)
         });
         if let Some(guild) = load {
             session::load_lists(Some(guild));
         }
-        with_controls(|c| {
-            if let Some(channel) =
-                channel.filter(|ch| c.model.settings().channel_id.as_ref() != Some(ch))
+        // The view keeps the old server's channel after a server change; only a channel the new server lists counts.
+        let kept = change(|c, p| {
+            if let Some(channel) = channel
+                .clone()
+                .filter(|ch| c.model.settings().channel_id.as_ref() != Some(ch))
             {
-                config_step(c, true, |c| {
-                    c.edit(config::save, |m| m.select_channel(&channel))
+                config_step(c, |c| {
+                    c.edit(p.write(), |m| m.pick_channel(&channel));
                 });
             }
+            c.model.settings().channel_id.clone()
         });
-        with_controls(|c| match selected_track(settings) {
-            Some(track) => config_step(c, true, |c| {
-                c.select_audio_track(track, config::save);
+        if kept != channel {
+            let kept = c_text(&kept.unwrap_or_default());
+            // SAFETY: libobs passes the source's own settings; it copies the string.
+            unsafe { sys::obs_data_set_string(settings, CHANNEL.as_ptr(), kept.as_ptr()) };
+        }
+        change(|c, p| match selected_track(settings) {
+            Some(track) => config_step(c, |c| {
+                c.select_audio_track(track, p.write());
             }),
             None => {
                 // SAFETY: libobs passes the source's own settings.
@@ -345,13 +502,13 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                     c"start",
                     c"Start",
                     Some(start_clicked),
-                    state == DockState::Idle,
+                    cfg!(unix) && state == DockState::Idle,
                 ),
                 (
                     c"stop",
                     c"Stop",
                     Some(stop_clicked),
-                    matches!(state, DockState::Live { .. }),
+                    cfg!(unix) && matches!(state, DockState::Live { .. }),
                 ),
             ];
             for (name, label, clicked, enabled) in buttons {

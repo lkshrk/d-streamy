@@ -90,9 +90,13 @@ pub struct Harness {
 
 impl Harness {
     pub fn new(config: &str) -> Self {
+        Self::with_mock(config, dstreamy_mock_discord::MockConfig::default())
+    }
+
+    pub fn with_mock(config: &str, discord: dstreamy_mock_discord::MockConfig) -> Self {
         mock_producer();
         let rt = Runtime::new().unwrap();
-        let mock = rt.block_on(MockDiscord::start()).unwrap();
+        let mock = rt.block_on(MockDiscord::start_with(discord)).unwrap();
         let dir = tempfile::tempdir().unwrap();
         ConfigPaths::in_dir(dir.path())
             .save_token(MOCK_TOKEN)
