@@ -20,6 +20,12 @@ if(OS_LINUX)
   target_link_libraries(obs-harness-frontend PRIVATE OBS::libobs)
   set_target_properties(obs-harness-frontend PROPERTIES PREFIX "" C_EXTENSIONS ON)
   add_dependencies(obs-harness obs-harness-frontend)
+  # A frontend that has the Tools menu but no properties dialog.
+  add_library(obs-harness-frontend-incomplete MODULE fake-frontend.c)
+  target_compile_definitions(obs-harness-frontend-incomplete PRIVATE FAKE_FRONTEND_INCOMPLETE)
+  target_link_libraries(obs-harness-frontend-incomplete PRIVATE OBS::libobs)
+  set_target_properties(obs-harness-frontend-incomplete PROPERTIES PREFIX "" C_EXTENSIONS ON)
+  add_dependencies(obs-harness obs-harness-frontend-incomplete)
   target_link_libraries(obs-harness PRIVATE ${CMAKE_DL_LIBS})
 
   add_test(

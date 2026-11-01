@@ -68,7 +68,7 @@ fn main() {
         .header("wrapper.h")
         .rust_edition(bindgen::RustEdition::Edition2024)
         .allowlist_function(
-            "obs_.*|blog|calldata_set_data|proc_handler_add|video_output_get_info|audio_output_get_channels",
+            "obs_.*|blog|bfree|calldata_set_data|proc_handler_add|video_output_get_info|audio_output_get_channels",
         )
         .allowlist_type(
             "obs_.*|encoder_packet|calldata_t|proc_handler_t|video_output_info|dstreamy_frontend_.*",

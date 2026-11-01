@@ -88,6 +88,7 @@ impl HarnessRun {
             .arg("--output-settings")
             .arg(settings.to_string())
             .args(args)
+            .current_dir(h.dir.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -981,11 +982,14 @@ fn report_ui(extra: &[&str]) -> Vec<String> {
     lines
 }
 
-fn fake_frontend() -> String {
-    let harness = obs_env().harness;
-    let lib = harness.with_file_name("obs-harness-frontend.so");
+fn harness_lib(name: &str) -> String {
+    let lib = obs_env().harness.with_file_name(name);
     assert!(lib.exists(), "{} is not built", lib.display());
     lib.to_string_lossy().into_owned()
+}
+
+fn fake_frontend() -> String {
+    harness_lib("obs-harness-frontend.so")
 }
 
 #[test]
@@ -1043,11 +1047,264 @@ fn tools_d_streamy_opens_the_private_settings_source_through_the_frontend() {
     for want in [
         "HARNESS frontend tools_items=1 name=D-Streamy\u{2026}",
         "HARNESS frontend opened id=dstreamy_settings public=0 flags=0x400",
+        "HARNESS frontend held expired=0",
         "HARNESS frontend closed expired=1",
         "HARNESS settings_source registered=1 listed=0 flags=0x400",
     ] {
         assert!(lines.iter().any(|l| l == want), "{want}: {lines:#?}");
     }
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_frontend_without_a_properties_dialog_offers_no_tools_entry() {
+    let lib = harness_lib("obs-harness-frontend-incomplete.so");
+    let lines = report_ui(&["--fake-frontend", lib.as_str()]);
+    assert!(
+        has_plugin_line(
+            &lines,
+            "OBS frontend lacks obs_frontend_open_source_properties: Tools > D-Streamy is unavailable"
+        ),
+        "{lines:#?}"
+    );
+    assert!(!has_plugin_line(&lines, "no OBS frontend"), "{lines:#?}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HARNESS frontend tools_items=0 name="),
+        "{lines:#?}"
+    );
+}
+
+const IDLE_STATUS: &str = "Idle \u{2014} start controls are unavailable";
+const ROUTING_HELP: &str = "D-Streamy sends this OBS mixer track to Discord. New OBS sources feed all tracks \
+     until you change them in Edit \u{203a} Advanced Audio Properties \u{203a} Tracks. This does not \
+     change OBS's stream or recording. A change applies on the next Go Live.";
+
+fn module_config(dir: &std::path::Path) -> PathBuf {
+    dir.join("obs-dstreamy").join("config.json")
+}
+
+fn write_module_config(dir: &std::path::Path, config: Value) {
+    let path = module_config(dir);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, config.to_string()).unwrap();
+}
+
+fn read_module_config(dir: &std::path::Path) -> Value {
+    let path = module_config(dir);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    serde_json::from_str(&text).unwrap()
+}
+
+fn settings_lines<'a>(lines: &'a [String], when: &str) -> Vec<&'a str> {
+    let prefix = format!(" when={when} ");
+    lines
+        .iter()
+        .filter(|l| l.starts_with("HARNESS settings_") && l.contains(&prefix))
+        .map(String::as_str)
+        .collect()
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn the_settings_dialog_offers_tracks_1_to_6_routing_help_and_no_working_start() {
+    let config = tempfile::tempdir().unwrap();
+    let dir = config.path().to_string_lossy().into_owned();
+    let lib = fake_frontend();
+    let lines = report_ui(&[
+        "--fake-frontend",
+        lib.as_str(),
+        "--module-config",
+        dir.as_str(),
+    ]);
+    let mut want = vec![
+        format!("HARNESS settings_property when=open name=status type=4 enabled=1 desc={IDLE_STATUS}"),
+        "HARNESS settings_info when=open name=status kind=0".to_owned(),
+        "HARNESS settings_property when=open name=audio_track type=6 enabled=1 desc=Discord audio track"
+            .to_owned(),
+    ];
+    for track in 1..=6 {
+        want.push(format!(
+            "HARNESS settings_item when=open name=audio_track value={track} text=Track {track}"
+        ));
+    }
+    want.extend([
+        format!(
+            "HARNESS settings_property when=open name=routing type=4 enabled=1 desc={ROUTING_HELP}"
+        ),
+        "HARNESS settings_info when=open name=routing kind=0".to_owned(),
+        "HARNESS settings_property when=open name=start type=8 enabled=0 desc=Start".to_owned(),
+        "HARNESS settings_property when=open name=stop type=8 enabled=0 desc=Stop".to_owned(),
+        "HARNESS settings_source when=open audio_track=1".to_owned(),
+    ]);
+    assert_eq!(settings_lines(&lines, "open"), want, "{lines:#?}");
+    assert!(
+        !lines.iter().any(|l| l.to_lowercase().contains("label")),
+        "{lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_track_chosen_in_the_dialog_is_saved_to_the_module_config_and_reopens() {
+    let config = tempfile::tempdir().unwrap();
+    let owned = json!({"connections": [{"id": 4, "fps": 30}], "guild_id": "g", "channel_id": "c", "instance": null});
+    write_module_config(
+        config.path(),
+        json!({"audio_track": 3, "guild_id": "g", "bitrate_kbps": 2500, "owned": owned}),
+    );
+    let dir = config.path().to_string_lossy().into_owned();
+    let lib = fake_frontend();
+    let lines = report_ui(&[
+        "--fake-frontend",
+        lib.as_str(),
+        "--module-config",
+        dir.as_str(),
+        "--settings-update",
+        r#"{"audio_track": 5}"#,
+    ]);
+    for want in [
+        "HARNESS settings_source when=open audio_track=3",
+        "HARNESS settings_source when=updated audio_track=5",
+        "HARNESS settings_source when=reopened audio_track=5",
+    ] {
+        assert!(lines.iter().any(|l| l == want), "{want}: {lines:#?}");
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|l| *l == format!("HARNESS settings_modified refresh=1 status={IDLE_STATUS}")),
+        "{lines:#?}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| *l == "HARNESS frontend closed expired=1")
+            .count(),
+        2,
+        "{lines:#?}"
+    );
+    let saved = read_module_config(config.path());
+    assert_eq!(saved["audio_track"], 5, "{saved}");
+    assert_eq!(saved["guild_id"], "g", "{saved}");
+    assert_eq!(saved["bitrate_kbps"], 2500, "{saved}");
+    assert_eq!(saved["owned"], owned, "{saved}");
+    assert!(!saved.to_string().contains("label"), "{saved}");
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn an_out_of_range_track_from_the_dialog_is_refused_and_not_saved() {
+    let config = tempfile::tempdir().unwrap();
+    write_module_config(config.path(), json!({"audio_track": 3}));
+    let dir = config.path().to_string_lossy().into_owned();
+    let lib = fake_frontend();
+    let lines = report_ui(&[
+        "--fake-frontend",
+        lib.as_str(),
+        "--module-config",
+        dir.as_str(),
+        "--settings-update",
+        r#"{"audio_track": 9}"#,
+    ]);
+    assert!(
+        has_plugin_line(
+            &lines,
+            "ignored Discord audio track 9: pick Track 1 to Track 6"
+        ),
+        "{lines:#?}"
+    );
+    for want in [
+        "HARNESS settings_source when=updated audio_track=3",
+        "HARNESS settings_source when=reopened audio_track=3",
+    ] {
+        assert!(lines.iter().any(|l| l == want), "{want}: {lines:#?}");
+    }
+    assert_eq!(read_module_config(config.path())["audio_track"], 3);
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn without_a_module_config_folder_the_dialog_says_the_track_is_not_saved() {
+    let lib = fake_frontend();
+    let lines = report_ui(&[
+        "--fake-frontend",
+        lib.as_str(),
+        "--settings-update",
+        r#"{"audio_track": 2}"#,
+    ]);
+    let error = "OBS gave D-Streamy no settings folder, so Track 2 is used until OBS quits but is not saved";
+    assert!(
+        lines.iter().any(|l| *l
+            == format!(
+                "HARNESS settings_property when=updated name=status type=4 enabled=1 desc={error}"
+            )),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HARNESS settings_info when=updated name=status kind=2"),
+        "{lines:#?}"
+    );
+    assert!(has_plugin_line(&lines, error), "{lines:#?}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HARNESS settings_source when=reopened audio_track=2"),
+        "{lines:#?}"
+    );
+    assert!(lines.iter().all(|l| !l.contains("relative")), "{lines:#?}");
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_track_chosen_in_the_dialog_while_live_never_touches_the_active_output() {
+    let config = tempfile::tempdir().unwrap();
+    let dir = config.path().to_string_lossy().into_owned();
+    let lib = fake_frontend();
+    let (lines, _) = stream(
+        json!({"audio_track": 1}),
+        &[
+            "--fake-frontend",
+            lib.as_str(),
+            "--module-config",
+            dir.as_str(),
+            "--settings-update-while-active",
+            r#"{"audio_track": 4}"#,
+        ],
+        60,
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HARNESS output_audio_track when=after_settings_update active=1 track=1"),
+        "{lines:#?}"
+    );
+    let encoder = |when: &str| {
+        lines
+            .iter()
+            .find_map(|l| {
+                l.strip_prefix(&format!("HARNESS audio_mixer when={when} "))?
+                    .split("encoder=")
+                    .nth(1)?
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| panic!("no {when} mixer report: {lines:#?}"))
+    };
+    assert_eq!(encoder("start"), encoder("after_settings_update"));
+    assert_eq!(
+        mixer_reports(&lines)
+            .iter()
+            .map(|r| (r.0.as_str(), r.1))
+            .collect::<Vec<_>>(),
+        [("start", Some(0)), ("after_settings_update", Some(0))],
+        "{lines:#?}"
+    );
+    assert_eq!(read_module_config(config.path())["audio_track"], 4);
 }
 
 #[test]

@@ -22,48 +22,79 @@ struct Frontend {
 static FRONTEND: OnceLock<Frontend> = OnceLock::new();
 
 #[cfg(unix)]
-fn host() -> Option<Library> {
-    Some(libloading::os::unix::Library::this().into())
+fn host() -> Result<Library, Missing> {
+    Ok(libloading::os::unix::Library::this().into())
 }
 
 #[cfg(windows)]
-fn host() -> Option<Library> {
+fn host() -> Result<Library, Missing> {
     libloading::os::windows::Library::open_already_loaded("obs-frontend-api.dll")
-        .ok()
         .map(Into::into)
+        .map_err(|_| Missing::Library)
 }
 
+/// Why the Tools entry is unavailable.
+enum Missing {
+    #[cfg_attr(unix, allow(dead_code))]
+    Library,
+    Frontend,
+    Symbol(&'static str),
+}
+
+const ADD_TOOLS_MENU_ITEM: &str = "obs_frontend_add_tools_menu_item";
+const OPEN_SOURCE_PROPERTIES: &str = "obs_frontend_open_source_properties";
+
 impl Frontend {
-    fn resolve() -> Option<Self> {
+    fn resolve() -> Result<Self, Missing> {
         let host = host()?;
         // SAFETY: wrapper.h asserts these types against obs-frontend-api.h; `_host` keeps the library loaded.
         let (add, open) = unsafe {
             (
-                *host
-                    .get::<sys::dstreamy_frontend_add_tools_menu_item>(
-                        b"obs_frontend_add_tools_menu_item\0",
-                    )
-                    .ok()?,
-                *host
-                    .get::<sys::dstreamy_frontend_open_source_properties>(
-                        b"obs_frontend_open_source_properties\0",
-                    )
-                    .ok()?,
+                host.get::<sys::dstreamy_frontend_add_tools_menu_item>(
+                    ADD_TOOLS_MENU_ITEM.as_bytes(),
+                )
+                .ok()
+                .and_then(|s| *s),
+                host.get::<sys::dstreamy_frontend_open_source_properties>(
+                    OPEN_SOURCE_PROPERTIES.as_bytes(),
+                )
+                .ok()
+                .and_then(|s| *s),
             )
         };
-        Some(Self {
-            add_tools_menu_item: Some(add?),
-            open_source_properties: Some(open?),
-            _host: host,
-        })
+        match (add, open) {
+            (Some(add), Some(open)) => Ok(Self {
+                add_tools_menu_item: Some(add),
+                open_source_properties: Some(open),
+                _host: host,
+            }),
+            (None, None) => Err(Missing::Frontend),
+            (None, Some(_)) => Err(Missing::Symbol(ADD_TOOLS_MENU_ITEM)),
+            (Some(_), None) => Err(Missing::Symbol(OPEN_SOURCE_PROPERTIES)),
+        }
     }
 }
 
 /// Adds Tools > D-Streamy… when OBS's frontend is present; call from `obs_module_load`, on the UI thread.
 pub fn install() {
-    let Some(frontend) = Frontend::resolve() else {
-        log::info("no OBS frontend: Tools > D-Streamy is unavailable");
-        return;
+    let frontend = match Frontend::resolve() {
+        Ok(frontend) => frontend,
+        Err(Missing::Library) => {
+            log::info(
+                "no OBS frontend (obs-frontend-api.dll is not loaded): Tools > D-Streamy is unavailable",
+            );
+            return;
+        }
+        Err(Missing::Frontend) => {
+            log::info("no OBS frontend: Tools > D-Streamy is unavailable");
+            return;
+        }
+        Err(Missing::Symbol(name)) => {
+            log::warn(&format!(
+                "OBS frontend lacks {name}: Tools > D-Streamy is unavailable"
+            ));
+            return;
+        }
     };
     let frontend = FRONTEND.get_or_init(|| frontend);
     if let Some(add) = frontend.add_tools_menu_item {

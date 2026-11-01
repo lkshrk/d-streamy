@@ -21,12 +21,14 @@ EXPORT void obs_frontend_add_tools_menu_item(const char *name, obs_frontend_cb c
 	item_data = private_data;
 }
 
+#ifndef FAKE_FRONTEND_INCOMPLETE
 // Holds a reference like OBSBasicProperties' OBSSource member does.
 EXPORT void obs_frontend_open_source_properties(obs_source_t *source)
 {
 	obs_source_release(opened);
 	opened = obs_source_get_ref(source);
 }
+#endif
 
 EXPORT int fake_frontend_tools_items(const char **name)
 {

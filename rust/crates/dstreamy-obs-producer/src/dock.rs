@@ -13,6 +13,16 @@ pub const BITRATE_KBPS: std::ops::RangeInclusive<i64> = 500..=50_000;
 /// OBS's mixer tracks, one-based.
 pub const AUDIO_TRACKS: std::ops::RangeInclusive<u8> = 1..=6;
 pub const DEFAULT_AUDIO_TRACK: u8 = 1;
+pub const AUDIO_TRACK_TITLE: &str = "Discord audio track";
+pub const AUDIO_TRACK_HELP: &str = "D-Streamy sends this OBS mixer track to Discord. New OBS sources feed all tracks \
+     until you change them in Edit › Advanced Audio Properties › Tracks. This does not \
+     change OBS's stream or recording. A change applies on the next Go Live.";
+
+/// OBS's fixed name for a mixer track; D-Streamy keeps no labels of its own.
+pub fn track_name(track: u8) -> String {
+    format!("Track {track}")
+}
+
 /// serve refuses a longer per-start grace (ADR 0004).
 pub const MAX_GRACE_SECS: u64 = 3600;
 
@@ -151,6 +161,14 @@ pub enum DockState {
     Stopping,
 }
 
+/// The selected track against the one bound to the running session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackStatus {
+    Idle { selected: u8 },
+    Live { track: u8 },
+    Pending { live: u8, next: u8 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockModel {
     settings: DockSettings,
@@ -158,16 +176,65 @@ pub struct DockModel {
     channels: Vec<Named>,
     state: DockState,
     error: Option<String>,
+    /// The track the running output was started with; set by `start`, cleared when the session ends.
+    live_track: Option<u8>,
 }
 
 impl DockModel {
     pub fn new(settings: DockSettings) -> Self {
         Self {
-            settings,
+            settings: settings.clamped(),
             guilds: Vec::new(),
             channels: Vec::new(),
             state: DockState::Idle,
             error: None,
+            live_track: None,
+        }
+    }
+
+    pub fn live_track(&self) -> Option<u8> {
+        self.live_track
+    }
+
+    pub fn track_status(&self) -> TrackStatus {
+        let selected = self.settings.audio_track;
+        match self.live_track {
+            None => TrackStatus::Idle { selected },
+            Some(track) if track == selected => TrackStatus::Live { track },
+            Some(live) => TrackStatus::Pending {
+                live,
+                next: selected,
+            },
+        }
+    }
+
+    /// Selects the track the next start binds; never touches a running session. False when out of range.
+    pub fn select_audio_track(&mut self, track: u8) -> bool {
+        if !AUDIO_TRACKS.contains(&track) {
+            return false;
+        }
+        self.settings.audio_track = track;
+        true
+    }
+
+    /// One line for the settings dialog; `controls` says whether it can start and stop D-Streamy.
+    pub fn status_text(&self, controls: bool) -> String {
+        let pending = match self.track_status() {
+            TrackStatus::Pending { next, .. } => {
+                format!(" — {} applies on next Go Live", track_name(next))
+            }
+            _ => String::new(),
+        };
+        let live = self.live_track.map(track_name).unwrap_or_default();
+        match &self.state {
+            DockState::Idle => match (&self.error, controls) {
+                (Some(error), _) => error.clone(),
+                (None, true) => "Idle".into(),
+                (None, false) => "Idle — start controls are unavailable".into(),
+            },
+            DockState::Starting => format!("Starting on {live}…{pending}"),
+            DockState::Live { .. } => format!("Live on {live}{pending}"),
+            DockState::Stopping => "Stopping…".into(),
         }
     }
 
@@ -223,6 +290,16 @@ impl DockModel {
         }
         self.channels.clear();
         self.settings.guild_id.clone()
+    }
+
+    /// Takes settings read back from the module config; its ownership counts only while no session runs.
+    pub fn reload(&mut self, settings: DockSettings) -> Option<String> {
+        let owned = settings.owned.clone();
+        let guild = self.set_settings(settings);
+        if self.state == DockState::Idle {
+            self.settings.owned = owned;
+        }
+        guild
     }
 
     /// Returns the guild whose channels to load next.
@@ -296,6 +373,7 @@ impl DockModel {
             Ok(_) => {
                 self.state = DockState::Starting;
                 self.error = None;
+                self.live_track = Some(self.settings.audio_track);
             }
             Err(e) => self.error = Some(e.clone()),
         }
@@ -351,6 +429,7 @@ impl DockModel {
                     self.settings.owned = Some(*provisional);
                 }
                 self.state = DockState::Idle;
+                self.live_track = None;
                 self.error = Some(failed.error.to_string());
             }
         }
@@ -371,6 +450,7 @@ impl DockModel {
             return;
         }
         self.state = DockState::Idle;
+        self.live_track = None;
         match result {
             Ok(()) => {
                 self.settings.owned = None;
@@ -386,6 +466,7 @@ impl DockModel {
             return;
         }
         self.state = DockState::Idle;
+        self.live_track = None;
         self.error = message;
     }
 
@@ -405,6 +486,7 @@ impl DockModel {
             "guilds": self.guilds,
             "channels": self.channels,
             "settings": self.settings,
+            "live_track": self.live_track,
         })
     }
 }
@@ -571,18 +653,143 @@ mod tests {
         }
     }
 
+    fn with_track(m: &mut DockModel, track: u8) {
+        let mut s = m.settings().clone();
+        s.audio_track = track;
+        m.set_settings(s);
+    }
+
+    #[test]
+    fn a_new_dock_is_idle_on_track_1() {
+        let m = DockModel::new(DockSettings::default());
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.track_status(), TrackStatus::Idle { selected: 1 });
+        assert_eq!(
+            m.status_text(false),
+            "Idle — start controls are unavailable"
+        );
+        assert_eq!(m.status_text(true), "Idle");
+    }
+
+    #[test]
+    fn reloading_the_config_keeps_its_ownership_unless_a_session_runs() {
+        let stored = DockSettings {
+            audio_track: 4,
+            owned: Some(ownership(3)),
+            ..picked().settings().clone()
+        };
+        let mut m = DockModel::new(DockSettings::default());
+        m.reload(stored.clone());
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+        assert_eq!(m.settings().audio_track, 4);
+
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership(7)))));
+        m.reload(stored);
+        assert_eq!(m.persisted(), Some(&ownership(7)), "the live session's own");
+        assert_eq!(m.settings().audio_track, 4);
+        assert_eq!(m.live_track(), Some(1));
+    }
+
+    #[test]
+    fn selecting_a_track_takes_only_tracks_1_to_6() {
+        let mut m = DockModel::new(DockSettings::default());
+        assert!(m.select_audio_track(6));
+        assert_eq!(m.settings().audio_track, 6);
+        for bad in [0, 7, 255] {
+            assert!(!m.select_audio_track(bad), "{bad}");
+            assert_eq!(m.settings().audio_track, 6);
+        }
+    }
+
+    #[test]
+    fn a_track_changed_while_idle_is_the_one_the_next_start_binds() {
+        let mut m = picked();
+        with_track(&mut m, 3);
+        assert_eq!(m.track_status(), TrackStatus::Idle { selected: 3 });
+        m.start(canvas()).unwrap();
+        assert_eq!(m.live_track(), Some(3));
+        assert_eq!(m.status_text(true), "Starting on Track 3…");
+        m.started(Ok(started(None)));
+        assert_eq!(m.track_status(), TrackStatus::Live { track: 3 });
+        assert_eq!(m.status_text(true), "Live on Track 3");
+    }
+
     #[test]
     fn a_track_changed_while_live_is_kept_for_the_next_start() {
         let mut m = picked();
+        with_track(&mut m, 2);
         m.start(canvas()).unwrap();
         m.started(Ok(started(None)));
+        with_track(&mut m, 5);
         assert!(matches!(m.state(), DockState::Live { .. }));
-        let mut s = m.settings().clone();
-        s.audio_track = 4;
-        m.set_settings(s);
-        assert!(matches!(m.state(), DockState::Live { .. }));
-        assert_eq!(m.settings().audio_track, 4);
-        assert_eq!(m.settings().output_settings()["audio_track"], json!(4));
+        assert_eq!(m.settings().audio_track, 5);
+        assert_eq!(m.settings().output_settings()["audio_track"], json!(5));
+        assert_eq!(m.live_track(), Some(2));
+        assert_eq!(m.track_status(), TrackStatus::Pending { live: 2, next: 5 });
+        assert_eq!(
+            m.status_text(false),
+            "Live on Track 2 — Track 5 applies on next Go Live"
+        );
+        with_track(&mut m, 2);
+        assert_eq!(m.track_status(), TrackStatus::Live { track: 2 });
+        assert_eq!(m.view()["live_track"], json!(2));
+    }
+
+    #[test]
+    fn every_way_out_of_a_session_clears_the_live_track() {
+        let live = |track: u8| {
+            let mut m = picked();
+            with_track(&mut m, track);
+            m.start(canvas()).unwrap();
+            m.started(Ok(started(None)));
+            with_track(&mut m, 6);
+            m
+        };
+        let mut m = live(2);
+        m.stop();
+        assert_eq!(m.live_track(), Some(2), "still bound while stopping");
+        assert_eq!(m.status_text(true), "Stopping…");
+        m.stopped(Ok(()));
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.track_status(), TrackStatus::Idle { selected: 6 });
+
+        let mut m = live(3);
+        m.stop();
+        m.stopped(Err("timed out".into()));
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.status_text(false), "timed out");
+
+        let mut m = live(4);
+        m.ended(Some("the session ended".into()));
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.track_status(), TrackStatus::Idle { selected: 6 });
+
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Err(ControlError::Stopping.into()));
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.view()["live_track"], Value::Null);
+    }
+
+    #[test]
+    fn tracks_have_fixed_names_and_the_routing_help_is_exact() {
+        let names: Vec<String> = AUDIO_TRACKS.map(track_name).collect();
+        assert_eq!(
+            names,
+            [
+                "Track 1", "Track 2", "Track 3", "Track 4", "Track 5", "Track 6"
+            ]
+        );
+        assert_eq!(AUDIO_TRACK_TITLE, "Discord audio track");
+        assert_eq!(
+            AUDIO_TRACK_HELP,
+            "D-Streamy sends this OBS mixer track to Discord. New OBS sources feed all tracks \
+             until you change them in Edit › Advanced Audio Properties › Tracks. This does not \
+             change OBS's stream or recording. A change applies on the next Go Live."
+        );
+        assert!(!AUDIO_TRACK_HELP.contains("label"));
     }
 
     #[test]

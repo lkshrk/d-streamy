@@ -67,6 +67,9 @@ const char *restart_output_settings;
 	bool stream_output;
 	bool report_ui;
 	const char *fake_frontend;
+	const char *module_config;
+	const char *settings_update;
+	const char *settings_update_while_active;
 	const char *update_output_while_active;
 	int seconds;
 	int fps;
@@ -587,6 +590,9 @@ static void usage(void)
 		"  [--restart-output-settings JSON (like --restart-video-settings, but updates the output's settings)]\n"
 		"  [--report-ui (print the output's property names, its audio_track default and the settings source's type)]\n"
 		"  [--fake-frontend LIB (Linux: load LIB's obs_frontend_* globally before the modules, then click its Tools items)]\n"
+		"  [--module-config DIR (libobs's module config directory; without it modules have none)]\n"
+		"  [--settings-update JSON (with --fake-frontend: update the opened settings source, then reopen it)]\n"
+		"  [--settings-update-while-active JSON (like --settings-update, but once the output is active)]\n"
 		"  [--update-output-while-active JSON (once the output is active, update its settings and report the bound mixer)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
@@ -678,6 +684,12 @@ static int parse_args(int argc, char **argv)
 			args.update_output_while_active = v;
 		else if (strcmp(a, "--fake-frontend") == 0)
 			args.fake_frontend = v;
+		else if (strcmp(a, "--module-config") == 0)
+			args.module_config = v;
+		else if (strcmp(a, "--settings-update") == 0)
+			args.settings_update = v;
+		else if (strcmp(a, "--settings-update-while-active") == 0)
+			args.settings_update_while_active = v;
 	else if (strcmp(a, "--dump-encoder-settings") == 0)
 			args.dump_encoder_settings = v;
 		else if (strcmp(a, "--release-after-start") == 0)
@@ -817,21 +829,54 @@ static bool load_fake_frontend(void)
 	return fake_frontend != NULL;
 }
 
-static bool click_fake_frontend(void)
+static obs_source_t *(*fake_take_opened)(void);
+static bool (*fake_click)(void);
+
+static void report_settings_properties(obs_source_t *source, const char *when)
 {
-	int (*items)(const char **) = (int (*)(const char **))dlsym(fake_frontend, "fake_frontend_tools_items");
-	bool (*click)(void) = (bool (*)(void))dlsym(fake_frontend, "fake_frontend_click");
-	obs_source_t *(*take)(void) = (obs_source_t * (*)(void)) dlsym(fake_frontend, "fake_frontend_take_opened");
-	if (!items || !click || !take) {
-		harness_error("--fake-frontend lacks its fake_frontend_* functions");
-		return false;
+	obs_properties_t *props = obs_source_properties(source);
+	for (obs_property_t *p = obs_properties_first(props); p; obs_property_next(&p)) {
+		const char *name = obs_property_name(p);
+		printf("HARNESS settings_property when=%s name=%s type=%d enabled=%d desc=%s\n", when, name,
+		       (int)obs_property_get_type(p), obs_property_enabled(p), obs_property_description(p));
+		const char *help = obs_property_long_description(p);
+		if (help)
+			printf("HARNESS settings_help when=%s name=%s text=%s\n", when, name, help);
+		if (obs_property_get_type(p) == OBS_PROPERTY_TEXT && obs_property_text_type(p) == OBS_TEXT_INFO)
+			printf("HARNESS settings_info when=%s name=%s kind=%d\n", when, name,
+			       (int)obs_property_text_info_type(p));
+		if (obs_property_get_type(p) == OBS_PROPERTY_LIST)
+			for (size_t i = 0; i < obs_property_list_item_count(p); i++)
+				printf("HARNESS settings_item when=%s name=%s value=%lld text=%s\n", when, name,
+				       obs_property_list_item_int(p, i), obs_property_list_item_name(p, i));
 	}
-	const char *name = NULL;
-	int count = items(&name);
-	printf("HARNESS frontend tools_items=%d name=%s\n", count, name ? name : "");
-	if (!click())
-		return true;
-	obs_source_t *source = take();
+	obs_properties_destroy(props);
+	obs_data_t *settings = obs_source_get_settings(source);
+	printf("HARNESS settings_source when=%s audio_track=%lld\n", when, obs_data_get_int(settings, "audio_track"));
+	obs_data_release(settings);
+}
+
+static obs_source_t *open_settings_dialog(void)
+{
+	if (!fake_click())
+		return NULL;
+	return fake_take_opened();
+}
+
+// Closes the dialog: drops the reference the fake frontend held and checks nothing else keeps the source.
+static void close_settings_dialog(obs_source_t *source)
+{
+	obs_weak_source_t *weak = obs_source_get_weak_source(source);
+	printf("HARNESS frontend held expired=%d\n", obs_weak_source_expired(weak));
+	obs_source_release(source);
+	printf("HARNESS frontend closed expired=%d\n", obs_weak_source_expired(weak));
+	obs_weak_source_release(weak);
+}
+
+// Runs the dialog like a user would: open, change settings as the properties view does, close, reopen.
+static bool settings_dialog(const char *update)
+{
+	obs_source_t *source = open_settings_dialog();
 	if (!source) {
 		printf("HARNESS frontend opened none\n");
 		return true;
@@ -840,11 +885,58 @@ static bool click_fake_frontend(void)
 	printf("HARNESS frontend opened id=%s public=%d flags=0x%x\n", obs_source_get_id(source), named == source,
 	       obs_source_get_output_flags(source));
 	obs_source_release(named);
-	obs_weak_source_t *weak = obs_source_get_weak_source(source);
-	obs_source_release(source);
-	printf("HARNESS frontend closed expired=%d\n", obs_weak_source_expired(weak));
-	obs_weak_source_release(weak);
+	if (args.report_ui || update)
+		report_settings_properties(source, "open");
+	if (update) {
+		obs_data_t *data = obs_data_create_from_json(update);
+		if (!data) {
+			harness_error("--settings-update is not a JSON object");
+			obs_source_release(source);
+			return false;
+		}
+		// Like OBSPropertiesView::ControlChanged: edit the source's settings in place, update, then call modified.
+		obs_properties_t *props = obs_source_properties(source);
+		obs_data_t *settings = obs_source_get_settings(source);
+		obs_data_apply(settings, data);
+		obs_data_release(data);
+		obs_source_update(source, settings);
+		obs_property_t *track = obs_properties_get(props, "audio_track");
+		bool refresh = track && obs_property_modified(track, settings);
+		obs_property_t *status = obs_properties_get(props, "status");
+		printf("HARNESS settings_modified refresh=%d status=%s\n", refresh,
+		       status ? obs_property_description(status) : "");
+		obs_data_release(settings);
+		obs_properties_destroy(props);
+		report_settings_properties(source, "updated");
+	}
+	close_settings_dialog(source);
+	if (!update)
+		return true;
+	source = open_settings_dialog();
+	if (!source) {
+		harness_error("the settings source did not reopen");
+		return false;
+	}
+	report_settings_properties(source, "reopened");
+	close_settings_dialog(source);
 	return true;
+}
+
+static bool click_fake_frontend(void)
+{
+	int (*items)(const char **) = (int (*)(const char **))dlsym(fake_frontend, "fake_frontend_tools_items");
+	fake_click = (bool (*)(void))dlsym(fake_frontend, "fake_frontend_click");
+	fake_take_opened = (obs_source_t * (*)(void)) dlsym(fake_frontend, "fake_frontend_take_opened");
+	if (!items || !fake_click || !fake_take_opened) {
+		harness_error("--fake-frontend lacks its fake_frontend_* functions");
+		return false;
+	}
+	const char *name = NULL;
+	int count = items(&name);
+	printf("HARNESS frontend tools_items=%d name=%s\n", count, name ? name : "");
+	if (args.settings_update_while_active)
+		return true;
+	return settings_dialog(args.settings_update);
 }
 #endif
 
@@ -1188,7 +1280,7 @@ int main(int argc, char **argv)
 		goto cleanup;                  \
 	} while (0)
 
-	if (!obs_startup("en-US", NULL, NULL))
+	if (!obs_startup("en-US", args.module_config, NULL))
 		FAIL("obs_startup failed (Linux needs an X display, e.g. xvfb-run)");
 	initialized = true;
 	printf("HARNESS libobs %s\n", obs_get_version_string());
@@ -1378,6 +1470,21 @@ int main(int argc, char **argv)
 		obs_data_release(live);
 		report_output_audio_track(output, "after_active_update");
 		report_audio_mixer(output, "after_active_update");
+	}
+	if (args.settings_update_while_active) {
+#ifdef __linux__
+		for (int i = 0; !obs_output_active(output); i++) {
+			if (i == 1000)
+				FAIL("output not active 10 s after its start");
+			os_sleep_ms(10);
+		}
+		if (!fake_frontend || !settings_dialog(args.settings_update_while_active))
+			FAIL("--settings-update-while-active needs a working --fake-frontend");
+		report_output_audio_track(output, "after_settings_update");
+		report_audio_mixer(output, "after_settings_update");
+#else
+		FAIL("--settings-update-while-active is Linux-only");
+#endif
 	}
 	struct frame_counts at_start = frame_counts();
 
