@@ -1,8 +1,11 @@
 //! Tools > D-Streamy… through obs-frontend-api, looked up at runtime so a libobs-only host still loads the plugin.
 
 use std::ffi::{CStr, c_void};
+use std::path::PathBuf;
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::thread::JoinHandle;
 
 use dstreamy_obs_sys as sys;
 use libloading::Library;
@@ -101,6 +104,48 @@ pub fn install() {
         // SAFETY: module load runs on the UI thread; the frontend copies the name.
         unsafe { add(TOOLS_ITEM.as_ptr(), Some(open_settings), ptr::null_mut()) };
         log::info("added Tools > D-Streamy");
+        if let Some(trigger) = crate::hooks::open_dialog_trigger() {
+            click_when(trigger);
+        }
+    }
+}
+
+static CLICKER: Mutex<Option<(Arc<AtomicBool>, JoinHandle<()>)>> = Mutex::new(None);
+
+/// Test hook: once `trigger` exists, runs the Tools item's callback on OBS's UI thread, as a click does.
+fn click_when(trigger: PathBuf) {
+    let unloading = Arc::new(AtomicBool::new(false));
+    let stop = unloading.clone();
+    let thread = std::thread::spawn(move || {
+        while !trigger.exists() {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        log::info("test hook: clicking Tools > D-Streamy");
+        // SAFETY: the task runs on the UI thread, where OBS runs a menu click's callback.
+        unsafe {
+            sys::obs_queue_task(
+                sys::OBS_TASK_UI,
+                Some(open_settings),
+                ptr::null_mut(),
+                false,
+            )
+        };
+    });
+    *CLICKER.lock().unwrap_or_else(PoisonError::into_inner) = Some((unloading, thread));
+}
+
+/// Ends the test hook's thread; call from `obs_module_unload`.
+pub fn shutdown() {
+    let clicker = CLICKER
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if let Some((unloading, thread)) = clicker {
+        unloading.store(true, Ordering::Release);
+        let _ = thread.join();
     }
 }
 

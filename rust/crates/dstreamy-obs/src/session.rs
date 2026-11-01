@@ -15,7 +15,7 @@ use dstreamy_obs_producer::dock::{Canvas, DockModel, DockState};
 #[cfg(unix)]
 use dstreamy_obs_producer::{
     Endpoint,
-    control::{ObsControl, Ownership, StartRequest},
+    control::{ControlError, ObsControl, Ownership, StartRequest},
 };
 use dstreamy_obs_sys as sys;
 use futures_util::FutureExt;
@@ -24,16 +24,16 @@ use tokio::sync::{mpsc, watch};
 
 use crate::log;
 use crate::output::{OutputPtr, text};
-use crate::settings_source::{change, refresh};
+use crate::settings_source::{change, refresh, with_controls};
 
 /// How long a dialog click waits for the service before it shows the state reached so far.
 pub const UI_WAIT: Duration = Duration::from_secs(3);
 /// How long Stop waits for the output to end before it still stops the service session.
 const OUTPUT_STOP_WAIT: Duration = Duration::from_secs(10);
-/// How long a service call in flight may still finish once OBS starts closing.
+/// How long after OBS starts closing the service calls in flight may still finish, all of them together.
 const CLOSING_GRACE: Duration = Duration::from_secs(5);
-/// How long stopping a session that came up while OBS was closing may take.
-const CLOSING_STOP_WAIT: Duration = Duration::from_secs(5);
+/// How long after OBS starts closing every control step, cleanup included, must be done.
+const CLOSING_LIMIT: Duration = Duration::from_secs(10);
 const OUTPUT_NAME: &std::ffi::CStr = c"D-Streamy";
 
 const CLOSING: &str = "OBS is closing, so D-Streamy did not start";
@@ -55,8 +55,48 @@ enum Job {
 
 struct Session {
     jobs: mpsc::UnboundedSender<Job>,
-    closing: watch::Sender<bool>,
+    closing: watch::Sender<Option<Instant>>,
     thread: JoinHandle<()>,
+}
+
+/// When OBS began closing, if it has; every wait after that counts against the same moment, so waits never add up.
+#[derive(Clone)]
+struct Closing(watch::Receiver<Option<Instant>>);
+
+impl Closing {
+    fn is_closing(&self) -> bool {
+        self.0.borrow().is_some()
+    }
+
+    fn deadline(&self, after: Duration) -> Option<Instant> {
+        self.0.borrow().map(|began| began + after)
+    }
+
+    /// Resolves once OBS has been closing for `after`.
+    async fn over(&mut self, after: Duration) {
+        let began = match self.0.wait_for(Option::is_some).await {
+            Ok(began) => *began,
+            Err(_) => None,
+        };
+        match began {
+            Some(began) => tokio::time::sleep_until((began + after).into()).await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Runs `call` until OBS has been closing for `after`; `None` once it was dropped.
+    async fn within<T>(&mut self, after: Duration, call: impl Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            biased;
+            value = call => Some(value),
+            () = self.over(after) => None,
+        }
+    }
+
+    /// A service call: once OBS starts closing, it may finish within [`CLOSING_GRACE`].
+    async fn call<T>(&mut self, call: impl Future<Output = T>) -> Option<T> {
+        self.within(CLOSING_GRACE, call).await
+    }
 }
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
@@ -110,7 +150,7 @@ pub fn install() {
         return;
     }
     let (jobs, receiver) = mpsc::unbounded_channel();
-    let (closing, closed) = watch::channel(false);
+    let (closing, closed) = watch::channel(None);
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -123,7 +163,7 @@ pub fn install() {
     };
     match std::thread::Builder::new()
         .name("dstreamy control".into())
-        .spawn(move || run(&runtime, receiver, closed))
+        .spawn(move || run(&runtime, receiver, Closing(closed)))
     {
         Ok(thread) => {
             *SESSION.lock().unwrap_or_else(PoisonError::into_inner) = Some(Session {
@@ -137,7 +177,8 @@ pub fn install() {
 }
 
 /// Ends the control thread and releases the output; call from `obs_module_unload`, before libobs unmaps the plugin.
-/// A service call in flight gets [`CLOSING_GRACE`] to finish, and a session it brought up is stopped, not streamed.
+/// Service calls in flight get [`CLOSING_GRACE`] to finish, a session they brought up is stopped, not streamed,
+/// and every step is over within [`CLOSING_LIMIT`].
 pub fn shutdown() {
     let session = SESSION
         .lock()
@@ -145,7 +186,7 @@ pub fn shutdown() {
         .take();
     if let Some(session) = session {
         let begun = Instant::now();
-        session.closing.send_replace(true);
+        session.closing.send_replace(Some(begun));
         log::info("OBS is closing: D-Streamy finishes its control steps");
         let _ = session.jobs.send(Job::Shutdown);
         if session.thread.join().is_err() {
@@ -276,27 +317,38 @@ impl Output {
         }
     }
 
-    /// Stops the output through libobs and waits until it is inactive.
-    fn stop(&self) -> Result<(), String> {
-        let Some(output) = self.0 else {
+    fn active(&self) -> bool {
+        // SAFETY: as in `start`.
+        self.0
+            .is_some_and(|output| unsafe { sys::obs_output_active(output.0) })
+    }
+
+    /// Stops the output through libobs and waits until it is inactive, or OBS's closing leaves no more time.
+    fn stop(&self, closing: &Closing) -> Result<(), String> {
+        let Some(output) = self.0.filter(|_| self.active()) else {
             return Ok(());
         };
         // SAFETY: as in `start`.
-        unsafe {
-            if !sys::obs_output_active(output.0) {
-                return Ok(());
+        unsafe { sys::obs_output_stop(output.0) };
+        self.wait_inactive(closing)
+    }
+
+    /// Waits until libobs has finished deactivating the output, or OBS's closing leaves no more time.
+    fn wait_inactive(&self, closing: &Closing) -> Result<(), String> {
+        let deadline = Instant::now() + OUTPUT_STOP_WAIT;
+        while self.active() {
+            let now = Instant::now();
+            if now >= deadline
+                || closing
+                    .deadline(CLOSING_LIMIT)
+                    .is_some_and(|end| now >= end)
+            {
+                return Err(format!(
+                    "D-Streamy's OBS output did not stop within {} s",
+                    OUTPUT_STOP_WAIT.as_secs()
+                ));
             }
-            sys::obs_output_stop(output.0);
-            let deadline = Instant::now() + OUTPUT_STOP_WAIT;
-            while sys::obs_output_active(output.0) {
-                if Instant::now() >= deadline {
-                    return Err(format!(
-                        "D-Streamy's OBS output did not stop within {} s",
-                        OUTPUT_STOP_WAIT.as_secs()
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         Ok(())
     }
@@ -341,10 +393,16 @@ extern "C" fn on_stop(_data: *mut c_void, cd: *mut sys::calldata_t) {
     });
 }
 
+/// The service session the job in progress brought up: `Some(ownership)` from the service's answer until the job ends.
+#[cfg(unix)]
+type Brought = Option<Option<Ownership>>;
+#[cfg(not(unix))]
+type Brought = Option<()>;
+
 fn run(
     runtime: &tokio::runtime::Runtime,
     mut jobs: mpsc::UnboundedReceiver<Job>,
-    closing: watch::Receiver<bool>,
+    closing: Closing,
 ) {
     let mut output = Output(None);
     runtime.block_on(async {
@@ -352,14 +410,21 @@ fn run(
             if matches!(job, Job::Shutdown) {
                 break;
             }
-            if let Err(payload) = AssertUnwindSafe(handle(&mut output, job, closing.clone()))
-                .catch_unwind()
-                .await
-            {
-                let message = crate::guard::record_panic("control", payload.as_ref());
-                log::error(&format!("a D-Streamy control step failed: {message}"));
+            let mut brought: Brought = None;
+            let step = AssertUnwindSafe(handle(&mut output, job, closing.clone(), &mut brought));
+            let Err(payload) = step.catch_unwind().await else {
+                continue;
+            };
+            let message = crate::guard::record_panic("control", payload.as_ref());
+            log::warn(&format!("a D-Streamy control step failed: {message}"));
+            let rollback = AssertUnwindSafe(recover(&output, brought, closing.clone(), &message));
+            if let Err(payload) = rollback.catch_unwind().await {
+                let again = crate::guard::record_panic("control rollback", payload.as_ref());
+                log::warn(&format!(
+                    "rolling back the failed D-Streamy control step failed: {again}"
+                ));
                 abort_pending(&format!(
-                    "D-Streamy's control step failed ({message}). See the OBS log, then press Start again"
+                    "D-Streamy's control step failed ({message}). See the OBS log, then restart OBS"
                 ));
             }
         }
@@ -367,22 +432,68 @@ fn run(
     output.release();
 }
 
-fn is_closing(closing: &watch::Receiver<bool>) -> bool {
-    *closing.borrow()
+/// After a panic: a start or stop it left pending never leaves an output or a service session behind unseen.
+/// A session already shown live keeps its Stop.
+#[cfg(unix)]
+async fn recover(output: &Output, brought: Brought, mut closing: Closing, failure: &str) {
+    let (state, persisted) =
+        with_controls(|c| (c.model.state().clone(), c.model.persisted().cloned()));
+    let brought = match state {
+        DockState::Starting => brought,
+        // A stop that failed half-way is finished: the session it was ending is the saved one.
+        DockState::Stopping => Some(persisted),
+        _ => {
+            refresh();
+            return;
+        }
+    };
+    let output_stopped = output.stop(&closing);
+    let service = match &brought {
+        None => Ok(()),
+        Some(ownership) => match control() {
+            Ok(control) => end_unused(&control, ownership.as_ref(), &mut closing).await,
+            Err(e) => Err(e),
+        },
+    };
+    let ended = brought.is_some() && service.is_ok();
+    let message = match (output_stopped, service) {
+        (Ok(()), Ok(())) => format!(
+            "D-Streamy's control step failed ({failure}), so it stopped what it had started. \
+             See the OBS log, then press Start again"
+        ),
+        (output, service) => {
+            let left: Vec<String> = [output.err(), service.err()]
+                .into_iter()
+                .flatten()
+                .collect();
+            format!(
+                "D-Streamy's control step failed ({failure}) and could not stop what it had started: {}. \
+                 Press Start to take the Discord session over, then Stop; see the OBS log",
+                left.join("; ")
+            )
+        }
+    };
+    log::warn(&message);
+    step(|m| {
+        if m.state() == &DockState::Starting {
+            if let Some(ownership) = brought {
+                m.claim(ownership);
+            }
+            m.output_failed(message, ended);
+        } else {
+            m.stopped(Err(message));
+            if ended {
+                m.restore_ownership(None);
+            }
+        }
+    });
 }
 
-/// Runs a service call; once OBS starts closing it gets [`CLOSING_GRACE`] more, then is dropped (`None`).
-async fn until_closing<T>(
-    closing: &mut watch::Receiver<bool>,
-    call: impl Future<Output = T>,
-) -> Option<T> {
-    let mut call = std::pin::pin!(call);
-    tokio::select! {
-        biased;
-        value = &mut call => return Some(value),
-        _ = closing.wait_for(|c| *c) => {}
-    }
-    tokio::time::timeout(CLOSING_GRACE, call).await.ok()
+#[cfg(not(unix))]
+async fn recover(_output: &Output, _brought: Brought, _closing: Closing, failure: &str) {
+    abort_pending(&format!(
+        "D-Streamy's control step failed ({failure}). See the OBS log, then press Start again"
+    ));
 }
 
 #[cfg(unix)]
@@ -392,20 +503,23 @@ fn control() -> Result<ObsControl, String> {
         .map_err(|e| format!("Cannot find the D-Streamy service: {e}"))
 }
 
-async fn handle(output: &mut Output, job: Job, mut closing: watch::Receiver<bool>) {
+const STOPPED_WAITING: &str =
+    "OBS is closing: D-Streamy stopped waiting for the Discord session it was starting";
+
+async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &mut Brought) {
     match job {
         Job::Lists(guild, done) => {
-            if !is_closing(&closing) {
+            if !closing.is_closing() {
                 lists(guild, &mut closing).await;
             }
             let _ = done.try_send(());
         }
         #[cfg(unix)]
         Job::Start(request, persisted, done) => {
-            if is_closing(&closing) {
+            if closing.is_closing() {
                 abort_pending(CLOSING);
             } else {
-                start_session(output, &request, persisted.as_ref(), &mut closing).await;
+                start_session(output, &request, persisted.as_ref(), &mut closing, brought).await;
             }
             let _ = done.try_send(());
         }
@@ -421,14 +535,20 @@ async fn handle(output: &mut Output, job: Job, mut closing: watch::Receiver<bool
                     .unwrap_or_else(|| format!("D-Streamy's OBS output stopped (code {code})"));
                 format!("D-Streamy stopped: {reason}. Press Start to go live again")
             });
+            // libobs signals "stop" before its end-capture thread clears `active`; Start must work once Idle shows.
+            if let Err(e) = output.wait_inactive(&closing) {
+                log::warn(&e);
+            }
             step(|m| m.ended(message));
         }
         Job::Shutdown => {}
     }
+    #[cfg(not(unix))]
+    let _ = brought;
 }
 
 #[cfg(unix)]
-async fn lists(guild: Option<String>, closing: &mut watch::Receiver<bool>) {
+async fn lists(guild: Option<String>, closing: &mut Closing) {
     let control = match control() {
         Ok(control) => control,
         Err(e) => {
@@ -436,13 +556,23 @@ async fn lists(guild: Option<String>, closing: &mut watch::Receiver<bool>) {
             return;
         }
     };
-    let Some(guilds) = until_closing(closing, control.guilds()).await else {
+    if let Some(gate) = crate::hooks::lists_gate() {
+        let opened = closing.call(async {
+            while !gate.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        if opened.await.is_none() {
+            return;
+        }
+    }
+    let Some(guilds) = closing.call(control.guilds()).await else {
         return;
     };
     let selected = change(|c, p| c.edit(p.write(), |m| m.guilds_loaded(guilds)));
     refresh();
     if let Some(guild) = guild.or(selected)
-        && let Some(channels) = until_closing(closing, control.channels(&guild)).await
+        && let Some(channels) = closing.call(control.channels(&guild)).await
     {
         change(|c, p| c.edit(p.write(), |m| m.channels_loaded(&guild, channels)));
         refresh();
@@ -450,26 +580,43 @@ async fn lists(guild: Option<String>, closing: &mut watch::Receiver<bool>) {
 }
 
 #[cfg(not(unix))]
-async fn lists(_guild: Option<String>, _closing: &mut watch::Receiver<bool>) {}
+async fn lists(_guild: Option<String>, _closing: &mut Closing) {}
 
 /// Ends a session this plugin brought up but won't stream; true once it is gone.
 #[cfg(unix)]
 async fn end_unused(
     control: &ObsControl,
     ownership: Option<&Ownership>,
-    closing: &mut watch::Receiver<bool>,
+    closing: &mut Closing,
 ) -> Result<(), String> {
-    let stop = control.stop(ownership);
-    let result = if is_closing(closing) {
-        tokio::time::timeout(CLOSING_STOP_WAIT, stop)
-            .await
-            .map_err(|_| format!("no reply within {} s", CLOSING_STOP_WAIT.as_secs()))?
-    } else {
-        until_closing(closing, stop)
-            .await
-            .ok_or_else(|| "OBS closed first".to_owned())?
-    };
-    result.map(|_| ()).map_err(|e| e.to_string())
+    closing
+        .within(CLOSING_LIMIT, control.stop(ownership))
+        .await
+        .ok_or_else(|| "OBS closed first".to_owned())?
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// A session that came up while OBS was closing is stopped, not streamed. When that can't finish in time its
+/// ownership stays saved, so the service's grace period ends it and the next Start takes it over or Stop ends it.
+#[cfg(unix)]
+async fn end_while_closing(
+    control: &ObsControl,
+    ownership: Option<Ownership>,
+    closing: &mut Closing,
+) {
+    let ended = end_unused(control, ownership.as_ref(), closing).await;
+    match &ended {
+        Ok(()) => log::info("D-Streamy stopped the Discord session it started, before streaming"),
+        Err(e) => log::warn(&format!(
+            "the Discord session D-Streamy started keeps running until the D-Streamy service's grace period \
+             ends ({e}); it stays saved, so the next Start takes it over and Stop ends it"
+        )),
+    }
+    step(|m| {
+        m.claim(ownership);
+        m.output_failed(CLOSING.into(), ended.is_ok());
+    });
 }
 
 #[cfg(unix)]
@@ -477,7 +624,8 @@ async fn start_session(
     output: &mut Output,
     request: &StartRequest,
     persisted: Option<&Ownership>,
-    closing: &mut watch::Receiver<bool>,
+    closing: &mut Closing,
+    brought: &mut Brought,
 ) {
     let control = match control() {
         Ok(control) => control,
@@ -486,54 +634,54 @@ async fn start_session(
             return;
         }
     };
-    let call = async {
-        if let Some(gate) = crate::hooks::start_gate() {
+    if let Some(gate) = crate::hooks::start_gate() {
+        let opened = closing.call(async {
             while !gate.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+        });
+        if opened.await.is_none() {
+            log::warn(STOPPED_WAITING);
+            abort_pending(CLOSING);
+            return;
         }
-        control.start(request, persisted).await
-    };
-    let started = match until_closing(closing, call).await {
-        Some(Ok(started)) => started,
-        Some(Err(failed)) => {
+    }
+    let mut abandon = closing.clone();
+    let started = control
+        .start_until(request, persisted, abandon.over(CLOSING_GRACE))
+        .await;
+    let started = match started {
+        Ok(started) => started,
+        Err(failed) if failed.error == ControlError::Abandoned => {
+            log::warn(STOPPED_WAITING);
+            match failed.ownership {
+                // The start was sent, so it may still land: its candidate is stopped or kept saved.
+                Some(candidate) => end_while_closing(&control, Some(*candidate), closing).await,
+                None => abort_pending(CLOSING),
+            }
+            return;
+        }
+        Err(failed) => {
             log::warn(&failed.to_string());
             step(|m| m.started(Err(failed)));
             return;
         }
-        None => {
-            log::warn(
-                "OBS is closing: D-Streamy stopped waiting for the Discord session it was starting",
-            );
-            abort_pending(CLOSING);
-            return;
-        }
     };
     let ownership = started.ownership.clone();
-    let settings = if is_closing(closing) {
+    *brought = Some(ownership.clone());
+    let settings = if closing.is_closing() {
         None
     } else {
         step(|m| m.claim(ownership.clone()))
     };
     // Checked again after the claim's save: OBS may have started closing meanwhile.
-    let Some(settings) = settings.filter(|_| !is_closing(closing)) else {
-        let ended = end_unused(&control, ownership.as_ref(), closing).await;
-        match &ended {
-            Ok(()) => {
-                log::info("D-Streamy stopped the Discord session it started, before streaming")
-            }
-            Err(e) => log::warn(&format!(
-                "the Discord session D-Streamy started keeps running: {e}"
-            )),
-        }
-        step(|m| {
-            m.claim(ownership);
-            m.output_failed(CLOSING.into(), ended.is_ok());
-        });
+    let Some(settings) = settings.filter(|_| !closing.is_closing()) else {
+        end_while_closing(&control, ownership, closing).await;
         return;
     };
     match output.start(&settings) {
         Ok(()) => {
+            crate::hooks::after_output_start();
             log::info(&format!(
                 "started from Tools > D-Streamy on Track {}",
                 settings["audio_track"]
@@ -565,14 +713,10 @@ async fn start_session(
 }
 
 #[cfg(unix)]
-async fn stop_session(
-    output: &Output,
-    ownership: Option<&Ownership>,
-    closing: &mut watch::Receiver<bool>,
-) {
-    let stopped_output = output.stop();
+async fn stop_session(output: &Output, ownership: Option<&Ownership>, closing: &mut Closing) {
+    let stopped_output = output.stop(closing);
     let service = match control() {
-        Ok(control) => match until_closing(closing, control.stop(ownership)).await {
+        Ok(control) => match closing.call(control.stop(ownership)).await {
             Some(result) => result.map(|_| ()).map_err(|e| e.to_string()),
             None => Err("OBS closed before the D-Streamy service answered".into()),
         },
@@ -595,4 +739,70 @@ async fn stop_session(
         log::warn(e);
     }
     step(|m| m.stopped(result));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn closing() -> (watch::Sender<Option<Instant>>, Closing) {
+        let (tx, rx) = watch::channel(None);
+        (tx, Closing(rx))
+    }
+
+    #[tokio::test]
+    async fn a_call_runs_to_its_end_while_obs_is_open() {
+        let (_tx, mut c) = closing();
+        let slow = tokio::time::sleep(Duration::from_millis(150));
+        assert_eq!(c.within(Duration::ZERO, slow).await, Some(()));
+    }
+
+    #[tokio::test]
+    async fn every_wait_after_closing_shares_one_deadline() {
+        let (tx, mut c) = closing();
+        let began = Instant::now();
+        tx.send_replace(Some(began));
+        let grace = Duration::from_millis(200);
+        for _ in 0..3 {
+            assert_eq!(c.within(grace, std::future::pending::<()>()).await, None);
+        }
+        let took = began.elapsed();
+        assert!(
+            (grace..grace * 2).contains(&took),
+            "three waits took {took:?}, not one grace"
+        );
+        assert_eq!(c.deadline(grace), Some(began + grace));
+    }
+
+    #[tokio::test]
+    async fn closing_cuts_a_call_already_waiting() {
+        let (tx, mut c) = closing();
+        let began = Instant::now();
+        let close = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tx.send_replace(Some(Instant::now()));
+            std::future::pending::<()>().await
+        };
+        let call = c.within(Duration::from_millis(100), std::future::pending::<()>());
+        tokio::select! {
+            dropped = call => assert_eq!(dropped, None),
+            () = close => unreachable!(),
+        }
+        let took = began.elapsed();
+        assert!(
+            (Duration::from_millis(200)..Duration::from_millis(400)).contains(&took),
+            "{took:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_done_within_the_grace_still_counts() {
+        let (tx, mut c) = closing();
+        tx.send_replace(Some(Instant::now()));
+        let quick = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            7
+        };
+        assert_eq!(c.within(Duration::from_millis(300), quick).await, Some(7));
+    }
 }

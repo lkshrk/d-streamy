@@ -169,6 +169,14 @@ pub enum TrackStatus {
     Pending { live: u8, next: u8 },
 }
 
+/// The settings dialog's picks; `None` is its "Pick a …" entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub guild_id: Option<String>,
+    pub channel_id: Option<String>,
+    pub audio_track: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockModel {
     settings: DockSettings,
@@ -385,6 +393,52 @@ impl DockModel {
             self.select_channel(channel_id);
         }
         listed
+    }
+
+    pub fn choice(&self) -> Choice {
+        Choice {
+            guild_id: self.settings.guild_id.clone(),
+            channel_id: self.settings.channel_id.clone(),
+            audio_track: self.settings.audio_track,
+        }
+    }
+
+    /// The dialog's server; "Pick a server" clears the server and its channel. Returns a guild whose channels to load.
+    pub fn choose_guild(&mut self, guild_id: Option<&str>) -> Option<String> {
+        if let Some(guild_id) = guild_id {
+            return self.select_guild(guild_id);
+        }
+        if self.settings.guild_id.take().is_some() {
+            self.settings.channel_id = None;
+            self.channels.clear();
+            self.error = None;
+        }
+        None
+    }
+
+    /// The dialog's channel: "Pick a voice channel" clears it, another is taken only when listed.
+    /// Returns the channel the dialog must show.
+    pub fn choose_channel(&mut self, channel_id: Option<&str>) -> Option<String> {
+        match channel_id {
+            None => self.settings.channel_id = None,
+            Some(channel) if self.settings.channel_id.as_deref() != Some(channel) => {
+                self.pick_channel(channel);
+            }
+            Some(_) => {}
+        }
+        self.settings.channel_id.clone()
+    }
+
+    /// The dialog's Cancel: back to the picks it opened with, listed or not. Returns a guild whose channels to load.
+    pub fn restore_choice(&mut self, opened: &Choice) -> Option<String> {
+        let load = (self.settings.guild_id != opened.guild_id).then(|| {
+            self.channels.clear();
+            self.settings.guild_id.clone_from(&opened.guild_id);
+            opened.guild_id.clone()
+        });
+        self.settings.channel_id.clone_from(&opened.channel_id);
+        self.select_audio_track(opened.audio_track);
+        load.flatten()
     }
 
     /// Moves to `Starting` and returns what to send, or the reason the dock can't start.
@@ -937,6 +991,88 @@ mod tests {
         );
         assert_eq!(m.settings().guild_id.as_deref(), Some("g"));
         assert!(m.channels().is_empty());
+    }
+
+    fn choice(guild: Option<&str>, channel: Option<&str>, track: u8) -> Choice {
+        Choice {
+            guild_id: guild.map(Into::into),
+            channel_id: channel.map(Into::into),
+            audio_track: track,
+        }
+    }
+
+    #[test]
+    fn pick_a_server_clears_the_server_and_its_channel() {
+        let mut m = picked();
+        assert_eq!(m.choose_guild(None), None);
+        assert_eq!(m.choice(), choice(None, None, 1));
+        assert!(
+            m.channels().is_empty(),
+            "the old server's channels are gone"
+        );
+        assert_eq!(
+            m.start(canvas()).unwrap_err(),
+            "Pick a server and a voice channel first"
+        );
+        assert_eq!(m.choose_guild(None), None, "already cleared");
+        assert_eq!(m.choose_guild(Some("h")), Some("h".into()));
+        assert_eq!(m.choice(), choice(Some("h"), None, 1));
+    }
+
+    #[test]
+    fn pick_a_voice_channel_clears_only_the_channel() {
+        let mut m = picked();
+        assert_eq!(m.choose_channel(None), None);
+        assert_eq!(m.choice(), choice(Some("g"), None, 1));
+        assert!(m.lists_channel("d"), "the server's channels stay listed");
+        assert_eq!(m.choose_channel(Some("d")), Some("d".into()));
+        assert_eq!(
+            m.choose_channel(Some("x")),
+            Some("d".into()),
+            "an unlisted channel is refused and the kept one shown"
+        );
+    }
+
+    #[test]
+    fn cancel_puts_back_what_the_dialog_opened_with_even_when_unlisted() {
+        let mut m = picked();
+        let opened = m.choice();
+        assert_eq!(m.choose_guild(Some("h")), Some("h".into()));
+        m.channels_loaded("h", Ok(vec![named("e")]));
+        assert_eq!(m.choose_channel(Some("e")), Some("e".into()));
+        assert!(m.select_audio_track(5));
+        assert_eq!(
+            m.restore_choice(&opened),
+            Some("g".into()),
+            "the opened server's channels are loaded again"
+        );
+        assert_eq!(m.choice(), opened);
+        assert!(m.channels().is_empty(), "h's channels are not g's");
+        assert_eq!(m.restore_choice(&opened), None, "nothing changes twice");
+
+        m.choose_guild(None);
+        assert_eq!(m.restore_choice(&opened), Some("g".into()));
+        assert_eq!(
+            m.choice(),
+            opened,
+            "the channel comes back although no list names it yet"
+        );
+        assert!(m.start(canvas()).is_ok());
+    }
+
+    #[test]
+    fn cancel_while_live_puts_back_the_track_as_pending_only() {
+        let mut m = picked();
+        assert!(m.select_audio_track(3));
+        m.start(canvas()).unwrap();
+        m.claim(None);
+        m.started(Ok(started(None)));
+        let opened = m.choice();
+        assert!(m.select_audio_track(5));
+        assert_eq!(m.track_status(), TrackStatus::Pending { live: 3, next: 5 });
+        m.restore_choice(&opened);
+        assert_eq!(m.track_status(), TrackStatus::Live { track: 3 });
+        assert!(matches!(m.state(), DockState::Live { .. }));
     }
 
     #[test]

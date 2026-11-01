@@ -17,6 +17,8 @@ pub enum ConfigError {
     Corrupt { path: String, detail: String },
     /// The file exists but reading it failed; it is never overwritten either.
     Unreadable { path: String, detail: String },
+    /// The file is a symbolic link, often into a dotfiles checkout; a save would replace the link, so it is never written.
+    Symlink { path: String },
     /// A write failed; it is retried on the next open.
     Failed(String),
 }
@@ -36,8 +38,22 @@ impl ConfigError {
                 "Couldn't read D-Streamy's settings from {path}: {detail}. \
                  Fix or delete the file; until then {track} is used until OBS quits but is not saved"
             ),
+            Self::Symlink { path } => format!(
+                "D-Streamy's settings file {path} is a symbolic link, which D-Streamy never replaces. \
+                 Replace the link with a copy of the file it points to, or delete it; \
+                 until then {track} is used until OBS quits but is not saved"
+            ),
             Self::Failed(reason) => format!("{reason}; {track} is used until OBS quits"),
         }
+    }
+}
+
+fn refuse_link(path: &Path) -> Result<(), ConfigError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(ConfigError::Symlink {
+            path: path.display().to_string(),
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -67,6 +83,7 @@ pub fn parse(text: &str) -> Result<DockSettings, String> {
 
 /// The saved bytes at `path`, or `None` only when no file exists yet.
 pub fn load_file(path: &Path) -> Result<Option<Saved>, ConfigError> {
+    refuse_link(path)?;
     match fs::read(path) {
         Ok(bytes) => Ok(Some(Saved {
             path: path.display().to_string(),
@@ -131,6 +148,7 @@ fn save_file_checked(
 
 /// The file's identity once its content reads as settings; `None` when there is no file.
 fn checked_identity(path: &Path) -> Result<Option<Identity>, ConfigError> {
+    refuse_link(path)?;
     let unreadable = |e: io::Error| ConfigError::Unreadable {
         path: path.display().to_string(),
         detail: e.to_string(),
@@ -230,7 +248,11 @@ impl ConfigState {
     fn blocked(&self) -> bool {
         matches!(
             self.error,
-            Some(ConfigError::Corrupt { .. } | ConfigError::Unreadable { .. })
+            Some(
+                ConfigError::Corrupt { .. }
+                    | ConfigError::Unreadable { .. }
+                    | ConfigError::Symlink { .. }
+            )
         )
     }
 
@@ -681,20 +703,81 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn is_link(path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn a_symlinked_file_still_saves() {
+    fn a_symlinked_config_is_refused_and_never_replaced() {
         let dir = scratch();
         let target = dir.path().join("real.json");
         let path = dir.path().join("config.json");
         fs::write(&target, r#"{"audio_track":2}"#).unwrap();
         std::os::unix::fs::symlink(&target, &path).unwrap();
-        save_file(&path, r#"{"audio_track":4}"#).unwrap();
+        let read = load_file(&path).unwrap_err();
         assert_eq!(
-            decode(load_file(&path).unwrap().unwrap())
-                .unwrap()
-                .audio_track,
-            4
+            read,
+            ConfigError::Symlink {
+                path: path.display().to_string()
+            }
         );
+        assert_eq!(
+            read.message(4),
+            format!(
+                "D-Streamy's settings file {} is a symbolic link, which D-Streamy never replaces. \
+                 Replace the link with a copy of the file it points to, or delete it; \
+                 until then Track 4 is used until OBS quits but is not saved",
+                path.display()
+            )
+        );
+        assert_eq!(save_file(&path, r#"{"audio_track":4}"#), Err(read));
+        assert!(is_link(&path));
+        assert_eq!(fs::read_to_string(&target).unwrap(), r#"{"audio_track":2}"#);
+        assert!(leftovers(dir.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_put_in_place_of_the_file_before_the_rename_is_kept() {
+        let dir = scratch();
+        let target = dir.path().join("dotfiles.json");
+        let path = dir.path().join("config.json");
+        fs::write(&target, r#"{"audio_track":6}"#).unwrap();
+        fs::write(&path, r#"{"audio_track":2}"#).unwrap();
+        let e = save_file_checked(&path, r#"{"audio_track":5}"#, |stage| {
+            if stage == Stage::BeforeCheck {
+                fs::remove_file(&path).unwrap();
+                std::os::unix::fs::symlink(&target, &path).unwrap();
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::Symlink { .. }), "{e:?}");
+        assert!(is_link(&path));
+        assert_eq!(fs::read_to_string(&target).unwrap(), r#"{"audio_track":6}"#);
+        assert!(leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_symlinked_config_blocks_every_write_until_it_is_a_file() {
+        let link = ConfigError::Symlink { path: "/c".into() };
+        let f = File::new(Some(r#"{"audio_track":2}"#));
+        let mut s = ConfigState::default();
+        s.open(
+            || Err(link.clone()),
+            |_| panic!("never written over a link"),
+        );
+        assert_eq!(s.error(), Some(&link));
+        assert!(s.select_audio_track(5, |_| panic!("never written over a link")));
+        s.open(
+            || Err(link.clone()),
+            |_| panic!("never written over a link"),
+        );
+        assert_eq!(s.model.settings().audio_track, 5);
+        assert_eq!(s.error(), Some(&link));
+        open(&mut s, &f);
+        assert_eq!(s.error(), None);
+        assert_eq!(s.model.settings().audio_track, 2);
     }
 
     #[test]

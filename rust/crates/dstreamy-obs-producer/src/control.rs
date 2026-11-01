@@ -423,6 +423,8 @@ pub enum ControlError {
         command: &'static str,
         secs: u64,
     },
+    /// The caller stopped waiting, as OBS does once it closes.
+    Abandoned,
     Protocol(String),
 }
 
@@ -493,6 +495,7 @@ impl fmt::Display for ControlError {
                 f,
                 "The D-Streamy service didn't answer {command} within {secs} s"
             ),
+            Self::Abandoned => f.write_str("D-Streamy stopped waiting for the D-Streamy service"),
             Self::Protocol(m) => write!(f, "The D-Streamy service answered unexpectedly: {m}"),
         }
     }

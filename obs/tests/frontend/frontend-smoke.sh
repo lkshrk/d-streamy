@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # usage: frontend-smoke.sh <obs-config-dir> <log-file> <obs-binary> [obs args...]
+# Env: EXPECT_LOG_LINE, a text OBS's own log must contain, such as a plugin's load line.
 set -uo pipefail
 
 config_dir=$1
@@ -55,9 +56,19 @@ if [[ -n $latest_log ]]; then
   cp "$latest_log" "$(dirname "$log_file")/obs-frontend-internal.log"
 fi
 
-if [[ $ws_status -eq 0 ]]; then
+status=$ws_status
+if [[ -n ${EXPECT_LOG_LINE:-} ]]; then
+  if [[ -n $latest_log ]] && grep -qF -- "$EXPECT_LOG_LINE" "$latest_log"; then
+    echo "the OBS log has: $EXPECT_LOG_LINE"
+  else
+    echo "the OBS log lacks: $EXPECT_LOG_LINE"
+    status=1
+  fi
+fi
+
+if [[ $status -eq 0 ]]; then
   echo "FRONTEND RESULT=PASS"
 else
   echo "FRONTEND RESULT=FAIL"
 fi
-exit "$ws_status"
+exit "$status"

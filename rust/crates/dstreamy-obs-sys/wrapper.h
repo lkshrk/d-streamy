@@ -27,4 +27,6 @@ _Static_assert(__builtin_types_compatible_p(__typeof__(&obs_frontend_add_tools_m
 _Static_assert(__builtin_types_compatible_p(__typeof__(&obs_frontend_open_source_properties),
 					    dstreamy_frontend_open_source_properties),
 	       "obs_frontend_open_source_properties changed");
+#elif defined(DSTREAMY_FRONTEND_ABI_CHECK)
+#error "DSTREAMY_FRONTEND_ABI_CHECK is set but obs-frontend-api.h is not on the include path, so the frontend types above go unchecked"
 #endif

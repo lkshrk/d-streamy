@@ -152,6 +152,7 @@ jobs:
           DSTREAMY_OBS_HARNESS: ${{ github.workspace }}/obs/build_x86_64/harness/obs-harness
           DSTREAMY_OBS_PLUGIN_BIN: ${{ github.workspace }}/obs/build_x86_64/rundir
           DSTREAMY_OBS_PLUGIN_DATA: ${{ github.workspace }}/obs/build_x86_64/harness/plugin-data
+          DSTREAMY_OBS_FRONTEND: ${{ runner.temp }}/obs-prefix/bin/obs
         run: |
           set -o pipefail
           xvfb-run -a -s "-screen 0 1280x720x24" \
@@ -267,6 +268,12 @@ jobs:
           cmake -DTEST_HOOKS=OFF -DLIBRARY="$RUNNER_TEMP/plugin-without-hooks/release/libdstreamy_obs.so" \
             -P "$GITHUB_WORKSPACE/obs/cmake/common/check_test_hooks.cmake"
 
+      - name: Missing frontend headers fail a frontend-checked build
+        run: |
+          set -o pipefail
+          bash .github/scripts/obs-frontend-abi-check.sh obs/build_x86_64/obs-config-RelWithDebInfo.txt \
+            "$RUNNER_TEMP/frontend-abi-check" | tee "$OBS_LOGS/frontend-abi-check.log"
+
       - name: Harness 5 s trace with A/V marker check
         run: |
           set -o pipefail
@@ -292,10 +299,14 @@ jobs:
           cp -R "$OBS_TRACES" ../obs/tests/traces
           cargo test --release --locked -p dstreamy-media --test obs_traces
 
-      - name: Frontend with obs-websocket
+      - name: Frontend with obs-websocket and the plugin's Tools entry
         run: |
           set -o pipefail
           export XDG_CONFIG_HOME="$RUNNER_TEMP/obs-config" LIBGL_ALWAYS_SOFTWARE=1
+          plugin="$XDG_CONFIG_HOME/obs-studio/plugins/obs-dstreamy"
+          mkdir -p "$plugin/bin/64bit" "$plugin/data"
+          cp obs/build_x86_64/rundir/obs-dstreamy.so "$plugin/bin/64bit/"
+          export EXPECT_LOG_LINE="[obs-dstreamy] added Tools > D-Streamy"
           xvfb-run -a -s "-screen 0 1920x1080x24" bash obs/tests/frontend/frontend-smoke.sh \
             "$XDG_CONFIG_HOME/obs-studio" "$OBS_LOGS/frontend-stdout.log" "$OBS_PREFIX/bin/obs" \
             | tee "$OBS_LOGS/frontend.log"
@@ -444,6 +455,13 @@ jobs:
           } | tee "$OBS_LOGS/plugin-bundle.log"
           test "$(lipo -archs MacOS/obs-dstreamy)" = "x86_64 arm64"
           test "$(otool -D -arch arm64 MacOS/obs-dstreamy | tail -n 1)" = "@rpath/obs-dstreamy"
+          # obs-frontend-api is looked up at runtime, so a libobs-only host still loads the plugin.
+          for a in arm64 x86_64; do
+            if otool -L -arch "$a" MacOS/obs-dstreamy | grep -q obs-frontend-api; then
+              echo "the $a slice links obs-frontend-api"
+              exit 1
+            fi
+          done
           for a in arm64 x86_64; do
             minos=$(vtool -arch "$a" -show-build MacOS/obs-dstreamy | awk '$1 == "minos" {print $2}')
             test "$minos" = 12.0 || { echo "$a slice minos $minos, expected 12.0"; exit 1; }
@@ -472,6 +490,17 @@ jobs:
           ARCH: arm64
           OBS_PREFIX: ${{ runner.temp }}/obs-prefix-arm64
         run: bash .github/scripts/obs-macos-encoder-settings.sh
+
+      - name: OBS.app loads the plugin and shows Tools > D-Streamy (arm64)
+        run: |
+          set -o pipefail
+          cfg="$HOME/Library/Application Support/obs-studio"
+          mkdir -p "$cfg/plugins"
+          rm -rf "$cfg/plugins/obs-dstreamy.plugin"
+          cp -R obs/build_macos/rundir/obs-dstreamy.plugin "$cfg/plugins/"
+          export EXPECT_LOG_LINE="[obs-dstreamy] added Tools > D-Streamy"
+          bash obs/tests/frontend/frontend-smoke.sh "$cfg" "$OBS_LOGS/frontend-stdout.log" \
+            "$RUNNER_TEMP/obs-prefix-arm64/OBS.app/Contents/MacOS/OBS" | tee "$OBS_LOGS/frontend.log"
 
       # Runs even when the arm64 slice failed, so one run reports both slices.
       - name: Load and panic tests (x86_64 slice)
@@ -619,6 +648,11 @@ jobs:
             "$DUMPBIN" -nologo -dependents obs/build_x64/rundir/obs-dstreamy.dll
           } | tee "$OBS_LOGS/plugin-dll.log"
           grep -qw obs_module_load "$OBS_LOGS/plugin-dll.log"
+          # obs-frontend-api.dll is looked up at runtime, so a libobs-only host still loads the plugin.
+          if grep -qi obs-frontend-api "$OBS_LOGS/plugin-dll.log"; then
+            echo "the plugin DLL links obs-frontend-api.dll"
+            exit 1
+          fi
 
       - name: Load and panic tests
         shell: bash
@@ -630,6 +664,20 @@ jobs:
           cd "$bindir"
           bash "$ws/obs/tests/rust-plugin.sh" ./obs-harness.exe "$ws/obs/build_x64/rundir" \
             "$ws/obs/build_x64/plugin-data" "$OBS_LOGS/rust-plugin" | tee "$OBS_LOGS/rust-plugin.log"
+
+      - name: obs64 loads the plugin and shows Tools > D-Streamy
+        shell: bash
+        run: |
+          set -o pipefail
+          ws="$GITHUB_WORKSPACE"
+          cfg="$(cygpath -u "$APPDATA")/obs-studio"
+          plugin="$cfg/plugins/obs-dstreamy"
+          mkdir -p "$plugin/bin/64bit" "$plugin/data"
+          cp "$ws/obs/build_x64/rundir/obs-dstreamy.dll" "$plugin/bin/64bit/"
+          export EXPECT_LOG_LINE="[obs-dstreamy] added Tools > D-Streamy"
+          cd "$(cygpath -u "$OBS_PREFIX")/bin/64bit"
+          bash "$ws/obs/tests/frontend/frontend-smoke.sh" "$cfg" "$OBS_LOGS/frontend-stdout.log" ./obs64.exe \
+            | tee "$OBS_LOGS/frontend.log"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()

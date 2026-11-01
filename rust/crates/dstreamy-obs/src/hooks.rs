@@ -1,4 +1,5 @@
-//! Test-only behaviour read from the output's settings; without the `test-hooks` feature every hook is a no-op.
+//! Test-only behaviour read from the output's settings and `DSTREAMY_TEST_*` variables; without the `test-hooks`
+//! feature every hook is a no-op and none of those names is in the plugin.
 
 #[cfg(feature = "test-hooks")]
 mod enabled {
@@ -83,6 +84,34 @@ mod enabled {
     pub fn no_control_thread() -> bool {
         std::env::var_os("DSTREAMY_TEST_NO_CONTROL_THREAD").is_some()
     }
+
+    /// Panics once Tools > D-Streamy's output has started, before the dialog shows it live.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn after_output_start() {
+        if std::env::var_os("DSTREAMY_TEST_PANIC_AFTER_OUTPUT_START").is_some() {
+            panic!("test panic after the output started");
+        }
+    }
+
+    /// A file whose appearance runs Tools > D-Streamy… as a click on it would, in a real OBS.
+    pub fn open_dialog_trigger() -> Option<std::path::PathBuf> {
+        std::env::var_os("DSTREAMY_TEST_OPEN_DIALOG").map(Into::into)
+    }
+
+    /// A file the server list waits for, so a test sees the open dialog rebuilt once it loads.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn lists_gate() -> Option<std::path::PathBuf> {
+        std::env::var_os("DSTREAMY_TEST_LISTS_GATE").map(Into::into)
+    }
+
+    /// Logs every build of the dialog, which a real OBS does on its own thread.
+    pub fn dialog_built(status: &str, servers: usize) {
+        if open_dialog_trigger().is_some() {
+            crate::log::info(&format!(
+                "test hook: dialog built servers={servers} status={status}"
+            ));
+        }
+    }
 }
 
 #[cfg(not(feature = "test-hooks"))]
@@ -97,6 +126,20 @@ mod enabled {
     pub fn no_control_thread() -> bool {
         false
     }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn after_output_start() {}
+
+    pub fn open_dialog_trigger() -> Option<std::path::PathBuf> {
+        None
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn lists_gate() -> Option<std::path::PathBuf> {
+        None
+    }
+
+    pub fn dialog_built(_status: &str, _servers: usize) {}
 
     pub struct Hooks;
 
@@ -117,4 +160,6 @@ mod enabled {
     }
 }
 
-pub use enabled::{Hooks, no_control_thread, start_gate};
+pub use enabled::{Hooks, dialog_built, no_control_thread, open_dialog_trigger};
+#[cfg(unix)]
+pub use enabled::{after_output_start, lists_gate, start_gate};

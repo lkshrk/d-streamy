@@ -57,6 +57,7 @@ pub extern "C" fn obs_module_load() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn obs_module_unload() {
     guard("obs_module_unload", (), || {
+        frontend::shutdown();
         session::shutdown();
         log::info("unloaded");
     });

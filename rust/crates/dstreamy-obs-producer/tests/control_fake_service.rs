@@ -203,6 +203,66 @@ async fn two_lost_starts_in_a_row_still_own_the_session() {
     );
 }
 
+fn unanswered_start() -> Fake {
+    Fake::scripted(vec![Script {
+        connection: 9,
+        hello: Value::Null,
+        statuses: vec![],
+        answer_start: false,
+    }])
+}
+
+#[tokio::test]
+async fn a_start_abandoned_after_it_was_sent_keeps_its_candidate() {
+    let fake = unanswered_start();
+    let failed = fake
+        .control(Duration::from_secs(5))
+        .start_until(
+            &request(),
+            None,
+            tokio::time::sleep(Duration::from_millis(300)),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failed.error, ControlError::Abandoned);
+    let candidate = *failed
+        .ownership
+        .expect("serve may still carry the start out");
+    assert_eq!(
+        candidate.connections,
+        [Candidate {
+            id: 9,
+            fps: Some(30)
+        }]
+    );
+    assert_eq!(candidate.instance, fake.ownership().instance);
+    assert_eq!(fake.commands(), ["hello", "start"]);
+}
+
+#[tokio::test]
+async fn a_start_abandoned_before_it_was_sent_claims_nothing() {
+    let fake = unanswered_start();
+    let failed = fake
+        .control(Duration::from_secs(5))
+        .start_until(&request(), None, std::future::ready(()))
+        .await
+        .unwrap_err();
+    assert_eq!(failed.error, ControlError::Abandoned);
+    assert_eq!(failed.ownership, None);
+    assert!(!fake.commands().contains(&"start".to_owned()));
+}
+
+#[tokio::test]
+async fn a_start_answered_before_it_is_abandoned_is_kept() {
+    let fake = Fake::start(Value::Null, vec![Some(status(Some(9)))]);
+    let started = fake
+        .control(Duration::from_secs(5))
+        .start_until(&request(), None, std::future::pending())
+        .await
+        .unwrap();
+    assert_eq!(started.ownership.unwrap().connections[0].id, 9);
+}
+
 #[tokio::test]
 async fn a_stop_waits_until_serve_names_our_start() {
     let fake = Fake::start(

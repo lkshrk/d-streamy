@@ -6,7 +6,7 @@ use std::ptr;
 use std::sync::{Mutex, PoisonError};
 
 use dstreamy_obs_producer::dock::{
-    AUDIO_TRACK_HELP, AUDIO_TRACK_TITLE, AUDIO_TRACKS, DockState, TrackStatus, track_name,
+    AUDIO_TRACK_HELP, AUDIO_TRACK_TITLE, AUDIO_TRACKS, Choice, DockState, TrackStatus, track_name,
 };
 use dstreamy_obs_producer::dock_config::{ConfigError, ConfigState};
 use dstreamy_obs_sys as sys;
@@ -240,6 +240,11 @@ extern "C" fn create(
         let guild = with_controls(|c| c.model.settings().guild_id.clone());
         session::load_lists(guild);
         let picked = with_controls(|c| c.model.settings().clone());
+        let choice = with_controls(|c| c.model.choice());
+        OPENED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Opened(source, choice));
         // SAFETY: libobs passes the new source's settings, which it owns; it copies the strings.
         unsafe {
             sys::obs_data_set_int(
@@ -258,7 +263,14 @@ extern "C" fn create(
 }
 
 extern "C" fn destroy(data: *mut c_void) {
-    guard("settings destroy", (), || forget_dialog(data.cast()));
+    guard("settings destroy", (), || {
+        let source: *mut sys::obs_source_t = data.cast();
+        OPENED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|o| o.0 != source);
+        forget_dialog(source);
+    });
 }
 
 extern "C" fn get_defaults(settings: *mut sys::obs_data_t) {
@@ -268,29 +280,62 @@ extern "C" fn get_defaults(settings: *mut sys::obs_data_t) {
     });
 }
 
-/// Runs on the UI thread whenever the dialog changes a value, and on Cancel with the old values.
-extern "C" fn update(_data: *mut c_void, settings: *mut sys::obs_data_t) {
+/// What each open dialog showed when it opened, by source, so its Cancel can put exactly that back.
+struct Opened(*mut sys::obs_source_t, Choice);
+
+// SAFETY: the pointer is only compared, never dereferenced.
+unsafe impl Send for Opened {}
+
+static OPENED: Mutex<Vec<Opened>> = Mutex::new(Vec::new());
+
+fn opened(source: *mut sys::obs_source_t) -> Option<Choice> {
+    let opened = OPENED.lock().unwrap_or_else(PoisonError::into_inner);
+    opened.iter().find(|o| o.0 == source).map(|o| o.1.clone())
+}
+
+/// Runs on the UI thread whenever the dialog changes a value. Cancel calls it with every value the dialog opened
+/// with; those are put back as they were, even ones the service doesn't list (yet).
+extern "C" fn update(data: *mut c_void, settings: *mut sys::obs_data_t) {
     guard("settings update", (), || {
         // SAFETY: libobs passes the source's own settings.
         let (guild, channel) = unsafe { (picked(settings, GUILD), picked(settings, CHANNEL)) };
-        let load = change(|c, p| {
-            let guild = guild.filter(|g| c.model.settings().guild_id.as_ref() != Some(g))?;
-            config_step(c, |c| {
-                c.edit(p.write(), |m| m.select_guild(&guild));
+        let shown = selected_track(settings).map(|audio_track| Choice {
+            guild_id: guild.clone(),
+            channel_id: channel.clone(),
+            audio_track,
+        });
+        if let Some(opened) = opened(data.cast()).filter(|o| Some(o) == shown.as_ref()) {
+            let load = change(|c, p| {
+                let mut load = None;
+                if c.model.choice() != opened {
+                    config_step(c, |c| {
+                        load = c.edit(p.write(), |m| m.restore_choice(&opened))
+                    });
+                }
+                load
             });
-            Some(guild)
+            if let Some(guild) = load {
+                session::load_lists(Some(guild));
+            }
+            return;
+        }
+        let load = change(|c, p| {
+            let mut load = None;
+            if c.model.settings().guild_id != guild {
+                config_step(c, |c| {
+                    load = c.edit(p.write(), |m| m.choose_guild(guild.as_deref()));
+                });
+            }
+            load
         });
         if let Some(guild) = load {
             session::load_lists(Some(guild));
         }
         // The view keeps the old server's channel after a server change; only a channel the new server lists counts.
         let kept = change(|c, p| {
-            if let Some(channel) = channel
-                .clone()
-                .filter(|ch| c.model.settings().channel_id.as_ref() != Some(ch))
-            {
+            if c.model.settings().channel_id != channel {
                 config_step(c, |c| {
-                    c.edit(p.write(), |m| m.pick_channel(&channel));
+                    c.edit(p.write(), |m| m.choose_channel(channel.as_deref()));
                 });
             }
             c.model.settings().channel_id.clone()
@@ -460,7 +505,9 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                 c"".as_ptr(),
                 sys::OBS_TEXT_INFO,
             );
-            set_status(status_prop, status(selected));
+            let shown = status(selected);
+            crate::hooks::dialog_built(&shown.0, guilds.len());
+            set_status(status_prop, shown);
             let guild = add_list(
                 props,
                 GUILD,

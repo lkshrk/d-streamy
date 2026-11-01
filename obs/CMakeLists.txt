@@ -11,7 +11,17 @@ include(rust_plugin)
 
 find_package(libobs REQUIRED)
 # Headers only, for the ABI check in dstreamy-obs-sys/wrapper.h; the plugin resolves the frontend at runtime.
+option(DSTREAMY_FRONTEND_ABI_CHECK "Check the plugin's frontend calls against obs-frontend-api.h" ON)
 find_package(obs-frontend-api QUIET)
+if(DSTREAMY_FRONTEND_ABI_CHECK AND NOT TARGET OBS::obs-frontend-api)
+  message(
+    FATAL_ERROR
+    "obs-frontend-api.h was not found, so Tools > D-Streamy's calls can't be checked against it. "
+    "Point CMAKE_PREFIX_PATH at an OBS build with its frontend, or pass -DDSTREAMY_FRONTEND_ABI_CHECK=OFF"
+  )
+elseif(NOT DSTREAMY_FRONTEND_ABI_CHECK)
+  message(WARNING "DSTREAMY_FRONTEND_ABI_CHECK is OFF: Tools > D-Streamy's calls are not checked against OBS")
+endif()
 
 add_rust_plugin(
   ${CMAKE_PROJECT_NAME}

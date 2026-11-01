@@ -19,6 +19,10 @@ function(add_rust_plugin target)
         "include=$<JOIN:$<REMOVE_DUPLICATES:$<TARGET_PROPERTY:OBS::obs-frontend-api,INTERFACE_INCLUDE_DIRECTORIES>>,\ninclude=>\n"
     )
   endif()
+  # wrapper.h fails the build when this is set and obs-frontend-api.h is still missing.
+  if(DSTREAMY_FRONTEND_ABI_CHECK)
+    string(APPEND frontend_includes "define=DSTREAMY_FRONTEND_ABI_CHECK\n")
+  endif()
 
   file(
     GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/obs-config-$<CONFIG>.txt"

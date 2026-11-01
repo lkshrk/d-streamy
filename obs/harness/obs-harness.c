@@ -78,6 +78,8 @@ const char *restart_output_settings;
 	const char *tools_stop_after;
 	bool tools_wait_end;
 	bool tools_exit_while_starting;
+	bool settings_cancel;
+	int audio_mixers;
 	int seconds;
 	int fps;
 	int width;
@@ -611,6 +613,9 @@ static void usage(void)
 		"  [--tools-stop-after PATH (with --tools-session: wait until PATH exists before clicking Stop)]\n"
 		"  [--tools-wait-end (with --tools-session: instead of Stop, wait for the session to end on its own)]\n"
 		"  [--tools-exit-while-starting (with --tools-session: close OBS right after the Start click)]\n"
+		"  [--settings-cancel (with --settings-update: then Cancel, as OBS's properties dialog does, before reopening)]\n"
+		"  [--audio-mixers MASK (route the harness audio source to these mixer tracks only, as Advanced Audio\n"
+		"   Properties > Tracks does: bit 0 is Track 1; default all six)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
@@ -673,6 +678,10 @@ static int parse_args(int argc, char **argv)
 		}
 		if (strcmp(a, "--tools-exit-while-starting") == 0) {
 			args.tools_exit_while_starting = true;
+			continue;
+		}
+		if (strcmp(a, "--settings-cancel") == 0) {
+			args.settings_cancel = true;
 			continue;
 		}
 		if (strcmp(a, "--report-ui") == 0) {
@@ -761,6 +770,8 @@ static int parse_args(int argc, char **argv)
 			ok = parse_int(a, v, 1, &args.bitrate);
 		else if (strcmp(a, "--audio-bitrate") == 0)
 			ok = parse_int(a, v, 1, &args.audio_bitrate);
+		else if (strcmp(a, "--audio-mixers") == 0)
+			ok = parse_int(a, v, 0, &args.audio_mixers) && args.audio_mixers <= 0x3f;
 		else if (strcmp(a, "--bf") == 0)
 			ok = args.bf_set = parse_int(a, v, 0, &args.bf);
 		else if (strcmp(a, "--keyint-sec") == 0)
@@ -1063,13 +1074,27 @@ static bool settings_dialog(const char *update)
 		obs_source_release(source);
 		return false;
 	}
+	obs_data_t *old_settings = obs_data_create();
+	obs_data_t *opened = obs_source_get_settings(source);
+	obs_data_apply(old_settings, opened);
+	obs_data_release(opened);
 	if (update) {
 		if (!apply_settings_update(source, update)) {
+			obs_data_release(old_settings);
 			obs_source_release(source);
 			return false;
 		}
 		report_settings_properties(source, "updated");
 	}
+	// OBSBasicProperties's Cancel (frontend/dialogs/OBSBasicProperties.cpp RejectRole): clear, then update with the old values.
+	if (update && args.settings_cancel) {
+		obs_data_t *settings = obs_source_get_settings(source);
+		obs_data_clear(settings);
+		obs_data_release(settings);
+		obs_source_update(source, old_settings);
+		report_settings_properties(source, "cancelled");
+	}
+	obs_data_release(old_settings);
 	close_settings_dialog(source);
 	if (!update)
 		return true;
@@ -1633,6 +1658,10 @@ int main(int argc, char **argv)
 	audio = obs_source_create(AUDIO_SOURCE_ID, "harness audio", NULL, NULL);
 	if (!audio)
 		FAIL("harness audio source create failed");
+	if (args.audio_mixers) {
+		obs_source_set_audio_mixers(audio, (uint32_t)args.audio_mixers);
+		printf("HARNESS audio_source mixers=0x%x\n", obs_source_get_audio_mixers(audio));
+	}
 
 	scene = obs_scene_create("harness scene");
 	if (!scene)

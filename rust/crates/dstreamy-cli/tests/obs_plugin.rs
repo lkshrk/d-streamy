@@ -2389,3 +2389,271 @@ fn the_own_encoder_resizes_an_i420_canvas_in_nv12() {
     );
     assert_eq!(first_picture_size(&stream_video(&recorded)), (1920, 1080));
 }
+
+/// Advanced Audio Properties › Tracks routes the harness tone to Track 2 only. Track 2 carries it to Discord;
+/// Track 1 sends silence at the same pace, and the video is the same either way.
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn only_the_chosen_mixer_track_carries_a_source_routed_to_it() {
+    let peak = |track: u8| {
+        let (lines, recorded) = stream(json!({"audio_track": track}), &["--audio-mixers", "2"], 90);
+        assert!(
+            lines.contains(&"HARNESS audio_source mixers=0x2".to_owned()),
+            "{lines:#?}"
+        );
+        let video = stream_video(&recorded);
+        let audio = producer_audio(&recorded);
+        let video_us = rtp_us(video.last().unwrap().rtp_timestamp, VIDEO_HZ)
+            - rtp_us(video[0].rtp_timestamp, VIDEO_HZ);
+        let audio_us = i64::try_from(audio.len()).unwrap() * 20_000;
+        assert!(
+            audio_us * 10 >= video_us * 8,
+            "Track {track}: {audio_us} µs of audio for {video_us} µs of video"
+        );
+        increasing(
+            "audio",
+            &audio.iter().map(|a| a.rtp_timestamp).collect::<Vec<_>>(),
+        );
+        pcm(&audio).iter().fold(0f32, |m, s| m.max(s.abs()))
+    };
+    let routed = peak(2);
+    let other = peak(1);
+    assert!(routed > 0.02, "Track 2 carries the tone: peak {routed}");
+    assert!(other < 0.001, "Track 1 stays silent: peak {other}");
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn cancel_in_the_dialog_puts_back_and_saves_what_it_opened_with() {
+    let config = picked_config(2);
+    let dir = config.path().to_string_lossy().into_owned();
+    let lib = fake_frontend();
+    let changes = json!({"guild_id": OTHER_GUILD_ID, "audio_track": 5}).to_string();
+    let lines = report_ui(&[
+        "--fake-frontend",
+        lib.as_str(),
+        "--module-config",
+        dir.as_str(),
+        "--settings-update",
+        &changes,
+        "--settings-cancel",
+    ]);
+    let opened = format!("guild_id={MOCK_GUILD_ID} channel_id={MOCK_VOICE_CHANNEL_ID}");
+    for want in [
+        format!("HARNESS pick when=updated guild_id={OTHER_GUILD_ID} channel_id="),
+        "HARNESS settings_source when=updated audio_track=5".to_owned(),
+        format!("HARNESS pick when=cancelled {opened}"),
+        "HARNESS settings_source when=cancelled audio_track=2".to_owned(),
+        format!("HARNESS pick when=reopened {opened}"),
+        "HARNESS settings_source when=reopened audio_track=2".to_owned(),
+    ] {
+        assert!(lines.contains(&want), "{want}: {lines:#?}");
+    }
+    let saved = read_module_config(config.path());
+    assert_eq!(saved["guild_id"], MOCK_GUILD_ID, "{saved}");
+    assert_eq!(saved["channel_id"], MOCK_VOICE_CHANNEL_ID, "{saved}");
+    assert_eq!(saved["audio_track"], 2, "{saved}");
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn pick_a_server_in_the_dialog_clears_the_server_and_its_channel() {
+    let config = picked_config(3);
+    let dir = config.path().to_string_lossy().into_owned();
+    let lib = fake_frontend();
+    let lines = report_ui(&[
+        "--fake-frontend",
+        lib.as_str(),
+        "--module-config",
+        dir.as_str(),
+        "--settings-update",
+        r#"{"guild_id": ""}"#,
+    ]);
+    for want in [
+        format!(
+            "HARNESS pick when=open guild_id={MOCK_GUILD_ID} channel_id={MOCK_VOICE_CHANNEL_ID}"
+        ),
+        "HARNESS pick when=updated guild_id= channel_id=".to_owned(),
+        "HARNESS pick when=reopened guild_id= channel_id=".to_owned(),
+        "HARNESS settings_source when=reopened audio_track=3".to_owned(),
+    ] {
+        assert!(lines.contains(&want), "{want}: {lines:#?}");
+    }
+    let saved = read_module_config(config.path());
+    assert_eq!(saved["guild_id"], Value::Null, "{saved}");
+    assert_eq!(saved["channel_id"], Value::Null, "{saved}");
+    assert_eq!(saved["audio_track"], 3, "{saved}");
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_panic_after_the_output_started_stops_it_and_its_session() {
+    let h = Harness::new("");
+    let _serve = default_serve(&h);
+    let config = picked_config(1);
+    let cleaned = "so it stopped what it had started. See the OBS log, then press Start again";
+    let (status, lines) = tools_run_env(
+        &h,
+        config.path(),
+        &[
+            "--tools-expect",
+            cleaned,
+            "--expect-panics",
+            "1",
+            "--seconds",
+            "30",
+            "--until-video",
+            "1",
+        ],
+        &[(
+            "DSTREAMY_TEST_PANIC_AFTER_OUTPUT_START",
+            std::path::Path::new("1"),
+        )],
+    )
+    .finish();
+    passed(status, &lines);
+    let shown = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("HARNESS settings_status when=live status="))
+        .unwrap_or_else(|| panic!("{lines:#?}"));
+    assert_eq!(
+        shown,
+        format!(
+            "D-Streamy's control step failed (panic caught in control: test panic after the output started), {cleaned}"
+        )
+    );
+    assert!(
+        lines.contains(&"HARNESS tools output=1 active=0".to_owned()),
+        "the output it started is stopped: {lines:#?}"
+    );
+    let session = serve_session(&h);
+    assert_eq!(session["state"], "stopped", "{session}");
+    assert_eq!(session["reason"]["reason"], "requested", "{session}");
+    assert_eq!(read_module_config(config.path())["owned"], Value::Null);
+    for (name, label, enabled) in [("start", "Start", 1), ("stop", "Stop", 0)] {
+        let want = format!(
+            "HARNESS settings_property when=after_stop name={name} type=8 enabled={enabled} desc={label}"
+        );
+        assert!(lines.contains(&want), "{want}: {lines:#?}");
+    }
+}
+
+/// A real OBS frontend, not the harness: OBS loads the plugin from the user's plugin folder like any third-party
+/// plugin, Tools > D-Streamy… opens OBS's own Qt properties dialog, and that dialog rebuilds itself when the
+/// server list arrives from the service after it opened.
+#[test]
+#[ignore = "needs OBS with its frontend, the built plugin and an X server; obs-ci runs it"]
+fn real_obs_shows_tools_d_streamy_and_rebuilds_its_dialog_from_the_service() {
+    use std::os::unix::fs::symlink;
+    let obs = PathBuf::from(
+        std::env::var("DSTREAMY_OBS_FRONTEND")
+            .expect("DSTREAMY_OBS_FRONTEND is unset: point it at OBS's obs binary"),
+    );
+    let env = obs_env();
+    let h = Harness::new("");
+    let _serve = default_serve(&h);
+    let home = h.dir.path().join("obs-home");
+    let cfg = home.join("obs-studio");
+    // As obs/tests/frontend/frontend-smoke.sh: no first-run wizard, no update check.
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("global.ini"),
+        "[General]\nLastVersion=537001986\nPre31Migrated=true\nEnableAutoUpdates=false\nInfoIncrement=99999\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.join("user.ini"),
+        "[General]\nFirstRun=true\nPre19Defaults=false\nPre21Defaults=false\nPre23Defaults=false\nPre24.1Defaults=false\n",
+    )
+    .unwrap();
+    let plugin = cfg.join("plugins").join("obs-dstreamy");
+    std::fs::create_dir_all(plugin.join("bin").join("64bit")).unwrap();
+    symlink(
+        PathBuf::from(&env.plugin_bin).join("obs-dstreamy.so"),
+        plugin.join("bin").join("64bit").join("obs-dstreamy.so"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(plugin.join("data")).unwrap();
+    write_module_config(
+        &cfg.join("plugin_config"),
+        json!({"guild_id": MOCK_GUILD_ID, "channel_id": MOCK_VOICE_CHANNEL_ID, "audio_track": 2}),
+    );
+    let open = h.dir.path().join("open-dialog");
+    let gate = h.dir.path().join("lists-gate");
+    let out = std::fs::File::create(h.dir.path().join("obs-stdout.log")).unwrap();
+    let child = Command::new(&obs)
+        .args(["--multi", "--disable-updater", "--verbose"])
+        .env("XDG_CONFIG_HOME", &home)
+        .env("XDG_RUNTIME_DIR", runtime_dir(&h))
+        .env("DSTREAMY_TEST_OPEN_DIALOG", &open)
+        .env("DSTREAMY_TEST_LISTS_GATE", &gate)
+        .env("LIBGL_ALWAYS_SOFTWARE", "1")
+        .current_dir(obs.parent().unwrap())
+        .stdin(Stdio::null())
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
+        .spawn()
+        .unwrap_or_else(|e| panic!("{}: {e}", obs.display()));
+    let mut obs_run = KillOnDrop(child);
+    let logs = cfg.join("logs");
+    let log = || -> String {
+        let newest = std::fs::read_dir(&logs).ok().and_then(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        });
+        newest
+            .and_then(|e| std::fs::read_to_string(e.path()).ok())
+            .unwrap_or_default()
+    };
+    let wait = |what: &str, done: &dyn Fn(&str) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let text = log();
+            if done(&text) {
+                return text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "OBS never logged {what}:\n{text}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait("its startup", &|l| {
+        l.contains("[obs-dstreamy] added Tools > D-Streamy") && l.contains("==== Startup complete")
+    });
+    std::fs::write(&open, "").unwrap();
+    let first = "[obs-dstreamy] test hook: dialog built servers=0 ";
+    wait("the dialog", &|l| l.contains(first));
+    std::fs::write(&gate, "").unwrap();
+    let rebuilt = "[obs-dstreamy] test hook: dialog built servers=1 ";
+    let text = wait("the rebuilt dialog", &|l| l.contains(rebuilt));
+    assert!(
+        text.find(first) < text.find(rebuilt),
+        "OBS built the dialog with the servers only after they loaded:\n{text}"
+    );
+    // SAFETY: signals the OBS child this test spawned; OBS closes its window on SIGINT.
+    unsafe { libc::kill(i32::try_from(obs_run.0.id()).unwrap(), libc::SIGINT) };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = obs_run.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "OBS did not exit:\n{}", log());
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let text = log();
+    assert!(status.success(), "OBS exited with {status}:\n{text}");
+    assert!(text.contains("[obs-dstreamy] unloaded"), "{text}");
+    assert!(!text.contains("[obs-dstreamy] panic caught"), "{text}");
+}
+
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}

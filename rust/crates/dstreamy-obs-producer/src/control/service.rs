@@ -1,4 +1,5 @@
 use std::os::unix::fs::MetadataExt;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use dstreamy_ipc::{ControlCodec, Endpoint, IpcError};
@@ -92,6 +93,40 @@ impl ObsControl {
         request: &StartRequest,
         persisted: Option<&Ownership>,
     ) -> Result<Started, StartFailed> {
+        self.start_sending(request, persisted, &Mutex::new(None))
+            .await
+    }
+
+    /// [`start`](Self::start) until `abandon` resolves. Abandoned once the start was sent, the failure still carries
+    /// its candidate ownership, since serve may carry the start out anyway.
+    pub async fn start_until(
+        &self,
+        request: &StartRequest,
+        persisted: Option<&Ownership>,
+        abandon: impl Future<Output = ()>,
+    ) -> Result<Started, StartFailed> {
+        let sent = Mutex::new(None);
+        tokio::select! {
+            biased;
+            started = self.start_sending(request, persisted, &sent) => started,
+            () = abandon => Err(StartFailed {
+                error: ControlError::Abandoned,
+                ownership: sent
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+                    .map(Box::new),
+            }),
+        }
+    }
+
+    /// `sent` holds the candidate ownership from just before the start is sent.
+    async fn start_sending(
+        &self,
+        request: &StartRequest,
+        persisted: Option<&Ownership>,
+        sent: &Mutex<Option<Ownership>>,
+    ) -> Result<Started, StartFailed> {
         let mut c = self.open().await?;
         if request.grace_secs.is_some() {
             c.require(START_GRACE_SECS)?;
@@ -120,6 +155,8 @@ impl ObsControl {
                     ))),
                 };
                 let id = c.id();
+                *sent.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(Ownership::with_candidate(persisted, provisional.clone()));
                 c.send(request.command(&id)).await.map_err(unconfirmed)?;
                 match c
                     .reply(&id, "start", self.start_timeout)
