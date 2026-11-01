@@ -40,6 +40,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy with browser-login
         run: cargo clippy -p dstreamy-cli --features browser-login --all-targets --locked -- -D warnings
+      - name: Browser login tests
+        run: cargo test -p dstreamy-cli --features browser-login --locked --lib --test browser_login
       - name: Install cargo-nextest
         run: |
           set -euo pipefail
@@ -176,7 +178,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          browser_deps='(^|[^[:alnum:]_-])(webkit2gtk|wry|tao|muda)(-[[:alnum:]_-]+)? v[0-9]'
+          browser_deps='(^|[^[:alnum:]_-])(webkit2gtk|gtk|wry|tao|muda)(-[[:alnum:]_-]+)? v[0-9]'
           tree=$(cargo tree --locked --target all -e normal -p dstreamy-cli)
           if ! grep -Fq 'dstreamy-cli' <<<"$tree"; then
             echo "cargo tree produced no dstreamy-cli dependency tree" >&2
