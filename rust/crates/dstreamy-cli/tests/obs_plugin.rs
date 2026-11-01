@@ -2278,9 +2278,28 @@ fn closing_obs_while_live_stops_the_output_then_the_session_promptly() {
             "{answered}: {lines:#?}"
         );
         let shutdown_ms = number_after(&lines, "HARNESS obs_shutdown ms=");
+        let bound = if answered { 4_000 } else { 8_000 };
         assert!(
-            shutdown_ms < 12_000,
+            shutdown_ms < bound,
             "{answered}: unload took {shutdown_ms} ms"
+        );
+        if !answered {
+            assert!(
+                shutdown_ms >= 4_000,
+                "the frozen service was waited on for its 5 s budget: {shutdown_ms} ms"
+            );
+        }
+        let position = |pred: &dyn Fn(&str) -> bool| lines.iter().position(|l| pred(l));
+        let begins = position(&|l| l.contains("it stops its output, then the Discord session"));
+        let output_stopped = position(&|l| l.starts_with("HARNESS tools output_stopped code=0"));
+        let ended = position(&|l| {
+            l.contains("[obs-dstreamy] ")
+                && (l.contains("stopped its output and the Discord session")
+                    || l.contains("may keep running until the D-Streamy service's grace period"))
+        });
+        assert!(
+            matches!((begins, output_stopped, ended), (Some(a), Some(b), Some(c)) if a < b && b < c),
+            "{answered}: output stop must happen between the plugin's start and end lines: {lines:#?}"
         );
         let owned = read_module_config(config.path())["owned"].clone();
         if answered {
@@ -2299,7 +2318,7 @@ fn closing_obs_while_live_stops_the_output_then_the_session_promptly() {
             assert!(
                 has_plugin_line(
                     &lines,
-                    "the Discord session D-Streamy started keeps running until the D-Streamy service's grace period ends"
+                    "the Discord session D-Streamy started may keep running until the D-Streamy service's grace period ends"
                 ),
                 "{lines:#?}"
             );

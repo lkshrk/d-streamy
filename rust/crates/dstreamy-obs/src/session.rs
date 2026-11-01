@@ -27,6 +27,7 @@ use crate::output::{OutputPtr, text};
 use crate::settings_source::{change, refresh, with_controls};
 
 /// How long the UI thread waits for a dialog job (Start, Stop, server lists) before it shows the state reached so far.
+/// The wait lets the dialog's first paint carry the loaded server lists and a fast `not_running` reply show at click time.
 pub const UI_WAIT: Duration = Duration::from_secs(3);
 /// How long Stop waits for the output to end before it still stops the service session.
 const OUTPUT_STOP_WAIT: Duration = Duration::from_secs(10);
@@ -616,7 +617,7 @@ async fn end_while_closing(
     match &ended {
         Ok(()) => log::info("D-Streamy stopped the Discord session it started, before streaming"),
         Err(e) => log::warn(&format!(
-            "the Discord session D-Streamy started keeps running until the D-Streamy service's grace period \
+            "the Discord session D-Streamy started may keep running until the D-Streamy service's grace period \
              ends ({e}); it stays saved, so the next Start takes it over and Stop ends it"
         )),
     }
@@ -734,7 +735,7 @@ async fn stop_on_close(output: &Output, mut closing: Closing) {
             log::info("OBS is closing: D-Streamy stopped the Discord session")
         }
         Err(SessionEnded(false)) => log::warn(
-            "the Discord session D-Streamy started keeps running until the D-Streamy service's grace period \
+            "the Discord session D-Streamy started may keep running until the D-Streamy service's grace period \
              ends; it stays saved, so the next Start takes it over and Stop ends it",
         ),
     }

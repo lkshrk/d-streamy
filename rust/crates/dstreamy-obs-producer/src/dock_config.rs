@@ -134,7 +134,7 @@ fn save_file_checked(
         if identity(&fs::metadata(path)).as_ref() != checked.as_ref() {
             return Err(ConfigError::Failed(format!(
                 "{} changed while D-Streamy was saving its settings, so D-Streamy left it as it is for now. \
-                 D-Streamy saves its settings again on your next change or when Tools > D-Streamy reopens, \
+                 D-Streamy saves its settings again on your next change, when Tools > D-Streamy reopens, or on any session ownership save (successful Start, Stop, or closing while Live), \
                  replacing what changed in the file",
                 path.display()
             )));
@@ -700,7 +700,7 @@ mod tests {
     }
 
     const RACED: &str = "changed while D-Streamy was saving its settings, so D-Streamy left it as it is for now. \
-         D-Streamy saves its settings again on your next change or when Tools > D-Streamy reopens, \
+         D-Streamy saves its settings again on your next change, when Tools > D-Streamy reopens, or when it saves the session it started or stopped, \
          replacing what changed in the file";
 
     #[test]

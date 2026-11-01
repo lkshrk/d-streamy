@@ -563,6 +563,13 @@ static void on_output_stop(void *param, calldata_t *cd)
 	os_event_signal(full_event);
 }
 
+static void on_tools_output_stop(void *param, calldata_t *cd)
+{
+	UNUSED_PARAMETER(param);
+	printf("HARNESS tools output_stopped code=%lld\n", calldata_int(cd, "code"));
+	fflush(stdout);
+}
+
 static void on_output_start(void *param, calldata_t *cd)
 {
 	UNUSED_PARAMETER(param);
@@ -1235,6 +1242,7 @@ static bool tools_session(void)
 			report_audio_mixer(output, "after_settings_update");
 		}
 		if (ok && args.tools_exit_while_live) {
+			signal_handler_connect(obs_output_get_signal_handler(output), "stop", on_tools_output_stop, NULL);
 			if (args.tools_stop_after)
 				ok = wait_for_file(args.tools_stop_after);
 			status = settings_status(source);
