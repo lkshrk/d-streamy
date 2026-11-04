@@ -733,7 +733,9 @@ pub fn prepare_environment() {
 struct Views {
     main: WebView,
     #[cfg(target_os = "linux")]
-    status: WebView,
+    _status: WebView,
+    #[cfg(target_os = "linux")]
+    status_bar: gtk::ScrolledWindow,
 }
 
 /// Blocks the main thread until the user logs in or leaves; only a validated token is returned.
@@ -830,7 +832,7 @@ fn build_views(
     nonces: &Nonces,
     start_url: &str,
 ) -> Result<Views, CliError> {
-    use gtk::prelude::{BoxExt, WidgetExt};
+    use gtk::prelude::{BoxExt, OverlayExt, ScrolledWindowExt, WidgetExt};
     use tao::platform::unix::WindowExtUnix;
     use webkit2gtk::WebViewExt;
     use wry::{WebViewBuilderExtUnix, WebViewExtUnix};
@@ -838,10 +840,21 @@ fn build_views(
     let vbox = window
         .default_vbox()
         .ok_or_else(|| CliError::BrowserLogin("no GTK container".into()))?;
+    // An overlay keeps the bar out of the window's size request; WebKit asks for the full window height.
+    let overlay = gtk::Overlay::new();
+    vbox.pack_start(&overlay, true, true, 0);
+    overlay.show();
+    let status_bar = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    status_bar.set_policy(gtk::PolicyType::Never, gtk::PolicyType::External);
+    status_bar.set_propagate_natural_height(false);
+    status_bar.set_min_content_height(STATUS_HEIGHT);
+    status_bar.set_max_content_height(STATUS_HEIGHT);
+    status_bar.set_valign(gtk::Align::Start);
+    status_bar.set_no_show_all(true);
+    overlay.add_overlay(&status_bar);
     let status_proxy = event_loop.create_proxy();
     let status = WebViewBuilder::new()
         .with_incognito(true)
-        .with_visible(false)
         .with_focused(false)
         .with_background_color(BACKGROUND)
         .with_html(STATUS_PAGE.replace("{nonce}", &nonces.app))
@@ -851,13 +864,10 @@ fn build_views(
                 body: request.body().clone(),
             });
         })
-        .build_gtk(vbox)
+        .build_gtk(&status_bar)
         .map_err(err)?;
-    let banner = status.webview();
-    vbox.set_child_packing(&banner, false, false, 0, gtk::PackType::Start);
-    banner.set_size_request(-1, STATUS_HEIGHT);
     let main = main_view(event_loop, nonces, start_url)
-        .build_gtk(vbox)
+        .build_gtk(&overlay)
         .map_err(err)?;
     let load_proxy = event_loop.create_proxy();
     main.webview().connect_load_failed(move |_, _, _, error| {
@@ -867,7 +877,11 @@ fn build_views(
         let _ = load_proxy.send_event(Msg::LoadFailed);
         true
     });
-    Ok(Views { main, status })
+    Ok(Views {
+        main,
+        _status: status,
+        status_bar,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -950,8 +964,9 @@ fn drive(
         if step.retitle {
             set_title(window, session.shown);
             #[cfg(target_os = "linux")]
-            if let Err(e) = views.status.set_visible(session.shown.verifying()) {
-                tracing::warn!("showing the verification status failed: {e}");
+            {
+                use gtk::prelude::WidgetExt;
+                views.status_bar.set_visible(session.shown.verifying());
             }
             #[cfg(feature = "test-hooks")]
             if smoke {
@@ -1038,7 +1053,6 @@ fn report_attention(out: &Out, failure: Failure) {
 }
 
 fn set_window_visible(window: &Window, visible: bool) {
-    // tao's show_all would also reveal the hidden status view.
     #[cfg(target_os = "linux")]
     {
         use gtk::prelude::{GtkWindowExt, WidgetExt};
