@@ -7,6 +7,9 @@ unsigned __int64 _udiv128(unsigned __int64, unsigned __int64, unsigned __int64, 
 #include <util/base.h>
 #include <util/bmem.h>
 
+/* The status-bar UI library's host table, so the plugin's struct comes from the same header. */
+#include "../../../obs/ui/dstreamy-ui.h"
+
 /* blog() takes int, but enum constants are unsigned int under the gcc/clang ABI and int under MSVC. */
 static const int DSTREAMY_LOG_ERROR = LOG_ERROR;
 static const int DSTREAMY_LOG_WARNING = LOG_WARNING;

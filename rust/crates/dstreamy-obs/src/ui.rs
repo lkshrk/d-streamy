@@ -18,8 +18,7 @@ use crate::output::text;
 use crate::session::{self, Wait};
 use crate::settings_source::{self, change, with_controls};
 
-/// `DSTREAMY_UI_ABI_VERSION` in `obs/ui/dstreamy-ui.h`.
-const ABI_VERSION: u32 = 4;
+const ABI_VERSION: u32 = sys::DSTREAMY_UI_ABI_VERSION;
 
 // libobs scans the module's own folder for modules, never this subfolder; macOS's bundle folder isn't scanned.
 #[cfg(not(target_os = "macos"))]
@@ -35,25 +34,8 @@ const LIBRARY: &str = "obs-dstreamy-ui.so";
 
 type Ctx = *mut c_void;
 
-/// `struct dstreamy_ui_host` in `obs/ui/dstreamy-ui.h`.
-#[repr(C)]
-struct Host {
-    abi_version: u32,
-    ctx: Ctx,
-    view_json: Option<extern "C" fn(Ctx) -> *mut c_char>,
-    free_string: Option<extern "C" fn(*mut c_char)>,
-    start: Option<extern "C" fn(Ctx)>,
-    stop: Option<extern "C" fn(Ctx)>,
-    load_lists: Option<extern "C" fn(Ctx)>,
-    select_guild: Option<extern "C" fn(Ctx, *const c_char)>,
-    select_channel: Option<extern "C" fn(Ctx, *const c_char)>,
-    set_track: Option<extern "C" fn(Ctx, c_int)>,
-    request_take_over: Option<extern "C" fn(Ctx)>,
-    confirm_take_over: Option<extern "C" fn(Ctx, bool)>,
-    set_source: Option<extern "C" fn(Ctx, *const c_char, bool)>,
-    panel_closed: Option<extern "C" fn(Ctx)>,
-    release_track: Option<extern "C" fn(Ctx, c_int)>,
-}
+/// Generated from `obs/ui/dstreamy-ui.h`, so the two sides can't drift.
+type Host = sys::dstreamy_ui_host;
 
 type Version = unsafe extern "C" fn() -> u32;
 type Load = unsafe extern "C" fn(*const Host) -> bool;
@@ -100,6 +82,26 @@ fn library_path() -> Option<PathBuf> {
 }
 
 const FALLBACK: &str = "Tools > D-Streamy opens the settings dialog instead";
+
+fn host() -> Host {
+    Host {
+        abi_version: ABI_VERSION,
+        ctx: ptr::null_mut(),
+        view_json: Some(view_json),
+        free_string: Some(free_string),
+        start: Some(start),
+        stop: Some(stop),
+        load_lists: Some(load_lists),
+        select_guild: Some(select_guild),
+        select_channel: Some(select_channel),
+        set_track: Some(set_track),
+        request_take_over: Some(request_take_over),
+        confirm_take_over: Some(confirm_take_over),
+        set_source: Some(set_source),
+        panel_closed: Some(panel_closed),
+        release_track: Some(release_track),
+    }
+}
 
 /// Adds the status-bar item and panel; false when only the settings dialog is left.
 pub fn install() -> bool {
@@ -163,23 +165,7 @@ pub fn install() -> bool {
         std::mem::forget(library);
         return false;
     }
-    let host = Host {
-        abi_version: ABI_VERSION,
-        ctx: ptr::null_mut(),
-        view_json: Some(view_json),
-        free_string: Some(free_string),
-        start: Some(start),
-        stop: Some(stop),
-        load_lists: Some(load_lists),
-        select_guild: Some(select_guild),
-        select_channel: Some(select_channel),
-        set_track: Some(set_track),
-        request_take_over: Some(request_take_over),
-        confirm_take_over: Some(confirm_take_over),
-        set_source: Some(set_source),
-        panel_closed: Some(panel_closed),
-        release_track: Some(release_track),
-    };
+    let host = host();
     // SAFETY: on the UI thread, with a host the library copies.
     if unsafe { load(&host) } {
         log::info("added the D-Streamy status-bar panel");
@@ -365,4 +351,358 @@ extern "C" fn panel_closed(_ctx: Ctx) {
     guard("panel closed", (), || {
         CONFIRMING.store(false, Ordering::Release);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Once;
+
+    use dstreamy_obs_producer::control::Named;
+    use dstreamy_obs_producer::dock_config::ConfigState;
+    use serde_json::Value;
+
+    use super::*;
+
+    const PLAIN: &CStr = c"dstreamy_test_audio";
+    const MIC: &CStr = c"dstreamy_test_input_capture";
+
+    extern "C" fn test_name(_type_data: *mut c_void) -> *const c_char {
+        c"test audio".as_ptr()
+    }
+
+    extern "C" fn test_create(
+        _settings: *mut sys::obs_data_t,
+        source: *mut sys::obs_source_t,
+    ) -> *mut c_void {
+        source.cast()
+    }
+
+    extern "C" fn test_destroy(_data: *mut c_void) {}
+
+    /// libobs without video or modules, plus two audio source types: a plain one and a microphone.
+    fn libobs() {
+        static STARTED: Once = Once::new();
+        STARTED.call_once(|| {
+            // SAFETY: started once for the test process; the registered strings are 'static.
+            unsafe {
+                assert!(sys::obs_startup(
+                    c"en-US".as_ptr(),
+                    ptr::null(),
+                    ptr::null_mut()
+                ));
+                for id in [PLAIN, MIC] {
+                    let info = sys::obs_source_info {
+                        id: id.as_ptr(),
+                        type_: sys::OBS_SOURCE_TYPE_INPUT,
+                        output_flags: sys::OBS_SOURCE_AUDIO,
+                        get_name: Some(test_name),
+                        create: Some(test_create),
+                        destroy: Some(test_destroy),
+                        ..Default::default()
+                    };
+                    sys::obs_register_source_s(&info, size_of::<sys::obs_source_info>());
+                }
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    struct Source(*mut sys::obs_source_t);
+
+    #[cfg(unix)]
+    impl Source {
+        fn new(id: &CStr, name: &CStr) -> Self {
+            // SAFETY: libobs is started and `id` is registered; the reference is released on drop.
+            let source = unsafe {
+                sys::obs_source_create(id.as_ptr(), name.as_ptr(), ptr::null_mut(), ptr::null_mut())
+            };
+            assert!(!source.is_null());
+            Self(source)
+        }
+
+        fn uuid(&self) -> CString {
+            // SAFETY: a live source.
+            CString::new(unsafe { text(sys::obs_source_get_uuid(self.0)) }).unwrap()
+        }
+
+        fn on(&self, track: u8) -> bool {
+            // SAFETY: a live source.
+            let mixers = unsafe { sys::obs_source_get_audio_mixers(self.0) };
+            mixers & (1 << (track - 1)) != 0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Source {
+        fn drop(&mut self) {
+            // SAFETY: the reference taken in `new`.
+            unsafe {
+                sys::obs_source_remove(self.0);
+                sys::obs_source_release(self.0);
+            }
+        }
+    }
+
+    fn call<R>(f: Option<unsafe extern "C" fn(Ctx) -> R>) -> R {
+        // SAFETY: the plugin's own callbacks, which ignore `ctx`.
+        unsafe { f.expect("callback set")(ptr::null_mut()) }
+    }
+
+    fn view() -> Value {
+        let host = host();
+        let raw = call(host.view_json);
+        assert!(!raw.is_null());
+        // SAFETY: a NUL-terminated string from `view_json`, freed below with `free_string`.
+        let json = unsafe { text(raw) };
+        // SAFETY: as above.
+        unsafe { host.free_string.unwrap()(raw) };
+        serde_json::from_str(&json).expect("the view is JSON")
+    }
+
+    fn confirming() -> bool {
+        CONFIRMING.load(Ordering::Acquire)
+    }
+
+    fn reset() {
+        CONFIRMING.store(false, Ordering::Release);
+        change(|c, _| *c = ConfigState::default());
+    }
+
+    #[test]
+    fn the_host_table_is_the_header_s_and_complete() {
+        let host = host();
+        assert_eq!(host.abi_version, 4);
+        assert!(host.ctx.is_null());
+        let set = [
+            host.view_json.is_some(),
+            host.free_string.is_some(),
+            host.start.is_some(),
+            host.stop.is_some(),
+            host.load_lists.is_some(),
+            host.select_guild.is_some(),
+            host.select_channel.is_some(),
+            host.set_track.is_some(),
+            host.request_take_over.is_some(),
+            host.confirm_take_over.is_some(),
+            host.set_source.is_some(),
+            host.panel_closed.is_some(),
+            host.release_track.is_some(),
+        ];
+        assert!(set.iter().all(|s| *s));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_audio_callbacks_take_over_tick_and_release_tracks() {
+        use dstreamy_obs_producer::dock::DockState;
+
+        let _serial = crate::serial();
+        libobs();
+        reset();
+        let host = host();
+        let desktop = Source::new(PLAIN, c"Desktop");
+        let mic = Source::new(MIC, c"Mic");
+        // SAFETY: the plugin's own callback.
+        unsafe { host.set_track.unwrap()(ptr::null_mut(), 1) };
+        assert_eq!(view()["audio"]["managed"], false);
+
+        call(host.start);
+        assert_eq!(
+            with_controls(|c| (c.model.state().clone(), c.model.error().map(str::to_owned))),
+            (DockState::Idle, None),
+            "a mic on unmanaged Track 1 holds Go Live back before anything else"
+        );
+
+        call(host.request_take_over);
+        assert!(confirming());
+        assert!(view()["audio"]["confirm"].is_object());
+        call(host.panel_closed);
+        assert!(!confirming());
+        call(host.request_take_over);
+        // SAFETY: the plugin's own callback.
+        unsafe { host.confirm_take_over.unwrap()(ptr::null_mut(), false) };
+        assert!(!confirming());
+        assert!(!with_controls(|c| c.model.manages(1)));
+        assert!(desktop.on(1) && mic.on(1), "Cancel changes no mixer");
+
+        call(host.request_take_over);
+        // SAFETY: as above.
+        unsafe { host.confirm_take_over.unwrap()(ptr::null_mut(), true) };
+        assert!(with_controls(|c| c.model.manages(1)));
+        assert!(!desktop.on(1) && !mic.on(1));
+        assert!(desktop.on(2), "only the taken track changes");
+        call(host.request_take_over);
+        assert!(!confirming(), "a managed track needs no confirm");
+        let shown = |name: &str| {
+            view()["audio"]["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["name"] == name)
+                .map(|s| s["on"].as_bool().unwrap())
+        };
+        assert_eq!((shown("Desktop"), shown("Mic")), (Some(false), Some(false)));
+
+        let set_source = host.set_source.unwrap();
+        // SAFETY: as above, with strings valid for each call.
+        unsafe {
+            set_source(ptr::null_mut(), desktop.uuid().as_ptr(), true);
+            assert!(desktop.on(1) && !mic.on(1));
+            assert_eq!(shown("Desktop"), Some(true));
+            set_source(ptr::null_mut(), desktop.uuid().as_ptr(), false);
+            assert!(!desktop.on(1));
+            set_source(ptr::null_mut(), c"".as_ptr(), true);
+            set_source(ptr::null_mut(), c"no-such-source".as_ptr(), true);
+            set_source(ptr::null_mut(), ptr::null(), true);
+        }
+        assert!(!desktop.on(1) && !mic.on(1));
+
+        call(host.start);
+        let (state, error) =
+            with_controls(|c| (c.model.state().clone(), c.model.error().map(str::to_owned)));
+        assert_eq!(state, DockState::Idle);
+        assert!(
+            error.is_some_and(|e| e.contains("no video")),
+            "with the mic off Discord's track, start reaches the canvas check"
+        );
+
+        let set_track = host.set_track.unwrap();
+        let release = host.release_track.unwrap();
+        // SAFETY: as above.
+        unsafe {
+            set_track(ptr::null_mut(), 2);
+            assert_eq!(with_controls(|c| c.model.settings().audio_track), 2);
+            call(host.request_take_over);
+            assert!(confirming(), "Track 2 isn't managed");
+            set_track(ptr::null_mut(), -1);
+            set_track(ptr::null_mut(), 300);
+            set_track(ptr::null_mut(), 0);
+            assert_eq!(with_controls(|c| c.model.settings().audio_track), 2);
+            assert!(confirming(), "an out-of-range track changes nothing");
+            set_track(ptr::null_mut(), 3);
+            assert!(!confirming(), "another track ends the confirm");
+
+            release(ptr::null_mut(), 1);
+            assert!(!with_controls(|c| c.model.manages(1)));
+            assert!(!desktop.on(1) && !mic.on(1), "releasing changes no mixer");
+
+            call(host.request_take_over);
+            host.confirm_take_over.unwrap()(ptr::null_mut(), true);
+            assert!(with_controls(|c| c.model.manages(3)));
+            release(ptr::null_mut(), 3);
+            assert!(
+                with_controls(|c| c.model.manages(3)),
+                "the track Discord gets stays managed"
+            );
+            release(ptr::null_mut(), -1);
+        }
+        drop((desktop, mic));
+        reset();
+    }
+
+    #[test]
+    fn the_list_callbacks_pick_servers_and_channels() {
+        let _serial = crate::serial();
+        libobs();
+        reset();
+        let host = host();
+        let named = |id: &str, name: &str| Named {
+            id: id.into(),
+            name: name.into(),
+        };
+        change(|c, _| {
+            c.model.guilds_loaded(Ok(vec![named("g1", "Guild")]));
+        });
+        let select_guild = host.select_guild.unwrap();
+        let select_channel = host.select_channel.unwrap();
+        // SAFETY: the plugin's own callbacks, with strings valid for each call.
+        unsafe {
+            select_guild(ptr::null_mut(), c"g1".as_ptr());
+            assert_eq!(
+                with_controls(|c| c.model.settings().guild_id.clone()).as_deref(),
+                Some("g1")
+            );
+            assert!(
+                !with_controls(|c| c.model.loading().0),
+                "without a control thread the channel load ends at once"
+            );
+            change(|c, _| {
+                c.model
+                    .channels_loaded("g1", Ok(vec![named("c1", "Voice")]))
+            });
+            select_channel(ptr::null_mut(), c"c1".as_ptr());
+            assert_eq!(
+                with_controls(|c| c.model.settings().channel_id.clone()).as_deref(),
+                Some("c1")
+            );
+            select_channel(ptr::null_mut(), c"unlisted".as_ptr());
+            assert_eq!(
+                with_controls(|c| c.model.settings().channel_id.clone()).as_deref(),
+                Some("c1"),
+                "an unlisted channel is ignored"
+            );
+            assert_eq!(view()["channels"]["items"][0]["selected"], true);
+            select_channel(ptr::null_mut(), c"".as_ptr());
+            assert_eq!(
+                with_controls(|c| c.model.settings().channel_id.clone()),
+                None
+            );
+            select_guild(ptr::null_mut(), ptr::null());
+            assert_eq!(with_controls(|c| c.model.settings().guild_id.clone()), None);
+        }
+
+        CONFIRMING.store(true, Ordering::Release);
+        call(host.load_lists);
+        assert!(!confirming(), "reloading the lists closes a confirm");
+        assert!(!with_controls(|c| c.model.loading().0));
+        reset();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_without_a_control_thread_ends_the_session_with_an_error() {
+        use dstreamy_obs_producer::control::Started;
+        use dstreamy_obs_producer::dock::{Canvas, DockState};
+
+        let _serial = crate::serial();
+        libobs();
+        reset();
+        let host = host();
+        change(|c, _| {
+            c.model.select_guild("g1");
+            c.model.select_channel("c1");
+            c.model
+                .start(Canvas {
+                    fps_num: 30,
+                    fps_den: 1,
+                    output_width: 1280,
+                    output_height: 720,
+                })
+                .expect("a start request");
+            c.model.started(Ok(Started {
+                ownership: None,
+                channel: "c1".into(),
+            }));
+        });
+        assert!(matches!(
+            with_controls(|c| c.model.state().clone()),
+            DockState::Live { .. }
+        ));
+        call(host.start);
+        assert!(
+            matches!(
+                with_controls(|c| c.model.state().clone()),
+                DockState::Live { .. }
+            ),
+            "start while live changes nothing"
+        );
+        call(host.stop);
+        let (state, error) =
+            with_controls(|c| (c.model.state().clone(), c.model.error().map(str::to_owned)));
+        assert_eq!(state, DockState::Idle);
+        assert!(error.is_some_and(|e| e.contains("control thread")));
+        call(host.stop);
+        assert_eq!(with_controls(|c| c.model.state().clone()), DockState::Idle);
+        reset();
+    }
 }

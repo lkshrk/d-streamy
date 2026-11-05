@@ -58,6 +58,7 @@ fn emit_link(link: &Path) {
 fn main() {
     println!("cargo:rerun-if-env-changed={CONFIG_ENV}");
     println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-changed=../../../obs/ui/dstreamy-ui.h");
     let config_path = PathBuf::from(env::var_os(CONFIG_ENV).unwrap_or_else(|| {
         panic!("{CONFIG_ENV} is unset; build this crate through the obs/ CMake project")
     }));
@@ -71,10 +72,10 @@ fn main() {
             "obs_.*|blog|bfree|calldata_set_data|calldata_get_data|signal_handler_connect|signal_handler_disconnect|proc_handler_add|video_output_get_info|audio_output_get_channels",
         )
         .allowlist_type(
-            "obs_.*|encoder_packet|calldata_t|proc_handler_t|signal_handler_t|signal_callback_t|video_output_info|dstreamy_frontend_.*",
+            "obs_.*|encoder_packet|calldata_t|proc_handler_t|signal_handler_t|signal_callback_t|video_output_info|dstreamy_frontend_.*|dstreamy_ui_host",
         )
         .allowlist_var(
-            "LIBOBS_API_.*|OBS_OUTPUT_.*|OBS_ENCODER_CAP_.*|OBS_SOURCE_CAP_DISABLED|OBS_SOURCE_AUDIO|DSTREAMY_LOG_.*|DSTREAMY_FRONTEND_EVENT_.*",
+            "LIBOBS_API_.*|OBS_OUTPUT_.*|OBS_ENCODER_CAP_.*|OBS_SOURCE_CAP_DISABLED|OBS_SOURCE_AUDIO|DSTREAMY_LOG_.*|DSTREAMY_FRONTEND_EVENT_.*|DSTREAMY_UI_ABI_VERSION",
         )
         .blocklist_item("obs_frontend_.*")
         .blocklist_function(

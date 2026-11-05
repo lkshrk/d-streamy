@@ -7,9 +7,13 @@ use dstreamy_obs_producer::dock_config::{self, ConfigError, Saved};
 use dstreamy_obs_sys as sys;
 
 fn path() -> Result<PathBuf, ConfigError> {
+    let module = crate::current_module();
+    if module.is_null() {
+        return Err(ConfigError::NoFolder);
+    }
     // SAFETY: the module pointer is set before load; libobs returns a bmalloc'd string that is freed below.
     let path = unsafe {
-        let raw = sys::obs_module_get_config_path(crate::current_module(), c"config.json".as_ptr());
+        let raw = sys::obs_module_get_config_path(module, c"config.json".as_ptr());
         if raw.is_null() {
             return Err(ConfigError::NoFolder);
         }

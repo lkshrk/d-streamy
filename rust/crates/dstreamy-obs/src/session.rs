@@ -932,7 +932,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_list_job_ends_loading_when_dropped_unhandled_or_when_it_panics() {
+        let _serial = crate::serial();
         let loading = || with_controls(|c| c.model.loading().0);
         let (done, _finished) = std_mpsc::sync_channel(1);
 

@@ -33,6 +33,14 @@ fn current_module() -> *mut sys::obs_module_t {
     MODULE.load(Ordering::Acquire)
 }
 
+/// Serializes unit tests that share the plugin's global model.
+#[cfg(test)]
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn obs_module_ver() -> u32 {
     guard("obs_module_ver", sys::LIBOBS_API_VER, || {
