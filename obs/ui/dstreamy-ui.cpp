@@ -142,6 +142,7 @@ struct Ui {
 	QPointer<QLabel> mark;
 	QPointer<ElidedLabel> state_line;
 	QPointer<ElidedLabel> state_fix;
+	QPointer<QPushButton> login;
 	QPointer<QComboBox> guilds;
 	QPointer<QComboBox> channels;
 	QPointer<QLabel> audio_title;
@@ -374,7 +375,7 @@ void fill_notices(const QJsonArray &notices)
 
 void order_tabs()
 {
-	QList<QWidget *> order{ui.guilds, ui.channels, ui.tracks};
+	QList<QWidget *> order{ui.login, ui.guilds, ui.channels, ui.tracks};
 	const QList<QPushButton *> releases =
 		ui.notices->findChildren<QPushButton *>(QString(), Qt::FindDirectChildrenOnly);
 	for (QPushButton *b : releases)
@@ -453,6 +454,9 @@ void render()
 	QString fix = view.value("state_fix").toString();
 	ui.state_fix->show_text(fix, tooltip);
 	ui.state_fix->setVisible(!fix.isEmpty());
+	QJsonObject login = view.value("login").toObject();
+	ui.login->setText(login.value("label").toString());
+	ui.login->setVisible(!login.isEmpty());
 
 	fill(ui.guilds, view.value("guilds").toObject());
 	fill(ui.channels, view.value("channels").toObject());
@@ -576,6 +580,17 @@ Panel *build_panel()
 	ui.state_fix->setObjectName(QStringLiteral("dstreamy-fix"));
 	ui.state_fix->setProperty("class", QStringLiteral("text-muted text-small"));
 	rows->addWidget(ui.state_fix);
+	ui.login = button("dstreamy-login", panel);
+	ui.login->setVisible(false);
+	QObject::connect(ui.login, &QPushButton::clicked, ui.login, [] {
+		guarded("login", [] {
+			if (!ui.active)
+				return;
+			ui.host.login(ui.host.ctx);
+			rerender();
+		});
+	});
+	rows->addWidget(ui.login, 0, Qt::AlignLeft);
 
 	auto *form = new QFormLayout();
 	ui.guilds = new QComboBox(panel);
@@ -723,7 +738,7 @@ bool load(const struct dstreamy_ui_host *host)
 	if (ui.active || !host || host->abi_version != DSTREAMY_UI_ABI_VERSION || !host->view_json ||
 	    !host->free_string || !host->start || !host->stop || !host->load_lists || !host->select_guild ||
 	    !host->select_channel || !host->set_track || !host->request_take_over || !host->confirm_take_over ||
-	    !host->set_source || !host->panel_closed || !host->release_track || failing)
+	    !host->set_source || !host->panel_closed || !host->release_track || !host->login || failing)
 		return false;
 	QMainWindow *window = dstreamy_ui::main_window();
 	if (!window)

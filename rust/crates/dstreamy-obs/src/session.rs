@@ -55,6 +55,8 @@ enum Job {
     Start(StartRequest, Option<Ownership>, Done),
     #[cfg(unix)]
     Stop(Option<Ownership>, Done),
+    #[cfg(unix)]
+    Login(Done),
     OutputStopped(i64),
     Shutdown,
 }
@@ -289,6 +291,17 @@ pub fn stop(wait: Wait) {
         settle_pending(GONE, FIX_RESTART_OBS);
     }
 }
+
+/// The login button of the dialog or the status-bar panel, on the UI thread: serve opens its login window.
+#[cfg(unix)]
+pub fn login(wait: Wait) {
+    if change(|c, _| c.model.begin_login()) && !queue(Job::Login, wait) {
+        change(|c, _| c.model.login_unfinished(GONE.into(), FIX_RESTART_OBS));
+    }
+}
+
+#[cfg(not(unix))]
+pub fn login(_wait: Wait) {}
 
 #[cfg(not(unix))]
 pub fn start(_wait: Wait) {
@@ -674,6 +687,12 @@ async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &m
             let _ = stop_session(output, ownership.as_ref(), &mut closing).await;
             let _ = done.try_send(());
         }
+        #[cfg(unix)]
+        Job::Login(done) => {
+            // The window stays open for minutes, so the login must not hold up Start, Stop or the lists.
+            tokio::spawn(login_session(closing));
+            let _ = done.try_send(());
+        }
         Job::OutputStopped(code) => {
             let message = (code != i64::from(sys::OBS_OUTPUT_SUCCESS)).then(|| {
                 let reason = output
@@ -727,6 +746,39 @@ async fn lists(guild: Option<String>, closing: &mut Closing) {
 
 #[cfg(not(unix))]
 async fn lists(_guild: Option<String>, _closing: &mut Closing) {}
+
+#[cfg(unix)]
+async fn login_session(mut closing: Closing) {
+    let login = async {
+        match control() {
+            Ok(control) => closing
+                .call(control.login())
+                .await
+                .unwrap_or(Err(ControlError::Abandoned)),
+            Err(e) => Err(ControlError::Connect(e)),
+        }
+    };
+    let result = match AssertUnwindSafe(login).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = crate::guard::record_panic("login", payload.as_ref());
+            step(|m| {
+                m.login_unfinished(
+                    format!("D-Streamy's login step failed ({message}). See the OBS log"),
+                    FIX_LOG,
+                )
+            });
+            return;
+        }
+    };
+    match &result {
+        Ok(_) => log::info("logged in to Discord in the D-Streamy login window"),
+        Err(e) => log::warn(&format!("the D-Streamy login didn't finish: {e}")),
+    }
+    if step(|m| m.login_finished(result)) {
+        request_lists(None);
+    }
+}
 
 /// Ends a session this plugin brought up but won't stream; true once it is gone.
 #[cfg(unix)]

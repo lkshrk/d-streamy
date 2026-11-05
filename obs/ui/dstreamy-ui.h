@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#define DSTREAMY_UI_ABI_VERSION 4u
+#define DSTREAMY_UI_ABI_VERSION 5u
 
 /* Callbacks run on the Qt UI thread; strings are UTF-8, valid only for the call. */
 struct dstreamy_ui_host {
@@ -40,6 +40,8 @@ struct dstreamy_ui_host {
 	void (*panel_closed)(void *ctx);
 	/* Stops managing a track Discord doesn't get; no mixer flag changes. */
 	void (*release_track)(void *ctx, int track);
+	/* Asks the service to open its login window; the view shows the wait. */
+	void (*login)(void *ctx);
 };
 
 /* DSTREAMY_UI_ABI_VERSION of this library; the plugin checks it before dstreamy_ui_load. */

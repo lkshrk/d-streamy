@@ -100,6 +100,7 @@ fn host() -> Host {
         set_source: Some(set_source),
         panel_closed: Some(panel_closed),
         release_track: Some(release_track),
+        login: Some(login),
     }
 }
 
@@ -278,6 +279,10 @@ extern "C" fn start(_ctx: Ctx) {
 
 extern "C" fn stop(_ctx: Ctx) {
     guard("panel stop", (), || session::stop(Wait::No));
+}
+
+extern "C" fn login(_ctx: Ctx) {
+    guard("panel login", (), || session::login(Wait::No));
 }
 
 extern "C" fn load_lists(_ctx: Ctx) {
@@ -505,7 +510,7 @@ pub(crate) mod tests {
     #[test]
     fn the_host_table_is_the_header_s_and_complete() {
         let host = host();
-        assert_eq!(host.abi_version, 4);
+        assert_eq!(host.abi_version, 5);
         assert!(host.ctx.is_null());
         let set = [
             host.view_json.is_some(),
@@ -521,6 +526,7 @@ pub(crate) mod tests {
             host.set_source.is_some(),
             host.panel_closed.is_some(),
             host.release_track.is_some(),
+            host.login.is_some(),
         ];
         assert!(set.iter().all(|s| *s));
     }
@@ -631,6 +637,40 @@ pub(crate) mod tests {
             release(ptr::null_mut(), -1);
         }
         drop((desktop, mic));
+        reset();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_login_callback_opens_the_window_only_where_the_view_offers_it() {
+        use dstreamy_obs_producer::control::ControlError;
+
+        let _serial = crate::serial();
+        libobs();
+        reset();
+        let host = host();
+        assert_eq!(view()["login"], Value::Null);
+        call(host.login);
+        assert_eq!(with_controls(|c| c.model.error().map(str::to_owned)), None);
+
+        change(|c, _| {
+            c.model
+                .guilds_loaded(Err(ControlError::InvalidToken { window: true }));
+        });
+        assert_eq!(view()["login"]["label"], "Log in again");
+        assert_eq!(view()["state_fix"], "", "the button replaces the command");
+        call(host.login);
+        let (headline, fix) = with_controls(|c| {
+            let p = c.model.problem().unwrap();
+            (p.headline, p.fix)
+        });
+        assert_eq!(
+            (headline, fix),
+            ("Login failed", "Restart OBS"),
+            "without a control thread the login can't start"
+        );
+        assert!(!with_controls(|c| c.model.logging_in()));
+        assert_eq!(view()["login"], Value::Null);
         reset();
     }
 

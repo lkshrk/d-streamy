@@ -56,6 +56,7 @@ struct Host {
 	int loads = 0;
 	int take_overs = 0;
 	int closed = 0;
+	int logins = 0;
 	std::vector<bool> confirms;
 	std::vector<int> releases;
 	std::string guild = "-";
@@ -145,6 +146,10 @@ dstreamy_ui_host make_host()
 	h.release_track = [](void *, int track) {
 		called();
 		host.releases.push_back(track);
+	};
+	h.login = [](void *) {
+		called();
+		host.logins++;
 	};
 	return h;
 }
@@ -244,7 +249,7 @@ const State attention{
 	"start",
 	true};
 
-std::string view(const State &s, const QJsonObject &a, bool loading = false)
+std::string view(const State &s, const QJsonObject &a, bool loading = false, const char *login = nullptr)
 {
 	bool lists = std::strcmp(s.tone, "live") != 0;
 	QJsonObject v{
@@ -262,7 +267,8 @@ std::string view(const State &s, const QJsonObject &a, bool loading = false)
 				     loading, lists)},
 		{"audio", a},
 		{"button",
-		 QJsonObject{{"label", QString::fromUtf8(s.button)}, {"action", s.action}, {"enabled", s.enabled}}}};
+		 QJsonObject{{"label", QString::fromUtf8(s.button)}, {"action", s.action}, {"enabled", s.enabled}}},
+		{"login", login ? QJsonValue(QJsonObject{{"label", QString::fromUtf8(login)}}) : QJsonValue()}};
 	return QJsonDocument(v).toJson(QJsonDocument::Compact).toStdString();
 }
 
@@ -452,17 +458,20 @@ int main(int argc, char **argv)
 	window.show();
 	fake::window = &window;
 
-	CHECK(dstreamy_ui_abi_version() == 4);
+	CHECK(dstreamy_ui_abi_version() == 5);
 	dstreamy_ui_host good = make_host();
 	CHECK(!dstreamy_ui_load(nullptr));
 	dstreamy_ui_host old = good;
-	old.abi_version = 3;
+	old.abi_version = 4;
 	CHECK(!dstreamy_ui_load(&old));
 	dstreamy_ui_host partial = good;
 	partial.panel_closed = nullptr;
 	CHECK(!dstreamy_ui_load(&partial));
 	partial = good;
 	partial.release_track = nullptr;
+	CHECK(!dstreamy_ui_load(&partial));
+	partial = good;
+	partial.login = nullptr;
 	CHECK(!dstreamy_ui_load(&partial));
 	fake::window = nullptr;
 	CHECK(!dstreamy_ui_load(&good));
@@ -518,7 +527,7 @@ int main(int argc, char **argv)
 		      "Discord hears every source on Track 6. Let D-Streamy manage Track 6 to pick sources here."));
 	CHECK(sources().isEmpty() || !visible("dstreamy-sources"));
 	CHECK(text("dstreamy-state") == QString::fromUtf8("Idle · Kids Lounge 🧃"));
-	CHECK(!visible("dstreamy-fix"));
+	CHECK(!visible("dstreamy-fix") && !visible("dstreamy-login"));
 	shoot("idle-unmanaged");
 	find<QPushButton>("dstreamy-manage")->click();
 	CHECK(host.take_overs == 1);
@@ -602,7 +611,47 @@ int main(int argc, char **argv)
 		      .startsWith(QLatin1String("The D-Streamy service is not running")));
 	CHECK(status->text() == QString::fromUtf8("⚠ D-Streamy ▴"));
 	CHECK(find<QLabel>("dstreamy-mark")->text() == QString::fromUtf8("⚠"));
+	CHECK(!visible("dstreamy-login"));
 	shoot("attention");
+
+	const State expired{"attention",
+			    "⚠",
+			    "⚠ D-Streamy ▴",
+			    "Discord login expired",
+			    "",
+			    "Discord rejected the saved login: press Log in again",
+			    "Start D-Streamy",
+			    "start",
+			    true};
+	show(view(expired, audio(true, false), false, "Log in again"));
+	auto *login = find<QPushButton>("dstreamy-login");
+	CHECK(login && visible("dstreamy-login") && login->text() == QLatin1String("Log in again"));
+	CHECK(!visible("dstreamy-fix"));
+	CHECK(login && tab_chain(login).mid(0, 2) == (QStringList{"dstreamy-login", "dstreamy-guilds"}));
+	shoot("login");
+	int views_before = host.views;
+	if (login)
+		login->click();
+	CHECK(host.logins == 1);
+	CHECK(wait_for([views_before] { return host.views > views_before; }));
+	show(view(expired, audio(true, false), false, "Log in"));
+	CHECK(login && login->text() == QLatin1String("Log in"));
+
+	const State waiting{"busy",
+			    "●",
+			    "D-Streamy logging in… ▴",
+			    "Logging in…",
+			    "Waiting for login in the browser window…",
+			    "Logging in…\nWaiting for login in the browser window…",
+			    "Start D-Streamy",
+			    "start",
+			    false};
+	show(view(waiting, audio(true, false)));
+	CHECK(!visible("dstreamy-login"));
+	CHECK(visible("dstreamy-fix") &&
+	      text("dstreamy-fix") == QString::fromUtf8("Waiting for login in the browser window…"));
+	CHECK(!find<QPushButton>("dstreamy-action")->isEnabled());
+	CHECK(host.logins == 1);
 
 	State long_state = live;
 	long_state.line = "Live · 12.3 Mbit/s · 60 fps · 1:02:05 · 1234 dropped and more text that cannot fit";

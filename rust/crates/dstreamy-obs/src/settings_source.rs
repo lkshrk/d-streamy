@@ -33,6 +33,7 @@ const AUDIO_TRACK: &CStr = c"audio_track";
 const GUILD: &CStr = c"guild_id";
 const CHANNEL: &CStr = c"channel_id";
 const STATUS: &CStr = c"status";
+const LOGIN: &CStr = c"login";
 
 /// The producer model behind every dialog; it outlives each dialog's source.
 struct Controls {
@@ -1179,6 +1180,17 @@ extern "C" fn start_clicked(
     })
 }
 
+extern "C" fn login_clicked(
+    _props: *mut sys::obs_properties_t,
+    _property: *mut sys::obs_property_t,
+    _data: *mut c_void,
+) -> bool {
+    guard("settings login", true, || {
+        session::login(session::Wait::Dialog);
+        true
+    })
+}
+
 extern "C" fn stop_clicked(
     _props: *mut sys::obs_properties_t,
     _property: *mut sys::obs_property_t,
@@ -1244,7 +1256,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
             .then(|| selected_track(settings))
             .flatten();
         let title = c_text(AUDIO_TRACK_TITLE);
-        let (guilds, channels, picked, state) = with_controls(|c| {
+        let (guilds, channels, picked, state, login) = with_controls(|c| {
             let named = |list: &[dstreamy_obs_producer::control::Named]| {
                 list.iter()
                     .map(|n| (n.id.clone(), n.name.clone()))
@@ -1255,6 +1267,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                 named(c.model.channels()),
                 c.model.settings().clone(),
                 c.model.state().clone(),
+                c.model.login_offer().filter(|_| cfg!(unix)),
             )
         });
         // SAFETY: the caller owns and destroys the returned properties; libobs copies every string.
@@ -1271,6 +1284,15 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
             let blocked = shown.2;
             crate::hooks::dialog_built(&shown.0, guilds.len());
             set_status(status_prop, shown);
+            if let Some(offer) = login {
+                let label = c_text(offer.label());
+                sys::obs_properties_add_button(
+                    props,
+                    LOGIN.as_ptr(),
+                    label.as_ptr(),
+                    Some(login_clicked),
+                );
+            }
             let guild = add_list(
                 props,
                 GUILD,
@@ -1619,6 +1641,43 @@ mod tests {
         // SAFETY: the copy made above.
         unsafe { sys::obs_data_release(opened) };
         drop((second, desktop));
+        reset();
+    }
+
+    #[test]
+    fn the_dialog_offers_the_login_window_with_its_label_only_when_the_model_does() {
+        use dstreamy_obs_producer::control::ControlError;
+
+        let _serial = start();
+        let dialog = Dialog::create();
+        let login_button = || {
+            // SAFETY: a live source; the properties are destroyed before returning.
+            unsafe {
+                let props = sys::obs_source_properties(dialog.0);
+                let button = sys::obs_properties_get(props, LOGIN.as_ptr());
+                let label =
+                    (!button.is_null()).then(|| text(sys::obs_property_description(button)));
+                let status = text(sys::obs_property_description(sys::obs_properties_get(
+                    props,
+                    STATUS.as_ptr(),
+                )));
+                sys::obs_properties_destroy(props);
+                (label, status)
+            }
+        };
+        assert_eq!(login_button().0, None);
+        change(|c, _| {
+            c.model
+                .guilds_loaded(Err(ControlError::NotLoggedIn { window: true }));
+        });
+        let (label, status) = login_button();
+        assert_eq!(label.as_deref(), Some("Log in"));
+        assert!(status.starts_with("Log in first: press Log in"), "{status}");
+        login_clicked(ptr::null_mut(), ptr::null_mut(), dialog.0.cast());
+        let (label, status) = login_button();
+        assert_eq!(label, None, "no control thread, so the login ends at once");
+        assert!(status.contains("control thread"), "{status}");
+        drop(dialog);
         reset();
     }
 
