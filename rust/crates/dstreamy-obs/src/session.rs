@@ -467,7 +467,7 @@ impl Output {
     }
 }
 
-/// The control thread's output, for the panel's stats: weak, so reading it never extends the output's life.
+/// The control thread's output, for the panel's stats: weak, so storing it here doesn't keep the output alive.
 struct Watched(*mut sys::obs_weak_output_t);
 
 // SAFETY: weak references are reference-counted by libobs and usable from any thread.

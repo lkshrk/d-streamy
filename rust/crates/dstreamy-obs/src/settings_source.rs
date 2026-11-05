@@ -364,19 +364,52 @@ fn touch(track: u8, settings: *mut sys::obs_data_t) {
 
 /// Runs `f` with a clicked dialog's settings, or NULL; `data` is the source `create` returned.
 fn with_dialog_settings<R>(data: *mut c_void, f: impl FnOnce(*mut sys::obs_data_t) -> R) -> R {
-    let source: *mut sys::obs_source_t = data.cast();
-    let settings = if source.is_null() {
-        ptr::null_mut()
-    } else {
-        // SAFETY: OBS passes the clicked source's data, which is the source itself; released below.
-        unsafe { sys::obs_source_get_settings(source) }
-    };
-    let result = f(settings);
-    if !settings.is_null() {
-        // SAFETY: the reference taken above.
-        unsafe { sys::obs_data_release(settings) };
+    // SAFETY: OBS passes the clicked source's data, which is the source itself or NULL.
+    let settings = unsafe { SourceSettings::of(data.cast()) };
+    f(settings.0)
+}
+
+/// A source's settings reference, released on drop so a panic doesn't leak it.
+struct SourceSettings(*mut sys::obs_data_t);
+
+impl SourceSettings {
+    /// # Safety
+    /// `source` is NULL or a live source.
+    unsafe fn of(source: *mut sys::obs_source_t) -> Self {
+        if source.is_null() {
+            Self(ptr::null_mut())
+        } else {
+            // SAFETY: the caller's contract; released in drop.
+            Self(unsafe { sys::obs_source_get_settings(source) })
+        }
     }
-    result
+}
+
+impl Drop for SourceSettings {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the reference taken in `of`.
+            unsafe { sys::obs_data_release(self.0) };
+        }
+    }
+}
+
+/// Properties being built, destroyed on drop unless handed to the caller.
+struct Properties(*mut sys::obs_properties_t);
+
+impl Properties {
+    fn into_raw(self) -> *mut sys::obs_properties_t {
+        let props = self.0;
+        mem::forget(self);
+        props
+    }
+}
+
+impl Drop for Properties {
+    fn drop(&mut self) {
+        // SAFETY: created by obs_properties_create and not handed out.
+        unsafe { sys::obs_properties_destroy(self.0) };
+    }
 }
 
 /// The track in a button's name after `prefix`.
@@ -920,13 +953,9 @@ unsafe fn add_list(
 
 extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
     guard("settings get_properties", ptr::null_mut(), || {
-        let source: *mut sys::obs_source_t = data.cast();
-        let settings = if source.is_null() {
-            ptr::null_mut()
-        } else {
-            // SAFETY: `data` is the source `create` returned; the reference is released below.
-            unsafe { sys::obs_source_get_settings(source) }
-        };
+        // SAFETY: `data` is the source `create` returned.
+        let owned = unsafe { SourceSettings::of(data.cast()) };
+        let settings = owned.0;
         RELOADING.with(|r| r.set(true));
         let selected = (!settings.is_null())
             .then(|| selected_track(settings))
@@ -947,7 +976,8 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
         });
         // SAFETY: the caller owns and destroys the returned properties; libobs copies every string.
         unsafe {
-            let props = sys::obs_properties_create();
+            let owned_props = Properties(sys::obs_properties_create());
+            let props = owned_props.0;
             let status_prop = sys::obs_properties_add_text(
                 props,
                 STATUS.as_ptr(),
@@ -993,9 +1023,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                 settings,
                 shown_track(selected.unwrap_or(picked.audio_track)),
             );
-            if !settings.is_null() {
-                sys::obs_data_release(settings);
-            }
+            drop(owned);
             let buttons: [(&CStr, &CStr, sys::obs_property_clicked_t, bool); 2] = [
                 (
                     c"start",
@@ -1015,7 +1043,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                     sys::obs_properties_add_button(props, name.as_ptr(), label.as_ptr(), clicked);
                 sys::obs_property_set_enabled(button, enabled);
             }
-            props
+            owned_props.into_raw()
         }
     })
 }

@@ -118,6 +118,15 @@ unsafe fn state<'a>(data: *mut c_void) -> &'a Output {
     unsafe { &*data.cast::<Output>() }
 }
 
+/// Like [`state`], for callbacks libobs makes without checking that create succeeded (obs-output.c:1186,1196).
+///
+/// # Safety
+/// `data` is NULL or the pointer `output_create` returned, not yet destroyed.
+unsafe fn state_or_null<'a>(data: *mut c_void) -> Option<&'a Output> {
+    // SAFETY: the caller's contract.
+    unsafe { data.cast::<Output>().as_ref() }
+}
+
 pub fn set_last_error(output: OutputPtr, message: &str) {
     let text = CString::new(message.replace('\0', " ")).expect("NUL bytes were replaced");
     // SAFETY: libobs copies the message (obs-output.c:3231-3242).
@@ -411,8 +420,8 @@ extern "C" fn get_stats(data: *mut c_void, cd: *mut sys::calldata_t) {
 /// `obs_output_get_total_bytes`: the bytes this output sent to the service since its start.
 extern "C" fn output_total_bytes(data: *mut c_void) -> u64 {
     guard("get_total_bytes", 0, || {
-        // SAFETY: libobs only calls this on a live output, with the pointer create returned.
-        unsafe { state(data) }.shared.ring.sent_bytes()
+        // SAFETY: libobs passes the pointer create returned, which is NULL after a failed create.
+        unsafe { state_or_null(data) }.map_or(0, |state| state.shared.ring.sent_bytes())
     })
 }
 
@@ -420,8 +429,9 @@ extern "C" fn output_total_bytes(data: *mut c_void) -> u64 {
 extern "C" fn output_dropped_frames(data: *mut c_void) -> c_int {
     guard("get_dropped_frames", 0, || {
         // SAFETY: as in `output_total_bytes`.
-        let dropped = unsafe { state(data) }.shared.ring.stats().dropped_video;
-        c_int::try_from(dropped).unwrap_or(c_int::MAX)
+        unsafe { state_or_null(data) }.map_or(0, |state| {
+            c_int::try_from(state.shared.ring.stats().dropped_video).unwrap_or(c_int::MAX)
+        })
     })
 }
 
@@ -445,4 +455,15 @@ pub fn register() {
     };
     // SAFETY: libobs copies `info` (`obs-module.c:894-912`); the strings it points to are 'static.
     unsafe { sys::obs_register_output_s(&info, mem::size_of::<sys::obs_output_info>()) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counters_of_an_output_whose_create_failed_are_zero() {
+        assert_eq!(output_total_bytes(ptr::null_mut()), 0);
+        assert_eq!(output_dropped_frames(ptr::null_mut()), 0);
+    }
 }
