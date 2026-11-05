@@ -471,11 +471,23 @@ impl ControlError {
             self,
             Self::LoginCancelled
                 | Self::LoginFailed(_)
+                | Self::LoginRunning
                 | Self::Timeout { .. }
                 | Self::Restarted
                 | Self::Abandoned
                 | Self::Protocol(_)
                 | Self::Refused { .. }
+        )
+    }
+
+    /// Its fix is pressing the login button, so the button can take the fix line's place.
+    pub fn fixed_by_login(&self) -> bool {
+        matches!(
+            self,
+            Self::NotLoggedIn { window: true }
+                | Self::InvalidToken { window: true }
+                | Self::LoginCancelled
+                | Self::LoginFailed(_)
         )
     }
 

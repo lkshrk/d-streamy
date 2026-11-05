@@ -161,6 +161,7 @@ struct Ui {
 	QPointer<QPushButton> action;
 	QByteArray shown;
 	QString pressed;
+	QString login_action;
 	QString source_list;
 	QString notice_list;
 };
@@ -457,6 +458,7 @@ void render()
 	QJsonObject login = view.value("login").toObject();
 	ui.login->setText(login.value("label").toString());
 	ui.login->setVisible(!login.isEmpty());
+	ui.login_action = login.value("action").toString();
 
 	fill(ui.guilds, view.value("guilds").toObject());
 	fill(ui.channels, view.value("channels").toObject());
@@ -586,7 +588,10 @@ Panel *build_panel()
 		guarded("login", [] {
 			if (!ui.active)
 				return;
-			ui.host.login(ui.host.ctx);
+			if (ui.login_action == QLatin1String("cancel"))
+				ui.host.cancel_login(ui.host.ctx);
+			else if (ui.login_action == QLatin1String("login"))
+				ui.host.login(ui.host.ctx);
 			rerender();
 		});
 	});
@@ -738,7 +743,8 @@ bool load(const struct dstreamy_ui_host *host)
 	if (ui.active || !host || host->abi_version != DSTREAMY_UI_ABI_VERSION || !host->view_json ||
 	    !host->free_string || !host->start || !host->stop || !host->load_lists || !host->select_guild ||
 	    !host->select_channel || !host->set_track || !host->request_take_over || !host->confirm_take_over ||
-	    !host->set_source || !host->panel_closed || !host->release_track || !host->login || failing)
+	    !host->set_source || !host->panel_closed || !host->release_track || !host->login ||
+	    !host->cancel_login || failing)
 		return false;
 	QMainWindow *window = dstreamy_ui::main_window();
 	if (!window)

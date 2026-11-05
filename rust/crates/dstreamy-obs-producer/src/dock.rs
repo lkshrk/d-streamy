@@ -215,6 +215,8 @@ pub struct Problem {
     pub lists: bool,
     /// Serve's login window fixes it.
     pub login: Option<Relogin>,
+    /// The login button is its whole fix, so the fix text may give way to it.
+    pub login_fix: bool,
 }
 
 impl Problem {
@@ -225,6 +227,7 @@ impl Problem {
             message: message.into(),
             lists: false,
             login: None,
+            login_fix: false,
         }
     }
 
@@ -235,6 +238,7 @@ impl Problem {
             message: error.to_string(),
             lists: false,
             login: error.relogin(),
+            login_fix: error.fixed_by_login(),
         }
     }
 }

@@ -47,6 +47,9 @@ const NO_VIDEO: &str = "OBS has no video running, so D-Streamy can't start. Chec
 const GONE: &str = "D-Streamy's control thread is not running, so Start and Stop can't finish. \
      See the OBS log and restart OBS";
 
+const LOGIN_GONE: &str = "D-Streamy's control thread is not running, so the login can't start. \
+     See the OBS log and restart OBS";
+
 type Done = std_mpsc::SyncSender<()>;
 
 enum Job {
@@ -56,7 +59,7 @@ enum Job {
     #[cfg(unix)]
     Stop(Option<Ownership>, Done),
     #[cfg(unix)]
-    Login(Done),
+    Login(tokio::sync::oneshot::Receiver<()>, Done),
     OutputStopped(i64),
     Shutdown,
 }
@@ -295,13 +298,40 @@ pub fn stop(wait: Wait) {
 /// The login button of the dialog or the status-bar panel, on the UI thread: serve opens its login window.
 #[cfg(unix)]
 pub fn login(wait: Wait) {
-    if change(|c, _| c.model.begin_login()) && !queue(Job::Login, wait) {
-        change(|c, _| c.model.login_unfinished(GONE.into(), FIX_RESTART_OBS));
+    if !change(|c, _| c.model.begin_login()) {
+        return;
+    }
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    *LOGIN_CANCEL.lock().unwrap_or_else(PoisonError::into_inner) = Some(cancel);
+    if !queue(|done| Job::Login(cancelled, done), wait) {
+        LOGIN_CANCEL
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        change(|c, _| c.model.login_unfinished(LOGIN_GONE.into(), FIX_RESTART_OBS));
     }
 }
 
+/// Closes the login window D-Streamy waits for: serve closes it once the request goes away.
+#[cfg(unix)]
+pub fn cancel_login() {
+    let cancel = LOGIN_CANCEL
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if cancel.is_none_or(|c| c.send(()).is_err()) {
+        change(|c, _| c.model.login_finished(Err(ControlError::LoginCancelled)));
+    }
+}
+
+#[cfg(unix)]
+static LOGIN_CANCEL: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
+
 #[cfg(not(unix))]
 pub fn login(_wait: Wait) {}
+
+#[cfg(not(unix))]
+pub fn cancel_login() {}
 
 #[cfg(not(unix))]
 pub fn start(_wait: Wait) {
@@ -688,9 +718,9 @@ async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &m
             let _ = done.try_send(());
         }
         #[cfg(unix)]
-        Job::Login(done) => {
+        Job::Login(cancelled, done) => {
             // The window stays open for minutes, so the login must not hold up Start, Stop or the lists.
-            tokio::spawn(login_session(closing));
+            tokio::spawn(login_session(closing, cancelled));
             let _ = done.try_send(());
         }
         Job::OutputStopped(code) => {
@@ -748,14 +778,15 @@ async fn lists(guild: Option<String>, closing: &mut Closing) {
 async fn lists(_guild: Option<String>, _closing: &mut Closing) {}
 
 #[cfg(unix)]
-async fn login_session(mut closing: Closing) {
+async fn login_session(mut closing: Closing, cancelled: tokio::sync::oneshot::Receiver<()>) {
     let login = async {
-        match control() {
-            Ok(control) => closing
-                .call(control.login())
-                .await
-                .unwrap_or(Err(ControlError::Abandoned)),
-            Err(e) => Err(ControlError::Connect(e)),
+        let control = match control() {
+            Ok(control) => control,
+            Err(e) => return Err(ControlError::Connect(e)),
+        };
+        tokio::select! {
+            result = closing.call(control.login()) => result.unwrap_or(Err(ControlError::Abandoned)),
+            Ok(()) = cancelled => Err(ControlError::LoginCancelled),
         }
     };
     let result = match AssertUnwindSafe(login).catch_unwind().await {

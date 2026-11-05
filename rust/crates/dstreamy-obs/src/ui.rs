@@ -101,6 +101,7 @@ fn host() -> Host {
         panel_closed: Some(panel_closed),
         release_track: Some(release_track),
         login: Some(login),
+        cancel_login: Some(cancel_login),
     }
 }
 
@@ -281,8 +282,19 @@ extern "C" fn stop(_ctx: Ctx) {
     guard("panel stop", (), || session::stop(Wait::No));
 }
 
+// Not a dialog callback, so the open dialog can rebuild at once.
 extern "C" fn login(_ctx: Ctx) {
-    guard("panel login", (), || session::login(Wait::No));
+    guard("panel login", (), || {
+        session::login(Wait::No);
+        settings_source::refresh();
+    });
+}
+
+extern "C" fn cancel_login(_ctx: Ctx) {
+    guard("panel cancel_login", (), || {
+        session::cancel_login();
+        settings_source::refresh();
+    });
 }
 
 extern "C" fn load_lists(_ctx: Ctx) {
@@ -400,7 +412,7 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) const PLAIN: &CStr = c"dstreamy_test_audio";
-    const MIC: &CStr = c"dstreamy_test_input_capture";
+    pub(crate) const MIC: &CStr = c"dstreamy_test_input_capture";
 
     extern "C" fn test_name(_type_data: *mut c_void) -> *const c_char {
         c"test audio".as_ptr()
@@ -527,6 +539,7 @@ pub(crate) mod tests {
             host.panel_closed.is_some(),
             host.release_track.is_some(),
             host.login.is_some(),
+            host.cancel_login.is_some(),
         ];
         assert!(set.iter().all(|s| *s));
     }
@@ -669,8 +682,24 @@ pub(crate) mod tests {
             ("Login failed", "Restart OBS"),
             "without a control thread the login can't start"
         );
+        assert!(
+            with_controls(|c| c.model.error().unwrap().contains("the login can't start")),
+            "its own words, not Start and Stop"
+        );
         assert!(!with_controls(|c| c.model.logging_in()));
         assert_eq!(view()["login"], Value::Null);
+
+        change(|c, _| {
+            c.model
+                .guilds_loaded(Err(ControlError::NotLoggedIn { window: true }));
+            assert!(c.model.begin_login());
+        });
+        assert_eq!(view()["login"]["action"], "cancel");
+        assert_eq!(view()["login"]["label"], "Cancel login");
+        call(host.cancel_login);
+        assert!(!with_controls(|c| c.model.logging_in()));
+        assert_eq!(view()["state_line"], "Login cancelled");
+        assert_eq!(view()["login"]["action"], "login");
         reset();
     }
 

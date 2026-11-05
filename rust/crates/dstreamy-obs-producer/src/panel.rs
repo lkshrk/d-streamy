@@ -79,11 +79,21 @@ pub struct Audio {
     pub notices: Vec<Notice>,
 }
 
-/// Opens serve's login window; it takes the place of the fix line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginAction {
+    Login,
+    Cancel,
+}
+
+/// Opens serve's login window, or closes the one it waits for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Login {
     pub label: &'static str,
+    pub action: LoginAction,
 }
+
+pub const CANCEL_LOGIN: &str = "Cancel login";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PanelView {
@@ -264,13 +274,19 @@ pub fn panel_view(
         ),
     };
     let (loading_guilds, loading_channels) = m.loading();
-    let login = controls
-        .then(|| m.login_offer())
-        .flatten()
-        .map(|offer| Login {
+    let offer = controls.then(|| m.login_offer()).flatten();
+    let login = match offer {
+        Some(offer) => Some(Login {
             label: offer.label(),
-        });
-    let state_fix = if login.is_some() {
+            action: LoginAction::Login,
+        }),
+        None if controls && m.logging_in() => Some(Login {
+            label: CANCEL_LOGIN,
+            action: LoginAction::Cancel,
+        }),
+        None => None,
+    };
+    let state_fix = if offer.is_some() && m.problem().is_some_and(|p| p.login_fix) {
         String::new()
     } else {
         state_fix
@@ -518,25 +534,27 @@ mod tests {
         assert_eq!(v.state_line, "Not logged in");
         assert_eq!(v.state_fix, "", "the button takes the fix line's place");
         assert_eq!(v.state_tooltip, "Log in first: press Log in");
-        assert_eq!(v.login, Some(Login { label: "Log in" }));
+        assert_eq!(v.login, Some(log_in("Log in")));
         assert_eq!(panel_view(&s, false, None, &[], false).login, None);
 
         s.model
             .guilds_loaded(Err(ControlError::InvalidToken { window: true }));
         let v = view(&s);
         assert_eq!(v.state_line, "Discord login expired");
-        assert_eq!(
-            v.login,
-            Some(Login {
-                label: "Log in again"
-            })
-        );
+        assert_eq!(v.login, Some(log_in("Log in again")));
 
         assert!(s.model.begin_login());
         let v = view(&s);
         assert_eq!(v.tone, Tone::Busy);
         assert_eq!(v.state_line, "Logging in…");
-        assert_eq!(v.login, None, "hidden while the window is open");
+        assert_eq!(
+            v.login,
+            Some(Login {
+                label: CANCEL_LOGIN,
+                action: LoginAction::Cancel
+            }),
+            "the wait can be ended from OBS"
+        );
         assert_eq!(v.status_bar, "D-Streamy logging in… ▴");
         assert!(!v.button.enabled);
         assert_eq!(v.state_fix, "Waiting for login in the browser window…");
@@ -544,18 +562,78 @@ mod tests {
         s.model.login_finished(Err(ControlError::LoginCancelled));
         let v = view(&s);
         assert_eq!(v.state_line, "Login cancelled");
-        assert_eq!(
-            v.login,
-            Some(Login {
-                label: "Log in again"
-            })
-        );
+        assert_eq!(v.login, Some(log_in("Log in again")));
 
         s.model.begin_login();
         s.model.login_finished(Ok(Some("Mock".into())));
         let v = view(&s);
         assert_eq!(v.tone, Tone::Idle);
         assert_eq!(v.state_line, "Not set up");
+        assert_eq!(v.login, None);
+    }
+
+    fn log_in(label: &'static str) -> Login {
+        Login {
+            label,
+            action: LoginAction::Login,
+        }
+    }
+
+    #[test]
+    fn a_missing_login_comes_before_a_mic_on_the_unmanaged_track() {
+        let mut s = picked(false);
+        let mut with_mic = sources();
+        with_mic[1].mic = true;
+        with_mic[1].mixers = 0b10_0000;
+        let shown = |s: &ConfigState| panel_view(s, true, None, &with_mic, false);
+        assert_eq!(shown(&s).state_line, "Discord would hear Mic");
+        s.model
+            .guilds_loaded(Err(ControlError::NotLoggedIn { window: true }));
+        let v = shown(&s);
+        assert_eq!(v.state_line, "Not logged in");
+        assert_eq!(v.state_fix, "");
+        assert_eq!(v.login, Some(log_in("Log in")));
+        assert!(!v.button.enabled, "the mic still holds Go Live back");
+        s.model.begin_login();
+        assert_eq!(
+            shown(&s).state_fix,
+            "Waiting for login in the browser window…"
+        );
+        s.model.login_finished(Ok(None));
+        let v = shown(&s);
+        assert_eq!(
+            v.state_line, "Discord would hear Mic",
+            "the mic once logged in"
+        );
+        assert_eq!(v.state_fix, "Manage Track 6");
+        assert_eq!(v.login, None);
+    }
+
+    #[test]
+    fn a_fix_the_button_doesn_t_cover_stays_next_to_it() {
+        let mut s = ConfigState::default();
+        s.model
+            .guilds_loaded(Err(ControlError::InvalidToken { window: true }));
+        s.model.begin_login();
+        s.model.login_finished(Err(ControlError::Timeout {
+            command: "login",
+            secs: 630,
+        }));
+        let v = view(&s);
+        assert_eq!(v.state_fix, "Check the service, then retry");
+        assert_eq!(v.login, Some(log_in("Log in again")));
+        s.model.begin_login();
+        s.model.login_finished(Err(ControlError::LoginRunning));
+        let v = view(&s);
+        assert_eq!(v.state_fix, "Finish the login in its window");
+        assert_eq!(v.login, Some(log_in("Log in again")), "never stuck");
+        s.model.begin_login();
+        s.model.login_finished(Err(ControlError::NotRunning(
+            "it closed the connection before answering login".into(),
+        )));
+        let v = view(&s);
+        assert_eq!(v.state_line, "Service not running");
+        assert!(!v.state_fix.is_empty());
         assert_eq!(v.login, None);
     }
 

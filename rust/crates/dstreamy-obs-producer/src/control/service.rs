@@ -362,8 +362,8 @@ impl Connection {
                         ))));
                     }
                     None => {
-                        return Err(ControlError::Protocol(format!(
-                            "connection closed before the {name} reply"
+                        return Err(ControlError::NotRunning(format!(
+                            "it closed the connection before answering {name}"
                         )));
                     }
                 };

@@ -42,6 +42,8 @@ struct dstreamy_ui_host {
 	void (*release_track)(void *ctx, int track);
 	/* Asks the service to open its login window; the view shows the wait. */
 	void (*login)(void *ctx);
+	/* Stops waiting for that window, which the service then closes. */
+	void (*cancel_login)(void *ctx);
 };
 
 /* DSTREAMY_UI_ABI_VERSION of this library; the plugin checks it before dstreamy_ui_load. */

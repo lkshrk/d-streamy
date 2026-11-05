@@ -131,7 +131,8 @@ pub fn dock_view(
                 let chosen = chosen_channel(m);
                 let blocked = mic.filter(|g| !g.live);
                 let start = button(START, Action::Start, chosen.is_some() && blocked.is_none());
-                if let Some(guard) = blocked {
+                // Without a login nothing can stream, so the login problem comes before the mic.
+                if let Some(guard) = blocked.filter(|_| m.login_offer().is_none()) {
                     detail_tooltip = Some(guard.tooltip());
                     (Tone::Attention, guard.headline(), guard.fix(), start)
                 } else if let Some(problem) = m.problem() {

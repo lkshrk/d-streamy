@@ -17,7 +17,7 @@ use dstreamy_obs_producer::mixer::{
     AudioView, CONFIRM, NOT_NOW, audio_view, instead_label, mic_guard, notices, release_label,
     track_bit,
 };
-use dstreamy_obs_producer::panel::NO_AUDIO_CONTROLS;
+use dstreamy_obs_producer::panel::{CANCEL_LOGIN, NO_AUDIO_CONTROLS};
 use dstreamy_obs_sys as sys;
 
 use crate::config;
@@ -301,7 +301,7 @@ fn selected_track(settings: *mut sys::obs_data_t) -> Option<u8> {
     u8::try_from(raw).ok().filter(|t| AUDIO_TRACKS.contains(t))
 }
 
-/// The status line for a dialog showing `selected`, how OBS should colour it, and whether a mic holds Start back.
+/// The status line for a dialog showing `selected`, how OBS should colour it, and whether a mic or a login holds Start back.
 fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type, bool) {
     let sources = if cfg!(unix) {
         crate::audio::sources()
@@ -318,12 +318,13 @@ fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type, bool) {
         let mic = (cfg!(unix) && (idle || live))
             .then(|| mic_guard(&preview, &sources))
             .flatten();
-        let held = idle && mic.is_some();
+        let held = idle && (mic.is_some() || preview.logging_in());
+        let login = preview.logging_in() || preview.login_offer().is_some();
         let quiet = idle && preview.error().is_none() && mic.is_none();
         let session = match &mic {
             _ if !cfg!(unix) => UNSUPPORTED.to_owned(),
-            Some(guard) => guard.message(),
-            None => preview.status_text(true),
+            Some(guard) if !login => guard.message(),
+            _ => preview.status_text(true),
         };
         if let Some(e) = c.error() {
             let config = e.message(preview.settings().audio_track);
@@ -335,7 +336,8 @@ fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type, bool) {
             return (text, sys::OBS_TEXT_INFO_ERROR, held);
         }
         let kind = match (preview.track_status(), preview.error()) {
-            _ if !cfg!(unix) || mic.is_some() => sys::OBS_TEXT_INFO_WARNING,
+            _ if cfg!(unix) && preview.logging_in() => sys::OBS_TEXT_INFO_NORMAL,
+            _ if !cfg!(unix) || (mic.is_some() && !login) => sys::OBS_TEXT_INFO_WARNING,
             (TrackStatus::Pending { .. }, _) => sys::OBS_TEXT_INFO_WARNING,
             (TrackStatus::Idle { .. }, Some(_)) => sys::OBS_TEXT_INFO_ERROR,
             _ => sys::OBS_TEXT_INFO_NORMAL,
@@ -1191,6 +1193,20 @@ extern "C" fn login_clicked(
     })
 }
 
+type LoginClicked =
+    unsafe extern "C" fn(*mut sys::obs_properties_t, *mut sys::obs_property_t, *mut c_void) -> bool;
+
+extern "C" fn cancel_login_clicked(
+    _props: *mut sys::obs_properties_t,
+    _property: *mut sys::obs_property_t,
+    _data: *mut c_void,
+) -> bool {
+    guard("settings cancel_login", true, || {
+        session::cancel_login();
+        true
+    })
+}
+
 extern "C" fn stop_clicked(
     _props: *mut sys::obs_properties_t,
     _property: *mut sys::obs_property_t,
@@ -1267,7 +1283,15 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                 named(c.model.channels()),
                 c.model.settings().clone(),
                 c.model.state().clone(),
-                c.model.login_offer().filter(|_| cfg!(unix)),
+                c.model
+                    .login_offer()
+                    .map(|offer| (offer.label(), Some(login_clicked as LoginClicked)))
+                    .or_else(|| {
+                        c.model
+                            .logging_in()
+                            .then_some((CANCEL_LOGIN, Some(cancel_login_clicked as LoginClicked)))
+                    })
+                    .filter(|_| cfg!(unix)),
             )
         });
         // SAFETY: the caller owns and destroys the returned properties; libobs copies every string.
@@ -1284,14 +1308,9 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
             let blocked = shown.2;
             crate::hooks::dialog_built(&shown.0, guilds.len());
             set_status(status_prop, shown);
-            if let Some(offer) = login {
-                let label = c_text(offer.label());
-                sys::obs_properties_add_button(
-                    props,
-                    LOGIN.as_ptr(),
-                    label.as_ptr(),
-                    Some(login_clicked),
-                );
+            if let Some((label, clicked)) = login {
+                let label = c_text(label);
+                sys::obs_properties_add_button(props, LOGIN.as_ptr(), label.as_ptr(), clicked);
             }
             let guild = add_list(
                 props,
@@ -1649,34 +1668,69 @@ mod tests {
         use dstreamy_obs_producer::control::ControlError;
 
         let _serial = start();
+        let mic = Source::new(crate::ui::tests::MIC, c"Mic");
         let dialog = Dialog::create();
-        let login_button = || {
+        let shown = || {
             // SAFETY: a live source; the properties are destroyed before returning.
             unsafe {
                 let props = sys::obs_source_properties(dialog.0);
                 let button = sys::obs_properties_get(props, LOGIN.as_ptr());
                 let label =
                     (!button.is_null()).then(|| text(sys::obs_property_description(button)));
-                let status = text(sys::obs_property_description(sys::obs_properties_get(
-                    props,
-                    STATUS.as_ptr(),
-                )));
+                let status = sys::obs_properties_get(props, STATUS.as_ptr());
+                let shown = (
+                    label,
+                    text(sys::obs_property_description(status)),
+                    sys::obs_property_text_info_type(status),
+                    sys::obs_property_enabled(sys::obs_properties_get(props, c"start".as_ptr())),
+                );
                 sys::obs_properties_destroy(props);
-                (label, status)
+                shown
             }
         };
-        assert_eq!(login_button().0, None);
+        assert_eq!(shown().0, None);
+        assert!(shown().1.starts_with("Mic is on Track 6"), "{}", shown().1);
         change(|c, _| {
+            c.model.select_guild("g");
+            c.model.select_channel("c");
             c.model
                 .guilds_loaded(Err(ControlError::NotLoggedIn { window: true }));
         });
-        let (label, status) = login_button();
+        let (label, status, _, start) = shown();
         assert_eq!(label.as_deref(), Some("Log in"));
-        assert!(status.starts_with("Log in first: press Log in"), "{status}");
+        assert!(
+            status.starts_with("Log in first: press Log in"),
+            "the login comes before the mic: {status}"
+        );
+        assert!(!start, "the mic still holds Start back");
+
+        drop(mic);
+        change(|c, _| {
+            c.open(|| Ok(None), |_| Ok(()));
+            assert!(
+                c.error().is_none(),
+                "a settings file problem would colour the line red"
+            );
+            assert!(c.model.begin_login());
+        });
+        let (label, status, kind, start) = shown();
+        assert_eq!(label.as_deref(), Some("Cancel login"));
+        assert!(
+            status.starts_with("Waiting for login in the browser window"),
+            "{status}"
+        );
+        assert_eq!(kind, sys::OBS_TEXT_INFO_NORMAL, "waiting is no error");
+        assert!(!start, "no Start while logging in");
+        cancel_login_clicked(ptr::null_mut(), ptr::null_mut(), dialog.0.cast());
+        let (label, status, _, start) = shown();
+        assert_eq!(label.as_deref(), Some("Log in"));
+        assert!(status.starts_with("The login window closed"), "{status}");
+        assert!(start);
+
         login_clicked(ptr::null_mut(), ptr::null_mut(), dialog.0.cast());
-        let (label, status) = login_button();
+        let (label, status, _, _) = shown();
         assert_eq!(label, None, "no control thread, so the login ends at once");
-        assert!(status.contains("control thread"), "{status}");
+        assert!(status.contains("the login can't start"), "{status}");
         drop(dialog);
         reset();
     }
