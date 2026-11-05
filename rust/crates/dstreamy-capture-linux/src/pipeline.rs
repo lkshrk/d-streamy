@@ -23,6 +23,10 @@ const SEND_RETRY: Duration = Duration::from_millis(1);
 const BUS_POLL: gst::ClockTime = gst::ClockTime::from_mseconds(100);
 /// How long a fresh pipeline gets to fail before it is accepted; a static screen may send no frame.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const AUDIO_RETRY_FIRST: Duration = Duration::from_millis(500);
+const AUDIO_RETRY_MAX: Duration = Duration::from_secs(5);
+/// Every audio element's name starts with this, so errors of a branch already replaced are still recognised.
+const AUDIO_ELEMENT_PREFIX: &str = "dstreamy-audio-";
 
 pub(crate) enum VideoInput {
     PipeWire {
@@ -234,6 +238,48 @@ fn video_source(input: &VideoInput, fps: u32) -> Result<Vec<gst::Element>, Media
     }
 }
 
+/// Stream properties that keep a chosen device's stream on that device: WirePlumber destroys it instead of moving it.
+pub(crate) fn pinned_stream_fields(
+    device: Option<&str>,
+) -> &'static [(&'static str, &'static str)] {
+    match device {
+        Some(_) => &[
+            ("node.dont-fallback", "true"),
+            ("node.dont-reconnect", "true"),
+            ("node.dont-move", "true"),
+        ],
+        None => &[],
+    }
+}
+
+/// `pulsesrc` stream properties, which pipewire-pulse copies onto the PipeWire node.
+pub(crate) fn pulse_stream_properties(device: Option<&str>) -> Option<gst::Structure> {
+    let fields = pinned_stream_fields(device);
+    (!fields.is_empty()).then(|| {
+        fields
+            .iter()
+            .fold(gst::Structure::builder("props"), |b, (k, v)| {
+                b.field(*k, *v)
+            })
+            .build()
+    })
+}
+
+pub(crate) fn pipewire_stream_properties(device: Option<&str>) -> gst::Structure {
+    let (target, capture_sink) = pipewire_target(device);
+    let mut props = gst::Structure::builder("props").field("media.category", "Capture");
+    if capture_sink {
+        props = props.field("stream.capture.sink", "true");
+    }
+    if let Some(target) = target {
+        props = props.field("target.object", target);
+    }
+    pinned_stream_fields(device)
+        .iter()
+        .fold(props, |b, (k, v)| b.field(*k, *v))
+        .build()
+}
+
 /// Where `pipewiresrc` should capture `device`, a pulse source name: a sink's monitor or a source.
 pub(crate) fn pipewire_target(device: Option<&str>) -> (Option<&str>, bool) {
     match device {
@@ -250,26 +296,25 @@ fn audio_source(input: AudioInput, device: Option<&str>) -> Result<gst::Element,
         AudioInput::PulseMonitor => {
             let src = make("pulsesrc")?;
             src.set_property("device", device.unwrap_or("@DEFAULT_MONITOR@"));
+            if let Some(props) = pulse_stream_properties(device) {
+                src.set_property("stream-properties", props);
+            }
             Ok(src)
         }
         AudioInput::PipeWireSink => {
             let src = make("pipewiresrc")?;
-            let (target, capture_sink) = pipewire_target(device);
-            let mut props = gst::Structure::builder("props").field("media.category", "Capture");
-            if capture_sink {
-                props = props.field("stream.capture.sink", "true");
-            }
-            if let Some(target) = target {
-                props = props.field("target.object", target);
+            if let Some(target) = pipewire_target(device).0 {
                 set_if_present(&src, "target-object", target);
+                set_if_present(&src, "on-disconnect", "error");
             }
-            src.set_property("stream-properties", props.build());
+            src.set_property("stream-properties", pipewire_stream_properties(device));
             Ok(src)
         }
         #[cfg(test)]
         AudioInput::Test { frames } => {
             let src = make("audiotestsrc")?;
             src.set_property("num-buffers", frames);
+            src.set_property("is-live", frames < 0);
             Ok(src)
         }
     }
@@ -280,6 +325,7 @@ struct Output {
     tx: Mutex<Option<mpsc::Sender<MediaFrame>>>,
     stop: AtomicBool,
     video_frames: AtomicU64,
+    audio_buffers: AtomicU64,
     error: Mutex<Option<String>>,
 }
 
@@ -289,6 +335,7 @@ impl Output {
             tx: Mutex::new(Some(tx)),
             stop: AtomicBool::new(false),
             video_frames: AtomicU64::new(0),
+            audio_buffers: AtomicU64::new(0),
             error: Mutex::new(None),
         })
     }
@@ -428,7 +475,7 @@ fn audio_sink(
         pending: Vec::with_capacity(OPUS_FRAME_SAMPLES * OPUS_CHANNELS * 2),
         next_pts_us: None,
     };
-    Ok(gst_app::AppSink::builder()
+    let sink = gst_app::AppSink::builder()
         .sync(false)
         .caps(&audio_caps())
         .callbacks(
@@ -437,6 +484,7 @@ fn audio_sink(
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                    output.audio_buffers.fetch_add(1, Ordering::Relaxed);
                     if let Some(activity) = &activity {
                         activity.samples(
                             map.as_slice()
@@ -458,7 +506,136 @@ fn audio_sink(
                 })
                 .build(),
         )
-        .build())
+        .build();
+    // A replacement branch is added to a playing pipeline, which must not wait for it to preroll.
+    sink.set_property("async", false);
+    Ok(sink)
+}
+
+/// The audio chain, which is rebuilt in place when its source fails so video keeps streaming.
+struct AudioBranch {
+    input: AudioInput,
+    device: Option<String>,
+    gain: f64,
+    activity: Option<AudioActivity>,
+    elements: Vec<gst::Element>,
+    generation: u64,
+}
+
+impl AudioBranch {
+    fn new(input: AudioInput, config: &CaptureConfig, activity: Option<&AudioActivity>) -> Self {
+        Self {
+            input,
+            device: config.audio_source.clone(),
+            gain: f64::from(config.audio_gain),
+            activity: activity.cloned(),
+            elements: Vec::new(),
+            generation: 0,
+        }
+    }
+
+    /// Builds the chain into `pipeline`; the caller brings it to the pipeline's state.
+    fn add(&mut self, pipeline: &gst::Pipeline, output: &Arc<Output>) -> Result<(), MediaError> {
+        self.generation += 1;
+        let volume = make("volume")?;
+        volume.set_property("volume", self.gain);
+        let source = audio_source(self.input, self.device.as_deref())?;
+        // Video would stall on a lost clock when a failed audio source that provided it is removed.
+        set_if_present(&source, "provide-clock", "false");
+        let chain = vec![
+            source,
+            make("audioconvert")?,
+            volume,
+            make("audioresample")?,
+            audio_sink(output.clone(), self.activity.clone())?.upcast(),
+        ];
+        for (i, e) in chain.iter().enumerate() {
+            e.set_property(
+                "name",
+                format!("{AUDIO_ELEMENT_PREFIX}{}-{i}", self.generation),
+            );
+        }
+        pipeline
+            .add_many(&chain)
+            .map_err(|e| MediaError::Backend(format!("cannot add elements: {e}")))?;
+        self.elements = chain;
+        gst::Element::link_many(&self.elements)
+            .map_err(|e| MediaError::Backend(format!("cannot link pipeline: {e}")))
+    }
+
+    fn attach(&mut self, pipeline: &gst::Pipeline, output: &Arc<Output>) -> Result<(), MediaError> {
+        self.add(pipeline, output)?;
+        for e in &self.elements {
+            e.sync_state_with_parent()
+                .map_err(|e| MediaError::Backend(format!("cannot start audio: {e}")))?;
+        }
+        Ok(())
+    }
+
+    fn detach(&mut self, pipeline: &gst::Pipeline) {
+        for e in self.elements.drain(..) {
+            // Ignored: the element is discarded either way.
+            let _ = e.set_state(gst::State::Null);
+            let _ = pipeline.remove(&e);
+        }
+    }
+}
+
+/// The audio branch generation an error came from, current or already replaced.
+fn audio_generation(err: &gst::message::Error) -> Option<u64> {
+    let name = err.src()?.name();
+    let (generation, _) = name.strip_prefix(AUDIO_ELEMENT_PREFIX)?.split_once('-')?;
+    generation.parse().ok()
+}
+
+/// When to rebuild a failed audio branch: soon at first, backing off while the device stays away.
+#[derive(Debug)]
+struct AudioRetry {
+    next: Option<Instant>,
+    delay: Duration,
+}
+
+impl Default for AudioRetry {
+    fn default() -> Self {
+        Self {
+            next: None,
+            delay: AUDIO_RETRY_FIRST,
+        }
+    }
+}
+
+impl AudioRetry {
+    fn failed(&mut self, now: Instant) {
+        self.next = Some(now + self.delay);
+        self.delay = (self.delay * 2).min(AUDIO_RETRY_MAX);
+    }
+
+    fn due(&mut self, now: Instant) -> bool {
+        let due = self.next.is_some_and(|at| now >= at);
+        if due {
+            self.next = None;
+        }
+        due
+    }
+
+    fn pending(&self) -> bool {
+        self.next.is_some()
+    }
+
+    fn recovered(&mut self) {
+        self.delay = AUDIO_RETRY_FIRST;
+    }
+}
+
+/// The message for an audio source that failed at start.
+fn audio_start_error(device: Option<&str>, err: &str) -> MediaError {
+    match device {
+        Some(id) => MediaError::Backend(format!(
+            "audio source {id:?} is not available ({err}); D-Streamy does not fall back to another device, \
+             so pick one from `dstreamy audio-sources`"
+        )),
+        None => MediaError::Backend(format!("audio capture failed: {err}")),
+    }
 }
 
 struct Built {
@@ -467,7 +644,7 @@ struct Built {
     /// Only used to explain a failure, never to reject a crop up front: the portal may report logical size.
     size_hint: Option<(u32, u32)>,
     video_sink: gst_app::AppSink,
-    audio: Vec<gst::Element>,
+    audio: Option<AudioBranch>,
 }
 
 /// The frame size `source` can produce, if it is a single fixed size regardless of downstream.
@@ -546,33 +723,32 @@ fn build(
         return Err(e);
     }
 
-    let mut audio_chain = Vec::new();
-    if let Some(input) = audio {
-        let volume = make("volume")?;
-        volume.set_property("volume", f64::from(config.audio_gain));
-        audio_chain = vec![
-            audio_source(input, config.audio_source.as_deref())?,
-            make("audioconvert")?,
-            volume,
-            make("audioresample")?,
-            audio_sink(output.clone(), activity.cloned())?.upcast(),
-        ];
-        link_chain(&pipeline, &audio_chain)?;
-    }
+    let audio = match audio {
+        Some(input) => {
+            let mut branch = AudioBranch::new(input, config, activity);
+            branch.add(&pipeline, output)?;
+            Some(branch)
+        }
+        None => None,
+    };
     Ok(Built {
         pipeline,
         video_source,
         size_hint,
         video_sink: sink,
-        audio: audio_chain,
+        audio,
     })
 }
 
-fn bus_error(err: &gst::message::Error) -> MediaError {
+fn bus_error_text(err: &gst::message::Error) -> String {
     let src = err
         .src()
         .map_or_else(|| "pipeline".to_owned(), |s| s.path_string().to_string());
-    MediaError::Backend(format!("{src}: {}", err.error()))
+    format!("{src}: {}", err.error())
+}
+
+fn bus_error(err: &gst::message::Error) -> MediaError {
+    MediaError::Backend(bus_error_text(err))
 }
 
 /// Why a candidate pipeline failed to start: only `Retry` moves on to the next encoder.
@@ -588,17 +764,15 @@ fn classify(err: &gst::message::Error, built: &Built, crop: Option<CropRect>) ->
     {
         return StartError::Fatal(e);
     }
-    let from_audio = err.src().is_some_and(|src| {
-        built
-            .audio
-            .iter()
-            .any(|e| src == e.upcast_ref::<gst::Object>())
-    });
-    if from_audio {
-        StartError::Fatal(MediaError::Backend(format!(
-            "audio capture failed: {}",
-            bus_error(err)
-        )))
+    if let Some(audio) = built
+        .audio
+        .as_ref()
+        .filter(|_| audio_generation(err).is_some())
+    {
+        StartError::Fatal(audio_start_error(
+            audio.device.as_deref(),
+            &bus_error_text(err),
+        ))
     } else {
         StartError::Retry(bus_error(err))
     }
@@ -703,12 +877,13 @@ impl Capture {
                 )))
             })?;
         probe(&built, &capture.output, config.crop)?;
-        let bus = capture.pipeline.bus().expect("pipeline has a bus");
+        let pipeline = capture.pipeline.clone();
         let output = capture.output.clone();
+        let audio = built.audio;
         capture.bus_thread = Some(
             std::thread::Builder::new()
                 .name("gst-bus".to_owned())
-                .spawn(move || watch_bus(&bus, &output))
+                .spawn(move || watch_bus(&pipeline, &output, audio))
                 .map_err(|e| StartError::Retry(MediaError::Backend(e.to_string())))?,
         );
         Ok(capture)
@@ -757,14 +932,42 @@ impl Drop for Capture {
     }
 }
 
-/// Closes the frame channel when the pipeline ends or fails, so consumers see the stream end.
-fn watch_bus(bus: &gst::Bus, output: &Output) {
+/// Closes the frame channel when the pipeline ends or fails; a failed audio branch is rebuilt for the same device instead.
+fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<AudioBranch>) {
+    let bus = pipeline.bus().expect("pipeline has a bus");
     let types = [gst::MessageType::Error, gst::MessageType::Eos];
+    let mut retry = AudioRetry::default();
+    let mut buffers_at_attach = output.audio_buffers.load(Ordering::Relaxed);
     while !output.stop.load(Ordering::Relaxed) {
+        if let Some(branch) = audio.as_mut() {
+            if retry.due(Instant::now()) {
+                buffers_at_attach = output.audio_buffers.load(Ordering::Relaxed);
+                if branch.attach(pipeline, output).is_err() {
+                    branch.detach(pipeline);
+                    retry.failed(Instant::now());
+                }
+            } else if !retry.pending()
+                && output.audio_buffers.load(Ordering::Relaxed) > buffers_at_attach
+            {
+                retry.recovered();
+            }
+        }
         let Some(msg) = bus.timed_pop_filtered(BUS_POLL, &types) else {
             continue;
         };
         if let gst::MessageView::Error(err) = msg.view() {
+            if let Some(generation) = audio_generation(err)
+                && let Some(branch) = audio.as_mut()
+            {
+                if generation == branch.generation && !retry.pending() {
+                    branch.detach(pipeline);
+                    if let Some(activity) = &branch.activity {
+                        activity.lost();
+                    }
+                    retry.failed(Instant::now());
+                }
+                continue;
+            }
             *output.error.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(bus_error(err).to_string());
         }
@@ -1125,6 +1328,347 @@ mod tests {
             pipewire_target(Some("pipeweaver_stream")),
             (Some("pipeweaver_stream"), false)
         );
+    }
+
+    fn field(props: &gst::Structure, name: &str) -> Option<String> {
+        props.get::<String>(name).ok()
+    }
+
+    #[test]
+    fn a_chosen_device_is_pinned_and_the_default_is_left_to_follow() {
+        init();
+        assert!(pinned_stream_fields(None).is_empty());
+        assert!(pulse_stream_properties(None).is_none());
+        let pulse = pulse_stream_properties(Some("pipeweaver_stream")).unwrap();
+        for key in [
+            "node.dont-fallback",
+            "node.dont-reconnect",
+            "node.dont-move",
+        ] {
+            assert_eq!(field(&pulse, key).as_deref(), Some("true"), "{key}");
+        }
+        let source = pipewire_stream_properties(Some("pipeweaver_stream"));
+        assert_eq!(
+            field(&source, "target.object").as_deref(),
+            Some("pipeweaver_stream")
+        );
+        assert_eq!(
+            field(&source, "node.dont-fallback").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            field(&source, "node.dont-reconnect").as_deref(),
+            Some("true")
+        );
+        assert!(!source.has_field("stream.capture.sink"));
+        let monitor = pipewire_stream_properties(Some("pipeweaver_music.monitor"));
+        assert_eq!(
+            field(&monitor, "target.object").as_deref(),
+            Some("pipeweaver_music")
+        );
+        assert_eq!(
+            field(&monitor, "stream.capture.sink").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            field(&monitor, "node.dont-fallback").as_deref(),
+            Some("true")
+        );
+        let default = pipewire_stream_properties(None);
+        assert!(!default.has_field("target.object"));
+        assert!(!default.has_field("node.dont-fallback"));
+        assert!(!default.has_field("node.dont-reconnect"));
+    }
+
+    #[test]
+    fn audio_elements_carry_the_pinning_properties() {
+        init();
+        let installed = available_factories();
+        if installed.contains(&"pulsesrc") {
+            let src = audio_source(AudioInput::PulseMonitor, Some("pipeweaver_stream")).unwrap();
+            assert_eq!(
+                src.property::<Option<String>>("device").as_deref(),
+                Some("pipeweaver_stream")
+            );
+            let props = src
+                .property::<Option<gst::Structure>>("stream-properties")
+                .unwrap();
+            assert_eq!(field(&props, "node.dont-fallback").as_deref(), Some("true"));
+            let default = audio_source(AudioInput::PulseMonitor, None).unwrap();
+            assert!(
+                default
+                    .property::<Option<gst::Structure>>("stream-properties")
+                    .is_none()
+            );
+        }
+        if installed.contains(&"pipewiresrc") {
+            let src = audio_source(AudioInput::PipeWireSink, Some("pipeweaver_stream")).unwrap();
+            let props = src
+                .property::<Option<gst::Structure>>("stream-properties")
+                .unwrap();
+            assert_eq!(
+                field(&props, "node.dont-reconnect").as_deref(),
+                Some("true")
+            );
+            let on_disconnect = src.property_value("on-disconnect");
+            assert_eq!(on_disconnect.serialize().unwrap().as_str(), "error");
+        }
+    }
+
+    #[test]
+    fn audio_retries_back_off_while_the_device_stays_away_and_reset_once_it_is_back() {
+        let t0 = Instant::now();
+        let mut r = AudioRetry::default();
+        assert!(!r.pending() && !r.due(t0));
+        r.failed(t0);
+        assert!(r.pending());
+        assert!(!r.due(t0 + AUDIO_RETRY_FIRST - Duration::from_millis(1)));
+        assert!(r.due(t0 + AUDIO_RETRY_FIRST));
+        assert!(!r.pending() && !r.due(t0 + AUDIO_RETRY_FIRST));
+        let mut at = t0;
+        let mut delays = Vec::new();
+        for _ in 0..6 {
+            r.failed(at);
+            let next = r.next.unwrap();
+            delays.push(next - at);
+            at = next;
+            assert!(r.due(at));
+        }
+        assert_eq!(delays[0], AUDIO_RETRY_FIRST * 2);
+        assert!(delays.windows(2).all(|w| w[1] >= w[0]));
+        assert_eq!(*delays.last().unwrap(), AUDIO_RETRY_MAX);
+        r.recovered();
+        r.failed(at);
+        assert_eq!(r.next.unwrap() - at, AUDIO_RETRY_FIRST);
+    }
+
+    #[test]
+    fn errors_are_told_apart_by_audio_branch_generation() {
+        init();
+        let error_from = |name: &str| {
+            let e = make("fakesrc").unwrap();
+            e.set_property("name", name);
+            gst::message::Error::builder(gst::ResourceError::NotFound, "gone")
+                .src(&e)
+                .build()
+        };
+        let audio = |name: &str| match error_from(name).view() {
+            gst::MessageView::Error(err) => audio_generation(err),
+            _ => unreachable!(),
+        };
+        assert_eq!(audio(&format!("{AUDIO_ELEMENT_PREFIX}3-0")), Some(3));
+        assert_eq!(audio(&format!("{AUDIO_ELEMENT_PREFIX}12-4")), Some(12));
+        assert_eq!(audio("pipewiresrc0"), None);
+        assert_eq!(audio(&format!("{AUDIO_ELEMENT_PREFIX}x-0")), None);
+    }
+
+    #[test]
+    fn a_chosen_device_that_fails_at_start_names_the_device_and_the_way_out() {
+        let err = "pulsesrc: Failed to connect stream: No such entity";
+        let msg = audio_start_error(Some("pipeweaver_stream"), err).to_string();
+        assert!(
+            msg.contains("\"pipeweaver_stream\" is not available"),
+            "{msg}"
+        );
+        assert!(msg.contains("No such entity"), "{msg}");
+        assert!(msg.contains("does not fall back"), "{msg}");
+        assert!(msg.contains("dstreamy audio-sources"), "{msg}");
+        let default = audio_start_error(None, err).to_string();
+        assert!(
+            default.ends_with(
+                "audio capture failed: pulsesrc: Failed to connect stream: No such entity"
+            ),
+            "{default}"
+        );
+    }
+
+    #[test]
+    fn a_failed_audio_source_is_rebuilt_while_video_keeps_streaming() {
+        init();
+        let cfg = CaptureConfig {
+            audio: true,
+            audio_source: Some("pipeweaver_stream".into()),
+            ..config(320, 240)
+        };
+        let video = VideoInput::Test {
+            width: 320,
+            height: 240,
+            frames: -1,
+        };
+        let activity = AudioActivity::default();
+        activity.started();
+        let audio = Some(AudioInput::Test { frames: -1 });
+        let (capture, mut rx) =
+            Capture::start_with(video, audio, &cfg, &x264(&cfg), Some(&activity)).unwrap();
+        let mut recv = |within: Duration| {
+            let deadline = Instant::now() + within;
+            let (mut video, mut audio) = (0, 0);
+            while Instant::now() < deadline {
+                match rx.try_recv() {
+                    Ok(MediaFrame::Video(_)) => video += 1,
+                    Ok(MediaFrame::Audio(_)) => audio += 1,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => panic!("the capture ended"),
+                }
+            }
+            (video, audio)
+        };
+        let (video, audio) = recv(Duration::from_millis(300));
+        assert!(
+            video > 0 && audio > 0,
+            "{video} video, {audio} audio before"
+        );
+        let first = capture
+            .pipeline
+            .by_name(&format!("{AUDIO_ELEMENT_PREFIX}1-0"))
+            .unwrap();
+        first
+            .post_message(
+                gst::message::Error::builder(gst::ResourceError::NotFound, "target not found")
+                    .src(&first)
+                    .build(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !activity.is_lost() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(activity.is_lost(), "the loss was not reported");
+        let (video, _) = recv(AUDIO_RETRY_FIRST / 2);
+        assert!(video > 0, "video stopped with the audio");
+        let (video, audio) = recv(AUDIO_RETRY_FIRST * 2);
+        assert!(video > 0 && audio > 0, "{video} video, {audio} audio after");
+        assert!(!activity.is_lost());
+        assert!(
+            capture
+                .pipeline
+                .by_name(&format!("{AUDIO_ELEMENT_PREFIX}1-0"))
+                .is_none()
+        );
+        assert!(
+            capture
+                .pipeline
+                .by_name(&format!("{AUDIO_ELEMENT_PREFIX}2-0"))
+                .is_some()
+        );
+        assert_eq!(capture.error(), None);
+        capture.stop();
+    }
+
+    /// A throwaway pipewire-pulse null sink, unloaded on drop.
+    struct NullSink(Option<String>);
+
+    impl NullSink {
+        const NAME: &str = "dstreamy_pin_e2e";
+
+        fn load() -> Self {
+            let out = std::process::Command::new("pactl")
+                .args([
+                    "load-module",
+                    "module-null-sink",
+                    &format!("sink_name={}", Self::NAME),
+                    "sink_properties=priority.session=0 priority.driver=0",
+                ])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            Self(Some(
+                String::from_utf8(out.stdout).unwrap().trim().to_owned(),
+            ))
+        }
+
+        fn unload(&mut self) {
+            if let Some(id) = self.0.take() {
+                let _ = std::process::Command::new("pactl")
+                    .args(["unload-module", &id])
+                    .status();
+            }
+        }
+    }
+
+    impl Drop for NullSink {
+        fn drop(&mut self) {
+            self.unload();
+        }
+    }
+
+    /// Run with `DSTREAMY_REAL_AUDIO_TEST=1 cargo test -- --ignored`: it adds and removes a null sink.
+    #[test]
+    #[ignore = "needs pipewire-pulse and creates a throwaway null sink"]
+    fn a_real_device_that_disappears_is_never_replaced_and_comes_back_by_name() {
+        if std::env::var_os("DSTREAMY_REAL_AUDIO_TEST").is_none() {
+            return;
+        }
+        init();
+        let mut sink = NullSink::load();
+        let cfg = CaptureConfig {
+            audio: true,
+            audio_source: Some(format!("{}.monitor", NullSink::NAME)),
+            ..config(320, 240)
+        };
+        let video = VideoInput::Test {
+            width: 320,
+            height: 240,
+            frames: -1,
+        };
+        let activity = AudioActivity::default();
+        activity.started();
+        let (capture, mut rx) = Capture::start_with(
+            video,
+            Some(AudioInput::PulseMonitor),
+            &cfg,
+            &x264(&cfg),
+            Some(&activity),
+        )
+        .unwrap();
+        let mut recv = |within: Duration| {
+            let deadline = Instant::now() + within;
+            let (mut video, mut audio) = (0, 0);
+            while Instant::now() < deadline {
+                match rx.try_recv() {
+                    Ok(MediaFrame::Video(_)) => video += 1,
+                    Ok(MediaFrame::Audio(_)) => audio += 1,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => panic!("the capture ended"),
+                }
+            }
+            (video, audio)
+        };
+        let (video, audio) = recv(Duration::from_secs(1));
+        assert!(
+            video > 0 && audio > 0,
+            "{video} video, {audio} audio before"
+        );
+        sink.unload();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !activity.is_lost() && Instant::now() < deadline {
+            recv(Duration::from_millis(20));
+        }
+        assert!(activity.is_lost(), "the loss was not reported");
+        let (video, audio) = recv(Duration::from_secs(3));
+        assert!(video > 0, "video stopped with the audio");
+        assert_eq!(
+            audio, 0,
+            "audio came from another device while the chosen one was gone"
+        );
+        assert!(activity.is_lost());
+        let _back = NullSink::load();
+        let deadline = Instant::now() + AUDIO_RETRY_MAX * 2;
+        let mut resumed = 0;
+        while resumed == 0 && Instant::now() < deadline {
+            resumed = recv(Duration::from_millis(100)).1;
+        }
+        assert!(
+            resumed > 0,
+            "audio did not resume from the returning device"
+        );
+        assert!(!activity.is_lost());
+        assert_eq!(capture.error(), None);
+        capture.stop();
     }
 
     fn drain(capture: Capture, mut rx: FrameReceiver) -> Vec<MediaFrame> {

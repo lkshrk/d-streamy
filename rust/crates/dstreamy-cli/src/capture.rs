@@ -37,13 +37,37 @@ pub async fn audio_sources() -> Result<Vec<AudioSource>, CliError> {
     }
 }
 
-/// Errors unless `id` names a listed audio source; an empty list cannot rule anything out.
-pub fn check_audio_source(id: &str, sources: &[AudioSource]) -> Result<(), CliError> {
-    if !id.trim().is_empty() && (sources.is_empty() || sources.iter().any(|s| s.id == id)) {
-        Ok(())
-    } else {
-        Err(CliError::UnknownAudioSource(id.to_owned()))
+/// Errors unless `id` names a listed audio source; a warning when the devices cannot be listed.
+pub fn check_audio_source(
+    id: &str,
+    listed: Result<Vec<AudioSource>, MediaError>,
+) -> Result<Option<String>, CliError> {
+    let unknown = || Err(CliError::UnknownAudioSource(id.to_owned()));
+    if id.trim().is_empty() {
+        return unknown();
     }
+    let why = match listed {
+        Ok(sources) if sources.iter().any(|s| s.id == id) => return Ok(None),
+        Ok(sources) if !sources.is_empty() => return unknown(),
+        Ok(_) => "no audio devices were listed".to_owned(),
+        Err(e) => format!("listing the audio devices failed: {e}"),
+    };
+    Ok(Some(format!(
+        "cannot confirm that audio source {id:?} exists ({why}); capturing it anyway, \
+         and the stream fails rather than capture another device if it does not"
+    )))
+}
+
+/// [`check_audio_source`] against what `source` lists; the test pattern captures no audio device.
+pub async fn verify_audio_source(
+    target: &str,
+    id: &str,
+    source: &dyn CaptureSource,
+) -> Result<Option<String>, CliError> {
+    if !id.trim().is_empty() && target == TEST_PATTERN_TARGET_ID {
+        return Ok(None);
+    }
+    check_audio_source(id, source.list_audio_sources().await)
 }
 
 /// The id of the one Linux target; the portal dialog picks the window or monitor.

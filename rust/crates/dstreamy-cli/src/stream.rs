@@ -133,14 +133,49 @@ pub fn capture_config(
 pub const SILENCE_WARNING: Duration = Duration::from_secs(10);
 const SILENCE_CHECK: Duration = Duration::from_secs(1);
 
-/// Warns once per stretch of silence that lasts [`SILENCE_WARNING`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum AudioNotice {
+    Warn(String),
+    Note(String),
+}
+
+/// Warns once per stretch of silence that lasts [`SILENCE_WARNING`], and once per loss of the audio device.
 #[derive(Debug, Default)]
 pub struct SilenceWarning {
     warned: bool,
+    lost: bool,
 }
 
 impl SilenceWarning {
-    pub fn check(&mut self, silent_for: Option<Duration>, source: Option<&str>) -> Option<String> {
+    pub fn check(
+        &mut self,
+        silent_for: Option<Duration>,
+        lost: bool,
+        source: Option<&str>,
+    ) -> Option<AudioNotice> {
+        let device = || {
+            source.map_or_else(
+                || "the default output".to_owned(),
+                |id| format!("audio source {id}"),
+            )
+        };
+        if lost != self.lost {
+            self.lost = lost;
+            self.warned = true;
+            return Some(if lost {
+                AudioNotice::Warn(format!(
+                    "{} disappeared, so viewers hear silence; video keeps streaming and audio resumes \
+                     from the same device when it is back, never from another one. \
+                     Restart or reconnect it, or stop and pick another from `dstreamy audio-sources`",
+                    device()
+                ))
+            } else {
+                AudioNotice::Note(format!("{} is back; viewers hear it again", device()))
+            });
+        }
+        if lost {
+            return None;
+        }
         let silent = silent_for.is_some_and(|d| d >= SILENCE_WARNING);
         if !silent {
             self.warned = false;
@@ -151,7 +186,7 @@ impl SilenceWarning {
         }
         self.warned = true;
         let secs = SILENCE_WARNING.as_secs();
-        Some(match source {
+        Some(AudioNotice::Warn(match source {
             Some(id) => format!(
                 "no sound from audio source {id} for {secs} s, so viewers hear silence; \
                  `dstreamy audio-sources` lists the other devices"
@@ -161,7 +196,7 @@ impl SilenceWarning {
                  if your apps play on another device, pick it with --audio-source \
                  (see `dstreamy audio-sources`)"
             ),
-        })
+        }))
     }
 }
 
@@ -194,8 +229,10 @@ pub async fn run_with(
         portal_token,
     } = capture::source_for(&args.target, restore_token.clone())?;
     let audio_source = capture.audio_source.clone();
-    if let Some(id) = &audio_source {
-        capture::check_audio_source(id, &source.list_audio_sources().await.unwrap_or_default())?;
+    if let Some(id) = &audio_source
+        && let Some(warning) = capture::verify_audio_source(&args.target, id, &*source).await?
+    {
+        out.warn(warning);
     }
     let activity = source.audio_activity();
     let mut silence = SilenceWarning::default();
@@ -230,8 +267,11 @@ pub async fn run_with(
             () = signals.recv() => break Outcome::Interrupted,
             _ = silence_check.tick(), if activity.is_some() => {
                 let silent_for = activity.as_ref().and_then(|a| a.silent_for());
-                if let Some(warning) = silence.check(silent_for, audio_source.as_deref()) {
-                    out.warn(warning);
+                let lost = activity.as_ref().is_some_and(|a| a.is_lost());
+                match silence.check(silent_for, lost, audio_source.as_deref()) {
+                    Some(AudioNotice::Warn(warning)) => out.warn(warning),
+                    Some(AudioNotice::Note(note)) => out.note(note),
+                    None => {}
                 }
             }
             event = events.recv() => match event {
@@ -478,16 +518,42 @@ mod tests {
     fn silence_warns_once_per_stretch_and_names_the_device() {
         let mut w = SilenceWarning::default();
         let just_under = SILENCE_WARNING - Duration::from_millis(1);
-        assert_eq!(w.check(None, None), None);
-        assert_eq!(w.check(Some(just_under), None), None);
-        let first = w.check(Some(SILENCE_WARNING), None).unwrap();
+        assert_eq!(w.check(None, false, None), None);
+        assert_eq!(w.check(Some(just_under), false, None), None);
+        let Some(AudioNotice::Warn(first)) = w.check(Some(SILENCE_WARNING), false, None) else {
+            panic!("no warning")
+        };
         assert!(first.contains("--audio-source"), "{first}");
-        assert_eq!(w.check(Some(SILENCE_WARNING * 3), None), None);
-        assert_eq!(w.check(Some(Duration::ZERO), None), None);
-        let again = w
-            .check(Some(SILENCE_WARNING), Some("pipeweaver_stream"))
-            .unwrap();
+        assert_eq!(w.check(Some(SILENCE_WARNING * 3), false, None), None);
+        assert_eq!(w.check(Some(Duration::ZERO), false, None), None);
+        let Some(AudioNotice::Warn(again)) =
+            w.check(Some(SILENCE_WARNING), false, Some("pipeweaver_stream"))
+        else {
+            panic!("no warning")
+        };
         assert!(again.contains("pipeweaver_stream"), "{again}");
+    }
+
+    #[test]
+    fn a_lost_device_is_reported_once_instead_of_as_silence_and_its_return_noted() {
+        let mut w = SilenceWarning::default();
+        let id = Some("pipeweaver_stream");
+        let Some(AudioNotice::Warn(lost)) = w.check(Some(Duration::ZERO), true, id) else {
+            panic!("no warning")
+        };
+        assert!(lost.contains("pipeweaver_stream disappeared"), "{lost}");
+        assert!(lost.contains("never from another"), "{lost}");
+        assert_eq!(w.check(Some(SILENCE_WARNING * 2), true, id), None);
+        let Some(AudioNotice::Note(back)) = w.check(Some(SILENCE_WARNING * 2), false, id) else {
+            panic!("no note")
+        };
+        assert!(back.contains("is back"), "{back}");
+        assert_eq!(w.check(Some(SILENCE_WARNING * 2), false, id), None);
+        assert_eq!(w.check(Some(Duration::ZERO), false, id), None);
+        assert!(matches!(
+            w.check(Some(SILENCE_WARNING), false, id),
+            Some(AudioNotice::Warn(_))
+        ));
     }
 
     #[test]
@@ -498,10 +564,31 @@ mod tests {
             kind: AudioSourceKind::Input,
             name: "PipeWeaver Stream".into(),
         }];
-        assert!(capture::check_audio_source("pipeweaver_stream", &listed).is_ok());
-        let err = capture::check_audio_source("nope", &listed).unwrap_err();
+        let check =
+            |id: &str, listed: &[AudioSource]| capture::check_audio_source(id, Ok(listed.to_vec()));
+        assert!(matches!(check("pipeweaver_stream", &listed), Ok(None)));
+        let err = check("nope", &listed).unwrap_err();
         assert!(err.to_string().contains("dstreamy audio-sources"), "{err}");
-        assert!(capture::check_audio_source("anything", &[]).is_ok());
-        assert!(capture::check_audio_source("", &[]).is_err());
+        let warning = check("anything", &[]).unwrap().unwrap();
+        assert!(warning.contains("\"anything\""), "{warning}");
+        assert!(
+            warning.contains("fails rather than capture another device"),
+            "{warning}"
+        );
+        let failed = capture::check_audio_source(
+            "pipeweaver_stream",
+            Err(dstreamy_media::MediaError::Backend("no pulse".into())),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            failed.contains("listing the audio devices failed: "),
+            "{failed}"
+        );
+        assert!(check("", &[]).is_err());
+        assert!(
+            capture::check_audio_source(" ", Err(dstreamy_media::MediaError::Backend("x".into())))
+                .is_err()
+        );
     }
 }

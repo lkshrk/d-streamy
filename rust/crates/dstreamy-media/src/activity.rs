@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Samples at or below this magnitude count as silence: about -60 dBFS.
@@ -16,6 +16,8 @@ struct Inner {
     epoch: Instant,
     /// Milliseconds after `epoch` since which the audio has been silent; `IDLE` while not capturing.
     silent_since_ms: AtomicU64,
+    /// The capture's audio device went away and has not delivered samples since.
+    lost: AtomicBool,
 }
 
 impl Default for AudioActivity {
@@ -23,6 +25,7 @@ impl Default for AudioActivity {
         Self(Arc::new(Inner {
             epoch: Instant::now(),
             silent_since_ms: AtomicU64::new(IDLE),
+            lost: AtomicBool::new(false),
         }))
     }
 }
@@ -34,6 +37,16 @@ impl AudioActivity {
 
     pub fn stopped(&self) {
         self.0.silent_since_ms.store(IDLE, Ordering::Relaxed);
+        self.0.lost.store(false, Ordering::Relaxed);
+    }
+
+    /// The audio device went away; cleared by the next samples, from the same device once it is back.
+    pub fn lost(&self) {
+        self.0.lost.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_lost(&self) -> bool {
+        self.0.lost.load(Ordering::Relaxed)
     }
 
     /// Records a block of interleaved samples; sound restarts the silence clock.
@@ -51,12 +64,14 @@ impl AudioActivity {
     }
 
     fn started_at(&self, now: Instant) {
+        self.0.lost.store(false, Ordering::Relaxed);
         self.0
             .silent_since_ms
             .store(self.ms(now), Ordering::Relaxed);
     }
 
     fn samples_at(&self, samples: impl IntoIterator<Item = i16>, now: Instant) {
+        self.0.lost.store(false, Ordering::Relaxed);
         if samples.into_iter().any(|s| s.unsigned_abs() > SILENCE_PEAK) {
             self.heard_at(now);
         }
@@ -119,6 +134,20 @@ mod tests {
         assert_eq!(a.silent_for_at(t0 + 3 * S), Some(S));
         a.samples_at([i16::MIN], t0 + 3 * S);
         assert_eq!(a.silent_for_at(t0 + 3 * S), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn a_lost_device_stays_lost_until_samples_arrive_even_silent_ones() {
+        let a = AudioActivity::default();
+        a.started();
+        assert!(!a.is_lost());
+        a.lost();
+        assert!(a.is_lost());
+        a.samples([0, 0]);
+        assert!(!a.is_lost());
+        a.lost();
+        a.stopped();
+        assert!(!a.is_lost());
     }
 
     #[test]
