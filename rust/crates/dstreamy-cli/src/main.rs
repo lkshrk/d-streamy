@@ -11,9 +11,11 @@ use dstreamy_cli::output::{Out, table};
 use dstreamy_cli::{CliError, Ctx, capture, daemon, serve, service, stream, tui};
 use dstreamy_core::{ConfigPaths, RotatingFileWriter};
 use dstreamy_discord::{CurrentUser, DEFAULT_GATEWAY_URL, VoiceChannelKind, remote_auth};
+use dstreamy_media::AUDIO_DEVICE_TARGET;
 use serde::Serialize;
 use tracing::Level;
-use tracing_subscriber::filter::Targets;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::{Targets, filter_fn};
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -145,7 +147,9 @@ fn main() -> ExitCode {
         }
         _ => (None, true),
     };
-    init_logging(&out, cli.verbose, log_file, to_stderr);
+    // `stream` prints its own warning and note for these, so stderr would show them twice.
+    let own_reports = matches!(cli.command, Command::Stream(_)).then_some(AUDIO_DEVICE_TARGET);
+    init_logging(&out, cli.verbose, log_file, to_stderr, own_reports);
     #[cfg(all(
         feature = "browser-login",
         any(target_os = "linux", target_os = "macos")
@@ -202,7 +206,13 @@ fn main() -> ExitCode {
     }
 }
 
-fn init_logging(out: &Out, verbose: u8, file: Option<PathBuf>, to_stderr: bool) {
+fn init_logging(
+    out: &Out,
+    verbose: u8,
+    file: Option<PathBuf>,
+    to_stderr: bool,
+    hidden_on_stderr: Option<&'static str>,
+) {
     let (ours, others) = match verbose {
         0 => (Level::WARN, Level::ERROR),
         1 => (Level::INFO, Level::WARN),
@@ -227,6 +237,7 @@ fn init_logging(out: &Out, verbose: u8, file: Option<PathBuf>, to_stderr: bool) 
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_writer(BoxMakeWriter::new(move || stderr.clone()))
+            .with_filter(filter_fn(move |m| Some(m.target()) != hidden_on_stderr))
     });
     let _ = tracing_subscriber::registry()
         .with(file)

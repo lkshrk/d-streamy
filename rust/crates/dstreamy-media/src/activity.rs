@@ -7,6 +7,9 @@ pub const SILENCE_PEAK: u16 = 32;
 
 const IDLE: u64 = u64::MAX;
 
+/// The tracing target of a capture's audio device loss and return, which `dstreamy stream` reports itself.
+pub const AUDIO_DEVICE_TARGET: &str = "dstreamy::audio_device";
+
 /// When captured audio last carried sound; every clone observes the same capture.
 #[derive(Debug, Clone)]
 pub struct AudioActivity(Arc<Inner>);

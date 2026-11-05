@@ -58,12 +58,26 @@ pub(crate) fn check_known(id: &str, sources: &[AudioSource]) -> Result<(), Media
 
 /// Errors for an id that pipewire-pulse would read as a device index: it `atoi`s source names.
 pub(crate) fn check_pulse_name(id: &str) -> Result<(), MediaError> {
-    let digits = id.bytes().take_while(u8::is_ascii_digit).count();
-    if id[..digits].bytes().any(|b| b != b'0') {
+    let rest = id.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let rest = rest.strip_prefix(['+', '-']).unwrap_or(rest);
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if rest[..digits].bytes().any(|b| b != b'0') {
         return Err(MediaError::InvalidConfig(format!(
             "audio source {id:?} starts with a number, which PulseAudio on PipeWire reads as a \
              device index, so another device could be captured; rename the device or pick \
              another from `dstreamy audio-sources`"
+        )));
+    }
+    Ok(())
+}
+
+/// Errors for a server alias such as `@DEFAULT_SOURCE@`: it names whatever the default is, not one device.
+pub(crate) fn check_not_alias(id: &str) -> Result<(), MediaError> {
+    if id.len() > 1 && id.starts_with('@') && id.ends_with('@') {
+        return Err(MediaError::InvalidConfig(format!(
+            "audio source {id:?} stands for whatever the default is, not one device; leave out \
+             --audio-source to capture the default output, or pick a device from \
+             `dstreamy audio-sources`"
         )));
     }
     Ok(())
@@ -99,11 +113,25 @@ mod tests {
         assert!(check_pulse_name("pipeweaver_stream").is_ok());
         assert!(check_pulse_name("0abc").is_ok());
         assert!(check_pulse_name("alsa_input.usb-2").is_ok());
-        for id in ["12abc", "3", "007x"] {
+        assert!(check_pulse_name("+0x").is_ok());
+        for id in ["12abc", "3", "007x", "+5x", "-5x", " 5x", "\t\n7"] {
             assert!(
                 matches!(check_pulse_name(id), Err(MediaError::InvalidConfig(_))),
                 "{id}"
             );
+        }
+    }
+
+    #[test]
+    fn server_aliases_cannot_be_chosen_as_a_device() {
+        for id in ["@DEFAULT_SOURCE@", "@DEFAULT_MONITOR@", "@x@"] {
+            assert!(
+                matches!(check_not_alias(id), Err(MediaError::InvalidConfig(_))),
+                "{id}"
+            );
+        }
+        for id in ["pipeweaver_stream", "@", "@half", "mail@host"] {
+            assert!(check_not_alias(id).is_ok(), "{id}");
         }
     }
 

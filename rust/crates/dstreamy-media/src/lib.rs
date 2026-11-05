@@ -13,7 +13,7 @@ mod source;
 mod target;
 mod test_pattern;
 
-pub use activity::{AudioActivity, SILENCE_PEAK};
+pub use activity::{AUDIO_DEVICE_TARGET, AudioActivity, SILENCE_PEAK};
 pub use encoder::{AudioEncoder, I420Frame, VideoEncoder};
 pub use error::MediaError;
 pub use external::{

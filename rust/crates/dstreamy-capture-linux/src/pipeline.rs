@@ -5,9 +5,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use dstreamy_media::{
-    AudioActivity, AudioEncoder, AudioFrame, CaptureConfig, CropRect, EncodedVideoFrame,
-    FRAME_CHANNEL_CAPACITY, FrameReceiver, MediaError, MediaFrame, OPUS_CHANNELS,
-    OPUS_FRAME_DURATION_US, OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE, OpusEncoder, VideoCodec,
+    AUDIO_DEVICE_TARGET, AudioActivity, AudioEncoder, AudioFrame, CaptureConfig, CropRect,
+    EncodedVideoFrame, FRAME_CHANNEL_CAPACITY, FrameReceiver, MediaError, MediaFrame,
+    OPUS_CHANNELS, OPUS_FRAME_DURATION_US, OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE, OpusEncoder,
+    VideoCodec,
 };
 use gstreamer as gst;
 
@@ -25,6 +26,12 @@ const BUS_POLL: gst::ClockTime = gst::ClockTime::from_mseconds(100);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const AUDIO_RETRY_FIRST: Duration = Duration::from_millis(500);
 const AUDIO_RETRY_MAX: Duration = Duration::from_secs(5);
+const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longer than pipewiresrc's own 30 s start wait, which its flush cuts short.
+const AUDIO_ABANDON_FLUSH: Duration = Duration::from_secs(35);
+/// Shorter than pulsesrc's 200 ms default, so less audio is held between capture and the pin check.
+const PINNED_BUFFER_TIME_US: u64 = 50_000;
+
 /// Every audio element's name starts with this, so errors of a branch already replaced are still recognised.
 const AUDIO_ELEMENT_PREFIX: &str = "dstreamy-audio-";
 
@@ -50,6 +57,9 @@ pub(crate) enum AudioInput {
     PipeWireSink,
     #[cfg(test)]
     Test { frames: i32 },
+    /// Blocks in READY to PAUSED until its source pad is flushed.
+    #[cfg(test)]
+    Blocking,
 }
 
 impl AudioInput {
@@ -291,16 +301,16 @@ pub(crate) fn pipewire_target(device: Option<&str>) -> (Option<&str>, bool) {
     }
 }
 
-fn audio_source(input: AudioInput, device: Option<&str>) -> Result<gst::Element, MediaError> {
+fn audio_source(
+    input: AudioInput,
+    device: Option<&str>,
+    pin_properties: bool,
+) -> Result<gst::Element, MediaError> {
     match input {
         AudioInput::PulseMonitor => {
             let src = make("pulsesrc")?;
             src.set_property("device", device.unwrap_or("@DEFAULT_MONITOR@"));
-            #[cfg(test)]
-            let device_for_props = device.filter(|d| !d.starts_with(tests::UNPINNED_PREFIX));
-            #[cfg(not(test))]
-            let device_for_props = device;
-            if let Some(props) = pulse_stream_properties(device_for_props) {
+            if let Some(props) = pulse_stream_properties(device.filter(|_| pin_properties)) {
                 src.set_property("stream-properties", props);
             }
             Ok(src)
@@ -321,6 +331,8 @@ fn audio_source(input: AudioInput, device: Option<&str>) -> Result<gst::Element,
             src.set_property("is-live", frames < 0);
             Ok(src)
         }
+        #[cfg(test)]
+        AudioInput::Blocking => Ok(glib::Object::new::<tests::BlockingSrc>().upcast()),
     }
 }
 
@@ -473,20 +485,53 @@ impl AudioPacketizer {
     }
 }
 
-/// A `pulsesrc` that must stay on `device`; plain PulseAudio moves it to the default when the device goes.
+/// Asks where an audio source's stream reads from now; tests swap in a fake.
+type DeviceQuery = Arc<dyn Fn(&gst::Element) -> Option<String> + Send + Sync>;
+
+fn pulse_current_device(source: &gst::Element) -> Option<String> {
+    source.property::<Option<String>>("current-device")
+}
+
+/// How a branch makes its audio source.
+#[derive(Clone)]
+struct AudioOptions {
+    pin_properties: bool,
+    device_query: Option<DeviceQuery>,
+}
+
+impl Default for AudioOptions {
+    fn default() -> Self {
+        Self {
+            pin_properties: true,
+            device_query: None,
+        }
+    }
+}
+
+/// An audio source that must stay on `device`; plain PulseAudio moves it to the default when the device goes.
 struct Pin {
     source: glib::WeakRef<gst::Element>,
     device: String,
     generation: u64,
+    query: DeviceQuery,
+    /// Set at the first mismatch; nothing from this source instance passes after it.
+    tainted: AtomicBool,
 }
 
 impl Pin {
-    /// The device the server says the stream reads from now; asked per buffer so no moved sample passes.
-    fn current(&self) -> Option<String> {
-        self.source.upgrade().map(|s| {
-            s.property::<Option<String>>("current-device")
-                .unwrap_or_default()
-        })
+    /// Whether a buffer reaching the sink now may pass; on a mismatch, where the server says the stream is.
+    fn admit(&self) -> Result<(), String> {
+        if self.tainted.load(Ordering::Relaxed) {
+            return Err(String::new());
+        }
+        let current = self.source.upgrade().and_then(|s| (self.query)(&s));
+        if on_pinned_device(&self.device, current.as_deref()) {
+            return Ok(());
+        }
+        self.tainted.store(true, Ordering::Relaxed);
+        Err(current
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| "an unknown device".to_owned()))
     }
 }
 
@@ -512,16 +557,14 @@ fn audio_sink(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    if let Some(pin) = &pin {
-                        let current = pin.current();
-                        if !on_pinned_device(&pin.device, current.as_deref()) {
-                            if let Some(current) = current.filter(|c| !c.is_empty()) {
-                                let mut moved =
-                                    output.moved.lock().unwrap_or_else(|e| e.into_inner());
-                                moved.get_or_insert((pin.generation, current));
-                            }
-                            return Ok(gst::FlowSuccess::Ok);
+                    if let Some(pin) = &pin
+                        && let Err(current) = pin.admit()
+                    {
+                        if !current.is_empty() {
+                            let mut moved = output.moved.lock().unwrap_or_else(|e| e.into_inner());
+                            moved.get_or_insert((pin.generation, current));
                         }
+                        return Ok(gst::FlowSuccess::Ok);
                     }
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
@@ -553,46 +596,119 @@ fn audio_sink(
     Ok(sink)
 }
 
-/// The audio chain, which is rebuilt in place when its source fails so video keeps streaming.
+/// A branch being brought up outside the pipeline, so a source that blocks in its state change blocks only this.
+struct AttachJob {
+    bin: gst::Bin,
+    bus: gst::Bus,
+    source: gst::Element,
+    done: std::sync::mpsc::Receiver<Result<(), gst::StateChangeError>>,
+    abandoned: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+}
+
+impl AttachJob {
+    /// Gives the job up without waiting for it: flushes its source until its state change returns.
+    fn abandon(self) {
+        self.abandoned.store(true, Ordering::Relaxed);
+        if self.done.try_recv().is_ok() {
+            let bin = self.bin;
+            std::thread::spawn(move || {
+                let _ = bin.set_state(gst::State::Null);
+            });
+            return;
+        }
+        let (source, finished) = (self.source, self.finished);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + AUDIO_ABANDON_FLUSH;
+            // Repeated: a flush that lands before the source activates its pad is cleared by that activation.
+            while !finished.load(Ordering::Relaxed) && Instant::now() < deadline {
+                if let Some(pad) = source.static_pad("src") {
+                    pad.send_event(gst::event::FlushStart::new());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+    }
+
+    fn errors(&self) -> Option<gst::Message> {
+        let mut first = None;
+        while let Some(msg) = self.bus.pop_filtered(&[gst::MessageType::Error]) {
+            first.get_or_insert(msg);
+        }
+        first
+    }
+}
+
+enum Attach {
+    Pending,
+    Attached,
+    /// Why, and the error message the source posted, if any.
+    Failed(String, Option<gst::Message>),
+}
+
+/// The audio chain, which is rebuilt when its source fails so video keeps streaming.
 struct AudioBranch {
     input: AudioInput,
     device: Option<String>,
     gain: f64,
     activity: Option<AudioActivity>,
-    elements: Vec<gst::Element>,
+    options: AudioOptions,
     generation: u64,
+    active: Option<gst::Bin>,
+    job: Option<AttachJob>,
 }
 
 impl AudioBranch {
-    fn new(input: AudioInput, config: &CaptureConfig, activity: Option<&AudioActivity>) -> Self {
+    fn new(
+        input: AudioInput,
+        config: &CaptureConfig,
+        activity: Option<&AudioActivity>,
+        options: AudioOptions,
+    ) -> Self {
         Self {
             input,
             device: config.audio_source.clone(),
             gain: f64::from(config.audio_gain),
             activity: activity.cloned(),
-            elements: Vec::new(),
+            options,
             generation: 0,
+            active: None,
+            job: None,
         }
     }
 
-    /// Builds the chain into `pipeline`; the caller brings it to the pipeline's state.
-    fn add(&mut self, pipeline: &gst::Pipeline, output: &Arc<Output>) -> Result<(), MediaError> {
+    /// The next generation's chain in a bin of its own, not yet started.
+    fn build(&mut self, output: &Arc<Output>) -> Result<(gst::Bin, gst::Element), MediaError> {
         self.generation += 1;
         let volume = make("volume")?;
         volume.set_property("volume", self.gain);
-        let source = audio_source(self.input, self.device.as_deref())?;
+        let source = audio_source(
+            self.input,
+            self.device.as_deref(),
+            self.options.pin_properties,
+        )?;
         // Video would stall on a lost clock when a failed audio source that provided it is removed.
         set_if_present(&source, "provide-clock", "false");
-        let pin = match (self.input, &self.device) {
-            (AudioInput::PulseMonitor, Some(device)) => Some(Pin {
-                source: source.downgrade(),
-                device: device.clone(),
-                generation: self.generation,
-            }),
+        let query = match (self.input, &self.options.device_query) {
+            (_, Some(query)) => Some(query.clone()),
+            (AudioInput::PulseMonitor, None) => Some(Arc::new(pulse_current_device) as DeviceQuery),
             _ => None,
         };
-        let chain = vec![
-            source,
+        let pin = match (query, &self.device) {
+            (Some(query), Some(device)) => {
+                set_if_present(&source, "buffer-time", &PINNED_BUFFER_TIME_US.to_string());
+                Some(Pin {
+                    source: source.downgrade(),
+                    device: device.clone(),
+                    generation: self.generation,
+                    query,
+                    tainted: AtomicBool::new(false),
+                })
+            }
+            _ => None,
+        };
+        let chain = [
+            source.clone(),
             make("audioconvert")?,
             volume,
             make("audioresample")?,
@@ -604,24 +720,109 @@ impl AudioBranch {
                 format!("{AUDIO_ELEMENT_PREFIX}{}-{i}", self.generation),
             );
         }
-        pipeline
-            .add_many(&chain)
+        let bin = gst::Bin::builder()
+            .name(format!("{AUDIO_ELEMENT_PREFIX}{}", self.generation))
+            .build();
+        bin.add_many(&chain)
             .map_err(|e| MediaError::Backend(format!("cannot add elements: {e}")))?;
-        self.elements = chain;
-        gst::Element::link_many(&self.elements)
-            .map_err(|e| MediaError::Backend(format!("cannot link pipeline: {e}")))
+        gst::Element::link_many(&chain)
+            .map_err(|e| MediaError::Backend(format!("cannot link pipeline: {e}")))?;
+        Ok((bin, source))
     }
 
-    fn attach(&mut self, pipeline: &gst::Pipeline, output: &Arc<Output>) -> Result<(), MediaError> {
-        self.add(pipeline, output)?;
-        for e in &self.elements {
-            if output.stop.load(Ordering::Relaxed) {
-                return Err(MediaError::Backend("capture is stopping".into()));
+    /// Starts bringing up the next generation on a thread of its own; [`Self::poll`] finishes it.
+    fn begin(&mut self, output: &Arc<Output>) -> Result<(), MediaError> {
+        let (bin, source) = self.build(output)?;
+        let bus = gst::Bus::new();
+        bin.set_bus(Some(&bus));
+        let (tx, done) = std::sync::mpsc::channel();
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (bin, abandoned, finished) = (bin.clone(), abandoned.clone(), finished.clone());
+            move || {
+                let started = bin.set_state(gst::State::Paused).map(drop);
+                finished.store(true, Ordering::Relaxed);
+                if abandoned.load(Ordering::Relaxed) || tx.send(started).is_err() {
+                    let _ = bin.set_state(gst::State::Null);
+                }
             }
-            e.sync_state_with_parent()
-                .map_err(|e| MediaError::Backend(format!("cannot start audio: {e}")))?;
-        }
+        };
+        std::thread::Builder::new()
+            .name("gst-audio-start".to_owned())
+            .spawn(thread)
+            .map_err(|e| MediaError::Backend(format!("cannot start audio: {e}")))?;
+        self.job = Some(AttachJob {
+            bin,
+            bus,
+            source,
+            done,
+            abandoned,
+            finished,
+        });
         Ok(())
+    }
+
+    /// Adds a started generation to `pipeline`, or reports why it failed; never blocks on the source.
+    fn poll(&mut self, pipeline: &gst::Pipeline) -> Attach {
+        let Some(job) = self.job.as_ref() else {
+            return Attach::Pending;
+        };
+        if let Some(msg) = job.errors() {
+            let why = match msg.view() {
+                gst::MessageView::Error(err) => bus_error_text(err),
+                _ => "audio source failed".to_owned(),
+            };
+            self.job.take().expect("job checked above").abandon();
+            return Attach::Failed(why, Some(msg));
+        }
+        let started = match job.done.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Attach::Pending,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("the audio start thread ended".to_owned())
+            }
+            Ok(started) => started.map_err(|e| format!("cannot start audio: {e}")),
+        };
+        let job = self.job.take().expect("job checked above");
+        if let Err(why) = started {
+            let posted = job.errors();
+            let _ = job.bin.set_state(gst::State::Null);
+            return match posted {
+                Some(msg) => match msg.view() {
+                    gst::MessageView::Error(err) => {
+                        Attach::Failed(bus_error_text(err), Some(msg.clone()))
+                    }
+                    _ => Attach::Failed(why, None),
+                },
+                None => Attach::Failed(why, None),
+            };
+        }
+        if let Some(msg) = job.errors() {
+            let _ = job.bin.set_state(gst::State::Null);
+            let why = match msg.view() {
+                gst::MessageView::Error(err) => bus_error_text(err),
+                _ => "audio source failed".to_owned(),
+            };
+            return Attach::Failed(why, Some(msg));
+        }
+        if let Err(e) = pipeline.add(&job.bin) {
+            let _ = job.bin.set_state(gst::State::Null);
+            return Attach::Failed(format!("cannot add audio: {e}"), None);
+        }
+        if let Err(e) = job.bin.sync_state_with_parent() {
+            let _ = job.bin.set_state(gst::State::Null);
+            let _ = pipeline.remove(&job.bin);
+            return Attach::Failed(format!("cannot start audio: {e}"), None);
+        }
+        self.active = Some(job.bin);
+        Attach::Attached
+    }
+
+    /// Gives up a generation still starting, without waiting for it.
+    fn abandon(&mut self) {
+        if let Some(job) = self.job.take() {
+            job.abandon();
+        }
     }
 
     fn name(&self) -> String {
@@ -638,6 +839,7 @@ impl AudioBranch {
             return;
         }
         tracing::warn!(
+            target: AUDIO_DEVICE_TARGET,
             "audio source {} lost ({why}); reconnecting to it",
             self.name()
         );
@@ -647,10 +849,36 @@ impl AudioBranch {
     }
 
     fn detach(&mut self, pipeline: &gst::Pipeline) {
-        for e in self.elements.drain(..) {
-            // Ignored: the element is discarded either way.
-            let _ = e.set_state(gst::State::Null);
-            let _ = pipeline.remove(&e);
+        if let Some(bin) = self.active.take() {
+            // Ignored: the bin is discarded either way.
+            let _ = bin.set_state(gst::State::Null);
+            let _ = pipeline.remove(&bin);
+        }
+    }
+
+    /// Brings the first generation up at start, failing with the device's own error.
+    fn start(&mut self, pipeline: &gst::Pipeline, output: &Arc<Output>) -> Result<(), MediaError> {
+        self.begin(output)
+            .map_err(|e| audio_start_error(self.device.as_deref(), &e.to_string()))?;
+        let deadline = Instant::now() + AUDIO_START_TIMEOUT;
+        loop {
+            match self.poll(pipeline) {
+                Attach::Attached => return Ok(()),
+                Attach::Failed(why, _) => {
+                    return Err(audio_start_error(self.device.as_deref(), &why));
+                }
+                Attach::Pending if Instant::now() >= deadline => {
+                    self.abandon();
+                    return Err(audio_start_error(
+                        self.device.as_deref(),
+                        &format!(
+                            "it did not start within {} s",
+                            AUDIO_START_TIMEOUT.as_secs()
+                        ),
+                    ));
+                }
+                Attach::Pending => std::thread::sleep(Duration::from_millis(10)),
+            }
         }
     }
 }
@@ -759,6 +987,7 @@ fn build(
     spec: &EncoderSpec,
     output: &Arc<Output>,
     activity: Option<&AudioActivity>,
+    options: &AudioOptions,
 ) -> Result<Built, MediaError> {
     let pipeline = gst::Pipeline::new();
 
@@ -819,14 +1048,7 @@ fn build(
         return Err(e);
     }
 
-    let audio = match audio {
-        Some(input) => {
-            let mut branch = AudioBranch::new(input, config, activity);
-            branch.add(&pipeline, output)?;
-            Some(branch)
-        }
-        None => None,
-    };
+    let audio = audio.map(|input| AudioBranch::new(input, config, activity, options.clone()));
     Ok(Built {
         pipeline,
         video_source,
@@ -902,6 +1124,19 @@ fn probe(built: &Built, output: &Output, crop: Option<CropRect>) -> Result<(), S
             && (built.audio.is_none() || output.audio_buffers.load(Ordering::Relaxed) > 0)
     };
     while Instant::now() < deadline && !started() {
+        if output.audio_buffers.load(Ordering::Relaxed) == 0
+            && let Some(audio) = &built.audio
+            && let Some((_, current)) = output
+                .moved
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        {
+            return Err(StartError::Fatal(audio_start_error(
+                audio.device.as_deref(),
+                &format!("the server put the stream on {current:?}"),
+            )));
+        }
         let Some(msg) = bus.timed_pop_filtered(gst::ClockTime::from_mseconds(10), &types) else {
             continue;
         };
@@ -947,6 +1182,24 @@ impl Capture {
         candidates: &[EncoderSpec],
         activity: Option<&AudioActivity>,
     ) -> Result<(Self, FrameReceiver), MediaError> {
+        Self::start_with_options(
+            video,
+            audio,
+            config,
+            candidates,
+            activity,
+            &AudioOptions::default(),
+        )
+    }
+
+    fn start_with_options(
+        video: VideoInput,
+        audio: Option<AudioInput>,
+        config: &CaptureConfig,
+        candidates: &[EncoderSpec],
+        activity: Option<&AudioActivity>,
+        options: &AudioOptions,
+    ) -> Result<(Self, FrameReceiver), MediaError> {
         if candidates.is_empty() {
             return Err(MediaError::Unsupported(format!(
                 "no GStreamer encoder for {:?}",
@@ -957,7 +1210,15 @@ impl Capture {
         for spec in candidates {
             // A channel per candidate, so frames of a failed attempt never reach the receiver.
             let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
-            match Self::try_start(&video, audio, config, spec, Output::new(tx), activity) {
+            match Self::try_start(
+                &video,
+                audio,
+                config,
+                spec,
+                Output::new(tx),
+                activity,
+                options,
+            ) {
                 Ok(capture) => return Ok((capture, rx)),
                 Err(StartError::Fatal(e)) => return Err(e),
                 Err(StartError::Retry(e)) => last_err = Some(e),
@@ -973,11 +1234,13 @@ impl Capture {
         spec: &EncoderSpec,
         output: Arc<Output>,
         activity: Option<&AudioActivity>,
+        options: &AudioOptions,
     ) -> Result<Self, StartError> {
-        let built = build(video, audio, config, spec, &output, activity).map_err(|e| match e {
-            MediaError::InvalidConfig(_) => StartError::Fatal(e),
-            e => StartError::Retry(e),
-        })?;
+        let mut built =
+            build(video, audio, config, spec, &output, activity, options).map_err(|e| match e {
+                MediaError::InvalidConfig(_) => StartError::Fatal(e),
+                e => StartError::Retry(e),
+            })?;
         let mut capture = Self {
             pipeline: built.pipeline.clone(),
             video_sink: built.video_sink.clone(),
@@ -992,6 +1255,11 @@ impl Capture {
                     spec.factory
                 )))
             }));
+        }
+        if let Some(branch) = built.audio.as_mut() {
+            branch
+                .start(&capture.pipeline, &capture.output)
+                .map_err(StartError::Fatal)?;
         }
         probe(&built, &capture.output, config.crop)?;
         let pipeline = capture.pipeline.clone();
@@ -1057,37 +1325,66 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
     let mut retry = AudioRetry::default();
     let mut lost = false;
     let mut buffers_at_attach = output.audio_buffers.load(Ordering::Relaxed);
+    let fail = |error: MediaError| {
+        tracing::error!("{error}");
+        *output.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
+        output.close();
+    };
     while !output.stop.load(Ordering::Relaxed) {
         if let Some(branch) = audio.as_mut() {
+            let flowed = output.audio_buffers.load(Ordering::Relaxed) > 0;
             let moved = output
                 .moved
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
-                .filter(|(generation, _)| *generation == branch.generation && !retry.pending());
+                .filter(|(generation, _)| {
+                    *generation == branch.generation && branch.active.is_some()
+                });
             if let Some((_, current)) = moved {
-                branch.lose(
-                    pipeline,
-                    &format!("the server moved the stream to {current:?}"),
-                    lost,
-                );
+                let why = format!("the server put the stream on {current:?}");
+                if !flowed {
+                    fail(audio_start_error(branch.device.as_deref(), &why));
+                    continue;
+                }
+                branch.lose(pipeline, &why, lost);
                 lost = true;
                 retry.failed(Instant::now());
             }
-            if retry.due(Instant::now()) {
-                buffers_at_attach = output.audio_buffers.load(Ordering::Relaxed);
-                if let Err(e) = branch.attach(pipeline, output) {
+            if branch.job.is_some() {
+                match branch.poll(pipeline) {
+                    Attach::Pending => {}
+                    Attach::Attached => {
+                        buffers_at_attach = output.audio_buffers.load(Ordering::Relaxed);
+                    }
+                    Attach::Failed(why, msg) => {
+                        let loss = msg.as_ref().is_none_or(|m| match m.view() {
+                            gst::MessageView::Error(err) => is_device_loss(err),
+                            _ => true,
+                        });
+                        if loss {
+                            branch.lose(pipeline, &why, lost);
+                            lost = true;
+                            retry.failed(Instant::now());
+                        } else {
+                            fail(MediaError::Backend(format!("audio capture failed: {why}")));
+                            continue;
+                        }
+                    }
+                }
+            } else if retry.due(Instant::now()) {
+                if let Err(e) = branch.begin(output) {
                     tracing::debug!("audio source {}: reconnecting failed: {e}", branch.name());
-                    branch.detach(pipeline);
                     retry.failed(Instant::now());
                 }
             } else if !retry.pending()
+                && branch.active.is_some()
                 && output.audio_buffers.load(Ordering::Relaxed) > buffers_at_attach
             {
                 retry.recovered();
                 if lost {
                     lost = false;
-                    tracing::info!("audio source {} is back", branch.name());
+                    tracing::info!(target: AUDIO_DEVICE_TARGET, "audio source {} is back", branch.name());
                 }
             }
         }
@@ -1098,7 +1395,7 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
             if let Some(generation) = audio_generation(err)
                 && let Some(branch) = audio.as_mut()
             {
-                if generation != branch.generation || retry.pending() {
+                if generation != branch.generation || branch.active.is_none() {
                     tracing::debug!(
                         "audio: ignoring an error of a replaced source: {}",
                         bus_error_text(err)
@@ -1112,19 +1409,20 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
                     retry.failed(Instant::now());
                     continue;
                 }
-                let error = if flowed {
+                fail(if flowed {
                     MediaError::Backend(format!("audio capture failed: {}", bus_error_text(err)))
                 } else {
                     audio_start_error(branch.device.as_deref(), &bus_error_text(err))
-                };
-                tracing::error!("{error}");
-                *output.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
-            } else {
-                *output.error.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(bus_error(err).to_string());
+                });
+                continue;
             }
+            *output.error.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(bus_error(err).to_string());
         }
         output.close();
+    }
+    if let Some(branch) = audio.as_mut() {
+        branch.abandon();
     }
 }
 
@@ -1538,7 +1836,8 @@ mod tests {
         init();
         let installed = available_factories();
         if installed.contains(&"pulsesrc") {
-            let src = audio_source(AudioInput::PulseMonitor, Some("pipeweaver_stream")).unwrap();
+            let src =
+                audio_source(AudioInput::PulseMonitor, Some("pipeweaver_stream"), true).unwrap();
             assert_eq!(
                 src.property::<Option<String>>("device").as_deref(),
                 Some("pipeweaver_stream")
@@ -1547,7 +1846,7 @@ mod tests {
                 .property::<Option<gst::Structure>>("stream-properties")
                 .unwrap();
             assert_eq!(field(&props, "node.dont-fallback").as_deref(), Some("true"));
-            let default = audio_source(AudioInput::PulseMonitor, None).unwrap();
+            let default = audio_source(AudioInput::PulseMonitor, None, true).unwrap();
             assert!(
                 default
                     .property::<Option<gst::Structure>>("stream-properties")
@@ -1555,7 +1854,8 @@ mod tests {
             );
         }
         if installed.contains(&"pipewiresrc") {
-            let src = audio_source(AudioInput::PipeWireSink, Some("pipeweaver_stream")).unwrap();
+            let src =
+                audio_source(AudioInput::PipeWireSink, Some("pipeweaver_stream"), true).unwrap();
             let props = src
                 .property::<Option<gst::Structure>>("stream-properties")
                 .unwrap();
@@ -1802,6 +2102,8 @@ mod tests {
             gst::ResourceError::OpenRead,
             gst::ResourceError::Read,
             gst::ResourceError::Busy,
+            gst::ResourceError::OpenReadWrite,
+            gst::ResourceError::Close,
         ] {
             assert!(loss(&source, resource(code)), "{code:?}");
         }
@@ -1836,15 +2138,10 @@ mod tests {
     #[test]
     fn audio_sources_never_provide_the_pipeline_clock() {
         init();
-        for input in [AudioInput::PulseMonitor, AudioInput::PipeWireSink] {
-            let factory = match input {
-                AudioInput::PulseMonitor => "pulsesrc",
-                _ => "pipewiresrc",
-            };
+        for (input, factory) in REAL_INPUTS {
             if !available_factories().contains(&factory) {
                 continue;
             }
-            let pipeline = gst::Pipeline::new();
             let (tx, _rx) = mpsc::channel(1);
             let mut branch = AudioBranch::new(
                 input,
@@ -1853,24 +2150,22 @@ mod tests {
                     ..config(320, 240)
                 },
                 None,
+                AudioOptions::default(),
             );
-            branch.add(&pipeline, &Output::new(tx)).unwrap();
-            let source = pipeline
-                .by_name(&format!("{AUDIO_ELEMENT_PREFIX}1-0"))
-                .unwrap();
+            let (_bin, source) = branch.build(&Output::new(tx)).unwrap();
             assert!(!source.property::<bool>("provide-clock"), "{factory}");
         }
     }
 
+    const REAL_INPUTS: [(AudioInput, &str); 2] = [
+        (AudioInput::PulseMonitor, "pulsesrc"),
+        (AudioInput::PipeWireSink, "pipewiresrc"),
+    ];
+
     #[test]
     fn an_unusable_chosen_device_fails_the_start_with_the_device_not_the_encoder() {
         init();
-        // pipewiresrc only gives up on a missing target after its own 30 s start timeout.
-        for input in [AudioInput::PulseMonitor] {
-            let factory = match input {
-                AudioInput::PulseMonitor => "pulsesrc",
-                _ => "pipewiresrc",
-            };
+        for (input, factory) in REAL_INPUTS {
             if !available_factories().contains(&factory) {
                 continue;
             }
@@ -1884,6 +2179,7 @@ mod tests {
                 height: 240,
                 frames: -1,
             };
+            let started = Instant::now();
             let err = Capture::start(video, Some(input), &cfg, &x264(&cfg))
                 .err()
                 .unwrap_or_else(|| panic!("{factory} started on a missing device"))
@@ -1892,6 +2188,312 @@ mod tests {
                 err.contains("\"dstreamy_no_such_source_test\" is not available"),
                 "{factory}: {err}"
             );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{factory}: {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    fn recv_audio(rx: &mut FrameReceiver, within: Duration) -> (usize, usize) {
+        let deadline = Instant::now() + within;
+        let (mut video, mut audio) = (0, 0);
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(MediaFrame::Video(_)) => video += 1,
+                Ok(MediaFrame::Audio(_)) => audio += 1,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => panic!("the capture ended"),
+            }
+        }
+        (video, audio)
+    }
+
+    fn fake_device(current: &Arc<Mutex<String>>) -> AudioOptions {
+        let current = current.clone();
+        AudioOptions {
+            pin_properties: true,
+            device_query: Some(Arc::new(move |_| Some(current.lock().unwrap().clone()))),
+        }
+    }
+
+    fn start_pinned_test_audio(
+        options: &AudioOptions,
+        activity: &AudioActivity,
+    ) -> Result<(Capture, FrameReceiver), MediaError> {
+        init();
+        let cfg = CaptureConfig {
+            audio: true,
+            audio_source: Some("chosen".into()),
+            ..config(320, 240)
+        };
+        let video = VideoInput::Test {
+            width: 320,
+            height: 240,
+            frames: -1,
+        };
+        activity.started();
+        Capture::start_with_options(
+            video,
+            Some(AudioInput::Test { frames: -1 }),
+            &cfg,
+            &x264(&cfg),
+            Some(activity),
+            options,
+        )
+    }
+
+    #[test]
+    fn a_pinned_source_the_server_reports_elsewhere_is_dropped_and_rebuilt() {
+        let current = Arc::new(Mutex::new("chosen".to_owned()));
+        let activity = AudioActivity::default();
+        let (capture, mut rx) = start_pinned_test_audio(&fake_device(&current), &activity).unwrap();
+        let (_, audio) = recv_audio(&mut rx, Duration::from_millis(300));
+        assert!(audio > 0, "no audio while on the chosen device");
+        *current.lock().unwrap() = "elsewhere".into();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !activity.is_lost() && Instant::now() < deadline {
+            recv_audio(&mut rx, Duration::from_millis(10));
+        }
+        assert!(activity.is_lost(), "the move was not reported");
+        let (video, audio) = recv_audio(&mut rx, AUDIO_RETRY_FIRST * 3);
+        assert!(video > 0, "video stopped with the audio");
+        assert_eq!(
+            audio, 0,
+            "audio passed while the server reported another device"
+        );
+        *current.lock().unwrap() = "chosen".into();
+        let deadline = Instant::now() + AUDIO_RETRY_MAX * 2;
+        let mut resumed = 0;
+        while resumed == 0 && Instant::now() < deadline {
+            resumed = recv_audio(&mut rx, Duration::from_millis(50)).1;
+        }
+        assert!(
+            resumed > 0,
+            "audio did not resume once back on the chosen device"
+        );
+        assert!(!activity.is_lost());
+        assert_eq!(capture.error(), None);
+        capture.stop();
+    }
+
+    #[test]
+    fn a_pinned_source_on_another_device_from_the_start_fails_the_start() {
+        let current = Arc::new(Mutex::new("elsewhere".to_owned()));
+        let activity = AudioActivity::default();
+        let err = start_pinned_test_audio(&fake_device(&current), &activity)
+            .err()
+            .expect("started on another device")
+            .to_string();
+        assert!(
+            err.contains(
+                "\"chosen\" is not available (the server put the stream on \"elsewhere\")"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn stop_returns_while_an_audio_rebuild_is_blocked_in_its_state_change() {
+        init();
+        let pipeline = gst::Pipeline::new();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (tx, _rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+        let output = Output::new(tx);
+        let mut branch = AudioBranch::new(
+            AudioInput::Blocking,
+            &CaptureConfig {
+                audio: true,
+                ..config(320, 240)
+            },
+            None,
+            AudioOptions::default(),
+        );
+        let released = BLOCKING_RELEASED.load(Ordering::SeqCst);
+        branch.begin(&output).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(matches!(branch.poll(&pipeline), Attach::Pending));
+        let bus_thread = {
+            let (pipeline, output) = (pipeline.clone(), output.clone());
+            std::thread::spawn(move || watch_bus(&pipeline, &output, Some(branch)))
+        };
+        let capture = Capture {
+            pipeline,
+            video_sink: gst_app::AppSink::builder().build(),
+            output,
+            bus_thread: Some(bus_thread),
+            encoder: "none",
+        };
+        std::thread::sleep(BUS_POLL.into());
+        let stopping = Instant::now();
+        capture.stop();
+        assert!(
+            stopping.elapsed() < Duration::from_secs(1),
+            "stop took {:?}",
+            stopping.elapsed()
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while BLOCKING_RELEASED.load(Ordering::SeqCst) == released && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            BLOCKING_RELEASED.load(Ordering::SeqCst) > released,
+            "the abandoned start was never flushed"
+        );
+    }
+
+    #[test]
+    fn the_bus_is_watched_while_an_audio_rebuild_is_blocked() {
+        init();
+        let pipeline = gst::Pipeline::new();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (tx, _rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+        let output = Output::new(tx);
+        let mut branch = AudioBranch::new(
+            AudioInput::Blocking,
+            &CaptureConfig {
+                audio: true,
+                ..config(320, 240)
+            },
+            None,
+            AudioOptions::default(),
+        );
+        branch.begin(&output).unwrap();
+        let bus_thread = {
+            let (pipeline, output) = (pipeline.clone(), output.clone());
+            std::thread::spawn(move || watch_bus(&pipeline, &output, Some(branch)))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        post_error_as(&pipeline, "videosrc", gst::StreamError::Failed);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !output.stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let error = output.error.lock().unwrap().clone();
+        assert!(
+            error.is_some_and(|e| e.contains("injected")),
+            "the video error went unhandled"
+        );
+        bus_thread.join().unwrap();
+        let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    pub(super) static BLOCKING_RELEASED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    glib::wrapper! {
+        pub struct BlockingSrc(ObjectSubclass<blocking::BlockingSrc>) @extends gst::Element, gst::Object;
+    }
+
+    /// Stands in for pipewiresrc's start wait: READY to PAUSED blocks until the source pad is flushed.
+    mod blocking {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Condvar, LazyLock, Mutex};
+        use std::time::Duration;
+
+        use gst::subclass::prelude::*;
+        use gstreamer as gst;
+        use gstreamer::prelude::*;
+
+        pub struct BlockingSrc {
+            pad: gst::Pad,
+            released: (Mutex<bool>, Condvar),
+        }
+
+        impl BlockingSrc {
+            fn release(&self) {
+                *self.released.0.lock().unwrap() = true;
+                self.released.1.notify_all();
+                super::BLOCKING_RELEASED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for BlockingSrc {
+            const NAME: &'static str = "DstreamyTestBlockingSrc";
+            type Type = super::BlockingSrc;
+            type ParentType = gst::Element;
+
+            fn with_class(klass: &Self::Class) -> Self {
+                let templ = klass.pad_template("src").unwrap();
+                let pad = gst::Pad::builder_from_template(&templ)
+                    .event_function(|_pad, parent, event| {
+                        BlockingSrc::catch_panic_pad_function(
+                            parent,
+                            || false,
+                            |this| {
+                                if event.type_() == gst::EventType::FlushStart {
+                                    this.release();
+                                }
+                                true
+                            },
+                        )
+                    })
+                    .build();
+                Self {
+                    pad,
+                    released: (Mutex::new(false), Condvar::new()),
+                }
+            }
+        }
+
+        impl ObjectImpl for BlockingSrc {
+            fn constructed(&self) {
+                self.parent_constructed();
+                self.obj().add_pad(&self.pad).unwrap();
+            }
+        }
+
+        impl GstObjectImpl for BlockingSrc {}
+
+        impl ElementImpl for BlockingSrc {
+            fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
+                static METADATA: LazyLock<gst::subclass::ElementMetadata> = LazyLock::new(|| {
+                    gst::subclass::ElementMetadata::new(
+                        "Blocking source",
+                        "Source/Audio",
+                        "Blocks in READY to PAUSED until flushed",
+                        "d-streamy tests",
+                    )
+                });
+                Some(&METADATA)
+            }
+
+            fn pad_templates() -> &'static [gst::PadTemplate] {
+                static TEMPLATES: LazyLock<Vec<gst::PadTemplate>> = LazyLock::new(|| {
+                    vec![
+                        gst::PadTemplate::new(
+                            "src",
+                            gst::PadDirection::Src,
+                            gst::PadPresence::Always,
+                            &gst::Caps::new_any(),
+                        )
+                        .unwrap(),
+                    ]
+                });
+                TEMPLATES.as_ref()
+            }
+
+            fn change_state(
+                &self,
+                transition: gst::StateChange,
+            ) -> Result<gst::StateChangeSuccess, gst::StateChangeError> {
+                let changed = self.parent_change_state(transition)?;
+                // As pipewiresrc: the wait comes after the parent activated the pads, so a flush reaches it.
+                if transition == gst::StateChange::ReadyToPaused {
+                    let (lock, flushed) = &self.released;
+                    let (released, _) = flushed
+                        .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(30), |r| !*r)
+                        .unwrap();
+                    if *released {
+                        return Err(gst::StateChangeError);
+                    }
+                }
+                Ok(changed)
+            }
         }
     }
 
@@ -2021,9 +2623,6 @@ mod tests {
         drop(back);
     }
 
-    /// Devices with this prefix get no pinning node properties, so a server can move them as plain PulseAudio would.
-    pub(super) const UNPINNED_PREFIX: &str = "dstreamy_unpinned_";
-
     /// Run with `DSTREAMY_REAL_AUDIO_TEST=1 cargo test -- --ignored`: it adds and removes two null sinks.
     #[test]
     #[ignore = "needs pipewire-pulse and creates throwaway null sinks"]
@@ -2033,8 +2632,8 @@ mod tests {
         }
         let _real = real_audio_lock();
         init();
-        let chosen = format!("{UNPINNED_PREFIX}a");
-        let other = format!("{UNPINNED_PREFIX}b");
+        let chosen = "dstreamy_unpinned_a".to_owned();
+        let other = "dstreamy_unpinned_b".to_owned();
         let a = NullSink::load_named(&chosen);
         let b = NullSink::load_named(&other);
         let cfg = CaptureConfig {
@@ -2049,12 +2648,17 @@ mod tests {
         };
         let activity = AudioActivity::default();
         activity.started();
-        let (capture, mut rx) = Capture::start_with(
+        let (capture, mut rx) = Capture::start_with_options(
             video,
             Some(AudioInput::PulseMonitor),
             &cfg,
             &x264(&cfg),
             Some(&activity),
+            // Without the node properties pipewire-pulse lets the stream move, as plain PulseAudio does.
+            &AudioOptions {
+                pin_properties: false,
+                device_query: None,
+            },
         )
         .unwrap();
         let mut recv = |within: Duration| {
