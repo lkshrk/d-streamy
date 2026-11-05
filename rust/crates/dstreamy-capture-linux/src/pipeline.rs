@@ -341,8 +341,6 @@ struct Output {
     stop: AtomicBool,
     video_frames: AtomicU64,
     audio_buffers: AtomicU64,
-    /// Warnings the audio elements posted, such as samples dropped because the sink fell behind.
-    audio_warnings: AtomicU64,
     /// The audio branch generation whose stream the server moved off the chosen device, and where to.
     moved: Mutex<Option<(u64, String)>>,
     error: Mutex<Option<String>>,
@@ -355,7 +353,6 @@ impl Output {
             stop: AtomicBool::new(false),
             video_frames: AtomicU64::new(0),
             audio_buffers: AtomicU64::new(0),
-            audio_warnings: AtomicU64::new(0),
             moved: Mutex::new(None),
             error: Mutex::new(None),
         })
@@ -702,6 +699,8 @@ struct AudioBranch {
     generation: u64,
     active: Option<gst::Bin>,
     job: Option<AttachJob>,
+    /// The last abandoned start, until its state change returns; no new start begins meanwhile.
+    blocked: Option<Arc<Mutex<JobState>>>,
 }
 
 impl AudioBranch {
@@ -720,6 +719,7 @@ impl AudioBranch {
             generation: 0,
             active: None,
             job: None,
+            blocked: None,
         }
     }
 
@@ -817,12 +817,12 @@ impl AudioBranch {
                 gst::MessageView::Error(err) => bus_error_text(err),
                 _ => "audio source failed".to_owned(),
             };
-            self.job.take().expect("job checked above").abandon();
+            self.abandon();
             return Attach::Failed(why, restart_for(Some(&msg)));
         }
         let Some(started) = job.take_result() else {
             if job.started_at.elapsed() >= AUDIO_ABANDON_FLUSH {
-                self.job.take().expect("job checked above").abandon();
+                self.abandon();
                 return Attach::Failed(
                     format!(
                         "it did not start within {} s",
@@ -868,8 +868,19 @@ impl AudioBranch {
     /// Gives up a generation still starting, without waiting for it.
     fn abandon(&mut self) {
         if let Some(job) = self.job.take() {
+            self.blocked = Some(job.state.clone());
             job.abandon();
         }
+    }
+
+    /// Whether an abandoned start is still inside its state change, as with a source that ignores the flush.
+    fn still_blocked(&self) -> bool {
+        self.blocked.as_ref().is_some_and(|state| {
+            matches!(
+                *state.lock().unwrap_or_else(|e| e.into_inner()),
+                JobState::Abandoned
+            )
+        })
     }
 
     fn name(&self) -> String {
@@ -968,6 +979,19 @@ struct WarningLog {
 
 impl WarningLog {
     /// `Some` with a note on held-back warnings when this one should be logged.
+    /// The count held back once the interval after the last logged warning has passed, or at `stop`.
+    fn flush(&mut self, now: Instant, stop: bool) -> Option<u64> {
+        let due = stop
+            || self
+                .last
+                .is_none_or(|last| now >= last + WARNING_LOG_INTERVAL);
+        if !due || self.held_back == 0 {
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.held_back))
+    }
+
     fn note(&mut self, now: Instant) -> Option<String> {
         if self
             .last
@@ -1400,7 +1424,17 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
         gst::MessageType::Eos,
         gst::MessageType::Warning,
     ];
-    let mut warnings = WarningLog::default();
+    let (mut audio_warnings, mut other_warnings) = (WarningLog::default(), WarningLog::default());
+    let mut told_blocked = false;
+    let flush_warnings = |audio: &mut WarningLog, other: &mut WarningLog, stop: bool| {
+        let now = Instant::now();
+        if let Some(n) = audio.flush(now, stop) {
+            tracing::warn!("{n} more audio warnings like the last one logged");
+        }
+        if let Some(n) = other.flush(now, stop) {
+            tracing::warn!("{n} more pipeline warnings like the last one logged");
+        }
+    };
     let mut retry = AudioRetry::default();
     let mut lost = false;
     let mut buffers_at_attach = output.audio_buffers.load(Ordering::Relaxed);
@@ -1448,9 +1482,22 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
                     }
                 }
             } else if retry.due(Instant::now()) {
-                if let Err(e) = branch.begin(output) {
-                    tracing::debug!("audio source {}: reconnecting failed: {e}", branch.name());
+                if branch.still_blocked() {
+                    if !told_blocked {
+                        told_blocked = true;
+                        tracing::warn!(
+                            "audio source {}: an earlier start is still stuck in the audio server; \
+                             trying again once it returns",
+                            branch.name()
+                        );
+                    }
                     retry.failed(Instant::now());
+                } else {
+                    told_blocked = false;
+                    if let Err(e) = branch.begin(output) {
+                        tracing::debug!("audio source {}: reconnecting failed: {e}", branch.name());
+                        retry.failed(Instant::now());
+                    }
                 }
             } else if !retry.pending()
                 && branch.active.is_some()
@@ -1463,6 +1510,7 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
                 }
             }
         }
+        flush_warnings(&mut audio_warnings, &mut other_warnings, false);
         let Some(msg) = bus.timed_pop_filtered(BUS_POLL, &types) else {
             continue;
         };
@@ -1470,13 +1518,15 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
             let from_audio = w
                 .src()
                 .is_some_and(|s| s.name().starts_with(AUDIO_ELEMENT_PREFIX));
-            if from_audio {
-                output.audio_warnings.fetch_add(1, Ordering::Relaxed);
-            }
             let src = w
                 .src()
                 .map_or_else(|| "pipeline".to_owned(), |s| s.path_string().to_string());
-            if let Some(repeated) = warnings.note(Instant::now()) {
+            let log = if from_audio {
+                &mut audio_warnings
+            } else {
+                &mut other_warnings
+            };
+            if let Some(repeated) = log.note(Instant::now()) {
                 let detail = w.debug().map(|d| format!(" ({d})")).unwrap_or_default();
                 tracing::warn!("{src}: {}{detail}{repeated}", w.error());
             }
@@ -1512,6 +1562,7 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
         }
         output.close();
     }
+    flush_warnings(&mut audio_warnings, &mut other_warnings, true);
     if let Some(branch) = audio.as_mut() {
         branch.abandon();
     }
@@ -2535,6 +2586,41 @@ mod tests {
             Some(" (2 more since the last one logged)")
         );
         assert_eq!(log.note(t0 + WARNING_LOG_INTERVAL * 2).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn held_back_warnings_are_counted_out_after_the_interval_or_at_stop() {
+        let t0 = Instant::now();
+        let mut log = WarningLog::default();
+        assert_eq!(log.flush(t0, true), None);
+        log.note(t0);
+        log.note(t0 + Duration::from_secs(1));
+        log.note(t0 + Duration::from_secs(2));
+        assert_eq!(log.flush(t0 + Duration::from_secs(3), false), None);
+        assert_eq!(log.flush(t0 + WARNING_LOG_INTERVAL, false), Some(2));
+        assert_eq!(log.flush(t0 + WARNING_LOG_INTERVAL * 2, false), None);
+        log.note(t0 + WARNING_LOG_INTERVAL + Duration::from_secs(1));
+        assert_eq!(
+            log.flush(t0 + WARNING_LOG_INTERVAL + Duration::from_secs(2), true),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn no_new_start_while_an_abandoned_one_is_still_in_its_state_change() {
+        init();
+        let mut branch = AudioBranch::new(
+            AudioInput::Test { frames: -1 },
+            &config(320, 240),
+            None,
+            AudioOptions::default(),
+        );
+        assert!(!branch.still_blocked());
+        let state = Arc::new(Mutex::new(JobState::Abandoned));
+        branch.blocked = Some(state.clone());
+        assert!(branch.still_blocked());
+        *state.lock().unwrap() = JobState::Taken;
+        assert!(!branch.still_blocked());
     }
 
     #[test]

@@ -23,6 +23,8 @@ struct Inner {
     lost: AtomicBool,
     /// Losses so far, so a reader polling now and then sees a loss that already ended.
     losses: AtomicU64,
+    /// Returns of a lost device, counted like `losses`.
+    recoveries: AtomicU64,
 }
 
 impl Default for AudioActivity {
@@ -32,6 +34,7 @@ impl Default for AudioActivity {
             silent_since_ms: AtomicU64::new(IDLE),
             lost: AtomicBool::new(false),
             losses: AtomicU64::new(0),
+            recoveries: AtomicU64::new(0),
         }))
     }
 }
@@ -55,6 +58,11 @@ impl AudioActivity {
     /// How many times the device was lost since this record was made; it never goes down.
     pub fn losses(&self) -> u64 {
         self.0.losses.load(Ordering::Relaxed)
+    }
+
+    /// How many times a lost device delivered samples again.
+    pub fn recoveries(&self) -> u64 {
+        self.0.recoveries.load(Ordering::Relaxed)
     }
 
     pub fn is_lost(&self) -> bool {
@@ -83,7 +91,9 @@ impl AudioActivity {
     }
 
     fn samples_at(&self, samples: impl IntoIterator<Item = i16>, now: Instant) {
-        self.0.lost.store(false, Ordering::Relaxed);
+        if self.0.lost.swap(false, Ordering::Relaxed) {
+            self.0.recoveries.fetch_add(1, Ordering::Relaxed);
+        }
         if samples.into_iter().any(|s| s.unsigned_abs() > SILENCE_PEAK) {
             self.heard_at(now);
         }
@@ -165,6 +175,7 @@ mod tests {
             2,
             "a loss stays counted after the device is back"
         );
+        assert_eq!(a.recoveries(), 1, "stopping is not a return");
     }
 
     #[test]
