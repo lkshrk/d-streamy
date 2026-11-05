@@ -10,6 +10,19 @@ use tokio_util::codec::{Decoder, Encoder};
 /// Longest line accepted, without its `\n` (ADR 0004).
 pub const MAX_LINE: usize = 1 << 20;
 
+/// The variables a control `login` may pass for its window: the client's graphical session, which serve may lack.
+pub const LOGIN_ENV: [&str; 6] = [
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+
+/// How long serve keeps a login window open before it closes it.
+pub const LOGIN_WINDOW_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// A line that is not one JSON value; the codec has already moved past it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Malformed {

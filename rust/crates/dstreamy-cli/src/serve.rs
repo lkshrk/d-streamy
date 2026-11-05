@@ -28,6 +28,7 @@ use crate::signals::Signals;
 use crate::stream::FORCED_EXIT;
 use crate::{CliError, Ctx};
 
+mod login;
 mod producer;
 
 pub const PROTOCOL: u64 = 2;
@@ -52,6 +53,8 @@ pub struct Options {
     pub event_capacity: usize,
     /// Enables the hidden test commands; only honoured with the `test-hooks` feature.
     pub test_hooks: bool,
+    /// Runs instead of this program's own browser login; only honoured with the `test-hooks` feature.
+    pub login_program: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +83,11 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
             allow_external: true,
         },
     );
+    #[cfg(feature = "test-hooks")]
+    let login_program = opts.login_program.clone();
+    #[cfg(not(feature = "test-hooks"))]
+    let login_program = None;
+    let login = Arc::new(login::Login::new(ctx, login_program));
     let (phase_tx, phase) = watch::channel(Phase::Running);
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
     let (orphans_tx, mut orphans_rx) = mpsc::unbounded_channel::<TaskSet>();
@@ -99,6 +107,7 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
                         let conn = Connection {
                             id: next_id,
                             engine: engine.clone(),
+                            login: login.clone(),
                             phase: phase.clone(),
                             shutdown: shutdown_tx.clone(),
                             orphans: orphans_tx.clone(),
@@ -247,14 +256,20 @@ enum Role {
 
 /// What this serve supports beyond protocol 2 as first released; every build reports the same `version`.
 const FEATURES: [&str; 2] = ["start_grace_secs", "status_place"];
+/// Offered only where `login` can open the browser login window.
+pub const BROWSER_LOGIN: &str = "browser_login";
 
-fn hello_data(engine: &Engine, connection: u64) -> Value {
+fn hello_data(engine: &Engine, login: &login::Login, connection: u64) -> Value {
+    let mut features = FEATURES.to_vec();
+    if login.available() {
+        features.push(BROWSER_LOGIN);
+    }
     json!({
         "protocol": PROTOCOL,
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
         "connection": connection,
-        "features": FEATURES,
+        "features": features,
         "status": engine.status(),
     })
 }
@@ -301,6 +316,7 @@ enum End {
 struct Connection {
     id: u64,
     engine: Arc<Engine>,
+    login: Arc<login::Login>,
     phase: watch::Receiver<Phase>,
     shutdown: mpsc::UnboundedSender<oneshot::Sender<()>>,
     /// Commands still running when the client left; the service aborts and awaits them before its engine shuts down.
@@ -357,7 +373,7 @@ impl Connection {
             Ok((id, Role::Control)) => {
                 queue(
                     &mut writer,
-                    Message::reply(Some(id), Ok(hello_data(&self.engine, self.id))),
+                    Message::reply(Some(id), Ok(hello_data(&self.engine, &self.login, self.id))),
                 );
                 self.control(reader, writer).await;
             }
@@ -517,7 +533,7 @@ impl Connection {
                                 pending.push_back(Message::reply(Some(id), Err(failure)));
                             }
                             Ok((id, Request::Hello)) => {
-                                pending.push_back(Message::reply(Some(id), Ok(hello_data(&self.engine, self.id))));
+                                pending.push_back(Message::reply(Some(id), Ok(hello_data(&self.engine, &self.login, self.id))));
                             }
                             Ok((id, Request::Status)) => {
                                 let status = serde_json::to_value(self.engine.status())
@@ -557,6 +573,21 @@ impl Connection {
                                     hook.run(&engine).await;
                                     if let Some(id) = lock(&unanswered).remove(&key) {
                                         let _ = replies.send((id, Ok(Value::Null)));
+                                    }
+                                });
+                            }
+                            Ok((id, Request::Login(params))) => {
+                                let key = next_key;
+                                next_key += 1;
+                                lock(&unanswered).insert(key, id);
+                                let engine = self.engine.clone();
+                                let login = self.login.clone();
+                                let replies = replies_tx.clone();
+                                let unanswered = unanswered.clone();
+                                tasks.spawn(async move {
+                                    let result = login.run(&engine, params).await;
+                                    if let Some(id) = lock(&unanswered).remove(&key) {
+                                        let _ = replies.send((id, result));
                                     }
                                 });
                             }
@@ -661,6 +692,7 @@ enum Request {
     Status,
     Subscribe,
     Shutdown,
+    Login(login::LoginParams),
     #[cfg(any(test, feature = "test-hooks"))]
     Test(hooks::Hook),
     Engine(engine::Command),
@@ -669,7 +701,7 @@ enum Request {
 impl Request {
     fn parse(value: Value, test_hooks: bool) -> Result<(String, Self), (Option<String>, Failure)> {
         let mut known: Vec<&str> = COMMANDS.to_vec();
-        known.extend(["status", "subscribe"]);
+        known.extend(["status", "subscribe", "login"]);
         #[cfg(any(test, feature = "test-hooks"))]
         if test_hooks {
             known.extend(hooks::COMMANDS);
@@ -682,6 +714,10 @@ impl Request {
             "status" => Self::Status,
             "subscribe" => Self::Subscribe,
             "shutdown" => Self::Shutdown,
+            "login" => match login::LoginParams::parse(value) {
+                Ok(params) => Self::Login(params),
+                Err(failure) => return Err((Some(id), failure)),
+            },
             #[cfg(any(test, feature = "test-hooks"))]
             cmd if hooks::COMMANDS.contains(&cmd) => match hooks::Hook::parse(value) {
                 Ok(hook) => Self::Test(hook),

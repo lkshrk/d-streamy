@@ -12,7 +12,7 @@ Scenarios:
 
 Normalisation, applied to the real output before comparing:
 
-- `hello`: `data.version` becomes `"<version>"`, `data.platform` `"<platform>"` and `data.connection` `"<connection>"`; `data.status` is normalised like a `status` reply.
+- `hello`: `data.version` becomes `"<version>"`, `data.platform` `"<platform>"` and `data.connection` `"<connection>"`; `data.features` loses `browser_login`, which depends on the build; `data.status` is normalised like a `status` reply.
 - `status`: a non-null `started_by` becomes `"<connection>"`, `source.for_ms` `0`, and every number in `source.stats` `0`.
 - Only `state` events (without `reconnecting`) and the first `health` event are kept. `source` events race with `state` events, so the scenario pins the source through `status` instead. Inside the health event, `status.stats` and the `stop` result (`StreamStats`), every number becomes `0`, every boolean `false`, `last_error` `null`, `*_level` `"good"` and `*_series` `[]`.
 

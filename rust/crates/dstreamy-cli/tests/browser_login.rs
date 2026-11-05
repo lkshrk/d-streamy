@@ -143,7 +143,9 @@ fn close_and_escape_produce_cancelled_without_token() {
 #[test]
 fn cancelled_outcome_never_reaches_the_saving_login() {
     match follow_up(BrowserLoginOutcome::Cancelled) {
-        Err(CliError::BrowserLogin(reason)) => assert_eq!(reason, "cancelled"),
+        Err(e @ CliError::BrowserLoginCancelled) => {
+            assert_eq!(e.to_string(), "browser login failed: cancelled")
+        }
         _ => panic!("cancel must end the command with an error"),
     }
     assert!(matches!(

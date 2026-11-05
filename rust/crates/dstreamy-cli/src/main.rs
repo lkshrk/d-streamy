@@ -60,6 +60,9 @@ enum Command {
         /// Log in on Discord's login page in a window instead of scanning a QR code
         #[arg(long)]
         browser: bool,
+        /// Offer no QR or token fallback, for a login started without a terminal
+        #[arg(long, hide = true, requires = "browser")]
+        window_only: bool,
     },
     /// List the account's guilds
     Guilds,
@@ -110,6 +113,9 @@ enum Command {
         #[cfg(feature = "test-hooks")]
         #[arg(long, hide = true)]
         test_hooks: bool,
+        #[cfg(feature = "test-hooks")]
+        #[arg(long, hide = true, value_name = "PATH")]
+        login_program: Option<PathBuf>,
     },
     /// Keep `dstreamy serve` running under the user's service manager
     ///
@@ -168,14 +174,18 @@ fn main() -> ExitCode {
         }
     };
     let credentials = match cli.command {
-        Command::Login { token, browser } => {
+        Command::Login {
+            token,
+            browser,
+            window_only,
+        } => {
             let mode = login_mode(token, browser, std::io::stdin().is_terminal());
             let read = match mode {
                 #[cfg(all(
                     feature = "browser-login",
                     any(target_os = "linux", target_os = "macos")
                 ))]
-                LoginMode::Browser => browser_token(&ctx, runtime.handle(), &out),
+                LoginMode::Browser => browser_token(&ctx, runtime.handle(), &out, window_only),
                 #[cfg(not(all(
                     feature = "browser-login",
                     any(target_os = "linux", target_os = "macos")
@@ -187,8 +197,13 @@ fn main() -> ExitCode {
             match read {
                 Ok(credentials) => credentials,
                 Err(e) => {
-                    out.error(e);
-                    return ExitCode::FAILURE;
+                    out.error(&e);
+                    return match e {
+                        CliError::BrowserLoginCancelled if window_only => {
+                            ExitCode::from(dstreamy_cli::login_capture::CANCELLED_EXIT)
+                        }
+                        _ => ExitCode::FAILURE,
+                    };
                 }
             }
         }
@@ -289,12 +304,14 @@ async fn run(
             skip_platform,
             event_capacity,
             test_hooks,
+            login_program,
         } => {
             let opts = serve::Options {
                 endpoint,
                 include_platform: !skip_platform,
                 event_capacity: usize::try_from(event_capacity).unwrap_or(usize::MAX),
                 test_hooks,
+                login_program,
             };
             serve::run(ctx, out, opts).await
         }
@@ -305,6 +322,7 @@ async fn run(
                 include_platform: true,
                 event_capacity: serve::DEFAULT_EVENT_CAPACITY,
                 test_hooks: false,
+                login_program: None,
             };
             serve::run(ctx, out, opts).await
         }
@@ -327,13 +345,24 @@ fn browser_token(
     ctx: &Ctx,
     runtime: &tokio::runtime::Handle,
     out: &Out,
+    window_only: bool,
 ) -> Result<Option<Credentials>, CliError> {
-    use dstreamy_cli::login_capture::{FollowUp, follow_up};
-    match follow_up(dstreamy_cli::browser_login::run(ctx, runtime, out)?)? {
+    use dstreamy_cli::login_capture::{FollowUp, Recovery, follow_up};
+    let recovery = if window_only {
+        Recovery::WindowOnly
+    } else {
+        Recovery::WithTerminal
+    };
+    match follow_up(dstreamy_cli::browser_login::run(
+        ctx, runtime, out, recovery,
+    )?)? {
         FollowUp::Login(verified) => Ok(Some(Credentials {
             token: verified.token,
             user: Some(verified.user),
         })),
+        FollowUp::Qr | FollowUp::ReadToken if window_only => Err(CliError::BrowserLogin(
+            "the QR code and token logins need a terminal: run `dstreamy login` in one".into(),
+        )),
         FollowUp::Qr => Ok(None),
         FollowUp::ReadToken => read_token().map(Credentials::unchecked).map(Some),
     }

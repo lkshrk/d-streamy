@@ -16,7 +16,7 @@ use wry::{NewWindowResponse, PageLoadEvent, WebView, WebViewBuilder};
 
 use crate::discord::{self, Persistence};
 use crate::login_capture::{
-    self, Action, BrowserLoginOutcome, BrowserState, Command, Failure, Job, RECOVERY_ACTIONS,
+    self, Action, BrowserLoginOutcome, BrowserState, Command, Failure, Job, Recovery,
     SeenCandidates, Validation, ValidationError, VerifiedLogin, View,
 };
 use crate::output::Out;
@@ -402,11 +402,12 @@ struct Session {
     loads: PageLoads,
     nonces: Nonces,
     start_url: String,
+    recovery: Recovery,
     trouble: Option<Trouble>,
 }
 
 impl Session {
-    fn new(nonces: Nonces, start_url: String, now: Instant) -> Self {
+    fn new(nonces: Nonces, start_url: String, recovery: Recovery, now: Instant) -> Self {
         Self {
             state: BrowserState::new(now),
             shown: Screen::Discord { verifying: false },
@@ -414,6 +415,7 @@ impl Session {
             loads: PageLoads::default(),
             nonces,
             start_url,
+            recovery,
             trouble: None,
         }
     }
@@ -547,7 +549,7 @@ const RECOVERY_PAGE: &str = r##"<!doctype html>
 <main>
   <h1>{title}</h1>
   <p>{message}</p>
-  <p class="hint">Nothing was saved. Try again, scan a QR code with the Discord app, or paste a token.</p>
+  <p class="hint">{hint}</p>
   <div class="actions">{actions}</div>
 </main>
 <script>
@@ -569,9 +571,11 @@ const RECOVERY_PAGE: &str = r##"<!doctype html>
 </html>
 "##;
 
-fn recovery_buttons() -> String {
-    RECOVERY_ACTIONS
-        .map(|action| {
+fn recovery_buttons(recovery: Recovery) -> String {
+    recovery
+        .actions()
+        .iter()
+        .map(|&action| {
             let (class, label) = match action {
                 Action::Retry => (r#" class="primary""#, "Retry"),
                 Action::UseQr => ("", "Use QR instead"),
@@ -583,6 +587,7 @@ fn recovery_buttons() -> String {
                 action.name()
             )
         })
+        .collect::<Vec<_>>()
         .join("\n    ")
 }
 
@@ -739,7 +744,12 @@ struct Views {
 }
 
 /// Blocks the main thread until the user logs in or leaves; only a validated token is returned.
-pub fn run(ctx: &Ctx, runtime: &Handle, out: &Out) -> Result<BrowserLoginOutcome, CliError> {
+pub fn run(
+    ctx: &Ctx,
+    runtime: &Handle,
+    out: &Out,
+    recovery: Recovery,
+) -> Result<BrowserLoginOutcome, CliError> {
     let mut event_loop = EventLoopBuilder::<Msg>::with_user_event().build();
     let nonces = Nonces::new()?;
     let start_url = login_url();
@@ -754,7 +764,7 @@ pub fn run(ctx: &Ctx, runtime: &Handle, out: &Out) -> Result<BrowserLoginOutcome
         .build(&event_loop)
         .map_err(|e| CliError::BrowserLogin(e.to_string()))?;
     let views = build_views(&event_loop, &window, &nonces, &start_url)?;
-    let mut session = Session::new(nonces, start_url, Instant::now());
+    let mut session = Session::new(nonces, start_url, recovery, Instant::now());
     let outcome = drive(
         &mut event_loop,
         &mut session,
@@ -956,7 +966,7 @@ fn drive(
             None => {}
         }
         if let Some(screen) = step.load {
-            show(&views.main, screen, &session.start_url, &session.nonces.app);
+            show(&views.main, screen, session);
         }
         if step.visible == Some(true) {
             set_window_visible(window, true);
@@ -1082,23 +1092,34 @@ fn set_title(window: &Window, screen: Screen) {
     window.set_title(title);
 }
 
-fn show(webview: &WebView, screen: Screen, start_url: &str, app_nonce: &str) {
+fn show(webview: &WebView, screen: Screen, session: &Session) {
     let loaded = match screen {
-        Screen::Discord { .. } => webview.load_url(start_url),
-        Screen::Recovery(failure) => webview.load_html(&recovery_page(failure, app_nonce)),
+        Screen::Discord { .. } => webview.load_url(&session.start_url),
+        Screen::Recovery(failure) => webview.load_html(&recovery_page(
+            failure,
+            &session.nonces.app,
+            session.recovery,
+        )),
     };
     if let Err(e) = loaded {
         tracing::warn!("showing the browser login page failed: {e}");
     }
 }
 
-fn recovery_page(failure: Failure, app_nonce: &str) -> String {
+fn recovery_page(failure: Failure, app_nonce: &str, recovery: Recovery) -> String {
     let (title, message) = recovery_text(failure);
+    let hint = match recovery {
+        Recovery::WithTerminal => {
+            "Nothing was saved. Try again, scan a QR code with the Discord app, or paste a token."
+        }
+        Recovery::WindowOnly => "Nothing was saved. Try again, or cancel and log in later.",
+    };
     RECOVERY_PAGE
         .replace("{nonce}", app_nonce)
         .replace("{title}", title)
         .replace("{message}", message)
-        .replace("{actions}", &recovery_buttons())
+        .replace("{hint}", hint)
+        .replace("{actions}", &recovery_buttons(recovery))
 }
 
 fn recovery_text(failure: Failure) -> (&'static str, &'static str) {
@@ -1159,7 +1180,7 @@ mod tests {
 
     use super::*;
     use crate::discord::BRIEF_VALIDATION_TIMEOUT;
-    use crate::login_capture::{Candidate, parse_candidate};
+    use crate::login_capture::{Candidate, RECOVERY_ACTIONS, parse_candidate};
 
     const WAIT: Duration = Duration::from_secs(5);
     const QUIET: Duration = Duration::from_millis(200);
@@ -1389,7 +1410,10 @@ mod tests {
         );
         assert_eq!(accepts(ON_RECOVERY, "about:blank", "ready"), None);
         assert_eq!(accepts(ON_DISCORD, "about:blank", &body), None);
-        assert!(recovery_page(Failure::Rejected, APP_NONCE).contains(r#"post("ready")"#));
+        assert!(
+            recovery_page(Failure::Rejected, APP_NONCE, Recovery::WithTerminal)
+                .contains(r#"post("ready")"#)
+        );
     }
 
     #[test]
@@ -1441,7 +1465,7 @@ mod tests {
     }
 
     fn session(now: Instant) -> Session {
-        let mut session = Session::new(nonces(), START.to_owned(), now);
+        let mut session = Session::new(nonces(), START.to_owned(), Recovery::WithTerminal, now);
         session.state.page_loaded();
         session
     }
@@ -1754,7 +1778,7 @@ mod tests {
         assert!(line.starts_with("The login needs your attention in the window: "));
         assert!(line.ends_with(recovery_text(Failure::Rejected).1));
         assert!(
-            recovery_page(Failure::Rejected, APP_NONCE)
+            recovery_page(Failure::Rejected, APP_NONCE, Recovery::WithTerminal)
                 .contains(recovery_text(Failure::Rejected).1)
         );
     }
@@ -1780,10 +1804,25 @@ mod tests {
 
     #[test]
     fn recovery_buttons_offer_every_recovery_action() {
-        let buttons = recovery_buttons();
+        let buttons = recovery_buttons(Recovery::WithTerminal);
         for action in RECOVERY_ACTIONS {
             assert!(buttons.contains(&format!("data-action=\"{}\"", action.name())));
         }
+    }
+
+    #[test]
+    fn a_window_only_login_offers_no_terminal_fallback() {
+        let page = recovery_page(Failure::Rejected, APP_NONCE, Recovery::WindowOnly);
+        for (action, offered) in [
+            (Action::Retry, true),
+            (Action::Cancel, true),
+            (Action::UseQr, false),
+            (Action::UseToken, false),
+        ] {
+            let button = format!("data-action=\"{}\"", action.name());
+            assert_eq!(page.contains(&button), offered, "{action:?}");
+        }
+        assert!(!page.contains("QR") && !page.contains("{hint}"));
     }
 
     #[test]
@@ -1832,7 +1871,7 @@ mod tests {
         assert_eq!(script.matches(nonces.discord.as_str()).count(), 1);
         assert!(script.find(nonces.discord.as_str()).unwrap() > guard);
         assert!(!script.contains(nonces.app.as_str()));
-        let recovery = recovery_page(Failure::Rejected, &nonces.app);
+        let recovery = recovery_page(Failure::Rejected, &nonces.app, Recovery::WithTerminal);
         assert!(recovery.contains(nonces.app.as_str()));
         assert!(!recovery.contains(nonces.discord.as_str()));
         assert!(!script.contains("window.ipc") && !recovery.contains("window.ipc"));

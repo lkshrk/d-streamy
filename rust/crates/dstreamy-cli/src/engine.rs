@@ -195,6 +195,7 @@ impl From<CliError> for Failure {
             CliError::Gateway(_) => "gateway",
             CliError::RemoteAuth(_)
             | CliError::BrowserLogin(_)
+            | CliError::BrowserLoginCancelled
             | CliError::BrowserLoginUnavailable => "remote_auth",
             CliError::UnknownGuild(guild) => {
                 return Self::new("unknown_guild", format!("unknown guild {guild}"));
@@ -582,6 +583,18 @@ impl Engine {
 
     fn current(&self) -> Option<Arc<Conn>> {
         lock(&self.conn).clone()
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.current().is_some_and(|c| c.live())
+    }
+
+    /// The saved token changed: an idle Discord connection made with the old one is closed, so the next opens with it.
+    pub async fn token_changed(&self) {
+        let _lifecycle = self.lifecycle.lock().await;
+        if !self.is_live() {
+            self.disconnect_locked().await;
+        }
     }
 
     async fn conn(&self) -> Result<Arc<Conn>, CliError> {

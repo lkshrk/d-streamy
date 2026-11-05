@@ -66,6 +66,25 @@ pub const RECOVERY_ACTIONS: [Action; 4] = [
     Action::Cancel,
 ];
 
+/// What the recovery page offers: the QR and token logins need a terminal to run in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recovery {
+    WithTerminal,
+    WindowOnly,
+}
+
+impl Recovery {
+    pub fn actions(self) -> &'static [Action] {
+        match self {
+            Self::WithTerminal => &RECOVERY_ACTIONS,
+            Self::WindowOnly => &[Action::Retry, Action::Cancel],
+        }
+    }
+}
+
+/// `dstreamy login --browser --window-only` exits with this when the window was closed without a login.
+pub const CANCELLED_EXIT: u8 = 3;
+
 pub fn parse_candidate(message: &str) -> Option<Candidate> {
     let value = message.strip_prefix("candidate:")?;
     if value.is_empty() || value.chars().any(char::is_whitespace) {
@@ -259,7 +278,7 @@ pub fn follow_up(outcome: BrowserLoginOutcome) -> Result<FollowUp, CliError> {
         BrowserLoginOutcome::Token(verified) => Ok(FollowUp::Login(verified)),
         BrowserLoginOutcome::UseQr => Ok(FollowUp::Qr),
         BrowserLoginOutcome::UseToken => Ok(FollowUp::ReadToken),
-        BrowserLoginOutcome::Cancelled => Err(CliError::BrowserLogin("cancelled".into())),
+        BrowserLoginOutcome::Cancelled => Err(CliError::BrowserLoginCancelled),
     }
 }
 

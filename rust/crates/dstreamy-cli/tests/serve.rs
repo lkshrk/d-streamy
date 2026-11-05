@@ -999,6 +999,174 @@ fn the_endpoint_stays_bound_until_the_session_is_torn_down_and_is_removed_after(
     );
 }
 
+/// Stands in for `dstreamy login --browser --window-only`: `fake-login-mode` in the config dir picks the outcome.
+fn fake_login(h: &Harness) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = h.run.path().join("fake-login");
+    let text = format!(
+        r#"#!/bin/sh
+dir=
+prev=
+for a in "$@"; do [ "$prev" = --config-dir ] && dir=$a; prev=$a; done
+printf '%s\n' "$@" > "$dir/fake-login-args"
+printf 'WAYLAND_DISPLAY=%s\nXAUTHORITY=%s\n' "${{WAYLAND_DISPLAY-unset}}" "${{XAUTHORITY-unset}}" > "$dir/fake-login-env"
+case "$(cat "$dir/fake-login-mode")" in
+ok) umask 077; printf '%s\n' '{MOCK_TOKEN}' > "$dir/token"; echo '{{"id":"1","username":"mock","global_name":null}}'; exit 0;;
+cancel) echo 'error: browser login failed: cancelled' >&2; exit 3;;
+hold) echo $$ > "$dir/fake-login-pid"; exec sleep 30;;
+*) echo 'some webview noise' >&2; echo 'error: browser login failed: no display' >&2; exit 1;;
+esac
+"#
+    );
+    std::fs::write(&script, text).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+fn login_mode(h: &Harness, mode: &str) {
+    std::fs::write(h.dir.path().join("fake-login-mode"), mode).unwrap();
+}
+
+fn serve_with_login(h: &Harness) -> Service {
+    let script = fake_login(h);
+    let s = Service::spawn(
+        h.cmd()
+            .env("XAUTHORITY", "/stale/xauthority")
+            .args([
+                "-v",
+                "serve",
+                "--skip-platform",
+                "--test-hooks",
+                "--endpoint",
+            ])
+            .arg(h.endpoint())
+            .arg("--login-program")
+            .arg(script)
+            .stdout(Stdio::null()),
+    );
+    let deadline = Instant::now() + T;
+    while UnixStream::connect(h.endpoint()).is_err() {
+        assert!(Instant::now() < deadline, "serve never listened");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    s
+}
+
+fn login(env: Value) -> Value {
+    json!({"id": "login", "cmd": "login", "env": env})
+}
+
+#[test]
+fn a_login_in_the_window_takes_effect_without_restarting_serve() {
+    let h = Harness::new();
+    let s = serve_with_login(&h);
+    let (mut c, hello) = h.control();
+    assert!(
+        hello["data"]["features"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("browser_login")),
+        "{hello}"
+    );
+    let guilds = json!({"id": "g", "cmd": "guilds"});
+    assert_eq!(c.request(&guilds)["code"], "not_logged_in");
+
+    login_mode(&h, "cancel");
+    let cancelled = c.request(&login(json!({"WAYLAND_DISPLAY": "wayland-test"})));
+    assert_eq!(cancelled["code"], "login_cancelled", "{cancelled}");
+
+    login_mode(&h, "fail");
+    let failed = c.request(&login(json!({})));
+    assert_eq!(
+        (failed["code"].as_str(), failed["message"].as_str()),
+        (
+            Some("login_failed"),
+            Some("browser login failed: no display")
+        ),
+        "{failed}"
+    );
+    assert_eq!(c.request(&guilds)["code"], "not_logged_in");
+
+    login_mode(&h, "ok");
+    let ok = c.request(&login(json!({"WAYLAND_DISPLAY": "wayland-test"})));
+    assert_eq!(ok["type"], "result", "{ok}");
+    assert_eq!(ok["data"]["username"], "mock");
+    let env = std::fs::read_to_string(h.dir.path().join("fake-login-env")).unwrap();
+    assert_eq!(env, "WAYLAND_DISPLAY=wayland-test\nXAUTHORITY=unset\n");
+    let args = std::fs::read_to_string(h.dir.path().join("fake-login-args")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    for expected in [
+        "--json",
+        "login",
+        "--browser",
+        "--window-only",
+        "--config-dir",
+    ] {
+        assert!(args.contains(&expected), "{args:?}");
+    }
+    assert!(args.contains(&h.dir.path().to_str().unwrap()), "{args:?}");
+
+    let listed = c.request(&guilds);
+    assert_eq!(listed["type"], "result", "{listed}");
+    assert_eq!(listed["data"][0]["id"], MOCK_GUILD_ID);
+    drop(c);
+    shutdown_and_exit(&h, s);
+}
+
+#[test]
+fn a_second_login_is_refused_while_the_window_is_open_and_shutdown_closes_it() {
+    let h = Harness::new();
+    let s = serve_with_login(&h);
+    login_mode(&h, "hold");
+    let (mut first, _) = h.control();
+    first.send(&login(json!({})));
+    let pid_file = h.dir.path().join("fake-login-pid");
+    let deadline = Instant::now() + T;
+    let pid = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|p| p.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the login window never opened");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (mut second, _) = h.control();
+    let refused = second.request(&json!({"id": "again", "cmd": "login"}));
+    assert_eq!(refused["code"], "login_running", "{refused}");
+    drop(second);
+
+    shutdown_and_exit(&h, s);
+    let reply = first.reply(Some("login"));
+    assert_eq!(reply["type"], "error", "{reply}");
+    let alive = || {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    let deadline = Instant::now() + T;
+    while alive() {
+        assert!(Instant::now() < deadline, "the login window outlived serve");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn malformed_login_parameters_are_invalid() {
+    let h = Harness::new();
+    let s = serve_with_login(&h);
+    let (mut c, _) = h.control();
+    let bad = c.request(&json!({"id": "l", "cmd": "login", "env": {"DISPLAY": 1}}));
+    assert_eq!(bad["code"], "invalid_params", "{bad}");
+    drop(c);
+    shutdown_and_exit(&h, s);
+}
+
 /// One scenario per fixture pair, as the daemon fixtures: replies in request order, then kept events.
 mod golden {
     use super::*;
@@ -1076,6 +1244,9 @@ mod golden {
                     data["version"] = json!("<version>");
                     data["platform"] = json!("<platform>");
                     data["connection"] = json!("<connection>");
+                    if let Some(features) = data["features"].as_array_mut() {
+                        features.retain(|f| f != "browser_login");
+                    }
                     status(&mut data["status"]);
                 } else if data.get("started_by").is_some() {
                     status(data);
