@@ -671,6 +671,8 @@ jobs:
           cargo fmt --all --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo clippy --workspace --all-targets --locked --features test-hooks -- -D warnings
+          # The test binary links obs.dll, like the Linux job's LD_LIBRARY_PATH.
+          $env:PATH = "$env:OBS_PREFIX\bin\64bit;$env:PATH"
           cargo test --workspace --locked
 
       - name: Locate dumpbin
