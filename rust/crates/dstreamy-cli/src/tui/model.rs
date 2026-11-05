@@ -87,8 +87,14 @@ pub enum Msg {
     },
     StartFailed(String),
     Stopping,
-    Session(SessionEvent),
+    Session(Box<SessionEvent>),
     Notice(Notice),
+}
+
+impl Msg {
+    pub fn session(event: SessionEvent) -> Self {
+        Self::Session(Box::new(event))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -497,7 +503,7 @@ impl App {
                     live.stopping = true;
                 }
             }
-            Msg::Session(event) => self.session_event(event),
+            Msg::Session(event) => self.session_event(*event),
             Msg::Notice(notice) => self.notice = Some(notice),
         }
         None
@@ -886,7 +892,7 @@ mod tests {
     }
 
     fn state(state: SessionState) -> Msg {
-        Msg::Session(SessionEvent::State { state })
+        Msg::session(SessionEvent::State { state })
     }
 
     #[test]
@@ -939,12 +945,12 @@ mod tests {
     #[test]
     fn session_events_update_the_live_panel() {
         let mut app = live_app();
-        app.update(Msg::Session(SessionEvent::ChannelMoved {
+        app.update(Msg::session(SessionEvent::ChannelMoved {
             guild_id: Some("g1".into()),
             channel_id: "c1".into(),
         }));
-        app.update(Msg::Session(SessionEvent::Resumed));
-        app.update(Msg::Session(SessionEvent::Error {
+        app.update(Msg::session(SessionEvent::Resumed));
+        app.update(Msg::session(SessionEvent::Error {
             message: "hiccup".into(),
             fatal: false,
         }));

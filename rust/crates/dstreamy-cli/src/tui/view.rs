@@ -335,13 +335,13 @@ mod tests {
     fn streaming() -> App {
         let mut app = at_settings();
         press(&mut app, &[Key::Enter]);
-        app.update(Msg::Session(SessionEvent::State {
+        app.update(Msg::session(SessionEvent::State {
             state: SessionState::Streaming,
         }));
         let history: Vec<StreamMetrics> = (0..30)
             .map(|i| healthy(if i % 7 == 3 { 20 } else { 30 }, 50 - i % 2))
             .collect();
-        app.update(Msg::Session(SessionEvent::Health(HealthSnapshot {
+        app.update(Msg::session(SessionEvent::Health(HealthSnapshot {
             metrics: history[history.len() - 1],
             health: StreamHealth::compute(&history, 30),
             stats: StreamStats {
@@ -414,11 +414,11 @@ mod tests {
     #[test]
     fn live_screen_after_failure() {
         let mut app = streaming();
-        app.update(Msg::Session(SessionEvent::Error {
+        app.update(Msg::session(SessionEvent::Error {
             message: "voice connection closed".into(),
             fatal: false,
         }));
-        app.update(Msg::Session(SessionEvent::State {
+        app.update(Msg::session(SessionEvent::State {
             state: SessionState::Stopped {
                 reason: StopReason::GaveUp { attempts: 10 },
             },
@@ -442,7 +442,7 @@ mod tests {
         let backend = render(&app);
         assert_eq!(fg(&backend, "streaming"), Color::Green);
         assert_eq!(fg(&backend, " 87% good"), Color::Green);
-        app.update(Msg::Session(SessionEvent::State {
+        app.update(Msg::session(SessionEvent::State {
             state: SessionState::Stopped {
                 reason: StopReason::GatewayClosed,
             },

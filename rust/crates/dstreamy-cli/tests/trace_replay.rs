@@ -558,9 +558,10 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
     let canary = StallCanary::start(&h.rt);
     let mut serve = h.serve();
     let mut c = h.external_session();
-    let window = send_window(Instant::now(), &want);
+    let before_replay = Instant::now();
     let p = h.replay(dir, &[]);
     let id = p.attached();
+    let window = send_window(before_replay, Instant::now(), &want);
     c.source("producing", |e| {
         e["state"] == "producing" && e["attachment"] == id
     });
@@ -648,13 +649,13 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
     .map(drop)
 }
 
-/// From just before the producer starts until the trace's last frame is due, at its dts pace.
-fn send_window(before_replay: Instant, want: &Expected) -> (Instant, Instant) {
+/// From just before the producer starts until its last frame is due, at the trace's dts pace from its attachment.
+fn send_window(before_replay: Instant, attached: Instant, want: &Expected) -> (Instant, Instant) {
     let dts = || want.video.iter().chain(&want.audio).map(|s| s.dts_usec);
     let span = dts().max().unwrap_or(0) - dts().min().unwrap_or(0);
     (
         before_replay,
-        before_replay + Duration::from_micros(span.unsigned_abs()),
+        attached.max(before_replay) + Duration::from_micros(span.unsigned_abs()),
     )
 }
 
@@ -667,7 +668,9 @@ fn overflow_explained(
 ) -> bool {
     let stats = &status["stats"];
     stats["last_error"].is_null()
-        && stats["keyframe_requests"].as_u64().is_some_and(|n| n > 0)
+        && stats["video_queue_overflows"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
         && stalls_fill_queue(stalls, window, fps)
 }
 
@@ -1148,7 +1151,8 @@ fn serve_drops(status: &Value, stalls: &[Stall], origin: Instant) -> Option<Stri
         .as_u64()
         .filter(|&n| n > 0)?;
     Some(format!(
-        "serve dropped {dropped} video frames ({} keyframe requests, last error {}); {}",
+        "serve dropped {dropped} video frames ({} queue overflows, {} keyframe requests, last error {}); {}",
+        status["stats"]["video_queue_overflows"],
         status["stats"]["keyframe_requests"],
         status["stats"]["last_error"],
         stall_summary(stalls, origin)
@@ -1421,9 +1425,14 @@ fn the_send_window_starts_before_the_replay_and_spans_the_trace() {
         audio: vec![sent(-20_000), sent(4_980_000)],
     };
     let before = Instant::now();
-    let (from, to) = send_window(before, &want);
-    assert_eq!(from, before);
-    assert_eq!(to - from, Duration::from_secs(5));
+    let attached = before + Duration::from_millis(300);
+    let (from, to) = send_window(before, attached, &want);
+    assert_eq!(from, before, "starts before the producer could send");
+    assert_eq!(
+        to - attached,
+        Duration::from_secs(5),
+        "ends a trace span after the attachment"
+    );
 }
 
 #[test]
@@ -1434,7 +1443,8 @@ fn only_queue_overflow_without_errors_is_excused() {
         origin + Duration::from_secs(1),
         origin + Duration::from_millis(1_300),
     )];
-    let status = |last_error: Value, requests: u64| serde_json::json!({"stats": {"last_error": last_error, "keyframe_requests": requests, "video_frames_dropped": 40}});
+    // Every session has keyframe requests (attach, viewer PLIs, DAVE); only the overflow count tells an overflow.
+    let status = |last_error: Value, overflows: u64| serde_json::json!({"stats": {"last_error": last_error, "video_queue_overflows": overflows, "keyframe_requests": 5, "video_frames_dropped": 40}});
     assert!(overflow_explained(
         &status(Value::Null, 2),
         &long,
@@ -1452,7 +1462,7 @@ fn only_queue_overflow_without_errors_is_excused() {
     );
     assert!(
         !overflow_explained(&status(Value::Null, 0), &long, window, 30),
-        "an overflow asks for a keyframe"
+        "drops with keyframe requests but no overflow are not excused"
     );
     assert!(!overflow_explained(
         &status(Value::Null, 2),
