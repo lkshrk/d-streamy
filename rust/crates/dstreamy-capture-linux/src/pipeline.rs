@@ -28,6 +28,8 @@ const AUDIO_RETRY_FIRST: Duration = Duration::from_millis(500);
 const AUDIO_RETRY_MAX: Duration = Duration::from_secs(5);
 const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(10);
 const WARNING_LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// An abandoned start usually returns within milliseconds; only one blocked this long is reported.
+const AUDIO_STUCK_WARNING: Duration = Duration::from_secs(5);
 /// Longer than pipewiresrc's own 30 s start wait, which its flush cuts short.
 const AUDIO_ABANDON_FLUSH: Duration = Duration::from_secs(35);
 
@@ -699,8 +701,8 @@ struct AudioBranch {
     generation: u64,
     active: Option<gst::Bin>,
     job: Option<AttachJob>,
-    /// The last abandoned start, until its state change returns; no new start begins meanwhile.
-    blocked: Option<Arc<Mutex<JobState>>>,
+    /// The last abandoned start and when it was given up; no new start begins while it is inside its state change.
+    blocked: Option<(Arc<Mutex<JobState>>, Instant)>,
 }
 
 impl AudioBranch {
@@ -868,19 +870,19 @@ impl AudioBranch {
     /// Gives up a generation still starting, without waiting for it.
     fn abandon(&mut self) {
         if let Some(job) = self.job.take() {
-            self.blocked = Some(job.state.clone());
+            self.blocked = Some((job.state.clone(), Instant::now()));
             job.abandon();
         }
     }
 
-    /// Whether an abandoned start is still inside its state change, as with a source that ignores the flush.
-    fn still_blocked(&self) -> bool {
-        self.blocked.as_ref().is_some_and(|state| {
-            matches!(
-                *state.lock().unwrap_or_else(|e| e.into_inner()),
-                JobState::Abandoned
-            )
-        })
+    /// How long the abandoned start has been inside its state change, if it still is.
+    fn blocked_for(&self) -> Option<Duration> {
+        let (state, since) = self.blocked.as_ref()?;
+        let running = matches!(
+            *state.lock().unwrap_or_else(|e| e.into_inner()),
+            JobState::Abandoned
+        );
+        running.then(|| since.elapsed())
     }
 
     fn name(&self) -> String {
@@ -975,12 +977,30 @@ fn is_device_loss(err: &gst::message::Error) -> bool {
 struct WarningLog {
     last: Option<Instant>,
     held_back: u64,
+    latest: Option<String>,
 }
 
 impl WarningLog {
-    /// `Some` with a note on held-back warnings when this one should be logged.
-    /// The count held back once the interval after the last logged warning has passed, or at `stop`.
-    fn flush(&mut self, now: Instant, stop: bool) -> Option<u64> {
+    /// The line to log for a new warning, or `None` while it falls within the interval after the last logged one.
+    fn note(&mut self, now: Instant, text: String) -> Option<String> {
+        if self
+            .last
+            .is_some_and(|last| now < last + WARNING_LOG_INTERVAL)
+        {
+            self.held_back += 1;
+            self.latest = Some(text);
+            return None;
+        }
+        self.last = Some(now);
+        self.latest = None;
+        Some(match std::mem::take(&mut self.held_back) {
+            0 => text,
+            held => format!("{text} ({held} more since the last one logged)"),
+        })
+    }
+
+    /// The latest held-back warning with their count, once the interval has passed or at `stop`.
+    fn flush(&mut self, now: Instant, stop: bool) -> Option<String> {
         let due = stop
             || self
                 .last
@@ -989,24 +1009,11 @@ impl WarningLog {
             return None;
         }
         self.last = Some(now);
-        Some(std::mem::take(&mut self.held_back))
-    }
-
-    fn note(&mut self, now: Instant) -> Option<String> {
-        if self
-            .last
-            .is_some_and(|last| now < last + WARNING_LOG_INTERVAL)
-        {
-            self.held_back += 1;
-            return None;
-        }
-        self.last = Some(now);
         let held = std::mem::take(&mut self.held_back);
-        Some(if held > 0 {
-            format!(" ({held} more since the last one logged)")
-        } else {
-            String::new()
-        })
+        let text = self.latest.take().unwrap_or_default();
+        Some(format!(
+            "{text} ({held} like this since the last one logged)"
+        ))
     }
 }
 
@@ -1428,11 +1435,11 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
     let mut told_blocked = false;
     let flush_warnings = |audio: &mut WarningLog, other: &mut WarningLog, stop: bool| {
         let now = Instant::now();
-        if let Some(n) = audio.flush(now, stop) {
-            tracing::warn!("{n} more audio warnings like the last one logged");
-        }
-        if let Some(n) = other.flush(now, stop) {
-            tracing::warn!("{n} more pipeline warnings like the last one logged");
+        for line in [audio.flush(now, stop), other.flush(now, stop)]
+            .into_iter()
+            .flatten()
+        {
+            tracing::warn!("{line}");
         }
     };
     let mut retry = AudioRetry::default();
@@ -1482,8 +1489,8 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
                     }
                 }
             } else if retry.due(Instant::now()) {
-                if branch.still_blocked() {
-                    if !told_blocked {
+                if let Some(blocked) = branch.blocked_for() {
+                    if !told_blocked && blocked >= AUDIO_STUCK_WARNING {
                         told_blocked = true;
                         tracing::warn!(
                             "audio source {}: an earlier start is still stuck in the audio server; \
@@ -1526,9 +1533,9 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
             } else {
                 &mut other_warnings
             };
-            if let Some(repeated) = log.note(Instant::now()) {
-                let detail = w.debug().map(|d| format!(" ({d})")).unwrap_or_default();
-                tracing::warn!("{src}: {}{detail}{repeated}", w.error());
+            let detail = w.debug().map(|d| format!(" ({d})")).unwrap_or_default();
+            if let Some(line) = log.note(Instant::now(), format!("{src}: {}{detail}", w.error())) {
+                tracing::warn!("{line}");
             }
             continue;
         }
@@ -2578,31 +2585,37 @@ mod tests {
     fn pipeline_warnings_are_logged_at_most_once_per_interval_with_a_count() {
         let t0 = Instant::now();
         let mut log = WarningLog::default();
-        assert_eq!(log.note(t0).as_deref(), Some(""));
-        assert_eq!(log.note(t0 + Duration::from_secs(1)), None);
-        assert_eq!(log.note(t0 + Duration::from_secs(2)), None);
+        let w = |n: u32| format!("warning {n}");
+        assert_eq!(log.note(t0, w(1)), Some(w(1)));
+        assert_eq!(log.note(t0 + Duration::from_secs(1), w(2)), None);
+        assert_eq!(log.note(t0 + Duration::from_secs(2), w(3)), None);
         assert_eq!(
-            log.note(t0 + WARNING_LOG_INTERVAL).as_deref(),
-            Some(" (2 more since the last one logged)")
+            log.note(t0 + WARNING_LOG_INTERVAL, w(4)).as_deref(),
+            Some("warning 4 (2 more since the last one logged)")
         );
-        assert_eq!(log.note(t0 + WARNING_LOG_INTERVAL * 2).as_deref(), Some(""));
+        assert_eq!(log.note(t0 + WARNING_LOG_INTERVAL * 2, w(5)), Some(w(5)));
     }
 
     #[test]
-    fn held_back_warnings_are_counted_out_after_the_interval_or_at_stop() {
+    fn held_back_warnings_are_logged_with_the_latest_text_after_the_interval_or_at_stop() {
         let t0 = Instant::now();
         let mut log = WarningLog::default();
+        let w = |n: u32| format!("warning {n}");
         assert_eq!(log.flush(t0, true), None);
-        log.note(t0);
-        log.note(t0 + Duration::from_secs(1));
-        log.note(t0 + Duration::from_secs(2));
+        log.note(t0, w(1));
+        log.note(t0 + Duration::from_secs(1), w(2));
+        log.note(t0 + Duration::from_secs(2), w(3));
         assert_eq!(log.flush(t0 + Duration::from_secs(3), false), None);
-        assert_eq!(log.flush(t0 + WARNING_LOG_INTERVAL, false), Some(2));
-        assert_eq!(log.flush(t0 + WARNING_LOG_INTERVAL * 2, false), None);
-        log.note(t0 + WARNING_LOG_INTERVAL + Duration::from_secs(1));
         assert_eq!(
-            log.flush(t0 + WARNING_LOG_INTERVAL + Duration::from_secs(2), true),
-            Some(1)
+            log.flush(t0 + WARNING_LOG_INTERVAL, false).as_deref(),
+            Some("warning 3 (2 like this since the last one logged)")
+        );
+        assert_eq!(log.flush(t0 + WARNING_LOG_INTERVAL * 2, false), None);
+        log.note(t0 + WARNING_LOG_INTERVAL + Duration::from_secs(1), w(4));
+        assert_eq!(
+            log.flush(t0 + WARNING_LOG_INTERVAL + Duration::from_secs(2), true)
+                .as_deref(),
+            Some("warning 4 (1 like this since the last one logged)")
         );
     }
 
@@ -2615,12 +2628,14 @@ mod tests {
             None,
             AudioOptions::default(),
         );
-        assert!(!branch.still_blocked());
+        assert!(branch.blocked_for().is_none());
         let state = Arc::new(Mutex::new(JobState::Abandoned));
-        branch.blocked = Some(state.clone());
-        assert!(branch.still_blocked());
+        branch.blocked = Some((state.clone(), Instant::now() - Duration::from_secs(2)));
+        assert!(branch.blocked_for().is_some());
+        let blocked = branch.blocked_for().unwrap();
+        assert!(blocked >= Duration::from_secs(2) && blocked < AUDIO_STUCK_WARNING);
         *state.lock().unwrap() = JobState::Taken;
-        assert!(!branch.still_blocked());
+        assert!(branch.blocked_for().is_none());
     }
 
     #[test]

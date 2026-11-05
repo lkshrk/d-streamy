@@ -144,12 +144,11 @@ pub enum AudioNotice {
 pub struct SilenceWarning {
     warned: bool,
     losses_seen: u64,
-    recoveries_seen: u64,
     owe_back_note: bool,
 }
 
 impl SilenceWarning {
-    /// `losses` and `recoveries` count every loss and return so far; each check reports the next one, in order.
+    /// `losses` and `recoveries` count every loss and its end so far; a burst between two checks is reported once, by its net state.
     pub fn check(
         &mut self,
         silent_for: Option<Duration>,
@@ -163,28 +162,31 @@ impl SilenceWarning {
                 |id| format!("audio source {id}"),
             )
         };
-        let back = self.owe_back_note && recoveries > self.recoveries_seen;
-        let new_loss = !self.owe_back_note && losses > self.losses_seen;
+        let new_losses = losses.saturating_sub(self.losses_seen);
+        let new_loss = !self.owe_back_note && new_losses > 0;
+        let back = self.owe_back_note && recoveries >= losses;
         if new_loss || back {
-            if new_loss {
-                self.losses_seen += 1;
-            } else {
-                self.recoveries_seen += 1;
-            }
+            self.losses_seen = losses;
             self.owe_back_note = new_loss;
             self.warned = true;
+            let times = if new_losses > 1 {
+                format!(" (lost {new_losses} times since the last check)")
+            } else {
+                String::new()
+            };
             return Some(if new_loss {
                 AudioNotice::Warn(match source {
                     Some(id) => format!(
                         "audio source {id} disappeared, so viewers hear silence; video keeps \
                          streaming and audio resumes from the same device when it is back, never \
                          from another one. Restart or reconnect it, or stop and pick another from \
-                         `dstreamy audio-sources`"
+                         `dstreamy audio-sources`{times}"
                     ),
-                    None => "audio capture from the default output was lost, so viewers hear \
-                             silence; video keeps streaming and audio resumes from whatever the \
-                             default output is once capture works again"
-                        .to_owned(),
+                    None => format!(
+                        "audio capture from the default output was lost, so viewers hear \
+                         silence; video keeps streaming and audio resumes from whatever the \
+                         default output is once capture works again{times}"
+                    ),
                 })
             } else {
                 AudioNotice::Note(format!("{} is back; viewers hear it again", device()))
@@ -591,6 +593,7 @@ mod tests {
         let id = Some("pipeweaver_stream");
         let mut check =
             |losses, recoveries| match w.check(Some(Duration::ZERO), losses, recoveries, id) {
+                Some(AudioNotice::Warn(text)) if text.contains("times since") => "warn many",
                 Some(AudioNotice::Warn(_)) => "warn",
                 Some(AudioNotice::Note(_)) => "back",
                 None => "-",
@@ -599,12 +602,41 @@ mod tests {
         assert_eq!(check(1, 1), "warn", "a loss that already ended");
         assert_eq!(check(1, 1), "back");
         assert_eq!(check(1, 1), "-");
-        assert_eq!(check(3, 2), "warn", "two more losses, the second still on");
-        assert_eq!(check(3, 2), "back", "the return between them");
-        assert_eq!(check(3, 2), "warn");
+        assert_eq!(check(3, 2), "warn many", "two losses, the second still on");
         assert_eq!(check(3, 2), "-", "still lost");
-        assert_eq!(check(3, 3), "back");
-        assert_eq!(check(3, 3), "-");
+        assert_eq!(check(6, 5), "-", "flapping while lost adds nothing");
+        assert_eq!(check(6, 6), "back");
+        assert_eq!(check(6, 6), "-");
+    }
+
+    #[test]
+    fn a_loss_ended_by_a_restart_gets_its_back_note_and_later_losses_still_warn() {
+        let mut w = SilenceWarning::default();
+        let id = Some("pipeweaver_stream");
+        let activity = dstreamy_media::AudioActivity::default();
+        activity.started();
+        let mut check = || {
+            w.check(
+                Some(Duration::ZERO),
+                activity.losses(),
+                activity.recoveries(),
+                id,
+            )
+        };
+        activity.lost();
+        assert!(matches!(check(), Some(AudioNotice::Warn(_))));
+        activity.stopped();
+        activity.started();
+        assert!(
+            matches!(check(), Some(AudioNotice::Note(_))),
+            "the restart ended the loss"
+        );
+        assert_eq!(check(), None);
+        activity.lost();
+        let Some(AudioNotice::Warn(again)) = check() else {
+            panic!("the next loss was not warned")
+        };
+        assert!(!again.contains("times since"), "{again}");
     }
 
     #[test]

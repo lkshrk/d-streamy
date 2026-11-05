@@ -46,7 +46,14 @@ impl AudioActivity {
 
     pub fn stopped(&self) {
         self.0.silent_since_ms.store(IDLE, Ordering::Relaxed);
-        self.0.lost.store(false, Ordering::Relaxed);
+        self.clear_lost();
+    }
+
+    /// Clears a loss and counts it as ended, so every loss has a matching recovery.
+    fn clear_lost(&self) {
+        if self.0.lost.swap(false, Ordering::Relaxed) {
+            self.0.recoveries.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The audio device went away; cleared by the next samples, from the same device once it is back.
@@ -84,16 +91,14 @@ impl AudioActivity {
     }
 
     fn started_at(&self, now: Instant) {
-        self.0.lost.store(false, Ordering::Relaxed);
+        self.clear_lost();
         self.0
             .silent_since_ms
             .store(self.ms(now), Ordering::Relaxed);
     }
 
     fn samples_at(&self, samples: impl IntoIterator<Item = i16>, now: Instant) {
-        if self.0.lost.swap(false, Ordering::Relaxed) {
-            self.0.recoveries.fetch_add(1, Ordering::Relaxed);
-        }
+        self.clear_lost();
         if samples.into_iter().any(|s| s.unsigned_abs() > SILENCE_PEAK) {
             self.heard_at(now);
         }
@@ -175,7 +180,16 @@ mod tests {
             2,
             "a loss stays counted after the device is back"
         );
-        assert_eq!(a.recoveries(), 1, "stopping is not a return");
+        assert_eq!(a.recoveries(), 2, "a stop ends the loss too");
+        a.started();
+        assert_eq!(a.recoveries(), 2, "a start without a loss counts nothing");
+        a.lost();
+        a.started();
+        assert_eq!(
+            (a.losses(), a.recoveries()),
+            (3, 3),
+            "a restart ends a loss"
+        );
     }
 
     #[test]

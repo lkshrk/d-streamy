@@ -655,7 +655,7 @@ fn send_window(before_replay: Instant, attached: Instant, want: &Expected) -> (I
     let span = dts().max().unwrap_or(0) - dts().min().unwrap_or(0);
     (
         before_replay,
-        attached.max(before_replay) + Duration::from_micros(span.unsigned_abs()),
+        attached + Duration::from_micros(span.unsigned_abs()),
     )
 }
 
