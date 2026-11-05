@@ -2,10 +2,12 @@
 // Windows has no service client yet, so only the lists and the stop signal reach the thread there.
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
+use std::cell::Cell;
 use std::ffi::{CString, c_void};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -292,11 +294,18 @@ pub fn start(_wait: Wait) {
 pub fn stop(_wait: Wait) {}
 
 /// The output the dialog starts; the control thread alone creates, starts, stops and releases it.
-struct Output(Option<OutputPtr>);
+struct Output {
+    ptr: Option<OutputPtr>,
+    /// A start libobs accepted whose "stop" hasn't been seen: `active` stays false until the worker connects.
+    started: Cell<bool>,
+}
+
+/// Counts the output's "stop" signals, so a stop can wait for one it caused.
+static STOPS: AtomicU64 = AtomicU64::new(0);
 
 impl Output {
     fn get(&mut self) -> Result<OutputPtr, String> {
-        if let Some(output) = self.0 {
+        if let Some(output) = self.ptr {
             return Ok(output);
         }
         // SAFETY: the type is registered at module load; a null settings object is allowed.
@@ -321,7 +330,7 @@ impl Output {
             );
         }
         let output = OutputPtr(raw);
-        self.0 = Some(output);
+        self.ptr = Some(output);
         // SAFETY: a weak reference to the live output, released in `release`.
         let weak = Watched(unsafe { sys::obs_output_get_weak_output(raw) });
         if let Some(old) = WATCHED
@@ -351,6 +360,7 @@ impl Output {
             sys::obs_output_update(output.0, data);
             sys::obs_data_release(data);
             if sys::obs_output_start(output.0) {
+                self.started.set(true);
                 return Ok(());
             }
             let error = text(sys::obs_output_get_last_error(output.0));
@@ -368,24 +378,43 @@ impl Output {
 
     fn active(&self) -> bool {
         // SAFETY: as in `start`.
-        self.0
+        self.ptr
             .is_some_and(|output| unsafe { sys::obs_output_active(output.0) })
     }
 
-    /// Stops the output through libobs and waits until it is inactive, or OBS's closing leaves no more time.
+    /// Stops the output, even one still connecting, and waits until it is inactive or OBS's closing leaves no more time.
     fn stop(&self, closing: &Closing) -> Result<(), String> {
-        let Some(output) = self.0.filter(|_| self.active()) else {
+        let Some(output) = self.ptr else {
             return Ok(());
         };
+        if self.active() {
+            // SAFETY: as in `start`.
+            unsafe { sys::obs_output_stop(output.0) };
+            return self.wait_inactive(closing);
+        }
+        if !self.started.get() {
+            return Ok(());
+        }
+        let stops = STOPS.load(Ordering::Acquire);
+        // obs_output_stop ignores an output whose capture hasn't begun; force_stop still calls the plugin's stop.
         // SAFETY: as in `start`.
-        unsafe { sys::obs_output_stop(output.0) };
-        self.wait_inactive(closing)
+        unsafe { sys::obs_output_force_stop(output.0) };
+        let stopped = self.wait_until(closing, || {
+            STOPS.load(Ordering::Acquire) != stops && !self.active()
+        });
+        self.started.set(false);
+        stopped
     }
 
     /// Waits until libobs has finished deactivating the output, or OBS's closing leaves no more time.
     fn wait_inactive(&self, closing: &Closing) -> Result<(), String> {
+        self.started.set(false);
+        self.wait_until(closing, || !self.active())
+    }
+
+    fn wait_until(&self, closing: &Closing, done: impl Fn() -> bool) -> Result<(), String> {
         let deadline = Instant::now() + OUTPUT_STOP_WAIT;
-        while self.active() {
+        while !done() {
             let now = Instant::now();
             if now >= deadline
                 || closing
@@ -403,7 +432,7 @@ impl Output {
     }
 
     fn last_error(&self) -> Option<String> {
-        let output = self.0?;
+        let output = self.ptr?;
         // SAFETY: as in `start`; libobs returns NULL or a string it owns.
         let error = unsafe { text(sys::obs_output_get_last_error(output.0)) };
         (!error.is_empty()).then_some(error)
@@ -418,7 +447,7 @@ impl Output {
             // SAFETY: the weak reference `get` took.
             unsafe { sys::obs_weak_output_release(weak.0) };
         }
-        if let Some(output) = self.0.take() {
+        if let Some(output) = self.ptr.take() {
             // SAFETY: release stops an active output first and joins its worker (output.rs `destroy`).
             unsafe {
                 sys::signal_handler_disconnect(
@@ -480,6 +509,7 @@ extern "C" fn on_stop(_data: *mut c_void, cd: *mut sys::calldata_t) {
             )
         };
         send(Job::OutputStopped(code));
+        STOPS.fetch_add(1, Ordering::AcqRel);
     });
 }
 
@@ -494,7 +524,10 @@ fn run(
     mut jobs: mpsc::UnboundedReceiver<Job>,
     closing: Closing,
 ) {
-    let mut output = Output(None);
+    let mut output = Output {
+        ptr: None,
+        started: Cell::new(false),
+    };
     runtime.block_on(async {
         while let Some(job) = jobs.recv().await {
             if matches!(job, Job::Shutdown) {
