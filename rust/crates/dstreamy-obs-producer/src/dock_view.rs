@@ -97,13 +97,12 @@ fn chosen_channel(m: &DockModel) -> Option<Option<&str>> {
     )
 }
 
-/// The dock and status bar; `controls`: this platform can start and stop; `live`: the output's stats while live;
-/// `blocked`: why Start must wait.
+/// The dock and status bar; `live`: the output's stats; `mic`: a mic Discord hears, or would on Go Live.
 pub fn dock_view(
     state: &ConfigState,
     controls: bool,
     live: Option<&LiveStats>,
-    blocked: Option<&MicGuard>,
+    mic: Option<&MicGuard>,
 ) -> DockView {
     let m = &state.model;
     let config_error = state.error();
@@ -121,15 +120,11 @@ pub fn dock_view(
         match m.state() {
             DockState::Idle => {
                 let chosen = chosen_channel(m);
+                let blocked = mic.filter(|g| !g.live);
                 let start = button(START, Action::Start, chosen.is_some() && blocked.is_none());
                 if let Some(guard) = blocked {
                     detail_tooltip = Some(guard.message());
-                    (
-                        Tone::Attention,
-                        MicGuard::HEADLINE.to_owned(),
-                        guard.fix(),
-                        start,
-                    )
+                    (Tone::Attention, guard.headline(), guard.fix(), start)
                 } else if let Some(problem) = m.problem() {
                     detail_tooltip = Some(joined(problem.message.clone(), config.as_deref()));
                     (
@@ -168,8 +163,18 @@ pub fn dock_view(
                     ),
                     _ => (short, full),
                 };
-                detail_tooltip = Some(tooltip);
+                let leak = mic.filter(|g| g.live);
+                detail_tooltip = Some(match leak {
+                    Some(guard) => format!("{}\n{tooltip}", guard.message()),
+                    None => tooltip,
+                });
                 match busy_or_live {
+                    DockState::Live { .. } if let Some(guard) = leak => (
+                        Tone::Attention,
+                        guard.headline(),
+                        guard.fix(),
+                        button(STOP, Action::Stop, true),
+                    ),
                     DockState::Live { channel, .. } => (
                         Tone::Live,
                         format!("Live · {channel}"),
@@ -193,6 +198,7 @@ pub fn dock_view(
         }
     };
     let (mark, status_bar) = match (tone, m.state()) {
+        (Tone::Attention, DockState::Live { .. }) => ("⚠", "⚠ D-Streamy live".to_owned()),
         (Tone::Attention, _) => ("⚠", "⚠ D-Streamy".to_owned()),
         (Tone::Live, _) => ("●", "● D-Streamy live".to_owned()),
         (_, DockState::Starting) => ("●", "D-Streamy starting…".to_owned()),
@@ -291,10 +297,11 @@ mod tests {
         let guard = MicGuard {
             track: 6,
             mics: vec!["Mic/Aux".into()],
+            live: false,
         };
         let v = dock_view(&picked(), true, None, Some(&guard));
         assert_eq!(v.tone, Tone::Attention);
-        assert_eq!(v.headline, "Discord would hear your mic");
+        assert_eq!(v.headline, "Discord would hear Mic/Aux");
         assert_eq!(v.detail, "Let D-Streamy manage Track 6");
         assert_eq!(v.detail_tooltip, guard.message());
         assert_eq!(v.button, button(START, Action::Start, false));
@@ -306,6 +313,32 @@ mod tests {
             "a running session is never held back"
         );
         assert!(live.button.enabled);
+    }
+
+    #[test]
+    fn a_mic_discord_hears_while_live_warns_and_keeps_streaming() {
+        let leak = MicGuard {
+            track: 6,
+            mics: vec!["Mic/Aux".into()],
+            live: true,
+        };
+        let v = dock_view(&live(), true, Some(&stats(true)), Some(&leak));
+        assert_eq!(v.tone, Tone::Attention);
+        assert_eq!(v.headline, "Discord hears Mic/Aux");
+        assert_eq!(v.detail, "Let D-Streamy manage Track 6");
+        assert!(
+            v.detail_tooltip.starts_with(&leak.message()),
+            "{}",
+            v.detail_tooltip
+        );
+        assert_eq!(
+            v.button,
+            button(STOP, Action::Stop, true),
+            "still streaming"
+        );
+        assert_eq!((v.mark, v.status_bar.as_str()), ("⚠", "⚠ D-Streamy live"));
+        let fine = dock_view(&live(), true, Some(&stats(true)), None);
+        assert_eq!(fine.tone, Tone::Live, "clears once resolved");
     }
 
     #[test]

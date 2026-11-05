@@ -37,13 +37,15 @@ pub enum AudioView {
         /// Sorted by name; empty when OBS has no audio source yet.
         sources: Vec<SourceRow>,
         empty: Option<String>,
+        /// A warning about the managed track itself.
+        note: Option<String>,
     },
 }
 
 /// OBS's global Mic/Aux channels, where Settings › Audio puts microphones (`OBSBasic::LoadData`).
 pub const MIC_AUX_CHANNELS: std::ops::RangeInclusive<u32> = 3..=6;
 
-/// Whether an unversioned source id captures an input device; no libobs flag tells them from media sources.
+/// Whether an unversioned source id captures an input device; video capture devices (mostly capture cards) don't.
 pub fn is_input_device(id: &str) -> bool {
     id.ends_with("_input_capture") || matches!(id, "jack_output_capture" | "sndio_output_capture")
 }
@@ -74,7 +76,12 @@ pub fn take_over_effect(track: u8) -> String {
 }
 
 pub const CONFIRM: &str = "Manage";
-pub const CANCEL: &str = "Cancel";
+pub const NOT_NOW: &str = "Not now";
+
+/// Shown while Track 1, OBS's own stream and recording track, is managed.
+pub const TRACK_1_NOTE: &str = "Track 1 is OBS's streaming and recording track, and D-Streamy turned it off \
+     on every source. To fix it, pick Track 6 for Discord, then turn Track 1 back on for each source in \
+     Edit › Advanced Audio Properties.";
 
 /// Names in one line: "Mic", "Mic and Headset", "Mic, Headset and Webcam".
 fn names(list: &[String]) -> String {
@@ -104,7 +111,7 @@ fn managed_help(track: u8) -> String {
     let t = track_name(track);
     format!(
         "Discord hears the ticked sources. Ticking turns {t} on for that source in Edit › Advanced Audio \
-         Properties, at once. Another track applies on the next Go Live and has to be taken over first."
+         Properties, at once. Another track applies on the next Go Live."
     )
 }
 
@@ -126,15 +133,24 @@ fn mics_on(track: u8, sources: &[AudioSource]) -> Vec<String> {
     mics.into_iter().map(|s| s.name.clone()).collect()
 }
 
-/// Go Live is held back: the track it would send is unmanaged and carries a microphone.
+/// A microphone feeds the unmanaged track Discord hears now, or would hear on Go Live.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicGuard {
     pub track: u8,
     pub mics: Vec<String>,
+    /// Discord hears it now; Go Live is otherwise held back.
+    pub live: bool,
 }
 
 impl MicGuard {
-    pub const HEADLINE: &'static str = "Discord would hear your mic";
+    pub fn headline(&self) -> String {
+        let who = names(&self.mics);
+        if self.live {
+            format!("Discord hears {who}")
+        } else {
+            format!("Discord would hear {who}")
+        }
+    }
 
     pub fn fix(&self) -> String {
         take_over_label(self.track)
@@ -143,22 +159,46 @@ impl MicGuard {
     pub fn message(&self) -> String {
         let t = track_name(self.track);
         let who = names(&self.mics);
-        let verb = if self.mics.len() == 1 { "is" } else { "are" };
+        let (verb, it) = if self.mics.len() == 1 {
+            ("is", "it")
+        } else {
+            ("are", "them")
+        };
+        let hears = if self.live {
+            format!("Discord hears {it} now")
+        } else {
+            format!("Discord would hear {it}")
+        };
         format!(
-            "{who} {verb} on {t}, so Discord would hear it. Let D-Streamy manage {t}, \
+            "{who} {verb} on {t}, so {hears}. Let D-Streamy manage {t}, \
              or turn {t} off for {who} in Edit › Advanced Audio Properties."
         )
     }
 }
 
-/// Why Go Live must wait, if the next start's track is unmanaged and a microphone feeds it.
+/// The mic Discord hears, or would hear on Go Live, from the unmanaged track it gets.
 pub fn mic_guard(model: &DockModel, sources: &[AudioSource]) -> Option<MicGuard> {
-    let track = model.settings().audio_track;
+    let track = model.heard_track();
     if model.manages(track) {
         return None;
     }
     let mics = mics_on(track, sources);
-    (!mics.is_empty()).then_some(MicGuard { track, mics })
+    (!mics.is_empty()).then_some(MicGuard {
+        track,
+        mics,
+        live: model.live_track().is_some(),
+    })
+}
+
+/// Cancel's mixer flags for one source: `touched` tracks as at open, or OBS's default for a source added since.
+pub fn restored_mixers(current: u32, at_open: Option<u32>, touched: u32, managed: u32) -> u32 {
+    let wanted = at_open.map_or(touched & !managed, |old| old & touched);
+    (current & !touched) | wanted
+}
+
+/// Cancel's managed tracks: only the `touched` ones go back; a takeover from elsewhere stays.
+pub fn restored_managed(current: u32, at_open: u32, touched: u32) -> u32 {
+    (current & !touched) | (at_open & touched)
 }
 
 /// The audio part for `track`, which may differ from the saved one while it is being picked or while live.
@@ -191,6 +231,7 @@ pub fn audio_view(model: &DockModel, track: u8, sources: &[AudioSource]) -> Audi
         help: managed_help(track),
         empty: rows.is_empty().then(|| NO_SOURCES.to_owned()),
         sources: rows,
+        note: (track == 1).then(|| TRACK_1_NOTE.to_owned()),
     }
 }
 
@@ -247,6 +288,11 @@ mod tests {
             "coreaudio_output_capture",
             "pipewire_audio_output_capture",
             "sck_audio_capture",
+            "dshow_input",
+            "macos-avcapture",
+            "av_capture_input",
+            "decklink-input",
+            "v4l2_input",
             "ffmpeg_source",
             "browser_source",
             "",
@@ -315,7 +361,8 @@ mod tests {
         ];
         let guard = mic_guard(&model(6, None), &sources).expect("held back");
         assert_eq!(guard.track, 6);
-        assert_eq!(MicGuard::HEADLINE, "Discord would hear your mic");
+        assert!(!guard.live);
+        assert_eq!(guard.headline(), "Discord would hear Mic/Aux");
         assert_eq!(guard.fix(), "Let D-Streamy manage Track 6");
         assert_eq!(
             guard.message(),
@@ -323,11 +370,12 @@ mod tests {
              or turn Track 6 off for Mic/Aux in Edit › Advanced Audio Properties."
         );
         let two = [mic("m", "Mic", 0b10_0000), mic("w", "Webcam", 0b10_0000)];
-        assert!(
-            mic_guard(&model(6, None), &two)
-                .unwrap()
-                .message()
-                .starts_with("Mic and Webcam are on Track 6"),
+        let both = mic_guard(&model(6, None), &two).unwrap();
+        assert_eq!(both.headline(), "Discord would hear Mic and Webcam");
+        assert_eq!(
+            both.message(),
+            "Mic and Webcam are on Track 6, so Discord would hear them. Let D-Streamy manage Track 6, \
+             or turn Track 6 off for Mic and Webcam in Edit › Advanced Audio Properties."
         );
 
         assert_eq!(mic_guard(&model(6, Some(6)), &sources), None, "managed");
@@ -346,6 +394,104 @@ mod tests {
             Some(3),
             "the next start's track counts"
         );
+    }
+
+    fn live_on(mut m: DockModel) -> DockModel {
+        m.start(crate::dock::Canvas {
+            fps_num: 30,
+            fps_den: 1,
+            output_width: 1280,
+            output_height: 720,
+        })
+        .ok();
+        m.claim(None);
+        m.started(Ok(crate::control::Started {
+            ownership: None,
+            channel: "c".into(),
+        }));
+        m
+    }
+
+    fn picked(track: u8, managed: Option<u8>) -> DockModel {
+        let mut m = DockModel::new(DockSettings {
+            guild_id: Some("g".into()),
+            channel_id: Some("c".into()),
+            audio_track: track,
+            ..DockSettings::default()
+        });
+        if let Some(t) = managed {
+            m.take_over(t);
+        }
+        m
+    }
+
+    #[test]
+    fn while_live_the_guard_follows_the_track_discord_hears() {
+        let sources = [mic("m", "Mic/Aux", 0b11_1111)];
+        let mut m = live_on(picked(6, None));
+        let guard = mic_guard(&m, &sources).expect("the mic leaks");
+        assert!(guard.live);
+        assert_eq!(guard.headline(), "Discord hears Mic/Aux");
+        assert_eq!(
+            guard.message(),
+            "Mic/Aux is on Track 6, so Discord hears it now. Let D-Streamy manage Track 6, \
+             or turn Track 6 off for Mic/Aux in Edit › Advanced Audio Properties."
+        );
+        m.select_audio_track(3);
+        m.take_over(3);
+        assert_eq!(
+            mic_guard(&m, &sources).map(|g| g.track),
+            Some(6),
+            "the live track counts, not the next pick"
+        );
+        m.take_over(6);
+        assert_eq!(mic_guard(&m, &sources), None, "resolved once managed");
+    }
+
+    #[test]
+    fn cancel_puts_back_only_the_touched_tracks() {
+        let six = track_bit(6);
+        assert_eq!(
+            restored_mixers(0b01_1111, Some(0b11_1111), six, 0),
+            0b11_1111
+        );
+        assert_eq!(
+            restored_mixers(0b11_1111, Some(0b01_1111), six, 0),
+            0b01_1111
+        );
+        assert_eq!(
+            restored_mixers(0b01_1110, Some(0b11_1111), six, 0),
+            0b11_1110,
+            "Track 1 changed elsewhere stays"
+        );
+        assert_eq!(
+            restored_mixers(0b1101_1111, None, six, 0),
+            0b1111_1111,
+            "a source added since gets OBS's default"
+        );
+        assert_eq!(
+            restored_mixers(0b1101_1111, None, six, six),
+            0b1101_1111,
+            "still managed: a new source starts without it"
+        );
+        assert_eq!(
+            restored_managed(six | track_bit(3), 0, six),
+            track_bit(3),
+            "a takeover from the panel stays"
+        );
+        assert_eq!(restored_managed(0, six, six), six, "managed at open stays");
+    }
+
+    #[test]
+    fn a_managed_track_1_warns_about_streams_and_recordings() {
+        let AudioView::Managed { note, .. } = audio_view(&model(1, Some(1)), 1, &[]) else {
+            panic!()
+        };
+        assert_eq!(note.as_deref(), Some(TRACK_1_NOTE));
+        let AudioView::Managed { note, .. } = audio_view(&model(6, Some(6)), 6, &[]) else {
+            panic!()
+        };
+        assert_eq!(note, None);
     }
 
     #[test]
@@ -396,6 +542,7 @@ mod tests {
             empty,
             help,
             track,
+            ..
         } = v
         else {
             panic!("{v:?}")
@@ -427,6 +574,7 @@ mod tests {
                 help: managed_help(2),
                 sources: vec![],
                 empty: Some(NO_SOURCES.to_owned()),
+                note: None,
             }
         );
     }

@@ -346,8 +346,9 @@ void render()
 	bool managed = audio.value("managed").toBool();
 	QJsonValue confirm = audio.value("confirm");
 	bool confirming = confirm.isObject();
-	ui.audio_line->setText(audio.value("line").toString());
-	ui.audio_line->setVisible(!managed && !confirming);
+	QString line = audio.value("line").toString();
+	ui.audio_line->setText(line);
+	ui.audio_line->setVisible(!confirming && !line.isEmpty());
 	QString manage = audio.value("manage").toString();
 	ui.manage->setText(manage);
 	ui.manage->setVisible(!managed && !confirming && !manage.isEmpty());

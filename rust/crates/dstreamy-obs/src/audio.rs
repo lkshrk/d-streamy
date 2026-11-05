@@ -9,7 +9,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use dstreamy_obs_producer::mixer::{
-    AudioSource, MIC_AUX_CHANNELS, MicGuard, is_input_device, mic_guard as guard_for, with_track,
+    AudioSource, MIC_AUX_CHANNELS, MicGuard, is_input_device, mic_guard as guard_for,
+    restored_managed, restored_mixers, track_bit, with_track,
 };
 use dstreamy_obs_sys as sys;
 
@@ -186,13 +187,20 @@ pub fn mixers() -> Mixers {
     sources().into_iter().map(|s| (s.uuid, s.mixers)).collect()
 }
 
-/// Puts `tracks` back as `before` had them and the managed tracks as `managed`; sources added since get OBS's default.
-pub fn restore(before: &[(String, u32)], tracks: u32, managed: u32) {
+/// Puts the `touched` tracks back as they were when a dialog opened; the managed tracks too.
+pub fn restore(before: &[(String, u32)], touched: u32, managed_at_open: u32) {
+    let managed = change(|c, _| {
+        let managed = restored_managed(c.model.managed_mixers(), managed_at_open, touched);
+        c.model.collection_loaded(managed);
+        managed
+    });
     let mut changed = 0;
     for source in sources() {
-        let old = before.iter().find(|(uuid, _)| *uuid == source.uuid);
-        let wanted = old.map_or(tracks & !managed, |(_, mixers)| mixers & tracks);
-        let next = (source.mixers & !tracks) | wanted;
+        let old = before
+            .iter()
+            .find(|(uuid, _)| *uuid == source.uuid)
+            .map(|(_, mixers)| *mixers);
+        let next = restored_mixers(source.mixers, old, touched, managed);
         if next != source.mixers {
             with_source(&source.uuid, |s| {
                 APPLYING.with(|a| a.set(true));
@@ -203,7 +211,6 @@ pub fn restore(before: &[(String, u32)], tracks: u32, managed: u32) {
             changed += 1;
         }
     }
-    change(|c, _| c.model.collection_loaded(managed));
     log::info(&format!(
         "D-Streamy put back the Discord tracks on {changed} audio sources"
     ));
@@ -214,24 +221,34 @@ pub fn restore(before: &[(String, u32)], tracks: u32, managed: u32) {
 /// # Safety
 /// `modules` is live or NULL.
 pub unsafe fn collection_loading(modules: *mut sys::obs_data_t) {
-    let managed = if modules.is_null() {
-        0
+    let saved = if modules.is_null() {
+        None
     } else {
         // SAFETY: the caller's contract; the object reference is released below.
         unsafe {
             let ours = sys::obs_data_get_obj(modules, COLLECTION_KEY.as_ptr());
-            let managed = if ours.is_null() {
-                0
-            } else {
-                sys::obs_data_get_int(ours, MANAGED_MIXERS.as_ptr())
-            };
+            let saved =
+                (!ours.is_null()).then(|| sys::obs_data_get_int(ours, MANAGED_MIXERS.as_ptr()));
             sys::obs_data_release(ours);
-            managed
+            saved
         }
     };
-    let managed = u32::try_from(managed).unwrap_or(0);
-    change(|c, _| c.model.collection_loaded(managed));
-    if managed != 0 {
+    let (managed, adopted) = change(|c, p| {
+        let adopted = c.edit(p.write(), |m| m.take_adoption());
+        let managed = match (saved, adopted) {
+            (Some(saved), _) => u32::try_from(saved).unwrap_or(0),
+            (None, Some(track)) => track_bit(track),
+            (None, None) => 0,
+        };
+        c.model.collection_loaded(managed);
+        (managed, adopted.filter(|_| saved.is_none()))
+    });
+    if let Some(track) = adopted {
+        log::info(&format!(
+            "D-Streamy managed Track {track} before it kept this per scene collection: \
+             this scene collection keeps it, its mixer flags unchanged"
+        ));
+    } else if managed != 0 {
         log::info(&format!(
             "this scene collection's Discord tracks managed by D-Streamy: {managed:#08b}"
         ));
@@ -270,8 +287,15 @@ fn left_collection() {
     request_refresh();
 }
 
+enum Request {
+    Refresh,
+    /// Decide a possible Cancel once the UI thread finished the call that raised it.
+    Settle,
+    Stop,
+}
+
 struct Refresher {
-    requests: Sender<bool>,
+    requests: Sender<Request>,
     thread: JoinHandle<()>,
 }
 
@@ -281,8 +305,20 @@ static REFRESHER: Mutex<Option<Refresher>> = Mutex::new(None);
 pub fn request_refresh() {
     let refresher = REFRESHER.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(r) = refresher.as_ref() {
-        let _ = r.requests.send(true);
+        let _ = r.requests.send(Request::Refresh);
     }
+}
+
+/// Runs `settings_source::settle` on the UI thread after the current UI call returns.
+pub fn request_settle() {
+    let refresher = REFRESHER.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(r) = refresher.as_ref() {
+        let _ = r.requests.send(Request::Settle);
+    }
+}
+
+extern "C" fn settle_task(_param: *mut c_void) {
+    guard("settings settle", (), settings_source::settle);
 }
 
 fn refresh_later() {
@@ -291,14 +327,32 @@ fn refresh_later() {
     }
 }
 
-fn run_refresher(requests: mpsc::Receiver<bool>) {
-    while let Ok(true) = requests.recv() {
-        std::thread::sleep(REFRESH_DELAY);
-        let mut stop = false;
+/// Queues a settle at once, and notes a refresh or stop for the caller.
+fn take(request: Request, refresh: &mut bool, stop: &mut bool) {
+    match request {
+        // SAFETY: queued from this thread, so OBS runs it later on its UI thread.
+        Request::Settle => unsafe {
+            sys::obs_queue_task(sys::OBS_TASK_UI, Some(settle_task), ptr::null_mut(), false)
+        },
+        Request::Refresh => *refresh = true,
+        Request::Stop => *stop = true,
+    }
+}
+
+fn run_refresher(requests: mpsc::Receiver<Request>) {
+    while let Ok(first) = requests.recv() {
+        let (mut refresh, mut stop) = (false, false);
+        take(first, &mut refresh, &mut stop);
         while let Ok(more) = requests.try_recv() {
-            stop |= !more;
+            take(more, &mut refresh, &mut stop);
         }
-        guard("audio refresh", (), settings_source::refresh);
+        if refresh {
+            std::thread::sleep(REFRESH_DELAY);
+            while let Ok(more) = requests.try_recv() {
+                take(more, &mut refresh, &mut stop);
+            }
+            guard("audio refresh", (), settings_source::refresh);
+        }
         if stop {
             return;
         }
@@ -460,7 +514,7 @@ pub fn shutdown() {
         .unwrap_or_else(PoisonError::into_inner)
         .take();
     if let Some(r) = refresher {
-        let _ = r.requests.send(false);
+        let _ = r.requests.send(Request::Stop);
         if r.thread.join().is_err() {
             log::warn("the D-Streamy refresh thread panicked");
         }

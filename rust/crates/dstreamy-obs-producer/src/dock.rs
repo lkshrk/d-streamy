@@ -53,6 +53,9 @@ pub struct DockSettings {
     pub audio_track: u8,
     pub owned: Option<Ownership>,
     pub config_version: u32,
+    /// A track managed under the old global setting, for the first scene collection that loads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adopt_managed_track: Option<u8>,
 }
 
 impl Default for DockSettings {
@@ -69,6 +72,7 @@ impl Default for DockSettings {
             audio_track: DEFAULT_AUDIO_TRACK,
             owned: None,
             config_version: CONFIG_VERSION,
+            adopt_managed_track: None,
         }
     }
 }
@@ -88,6 +92,12 @@ impl DockSettings {
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
         }
         let version = field::<u32>(&map, "config_version").unwrap_or(0);
+        let adopt = if version >= CONFIG_VERSION {
+            field::<u8>(&map, "adopt_managed_track")
+        } else {
+            field::<u8>(&map, "managed_track")
+        }
+        .filter(|t| AUDIO_TRACKS.contains(t));
         let bitrate = map
             .get("bitrate_kbps")
             .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
@@ -107,10 +117,13 @@ impl DockSettings {
                         .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))
                 })
                 .and_then(|n| u8::try_from(n).ok())
-                .filter(|&t| version >= CONFIG_VERSION || t != LEGACY_DEFAULT_TRACK)
+                .filter(|&t| {
+                    version >= CONFIG_VERSION || t != LEGACY_DEFAULT_TRACK || adopt == Some(t)
+                })
                 .unwrap_or(d.audio_track),
             owned: field(&map, "owned"),
             config_version: CONFIG_VERSION,
+            adopt_managed_track: adopt,
         }
         .clamped()
     }
@@ -121,6 +134,9 @@ impl DockSettings {
                 .bitrate_kbps
                 .clamp(*BITRATE_KBPS.start(), *BITRATE_KBPS.end()),
             grace_secs: self.grace_secs.map(|s| s.min(MAX_GRACE_SECS)),
+            adopt_managed_track: self
+                .adopt_managed_track
+                .filter(|t| AUDIO_TRACKS.contains(t)),
             audio_track: if AUDIO_TRACKS.contains(&self.audio_track) {
                 self.audio_track
             } else {
@@ -337,6 +353,11 @@ impl DockModel {
     /// A scene collection was loaded, or left (`0`); its saved mixer bits say which tracks D-Streamy manages there.
     pub fn collection_loaded(&mut self, managed_mixers: u32) {
         self.managed_mixers = managed_mixers & ((1 << AUDIO_TRACKS.end()) - 1);
+    }
+
+    /// The legacy managed track, once: the first scene collection that loads takes it.
+    pub fn take_adoption(&mut self) -> Option<u8> {
+        self.settings.adopt_managed_track.take()
     }
 
     /// The track Discord hears now while a session runs, else the one the next Go Live binds.
@@ -913,9 +934,51 @@ mod tests {
             "Track 1 picked after the move stays"
         );
         assert!(
-            !saved.contains("managed_track"),
+            !saved.contains("\"managed_track\"") && !saved.contains("adopt_managed_track"),
             "the managed track lives in the scene collection: {saved}"
         );
+    }
+
+    #[test]
+    fn a_track_managed_under_the_old_global_setting_is_adopted_once() {
+        let s = DockSettings::from_json(r#"{"audio_track":6,"managed_track":6}"#);
+        assert_eq!((s.audio_track, s.adopt_managed_track), (6, Some(6)));
+        let deliberate = DockSettings::from_json(r#"{"audio_track":1,"managed_track":1}"#);
+        assert_eq!(
+            (deliberate.audio_track, deliberate.adopt_managed_track),
+            (1, Some(1)),
+            "a Track 1 takeover was deliberate and stays"
+        );
+        let other = DockSettings::from_json(r#"{"audio_track":1,"managed_track":3}"#);
+        assert_eq!((other.audio_track, other.adopt_managed_track), (6, Some(3)));
+        for bad in ["0", "7", "\"6\"", "null"] {
+            let s =
+                DockSettings::from_json(&format!(r#"{{"audio_track":6,"managed_track":{bad}}}"#));
+            assert_eq!(s.adopt_managed_track, None, "{bad}");
+        }
+        let current =
+            DockSettings::from_json(r#"{"audio_track":6,"managed_track":6,"config_version":2}"#);
+        assert_eq!(
+            current.adopt_managed_track, None,
+            "the old field counts only before version 2"
+        );
+
+        let mut m = DockModel::new(s_with_adoption());
+        let saved = m.settings().to_json();
+        assert_eq!(
+            DockSettings::from_json(&saved).adopt_managed_track,
+            Some(6),
+            "kept until a collection loads: {saved}"
+        );
+        assert_eq!(m.take_adoption(), Some(6));
+        assert_eq!(m.take_adoption(), None, "once");
+        let saved = m.settings().to_json();
+        assert_eq!(DockSettings::from_json(&saved).adopt_managed_track, None);
+        assert!(!saved.contains("managed_track\":6"), "{saved}");
+    }
+
+    fn s_with_adoption() -> DockSettings {
+        DockSettings::from_json(r#"{"audio_track":6,"managed_track":6}"#)
     }
 
     #[test]

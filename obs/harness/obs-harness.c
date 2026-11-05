@@ -76,6 +76,7 @@ const char *restart_output_settings;
 	bool mixer_session;
 	bool mixer_cancel;
 	bool collection_session;
+	bool collection_adopt;
 	const char *then_update;
 	const char *tools_expect;
 	const char *tools_stop_after;
@@ -632,6 +633,8 @@ static void usage(void)
 		"   add a source, then Cancel, reporting every source's mixers)]\n"
 		"  [--collection-session (with --fake-frontend: take Track 6 over in one scene collection, switch to\n"
 		"   another and back as OBSBasic does, reporting mixers, the saved module data and the dialog)]\n"
+		"  [--collection-adopt (with --fake-frontend: load one scene collection without D-Streamy data, report\n"
+		"   its mixers and the dialog, then save it)]\n"
 		"  [--audio-mixers MASK (route the harness audio source to these mixer tracks only, as Advanced Audio\n"
 		"   Properties > Tracks does: bit 0 is Track 1; default all six)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
@@ -700,6 +703,10 @@ static int parse_args(int argc, char **argv)
 		}
 		if (strcmp(a, "--collection-session") == 0) {
 			args.collection_session = true;
+			continue;
+		}
+		if (strcmp(a, "--collection-adopt") == 0) {
+			args.collection_adopt = true;
 			continue;
 		}
 		if (strcmp(a, "--tools-wait-end") == 0) {
@@ -960,7 +967,7 @@ static bool load_fake_frontend(void)
 	return fake_frontend != NULL;
 }
 
-// OBSBasic::closeWindow sends the exit event after ClearSceneData and before obs_shutdown.
+// OBSBasic::closeWindow: saveAll, ClearSceneData with its cleanup event, then the exit event, before obs_shutdown.
 static void fake_frontend_exit(void)
 {
 	size_t (*fire)(void) = (size_t (*)(void))dlsym(fake_frontend, "fake_frontend_exit");
@@ -1010,6 +1017,34 @@ static void report_settings_properties(obs_source_t *source, const char *when)
 	printf("HARNESS pick when=%s guild_id=%s channel_id=%s\n", when, obs_data_get_string(settings, "guild_id"),
 	       obs_data_get_string(settings, "channel_id"));
 	obs_data_release(settings);
+}
+
+// OBSBasicProperties::CheckSettings: closing asks Save/Discard/Cancel when the JSON differs from its copy.
+static bool check_settings(obs_source_t *dialog, obs_data_t *old_settings, const char *when)
+{
+	obs_data_t *settings = obs_source_get_settings(dialog);
+	bool differ = strcmp(obs_data_get_json(settings), obs_data_get_json(old_settings)) != 0;
+	obs_data_release(settings);
+	printf("HARNESS check_settings when=%s differ=%d\n", when, differ);
+	return !differ;
+}
+
+// UI tasks queued from other threads, such as the plugin's settle after a Cancel.
+static void settle_ui_tasks(void)
+{
+	for (int i = 0; i < 30; i++) {
+		os_sleep_ms(10);
+		run_ui_tasks();
+	}
+}
+
+static obs_data_t *copy_settings(obs_source_t *dialog)
+{
+	obs_data_t *copy = obs_data_create();
+	obs_data_t *settings = obs_source_get_settings(dialog);
+	obs_data_apply(copy, settings);
+	obs_data_release(settings);
+	return copy;
 }
 
 static obs_source_t *open_settings_dialog(void)
@@ -1200,8 +1235,12 @@ static bool settings_dialog(const char *update)
 		obs_data_clear(settings);
 		obs_data_release(settings);
 		obs_source_update(source, old_settings);
+		settle_ui_tasks();
+		check_settings(source, old_settings, "cancelled");
 		report_settings_properties(source, "cancelled");
 	}
+	if (!update)
+		check_settings(source, old_settings, "close");
 	obs_data_release(old_settings);
 	close_settings_dialog(source);
 	if (!update)
@@ -1451,6 +1490,30 @@ static void report_source_mixers(const char *when, obs_source_t *source)
 	       obs_source_get_audio_mixers(source));
 }
 
+// A Cancel with the managed track at open: tick Music off, then Cancel.
+static bool cancel_while_managed(obs_source_t *music)
+{
+	obs_source_t *dialog = open_settings_dialog();
+	if (!dialog) {
+		harness_error("the settings dialog did not reopen");
+		return false;
+	}
+	obs_data_t *old_settings = copy_settings(dialog);
+	report_settings_properties(dialog, "managed_open");
+	bool ok = tick_source(dialog, "Music", false);
+	run_ui_tasks();
+	report_source_mixers("managed_ticked", music);
+	cancel_settings_dialog(dialog, old_settings);
+	settle_ui_tasks();
+	ok = check_settings(dialog, old_settings, "managed_cancelled") && ok;
+	obs_data_release(old_settings);
+	report_source_mixers("managed_cancelled", music);
+	report_settings_properties(dialog, "managed_cancelled");
+	close_settings_dialog(dialog);
+	run_ui_tasks();
+	return ok;
+}
+
 static bool mixer_cancel(void)
 {
 	obs_register_source(&mixer_source_info);
@@ -1462,30 +1525,31 @@ static bool mixer_cancel(void)
 	bool ok = music && voice && gone;
 	if (!ok)
 		harness_error("could not create the mixer sources");
-	for (obs_source_t **s = (obs_source_t *[]){music, voice, gone, NULL}; ok && *s; s++)
-		obs_source_set_audio_mixers(*s, 0x3f);
-	if (ok)
+	if (ok) {
+		obs_source_set_audio_mixers(music, 0x3f);
+		obs_source_set_audio_mixers(voice, 0x1f);
+		obs_source_set_audio_mixers(gone, 0x3f);
 		dialog = open_settings_dialog();
+	}
 	if (ok && !dialog) {
 		harness_error("the settings dialog did not open");
 		ok = false;
 	}
 	if (ok) {
-		obs_data_t *old_settings = obs_data_create();
-		obs_data_t *opened = obs_source_get_settings(dialog);
-		obs_data_apply(old_settings, opened);
-		obs_data_release(opened);
+		obs_data_t *old_settings = copy_settings(dialog);
 		mixer_dialog = dialog;
 		signal_handler_t *signals = obs_source_get_signal_handler(dialog);
 		signal_handler_connect(signals, "update_properties", on_mixer_update_properties, NULL);
 		report_settings_properties(dialog, "open");
+		report_source_mixers("open", music);
+		report_source_mixers("open", voice);
 		long seen = os_atomic_load_long(&mixer_views);
 		click_settings_button(dialog, "take_over");
 		ok = wait_for_view(seen, "the takeover");
 		seen = os_atomic_load_long(&mixer_views);
 		click_settings_button(dialog, "confirm_take_over");
 		ok = ok && wait_for_view(seen, "the takeover's confirm");
-		ok = ok && tick_source(dialog, "Music", true);
+		ok = ok && tick_source(dialog, "Voice", true);
 		run_ui_tasks();
 		report_source_mixers("changed", music);
 		report_source_mixers("changed", voice);
@@ -1499,8 +1563,9 @@ static bool mixer_cancel(void)
 			report_source_mixers("changed", late);
 		printf("HARNESS mixer_step name=cancel\n");
 		cancel_settings_dialog(dialog, old_settings);
+		settle_ui_tasks();
+		ok = check_settings(dialog, old_settings, "cancelled") && ok;
 		obs_data_release(old_settings);
-		run_ui_tasks();
 		report_source_mixers("cancelled", music);
 		report_source_mixers("cancelled", voice);
 		if (late)
@@ -1508,6 +1573,20 @@ static bool mixer_cancel(void)
 		report_settings_properties(dialog, "cancelled");
 		signal_handler_disconnect(signals, "update_properties", on_mixer_update_properties, NULL);
 		mixer_dialog = NULL;
+
+		printf("HARNESS mixer_step name=managed\n");
+		seen = os_atomic_load_long(&mixer_views);
+		click_settings_button(dialog, "take_over");
+		run_ui_tasks();
+		click_settings_button(dialog, "confirm_take_over");
+		run_ui_tasks();
+		ok = tick_source(dialog, "Music", true) && ok;
+		run_ui_tasks();
+		close_settings_dialog(dialog);
+		dialog = NULL;
+		run_ui_tasks();
+		report_source_mixers("kept", music);
+		ok = cancel_while_managed(music) && ok;
 	}
 	if (dialog)
 		close_settings_dialog(dialog);
@@ -1575,6 +1654,9 @@ static void save_collection(struct collection *c)
 	for (size_t i = 0; i < COLLECTION_SOURCES; i++)
 		if (collection_sources[i])
 			c->mixers[i] = obs_source_get_audio_mixers(collection_sources[i]);
+	// OBSBasic::Save creates collectionModuleData when the loaded file had none.
+	if (!c->modules)
+		c->modules = obs_data_create();
 	fake_save(c->modules);
 	obs_data_t *ours = obs_data_get_obj(c->modules, "dstreamy");
 	printf("HARNESS collection_saved name=%s managed_mixers=%lld\n", c->name,
@@ -1609,16 +1691,27 @@ static void switch_collection(struct collection *from, struct collection *to)
 	load_collection(to);
 }
 
-static void report_dialog(const char *when)
+static bool report_dialog(const char *when)
 {
 	obs_source_t *dialog = open_settings_dialog();
 	if (!dialog) {
 		harness_error("the settings dialog did not open (%s)", when);
-		return;
+		return false;
 	}
+	obs_data_t *old_settings = copy_settings(dialog);
 	report_settings_properties(dialog, when);
+	bool unchanged = check_settings(dialog, old_settings, when);
+	obs_data_release(old_settings);
 	close_settings_dialog(dialog);
 	run_ui_tasks();
+	return unchanged;
+}
+
+static void click_and_wait(obs_source_t *dialog, const char *button, bool *ok)
+{
+	long seen = os_atomic_load_long(&mixer_views);
+	click_settings_button(dialog, button);
+	*ok = wait_for_view(seen, button) && *ok;
 }
 
 static bool collection_session(void)
@@ -1635,42 +1728,74 @@ static bool collection_session(void)
 	obs_register_source(&mic_source_info);
 	struct collection a = {"A", obs_data_create(), {0x3f, 0x3f}};
 	struct collection b = {"B", obs_data_create(), {0x3f, 0x3f}};
+	struct collection c = {"C", NULL, {0x3f, 0x3f}};
 	bool ok = true;
 
 	load_collection(&a);
 	report_collection_mixers("a_loaded");
+	if (args.collection_adopt) {
+		ok = report_dialog("adopted");
+		save_collection(&a);
+		clear_collection();
+		run_ui_tasks();
+		obs_data_release(a.modules);
+		obs_data_release(b.modules);
+		return ok;
+	}
 	obs_source_t *dialog = open_settings_dialog();
 	if (!dialog) {
 		harness_error("the settings dialog did not open");
-		ok = false;
-	} else {
-		mixer_dialog = dialog;
-		signal_handler_t *signals = obs_source_get_signal_handler(dialog);
-		signal_handler_connect(signals, "update_properties", on_mixer_update_properties, NULL);
-		report_settings_properties(dialog, "a_unmanaged");
-		long seen = os_atomic_load_long(&mixer_views);
-		click_settings_button(dialog, "take_over");
-		ok = wait_for_view(seen, "the takeover");
-		report_collection_mixers("a_confirming");
-		report_settings_properties(dialog, "a_confirming");
-		seen = os_atomic_load_long(&mixer_views);
-		click_settings_button(dialog, "confirm_take_over");
-		ok = ok && wait_for_view(seen, "the takeover's confirm");
-		report_collection_mixers("a_taken");
-		report_settings_properties(dialog, "a_managed");
-		signal_handler_disconnect(signals, "update_properties", on_mixer_update_properties, NULL);
-		mixer_dialog = NULL;
-		close_settings_dialog(dialog);
-		run_ui_tasks();
+		return false;
 	}
+	mixer_dialog = dialog;
+	signal_handler_t *signals = obs_source_get_signal_handler(dialog);
+	signal_handler_connect(signals, "update_properties", on_mixer_update_properties, NULL);
+	report_settings_properties(dialog, "a_unmanaged");
+	click_and_wait(dialog, "take_over", &ok);
+	report_collection_mixers("a_confirming");
+	report_settings_properties(dialog, "a_confirming");
+	click_and_wait(dialog, "cancel_take_over", &ok);
+	report_collection_mixers("a_not_now");
+	report_settings_properties(dialog, "a_not_now");
+	click_and_wait(dialog, "take_over", &ok);
+	click_and_wait(dialog, "confirm_take_over", &ok);
+	report_collection_mixers("a_taken");
+	report_settings_properties(dialog, "a_managed");
+	ok = tick_source(dialog, "Music", true) && ok;
+	run_ui_tasks();
+	report_collection_mixers("a_ticked");
+	close_settings_dialog(dialog);
+	run_ui_tasks();
 
 	switch_collection(&a, &b);
 	report_collection_mixers("b_loaded");
-	report_dialog("b");
+	ok = report_dialog("b") && ok;
 
-	switch_collection(&b, &a);
+	printf("HARNESS collection_step name=confirm_across_switch\n");
+	dialog = open_settings_dialog();
+	if (!dialog) {
+		harness_error("the settings dialog did not reopen");
+		return false;
+	}
+	mixer_dialog = dialog;
+	signals = obs_source_get_signal_handler(dialog);
+	signal_handler_connect(signals, "update_properties", on_mixer_update_properties, NULL);
+	click_and_wait(dialog, "take_over", &ok);
+	report_settings_properties(dialog, "b_confirming");
+	switch_collection(&b, &c);
+	report_collection_mixers("c_loaded");
+	click_settings_button(dialog, "confirm_take_over");
+	settle_ui_tasks();
+	report_settings_properties(dialog, "c");
+	report_collection_mixers("c_after");
+	signal_handler_disconnect(signals, "update_properties", on_mixer_update_properties, NULL);
+	mixer_dialog = NULL;
+	close_settings_dialog(dialog);
+	run_ui_tasks();
+
+	switch_collection(&c, &a);
 	report_collection_mixers("a_again");
-	report_dialog("a_again");
+	ok = report_dialog("a_again") && ok;
 
 	printf("HARNESS collection_step name=new\n");
 	fake_event(FAKE_EVENT_SCENE_COLLECTION_CHANGING);
@@ -1680,12 +1805,16 @@ static bool collection_session(void)
 	fake_event(FAKE_EVENT_SCENE_COLLECTION_CHANGED);
 	run_ui_tasks();
 	report_collection_mixers("new");
-	report_dialog("new");
+	ok = report_dialog("new") && ok;
+	// CreateDefaultScene keeps the last collection's collectionModuleData, so a save reuses A's object.
+	struct collection fresh = {"new", a.modules, {0x3f, 0x3f}};
+	save_collection(&fresh);
 
 	clear_collection();
 	run_ui_tasks();
 	obs_data_release(a.modules);
 	obs_data_release(b.modules);
+	obs_data_release(c.modules);
 	return ok;
 }
 
@@ -1705,7 +1834,7 @@ static bool click_fake_frontend(void)
 		return mixer_session();
 	if (args.mixer_cancel)
 		return mixer_cancel();
-	if (args.collection_session)
+	if (args.collection_session || args.collection_adopt)
 		return collection_session();
 	if (args.settings_update_while_active || args.tools_session)
 		return true;

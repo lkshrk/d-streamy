@@ -1,5 +1,6 @@
 //! `dstreamy_settings`: a private source whose stock properties dialog is D-Streamy's settings window.
 
+use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem;
 use std::ptr;
@@ -12,7 +13,7 @@ use dstreamy_obs_producer::dock::{
 };
 use dstreamy_obs_producer::dock_config::{ConfigError, ConfigState};
 use dstreamy_obs_producer::dock_view::UNSUPPORTED;
-use dstreamy_obs_producer::mixer::{AudioView, CANCEL, CONFIRM, audio_view, mic_guard, track_bit};
+use dstreamy_obs_producer::mixer::{AudioView, CONFIRM, NOT_NOW, audio_view, mic_guard, track_bit};
 use dstreamy_obs_producer::panel::NO_AUDIO_CONTROLS;
 use dstreamy_obs_sys as sys;
 
@@ -29,8 +30,6 @@ const AUDIO_TRACK: &CStr = c"audio_track";
 const GUILD: &CStr = c"guild_id";
 const CHANNEL: &CStr = c"channel_id";
 const STATUS: &CStr = c"status";
-/// In the settings the dialog opened with, and gone once its view is built, so only a Cancel brings it back.
-const OPENED_MARK: &CStr = c"dstreamy_opened";
 
 /// The producer model behind every dialog; it outlives each dialog's source.
 struct Controls {
@@ -200,7 +199,7 @@ fn selected_track(settings: *mut sys::obs_data_t) -> Option<u8> {
     u8::try_from(raw).ok().filter(|t| AUDIO_TRACKS.contains(t))
 }
 
-/// The status line for a dialog showing `selected`, how OBS should colour it, and whether Start must wait.
+/// The status line for a dialog showing `selected`, how OBS should colour it, and whether a mic holds Start back.
 fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type, bool) {
     let sources = if cfg!(unix) {
         crate::audio::sources()
@@ -213,11 +212,13 @@ fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type, bool) {
             preview.select_audio_track(track);
         }
         let idle = preview.state() == &DockState::Idle;
-        let blocked = (cfg!(unix) && idle)
+        let live = matches!(preview.state(), DockState::Live { .. });
+        let mic = (cfg!(unix) && (idle || live))
             .then(|| mic_guard(&preview, &sources))
             .flatten();
-        let quiet = idle && preview.error().is_none() && blocked.is_none();
-        let session = match &blocked {
+        let held = idle && mic.is_some();
+        let quiet = idle && preview.error().is_none() && mic.is_none();
+        let session = match &mic {
             _ if !cfg!(unix) => UNSUPPORTED.to_owned(),
             Some(guard) => guard.message(),
             None => preview.status_text(true),
@@ -229,15 +230,15 @@ fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type, bool) {
             } else {
                 format!("{}. {config}", session.trim_end_matches('.'))
             };
-            return (text, sys::OBS_TEXT_INFO_ERROR, blocked.is_some());
+            return (text, sys::OBS_TEXT_INFO_ERROR, held);
         }
         let kind = match (preview.track_status(), preview.error()) {
-            _ if !cfg!(unix) || blocked.is_some() => sys::OBS_TEXT_INFO_WARNING,
+            _ if !cfg!(unix) || mic.is_some() => sys::OBS_TEXT_INFO_WARNING,
             (TrackStatus::Pending { .. }, _) => sys::OBS_TEXT_INFO_WARNING,
             (TrackStatus::Idle { .. }, Some(_)) => sys::OBS_TEXT_INFO_ERROR,
             _ => sys::OBS_TEXT_INFO_NORMAL,
         };
-        (session, kind, blocked.is_some())
+        (session, kind, held)
     })
 }
 
@@ -274,7 +275,6 @@ extern "C" fn create(
             });
         // SAFETY: libobs passes the new source's settings, which it owns; it copies the strings.
         unsafe {
-            sys::obs_data_set_bool(settings, OPENED_MARK.as_ptr(), true);
             sys::obs_data_set_int(
                 settings,
                 AUDIO_TRACK.as_ptr(),
@@ -352,27 +352,47 @@ pub fn collection_changed() {
         o.mixers = None;
         o.touched = 0;
     }
-}
-
-/// Cancel or Discard: puts back the opened picks, listed or not, and the Discord tracks the dialog changed.
-fn cancel(source: *mut sys::obs_source_t) {
-    let opened = OPENED
+    REVERTING
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .iter_mut()
-        .find(|o| o.source == source)
-        .map(|o| {
-            let touched = std::mem::take(&mut o.touched);
-            (o.choice.clone(), o.mixers.clone(), o.managed, touched)
-        });
-    let Some((choice, mixers, managed, touched)) = opened else {
-        return;
-    };
+        .take();
+}
+
+thread_local! {
+    /// Set while OBS rebuilds a dialog, which runs every modified callback; cleared by the next update.
+    static RELOADING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A dialog whose picks went back to what it opened with: a Cancel or Discard, unless a modified callback follows.
+struct Reverting {
+    source: *mut sys::obs_source_t,
+    mixers: Option<crate::audio::Mixers>,
+    managed: u32,
+    touched: u32,
+}
+
+// SAFETY: the pointer is only compared, never dereferenced.
+unsafe impl Send for Reverting {}
+
+static REVERTING: Mutex<Option<Reverting>> = Mutex::new(None);
+
+/// A property's modified callback: the update before it was the user's own edit, not a Cancel.
+fn edited() {
+    if !RELOADING.with(Cell::get) {
+        REVERTING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+}
+
+/// Puts back the opened picks, listed or not, and arms the mixer part for [`settle`].
+fn restore_picks(source: *mut sys::obs_source_t, opened: &Choice) {
     let load = change(|c, p| {
         let mut load = None;
-        if c.model.choice() != choice {
+        if c.model.choice() != *opened {
             config_step(c, |c| {
-                load = c.edit(p.write(), |m| m.restore_choice(&choice))
+                load = c.edit(p.write(), |m| m.restore_choice(opened))
             });
         }
         load
@@ -380,23 +400,66 @@ fn cancel(source: *mut sys::obs_source_t) {
     if let Some(guild) = load {
         session::load_lists(Some(guild));
     }
+    let pending = OPENED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|o| o.source == source)
+        .map(|o| Reverting {
+            source,
+            mixers: o.mixers.clone(),
+            managed: o.managed,
+            touched: o.touched,
+        });
+    *REVERTING.lock().unwrap_or_else(PoisonError::into_inner) = pending;
+    crate::audio::request_settle();
+}
+
+/// On the UI thread once the call that armed it returned: a Cancel puts back the Discord tracks the dialog changed.
+pub fn settle() {
+    let Some(pending) = REVERTING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+    else {
+        return;
+    };
+    let current = OPENED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter_mut()
+        .find(|o| o.source == pending.source)
+        .map(|o| (std::mem::take(&mut o.touched), o.mixers.clone(), o.managed));
+    let (touched, mixers, managed) =
+        current.unwrap_or((pending.touched, pending.mixers, pending.managed));
     if let Some(mixers) = mixers.filter(|_| touched != 0) {
         crate::audio::restore(&mixers, touched, managed);
+        crate::audio::request_refresh();
     }
 }
 
-/// Runs on the UI thread whenever the dialog changes a value, and on Cancel with every value it opened with.
+/// Runs on the UI thread whenever the dialog changes a value, and on Cancel or Discard with every value it opened with.
 extern "C" fn update(data: *mut c_void, settings: *mut sys::obs_data_t) {
     guard("settings update", (), || {
-        // SAFETY: libobs passes the source's own settings.
-        if unsafe { sys::obs_data_has_user_value(settings, OPENED_MARK.as_ptr()) } {
-            // SAFETY: as above.
-            unsafe { sys::obs_data_erase(settings, OPENED_MARK.as_ptr()) };
-            cancel(data.cast());
-            return;
-        }
+        RELOADING.with(|r| r.set(false));
+        let source: *mut sys::obs_source_t = data.cast();
         // SAFETY: libobs passes the source's own settings.
         let (guild, channel) = unsafe { (picked(settings, GUILD), picked(settings, CHANNEL)) };
+        let shown = selected_track(settings).map(|audio_track| Choice {
+            guild_id: guild.clone(),
+            channel_id: channel.clone(),
+            audio_track,
+        });
+        let opened = OPENED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|o| o.source == source)
+            .map(|o| o.choice.clone());
+        if let Some(opened) = opened.filter(|o| Some(o) == shown.as_ref()) {
+            restore_picks(source, &opened);
+            return;
+        }
         let load = change(|c, p| {
             let mut load = None;
             if c.model.settings().guild_id != guild {
@@ -459,6 +522,7 @@ extern "C" fn track_modified(
     settings: *mut sys::obs_data_t,
 ) -> bool {
     guard("settings track_modified", false, || {
+        edited();
         // SAFETY: the view passes the properties it shows and their settings.
         let status_prop = unsafe { sys::obs_properties_get(props, STATUS.as_ptr()) };
         if status_prop.is_null() {
@@ -466,7 +530,10 @@ extern "C" fn track_modified(
         }
         let selected = selected_track(settings);
         set_status(status_prop, status(selected));
-        if selected.is_some_and(|t| t != AUDIO_BUILT_FOR.load(Ordering::Acquire)) {
+        if selected
+            .map(shown_track)
+            .is_some_and(|t| t != AUDIO_BUILT_FOR.load(Ordering::Acquire))
+        {
             crate::audio::request_refresh();
         }
         true
@@ -475,6 +542,11 @@ extern "C" fn track_modified(
 
 /// The track the open dialog's audio part shows; a different pick rebuilds it.
 static AUDIO_BUILT_FOR: AtomicU8 = AtomicU8::new(0);
+
+/// The audio part shows the track Discord hears while live, like the panel, else the dialog's pick.
+fn shown_track(selected: u8) -> u8 {
+    with_controls(|c| c.model.live_track()).unwrap_or(selected)
+}
 /// The track whose takeover waits for its confirm in the dialog; 0 for none.
 static CONFIRMING: AtomicU8 = AtomicU8::new(0);
 
@@ -484,6 +556,7 @@ const TAKE_OVER_EFFECT: &CStr = c"take_over_effect";
 const CONFIRM_TAKE_OVER: &CStr = c"confirm_take_over";
 const CANCEL_TAKE_OVER: &CStr = c"cancel_take_over";
 const AUDIO_EMPTY: &CStr = c"audio_empty";
+const AUDIO_NOTE: &CStr = c"audio_note";
 const SOURCE_PREFIX: &str = "source_";
 
 // Each button returns false and rebuilds from another thread: a rebuild inside the click frees the button.
@@ -532,6 +605,7 @@ extern "C" fn source_toggled(
     settings: *mut sys::obs_data_t,
 ) -> bool {
     guard("settings source_toggled", false, || {
+        edited();
         // SAFETY: the view passes a live property and its settings; libobs owns the name.
         let (name, on, written) = unsafe {
             let name = sys::obs_property_name(property);
@@ -587,7 +661,7 @@ unsafe fn add_audio(props: *mut sys::obs_properties_t, settings: *mut sys::obs_d
                 if CONFIRMING.load(Ordering::Acquire) == track {
                     info(TAKE_OVER_EFFECT, &effect);
                     button(CONFIRM_TAKE_OVER, CONFIRM, Some(confirm_take_over_clicked));
-                    button(CANCEL_TAKE_OVER, CANCEL, Some(cancel_take_over_clicked));
+                    button(CANCEL_TAKE_OVER, NOT_NOW, Some(cancel_take_over_clicked));
                 } else {
                     button(TAKE_OVER, &take_over, Some(take_over_clicked));
                 }
@@ -596,16 +670,24 @@ unsafe fn add_audio(props: *mut sys::obs_properties_t, settings: *mut sys::obs_d
                 help,
                 sources,
                 empty,
+                note,
                 ..
             } => {
                 info(AUDIO_HELP, &help);
+                if let Some(note) = note {
+                    info(AUDIO_NOTE, &note);
+                }
                 for row in sources {
                     let key = c_text(&format!("{SOURCE_PREFIX}{}", row.uuid));
                     let name = c_text(&row.name);
                     let checkbox = sys::obs_properties_add_bool(props, key.as_ptr(), name.as_ptr());
                     // Without the dialog's own settings there is no real state, and defaults would untick all.
                     if !settings.is_null() {
-                        sys::obs_data_set_bool(settings, key.as_ptr(), row.on);
+                        // A default keeps the settings equal to OBS's copy, so closing asks nothing.
+                        sys::obs_data_set_default_bool(settings, key.as_ptr(), row.on);
+                        if sys::obs_data_has_user_value(settings, key.as_ptr()) {
+                            sys::obs_data_set_bool(settings, key.as_ptr(), row.on);
+                        }
                         sys::obs_property_set_modified_callback(checkbox, Some(source_toggled));
                     }
                 }
@@ -632,6 +714,7 @@ extern "C" fn guild_modified(
     _property: *mut sys::obs_property_t,
     _settings: *mut sys::obs_data_t,
 ) -> bool {
+    edited();
     // Rebuilds the dialog, so the channel list shows the new server's channels.
     true
 }
@@ -702,10 +785,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
             // SAFETY: `data` is the source `create` returned; the reference is released below.
             unsafe { sys::obs_source_get_settings(source) }
         };
-        if !settings.is_null() {
-            // SAFETY: a strong reference to the source's settings, released below.
-            unsafe { sys::obs_data_erase(settings, OPENED_MARK.as_ptr()) };
-        }
+        RELOADING.with(|r| r.set(true));
         let selected = (!settings.is_null())
             .then(|| selected_track(settings))
             .flatten();
@@ -766,7 +846,11 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                 sys::obs_property_list_add_int(tracks, name.as_ptr(), i64::from(track));
             }
             sys::obs_property_set_modified_callback(tracks, Some(track_modified));
-            add_audio(props, settings, selected.unwrap_or(picked.audio_track));
+            add_audio(
+                props,
+                settings,
+                shown_track(selected.unwrap_or(picked.audio_track)),
+            );
             if !settings.is_null() {
                 sys::obs_data_release(settings);
             }

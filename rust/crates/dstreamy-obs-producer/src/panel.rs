@@ -7,7 +7,7 @@ use crate::dock::{AUDIO_TRACKS, DockState, track_name};
 use crate::dock_config::ConfigState;
 use crate::dock_view::{Button, Tone, dock_view};
 use crate::live::LiveStats;
-use crate::mixer::{AudioSource, AudioView, CANCEL, CONFIRM, audio_view, mic_guard};
+use crate::mixer::{AudioSource, AudioView, CONFIRM, NOT_NOW, audio_view, mic_guard};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Item {
@@ -52,7 +52,7 @@ pub struct Audio {
     pub track: u8,
     pub tracks: Vec<TrackItem>,
     pub managed: bool,
-    /// Shown instead of the checkboxes while the track is unmanaged.
+    /// Shown instead of the checkboxes while the track is unmanaged, and above them for a warning.
     pub line: String,
     pub manage: String,
     pub confirm: Option<Confirm>,
@@ -149,11 +149,17 @@ fn audio(state: &ConfigState, controls: bool, sources: &[AudioSource], confirmin
             audio.confirm = confirming.then(|| Confirm {
                 text: effect,
                 ok: CONFIRM.to_owned(),
-                cancel: CANCEL.to_owned(),
+                cancel: NOT_NOW.to_owned(),
             });
         }
-        AudioView::Managed { sources, empty, .. } => {
+        AudioView::Managed {
+            sources,
+            empty,
+            note,
+            ..
+        } => {
             audio.managed = true;
+            audio.line = note.unwrap_or_default();
             audio.sources = sources
                 .into_iter()
                 .map(|s| Source {
@@ -179,8 +185,8 @@ pub fn panel_view(
     let m = &state.model;
     let settings = m.settings();
     let idle = m.state() == &DockState::Idle;
-    let blocked = (controls && idle).then(|| mic_guard(m, sources)).flatten();
-    let dock = dock_view(state, controls, live, blocked.as_ref());
+    let mic = controls.then(|| mic_guard(m, sources)).flatten();
+    let dock = dock_view(state, controls, live, mic.as_ref());
     let not_set_up =
         dock.tone == Tone::Idle && (settings.guild_id.is_none() || settings.channel_id.is_none());
     let (state_line, state_fix, state_tooltip) = match dock.tone {
@@ -459,7 +465,7 @@ mod tests {
                 text: "Turns Track 6 off on every audio source, also for recordings and streams that use it."
                     .into(),
                 ok: "Manage".into(),
-                cancel: "Cancel".into(),
+                cancel: "Not now".into(),
             })
         );
     }
@@ -538,7 +544,7 @@ mod tests {
     fn a_mic_on_the_unmanaged_track_blocks_go_live_and_says_how_to_fix_it() {
         let v = panel_view(&picked(false), true, None, &mic_on_track_6(), false);
         assert_eq!(v.tone, Tone::Attention);
-        assert_eq!(v.state_line, "Discord would hear your mic");
+        assert_eq!(v.state_line, "Discord would hear Mic/Aux");
         assert_eq!(v.state_fix, "Let D-Streamy manage Track 6");
         assert!(
             v.state_tooltip
@@ -558,8 +564,41 @@ mod tests {
         assert!(managed.button.enabled, "a managed track can go live");
         let no_mic = view(&picked(false));
         assert!(no_mic.button.enabled, "nothing to hold back without a mic");
-        let live = panel_view(&live(picked(false)), true, None, &mic_on_track_6(), false);
-        assert_eq!(live.tone, Tone::Live, "a running session is left alone");
+        let leak = panel_view(&live(picked(false)), true, None, &mic_on_track_6(), false);
+        assert_eq!(leak.tone, Tone::Attention, "Discord hears the mic now");
+        assert_eq!(leak.state_line, "Discord hears Mic/Aux");
+        assert_eq!(leak.state_fix, "Let D-Streamy manage Track 6");
+        assert_eq!(leak.status_bar, "⚠ D-Streamy live ▴");
+        assert!(leak.button.enabled, "Stop stays");
+        assert_eq!(
+            leak.audio.manage, "Manage Track 6",
+            "the fix for the heard track"
+        );
+        let mut s = live(picked(false));
+        s.model.take_over(6);
+        let resolved = panel_view(&s, true, None, &mic_on_track_6(), false);
+        assert_eq!(resolved.tone, Tone::Live, "clears once managed");
+    }
+
+    #[test]
+    fn a_managed_track_1_says_streams_and_recordings_lost_it() {
+        let mut s = picked(false);
+        s.model.select_audio_track(1);
+        s.model.take_over(1);
+        let v = view(&s);
+        assert!(v.audio.managed);
+        assert!(
+            v.audio
+                .line
+                .starts_with("Track 1 is OBS's streaming and recording track"),
+            "{}",
+            v.audio.line
+        );
+        assert_eq!(
+            view(&picked(true)).audio.line,
+            "",
+            "Track 6 needs no warning"
+        );
     }
 
     #[test]

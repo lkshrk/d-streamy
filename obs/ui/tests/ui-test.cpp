@@ -168,7 +168,8 @@ QJsonObject audio(bool managed, bool confirming, int track = 6, const std::vecto
 		      {"managed", managed},
 		      {"line",
 		       managed ? QString()
-			       : QStringLiteral("Discord hears Track %1. Let D-Streamy manage it to pick sources here.")
+			       : QStringLiteral("Discord hears every source on Track %1. Let D-Streamy manage Track %1 "
+						"to pick sources here.")
 					 .arg(track)},
 		      {"manage", managed ? QString() : QStringLiteral("Manage Track %1").arg(track)},
 		      {"sources", sources},
@@ -176,10 +177,10 @@ QJsonObject audio(bool managed, bool confirming, int track = 6, const std::vecto
 	a["confirm"] = confirming
 			       ? QJsonValue(QJsonObject{
 					 {"text", QStringLiteral("Turns Track %1 off on every audio source, also for "
-								 "recordings or VODs that use it.")
+								 "recordings and streams that use it.")
 							  .arg(track)},
 					 {"ok", "Manage"},
-					 {"cancel", "Cancel"}})
+					 {"cancel", "Not now"}})
 			       : QJsonValue();
 	return a;
 }
@@ -383,7 +384,8 @@ int main(int argc, char **argv)
 
 	CHECK(visible("dstreamy-audio-line") && visible("dstreamy-manage") && !visible("dstreamy-confirm"));
 	CHECK(text("dstreamy-audio-line") ==
-	      QLatin1String("Discord hears Track 6. Let D-Streamy manage it to pick sources here."));
+	      QLatin1String(
+		      "Discord hears every source on Track 6. Let D-Streamy manage Track 6 to pick sources here."));
 	CHECK(sources().isEmpty() || !visible("dstreamy-sources"));
 	CHECK(text("dstreamy-state") == QString::fromUtf8("Idle · Kids Lounge 🧃"));
 	CHECK(!visible("dstreamy-fix"));
@@ -415,6 +417,17 @@ int main(int argc, char **argv)
 	CHECK(boxes.size() == 5 && !boxes[1]->isChecked());
 	find<QPushButton>("dstreamy-action")->click();
 	CHECK(host.starts == 1);
+
+	QJsonObject noted = audio(true, false);
+	noted["line"] = QStringLiteral("Track 1 is OBS's streaming and recording track");
+	show(view(idle, noted));
+	CHECK(visible("dstreamy-audio-line") && visible("dstreamy-sources") && !visible("dstreamy-manage"));
+
+	QJsonObject no_controls = audio(false, false);
+	no_controls["manage"] = QString();
+	no_controls["line"] = QStringLiteral("D-Streamy can't change Discord audio on Windows yet.");
+	show(view(idle, no_controls));
+	CHECK(visible("dstreamy-audio-line") && !visible("dstreamy-manage") && !visible("dstreamy-sources"));
 
 	show(view(live, audio(true, false)));
 	CHECK(status->text() == QString::fromUtf8("● D-Streamy live ▴"));
