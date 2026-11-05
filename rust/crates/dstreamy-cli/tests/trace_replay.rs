@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use dstreamy_discord::stream::StreamOptions;
 use dstreamy_media::annexb;
 use dstreamy_mock_discord::{
     FIRST_FRAME_DAVE_DROP, Recorded, RecordedAudioFrame, RecordedVideoFrame, VoiceKind,
@@ -27,8 +28,6 @@ const STALL_TICK: Duration = Duration::from_millis(2);
 const STALL_MIN: Duration = Duration::from_millis(10);
 // The A/V median needs 10 unique payloads; the restart trace repeats frames 9 and 11 later, so 15 frames leave 13.
 const MIN_BASELINE_FRAMES: usize = 15;
-// Measured runner stalls that, in all, explain serve dropping video to a keyframe: the replay is retried.
-const INCONCLUSIVE_STALLS: Duration = Duration::from_millis(200);
 const REPLAY_ATTEMPTS: usize = 3;
 // GitHub's macOS runners have too few cores to pace six replays, their serves and producers at once.
 const CONCURRENT_TRACES: usize = if cfg!(target_os = "macos") {
@@ -219,10 +218,6 @@ impl StallCanary {
 #[derive(Debug)]
 struct Stalled(String);
 
-fn stalled_for(stalls: &[Stall]) -> Duration {
-    stalls.iter().map(|&(from, to)| to - from).sum()
-}
-
 /// Arrival at the mock follows the trace's libobs dts, except during or just after a stall of the mock's runtime.
 fn assert_paced<F>(
     recorded: &[&F],
@@ -296,6 +291,13 @@ fn paced<F>(
         arrived - (s.dts_usec - s0.dts_usec)
     };
     let unexcused: Vec<_> = pairs.iter().filter(|(f, _)| !after_stall(at(f))).collect();
+    if unexcused.len() < 10 && pairs.len() >= 10 {
+        return Err(Stalled(format!(
+            "{what}: only {} of {} frames arrived outside a stall of the mock's runtime, too few for a baseline: {stalls:?}",
+            unexcused.len(),
+            pairs.len()
+        )));
+    }
     let mid = median(unexcused.iter().map(|p| lag(p)).collect());
     // A backlog can outlast the stall, so late frames within the stall's length after its window, none later than the first, go with it.
     let mut checked = Vec::new();
@@ -327,7 +329,7 @@ fn paced<F>(
         pairs.len() - checked.len(),
         stalls.len()
     );
-    // A hot loop in serve or the producer also starves the runtime; it stalls every retry, so it still fails.
+    // Retries run at the first attempt's concurrency, so a hot loop in serve or the producer stalls each of them.
     if excused * 4 > span {
         return Err(Stalled(format!(
             "{what}: stalls of the mock's runtime would excuse {excused:?} of the {span:?} trace, over a quarter: {stalls:?}"
@@ -584,7 +586,9 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
             );
             match c.try_status() {
                 Ok(s) => match serve_drops(&s, &canary.stalls()) {
-                    Some(drops) if drops_explained(&canary.stalls()) => {
+                    Some(drops)
+                        if drops_explained(&canary.stalls(), &stream_video(&r), want.fps) =>
+                    {
                         return Err(Stalled(format!("{counts}; {drops}")));
                     }
                     Some(drops) => panic!("{counts}; {drops}"),
@@ -638,25 +642,95 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
     .map(drop)
 }
 
-/// Serve dropping video to a keyframe is by design once the runner stalled long enough to overfill its queue.
-fn drops_explained(stalls: &[Stall]) -> bool {
-    stalled_for(stalls) >= INCONCLUSIVE_STALLS
+/// Whether stalls while video was arriving add up to serve's whole video queue, which it drops to a keyframe by design.
+fn drops_explained(stalls: &[Stall], video: &[&RecordedVideoFrame], fps: i64) -> bool {
+    match (video.first(), video.last()) {
+        (Some(first), Some(last)) => {
+            stalls_fill_queue(stalls, (first.received_at, last.received_at), fps)
+        }
+        _ => false,
+    }
 }
 
-/// Retries a replay that stalls made inconclusive, alone, until `REPLAY_ATTEMPTS` in all.
-fn retry_stalled(name: &str, dir: &Path, trace: &Trace, plis: bool, first: Stalled) {
-    let mut reasons = vec![first.0];
-    while reasons.len() < REPLAY_ATTEMPTS {
-        eprintln!(
-            "{name}: retrying alone after a stalled attempt: {}",
-            reasons.last().unwrap()
-        );
-        match replay_through_serve(name, dir, trace, plis) {
-            Ok(()) => return,
-            Err(Stalled(e)) => reasons.push(e),
+/// Stalls of at least a frame inside `(first, last)` arrivals, summed against serve's video queue length.
+fn stalls_fill_queue(stalls: &[Stall], (first, last): (Instant, Instant), fps: i64) -> bool {
+    let frame = Duration::from_micros((1_000_000 / fps.max(1)) as u64);
+    let queue = frame * StreamOptions::default().max_queued_video as u32;
+    let stalled: Duration = stalls
+        .iter()
+        .filter(|&&(from, to)| to - from >= frame)
+        .map(|&(from, to)| to.min(last).saturating_duration_since(from.max(first)))
+        .sum();
+    stalled >= queue
+}
+
+fn annotation(line: &str) -> String {
+    let escaped = line
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A");
+    format!("::warning title=trace replay retried::{escaped}")
+}
+
+/// Prints past the test harness's output capture, and as a GitHub annotation and step summary line in CI.
+fn report(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{line}");
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        let _ = writeln!(std::io::stdout(), "{}", annotation(line));
+        if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY")
+            && let Ok(mut summary) = std::fs::OpenOptions::new().append(true).open(path)
+        {
+            let _ = writeln!(summary, "- trace replay: {line}");
         }
     }
-    panic!("{name}: every one of {REPLAY_ATTEMPTS} attempts stalled: {reasons:#?}");
+}
+
+/// Replays `batch` concurrently until each trace has passed once, rerunning the whole batch so retries see the same load.
+fn replay_until_conclusive(batch: &[(String, PathBuf, Trace)], plis: bool) {
+    let mut reasons: Vec<Vec<String>> = vec![Vec::new(); batch.len()];
+    let mut passed = vec![false; batch.len()];
+    for attempt in 1..=REPLAY_ATTEMPTS {
+        let results: Vec<Result<(), Stalled>> = std::thread::scope(|s| {
+            let runs: Vec<_> = batch
+                .iter()
+                .map(|(name, dir, trace)| {
+                    s.spawn(move || replay_through_serve(name, dir, trace, plis))
+                })
+                .collect();
+            runs.into_iter()
+                .map(|run| run.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(()) => passed[i] = true,
+                Err(Stalled(why)) if !passed[i] => {
+                    report(&format!(
+                        "{}: attempt {attempt} of {REPLAY_ATTEMPTS} inconclusive: {why}",
+                        batch[i].0
+                    ));
+                    reasons[i].push(why);
+                }
+                Err(_) => {}
+            }
+        }
+        if passed.iter().all(|&p| p) {
+            return;
+        }
+    }
+    let failed: Vec<String> = batch
+        .iter()
+        .zip(&reasons)
+        .zip(&passed)
+        .filter(|(_, p)| !**p)
+        .map(|(((name, _, _), why), _)| format!("{name}:\n  {}", why.join("\n  ")))
+        .collect();
+    panic!(
+        "{}\nno attempt of these traces was conclusive in {REPLAY_ATTEMPTS} tries: the mock's runtime \
+         stalled, from the runner or from serve or the producer using the CPU",
+        failed.join("\n")
+    );
 }
 
 #[test]
@@ -667,27 +741,8 @@ fn every_positive_trace_replays_through_serve() {
         .collect();
     assert!(positives.len() >= 6, "{} positive traces", positives.len());
     let _paced = exclusive_on_macos();
-    let mut stalled = Vec::new();
     for batch in positives.chunks(CONCURRENT_TRACES) {
-        std::thread::scope(|s| {
-            let runs: Vec<_> = batch
-                .iter()
-                .map(|t @ (name, dir, trace)| {
-                    (
-                        t,
-                        s.spawn(move || replay_through_serve(name, dir, trace, false)),
-                    )
-                })
-                .collect();
-            for (t, run) in runs {
-                if let Err(e) = run.join().unwrap_or_else(|p| std::panic::resume_unwind(p)) {
-                    stalled.push((t, e));
-                }
-            }
-        });
-    }
-    for ((name, dir, trace), e) in stalled {
-        retry_stalled(name, dir, trace, false, e);
+        replay_until_conclusive(batch, false);
     }
 }
 
@@ -698,9 +753,7 @@ fn control_events_during_a_replay_lose_no_packet() {
         .find(|(n, _, _)| n == "linux-x264-main-bf0-keyint2-30fps")
         .unwrap();
     let _paced = exclusive_on_macos();
-    if let Err(e) = replay_through_serve(&name, &dir, &trace, true) {
-        retry_stalled(&name, &dir, &trace, true, e);
-    }
+    replay_until_conclusive(&[(name, dir, trace)], true);
 }
 
 /// 150 frames sent at 30 fps; frames due inside `late_within` arrive `late` behind their dts.
@@ -1184,20 +1237,45 @@ fn a_replay_killed_and_restarted_after_grace_minus_1_s_stays_aligned() {
 }
 
 #[test]
-fn serve_drops_make_a_replay_inconclusive_only_after_long_stalls() {
+fn serve_drops_make_a_replay_inconclusive_only_after_stalls_that_fill_its_queue() {
     let start = Instant::now();
     let stall = |at_ms: u64, ms: u64| {
         let from = start + Duration::from_millis(at_ms);
         (from, from + Duration::from_millis(ms))
     };
-    assert!(!drops_explained(&[]));
-    assert!(!drops_explained(&[stall(0, 36), stall(500, 13)]));
-    assert!(!drops_explained(&[stall(0, 199)]));
-    assert!(drops_explained(&[
-        stall(0, 80),
-        stall(400, 115),
-        stall(900, 21)
-    ]));
+    let video = (start, start + Duration::from_secs(5));
+    let fills = |stalls: &[Stall], fps| stalls_fill_queue(stalls, video, fps);
+    assert_eq!(StreamOptions::default().max_queued_video, 8);
+    assert!(!fills(&[], 30));
+    assert!(!fills(&[stall(100, 260)], 30), "under 8 frames at 30 fps");
+    assert!(fills(&[stall(100, 270)], 30));
+    assert!(fills(&[stall(100, 140)], 60), "8 frames at 60 fps");
+    assert!(
+        !fills(
+            &(0..40)
+                .map(|i| stall(100 + i * 100, 30))
+                .collect::<Vec<_>>(),
+            30
+        ),
+        "stalls shorter than a frame cannot fill the queue however many"
+    );
+    assert!(fills(
+        &[
+            stall(100, 80),
+            stall(400, 115),
+            stall(900, 34),
+            stall(1500, 46)
+        ],
+        30
+    ));
+    assert!(
+        !fills(&[stall(5_100, 400), stall(0, 50)], 30),
+        "stalls outside the time video arrived do not count"
+    );
+    assert!(
+        !fills(&[stall(4_800, 400)], 30),
+        "only the part before the frames stopped counts"
+    );
 }
 
 #[test]
@@ -1224,4 +1302,38 @@ fn stalls_over_a_quarter_of_the_trace_are_inconclusive_not_passed() {
         panic!("{verdict:?}")
     };
     assert!(why.contains("over a quarter"), "{why}");
+}
+
+#[test]
+fn retry_annotations_stay_on_one_line() {
+    assert_eq!(
+        annotation("a: 50% late\nb"),
+        "::warning title=trace replay retried::a: 50%25 late%0Ab"
+    );
+}
+
+#[test]
+fn a_trace_mostly_inside_stalls_is_inconclusive_not_a_baseline_failure() {
+    let start = Instant::now();
+    let stalls: Vec<Stall> = (0..15u64)
+        .map(|i| {
+            let from = start + Duration::from_millis(i * 330);
+            (from, from + Duration::from_millis(300))
+        })
+        .collect();
+    let (sent, arrived) = paced_arrivals(start, &[], Duration::ZERO);
+    let recorded: Vec<&(Vec<u8>, Instant)> = arrived.iter().collect();
+    let verdict = paced(
+        &recorded,
+        |a| a.0.clone(),
+        |a| a.1,
+        &sent,
+        33_333,
+        &stalls,
+        "synthetic",
+    );
+    let Err(Stalled(why)) = verdict else {
+        panic!("{verdict:?}")
+    };
+    assert!(why.contains("too few for a baseline"), "{why}");
 }
