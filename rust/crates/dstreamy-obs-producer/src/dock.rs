@@ -355,7 +355,7 @@ impl DockModel {
         self.managed_mixers
     }
 
-    /// Marks `track` as managed, keeping the others; the caller clears it on every source first.
+    /// Marks `track` as managed, keeping the others; it changes no mixer flag.
     pub fn take_over(&mut self, track: u8) -> bool {
         if !AUDIO_TRACKS.contains(&track) {
             return false;

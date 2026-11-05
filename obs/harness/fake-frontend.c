@@ -53,8 +53,7 @@ EXPORT void fake_frontend_set_close_dialogs(bool (*close)(void))
 }
 
 #ifndef FAKE_FRONTEND_INCOMPLETE
-// OBSBasic::CreatePropertiesWindow: close the open dialog or give up, then hold a reference; the view's first
-// build is queued (OBSPropertiesView's constructor), so the harness runs it after this returns.
+// OBSBasic::CreatePropertiesWindow: close the open dialog or give up, then hold a reference; the build is queued.
 EXPORT void obs_frontend_open_source_properties(obs_source_t *source)
 {
 	if (close_dialogs && !close_dialogs())

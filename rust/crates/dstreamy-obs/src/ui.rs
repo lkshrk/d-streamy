@@ -186,10 +186,21 @@ pub fn install() -> bool {
 
 /// Opens the panel like a status-bar click: whether it shows, or `None` when it isn't loaded. UI thread.
 pub fn open_panel() -> Option<bool> {
-    let ui = UI.lock().unwrap_or_else(PoisonError::into_inner);
-    let ui = ui.as_ref()?;
-    // SAFETY: on the UI thread, while the library is loaded.
-    Some(unsafe { (ui.open_panel)() })
+    let shown = {
+        let ui = UI.lock().unwrap_or_else(PoisonError::into_inner);
+        let ui = ui.as_ref()?;
+        // SAFETY: on the UI thread, while the library is loaded.
+        unsafe { (ui.open_panel)() }
+    };
+    opened(shown);
+    Some(shown)
+}
+
+/// A panel that didn't show, or threw while opening, is closed for the host's state too.
+fn opened(shown: bool) {
+    if !shown {
+        panel_closed(ptr::null_mut());
+    }
 }
 
 /// Ends every call into the host; call from `obs_module_unload` before the session shuts down.
@@ -620,6 +631,21 @@ pub(crate) mod tests {
             release(ptr::null_mut(), -1);
         }
         drop((desktop, mic));
+        reset();
+    }
+
+    #[test]
+    fn a_panel_that_fails_to_open_is_closed() {
+        let _serial = crate::serial();
+        libobs();
+        reset();
+        call(host().load_lists);
+        assert!(panel_open());
+        CONFIRMING.store(true, Ordering::Release);
+        opened(true);
+        assert!(panel_open());
+        opened(false);
+        assert!(!panel_open() && !confirming());
         reset();
     }
 

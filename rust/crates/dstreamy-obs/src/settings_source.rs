@@ -560,20 +560,11 @@ fn keep_mixer_changes() {
 
 /// OBS leaves the collection and closes the dialog: its mixer changes stay, and closing asks only about picks.
 pub fn collection_leaving() {
-    let (kept, reclaim): (bool, Vec<u8>) = {
-        let opened = OPENED.lock().unwrap_or_else(PoisonError::into_inner);
-        (
-            opened.iter().any(|o| o.touched != 0),
-            opened
-                .iter()
-                .filter(|o| o.mixers.is_some() && o.managed & track_bit(o.choice.audio_track) != 0)
-                .map(|o| o.choice.audio_track)
-                .collect(),
-        )
-    };
-    for track in reclaim {
-        reclaim_opened_pick(track);
-    }
+    let kept = OPENED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|o| o.touched != 0);
     keep_mixer_changes();
     if kept {
         log::info(
@@ -1632,6 +1623,23 @@ mod tests {
     }
 
     #[test]
+    fn a_reopened_dialog_built_before_the_old_one_is_destroyed_stays_in_charge() {
+        let _serial = start();
+        let first = Dialog::create();
+        first.build();
+        let second = opening(Dialog::create);
+        second.build();
+        assert!(second.is_the_dialog());
+        drop(first);
+        assert!(
+            second.is_the_dialog(),
+            "the old dialog's destroy leaves the new one watched"
+        );
+        drop(second);
+        reset();
+    }
+
+    #[test]
     fn cancel_manages_the_opened_pick_again_after_the_panel_let_it_go() {
         let _serial = start();
         change(|c, _| c.model.take_over(6));
@@ -1667,8 +1675,18 @@ mod tests {
         assert!(crate::audio::release(6));
         collection_leaving();
         assert!(
-            with_controls(|c| c.model.manages(6)),
-            "OBS saves before it closes, and its Discard can only put the pick back"
+            !with_controls(|c| c.model.manages(6)),
+            "a close OBS starts keeps the release, like every other mixer change it saves"
+        );
+        // SAFETY: OBS's Discard after its own save: an update with the copy.
+        unsafe { sys::obs_source_update(dialog.0, opened) };
+        settle();
+        let view = with_controls(|c| {
+            dstreamy_obs_producer::mixer::audio_view(&c.model, c.model.settings().audio_track, &[])
+        });
+        assert!(
+            matches!(view, AudioView::Unmanaged { track: 6, ref take_over, .. } if take_over == "Manage Track 6"),
+            "the pick put back shows as unmanaged, with its takeover: {view:?}"
         );
         // SAFETY: the copy made above.
         unsafe { sys::obs_data_release(opened) };
