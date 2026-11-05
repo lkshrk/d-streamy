@@ -946,6 +946,21 @@ static bool load_fake_frontend(void)
 	return fake_frontend != NULL;
 }
 
+// OBSBasic::closeWindow sends the exit event after ClearSceneData and before obs_shutdown.
+static void fake_frontend_exit(void)
+{
+	size_t (*fire)(void) = (size_t (*)(void))dlsym(fake_frontend, "fake_frontend_exit");
+	if (!fire) {
+		harness_error("--fake-frontend lacks fake_frontend_exit");
+		return;
+	}
+	uint64_t exit_ns = os_gettime_ns();
+	size_t callbacks = fire();
+	printf("HARNESS frontend_exit callbacks=%zu ms=%llu\n", callbacks,
+	       (unsigned long long)((os_gettime_ns() - exit_ns) / 1000000));
+	fflush(stdout);
+}
+
 static obs_source_t *(*fake_take_opened)(void);
 static bool (*fake_click)(void);
 
@@ -2223,8 +2238,15 @@ cleanup:
 		while (obs_wait_for_destroy_queue())
 			;
 #ifdef __linux__
+		if (fake_frontend)
+			fake_frontend_exit();
 		run_ui_tasks();
 #endif
+		obs_output_t *left = obs_get_output_by_name("D-Streamy");
+		printf("HARNESS obs_shutdown begins dstreamy_output=%d active=%d\n", left != NULL,
+		       left && obs_output_active(left) ? 1 : 0);
+		fflush(stdout);
+		obs_output_release(left);
 		uint64_t shutdown_ns = os_gettime_ns();
 		obs_shutdown();
 		printf("HARNESS obs_shutdown ms=%llu\n", (unsigned long long)((os_gettime_ns() - shutdown_ns) / 1000000));

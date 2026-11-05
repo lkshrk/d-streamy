@@ -2319,6 +2319,44 @@ fn a_stop_the_service_cannot_answer_says_what_to_do_next() {
     );
 }
 
+/// Milliseconds from the frontend's exit event to the end of `obs_shutdown`.
+fn closing_ms(lines: &[String]) -> u64 {
+    let exit = lines
+        .iter()
+        .find_map(|l| {
+            l.strip_prefix("HARNESS frontend_exit ")?
+                .split(" ms=")
+                .nth(1)?
+                .parse::<u64>()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no frontend exit in the harness output: {lines:#?}"));
+    exit + number_after(lines, "HARNESS obs_shutdown ms=")
+}
+
+/// The plugin shut down once, on the frontend's exit event, and left no output for `obs_shutdown` to stop after audio.
+fn assert_closed_on_frontend_exit(lines: &[String]) {
+    let position = |text: &str| lines.iter().position(|l| l.contains(text));
+    let exiting =
+        position("OBS's frontend is exiting: D-Streamy stops before OBS stops audio and video");
+    let shutdown = position("HARNESS obs_shutdown begins dstreamy_output=0 active=0");
+    let closing = "OBS is closing: D-Streamy finishes its control steps";
+    let ended = position("the D-Streamy control thread ended in ");
+    assert!(
+        matches!((exiting, ended, shutdown), (Some(a), Some(b), Some(c)) if a < b && b < c),
+        "the control thread ended on the exit event, before obs_shutdown: {lines:#?}"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.contains(closing)).count(),
+        1,
+        "unload after the exit event shuts down nothing again: {lines:#?}"
+    );
+    assert!(
+        has_line(lines, "HARNESS frontend_exit callbacks=1 "),
+        "the plugin watched the frontend's exit: {lines:#?}"
+    );
+}
+
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn closing_obs_during_a_start_never_streams_and_unloads_promptly() {
@@ -2355,11 +2393,12 @@ fn closing_obs_during_a_start_never_streams_and_unloads_promptly() {
             !has_plugin_line(&lines, "started from Tools"),
             "{answered}: {lines:#?}"
         );
-        let shutdown_ms = number_after(&lines, "HARNESS obs_shutdown ms=");
+        let closing_ms = closing_ms(&lines);
         assert!(
-            shutdown_ms < 12_000,
-            "{answered}: unload took {shutdown_ms} ms"
+            closing_ms < 12_000,
+            "{answered}: closing took {closing_ms} ms"
         );
+        assert_closed_on_frontend_exit(&lines);
         if answered {
             assert!(
                 has_plugin_line(
@@ -2434,19 +2473,26 @@ fn closing_obs_while_live_stops_the_output_then_the_session_promptly() {
             ),
             "{answered}: {lines:#?}"
         );
-        let shutdown_ms = number_after(&lines, "HARNESS obs_shutdown ms=");
+        let position = |pred: &dyn Fn(&str) -> bool| lines.iter().position(|l| pred(l));
+        let closing_ms = closing_ms(&lines);
         let bound = if answered { 4_000 } else { 8_000 };
         assert!(
-            shutdown_ms < bound,
-            "{answered}: unload took {shutdown_ms} ms"
+            closing_ms < bound,
+            "{answered}: closing took {closing_ms} ms"
         );
         if !answered {
             assert!(
-                shutdown_ms >= 4_000,
-                "the frozen service was waited on for its 5 s budget: {shutdown_ms} ms"
+                closing_ms >= 4_000,
+                "the frozen service was waited on for its 5 s budget: {closing_ms} ms"
             );
         }
-        let position = |pred: &dyn Fn(&str) -> bool| lines.iter().position(|l| pred(l));
+        assert_closed_on_frontend_exit(&lines);
+        let stopped = position(&|l| l.starts_with("HARNESS tools output_stopped code=0"));
+        let shutdown = position(&|l| l.starts_with("HARNESS obs_shutdown begins"));
+        assert!(
+            matches!((stopped, shutdown), (Some(a), Some(b)) if a < b),
+            "{answered}: the output stopped before obs_shutdown stopped audio: {lines:#?}"
+        );
         let begins = position(&|l| l.contains("it stops its output, then the Discord session"));
         let output_stopped = position(&|l| l.starts_with("HARNESS tools output_stopped code=0"));
         let ended = position(&|l| {

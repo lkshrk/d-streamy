@@ -18,6 +18,10 @@ typedef void (*dstreamy_frontend_cb)(void *private_data);
 typedef void (*dstreamy_frontend_add_tools_menu_item)(const char *name, dstreamy_frontend_cb callback,
 						      void *private_data);
 typedef void (*dstreamy_frontend_open_source_properties)(obs_source_t *source);
+/* The event is enum obs_frontend_event, int-sized under every OBS ABI. */
+typedef void (*dstreamy_frontend_event_cb)(int event, void *private_data);
+typedef void (*dstreamy_frontend_event_callback)(dstreamy_frontend_event_cb callback, void *private_data);
+#define DSTREAMY_FRONTEND_EVENT_EXIT 17
 
 #if __has_include(<obs-frontend-api.h>)
 #include <obs-frontend-api.h>
@@ -27,6 +31,16 @@ _Static_assert(__builtin_types_compatible_p(__typeof__(&obs_frontend_add_tools_m
 _Static_assert(__builtin_types_compatible_p(__typeof__(&obs_frontend_open_source_properties),
 					    dstreamy_frontend_open_source_properties),
 	       "obs_frontend_open_source_properties changed");
+_Static_assert(__builtin_types_compatible_p(obs_frontend_event_cb, void (*)(enum obs_frontend_event, void *)),
+	       "obs_frontend_event_cb changed");
+_Static_assert(sizeof(enum obs_frontend_event) == sizeof(int), "enum obs_frontend_event is not int-sized");
+_Static_assert(OBS_FRONTEND_EVENT_EXIT == DSTREAMY_FRONTEND_EVENT_EXIT, "OBS_FRONTEND_EVENT_EXIT changed");
+_Static_assert(__builtin_types_compatible_p(__typeof__(&obs_frontend_add_event_callback),
+					    void (*)(obs_frontend_event_cb, void *)),
+	       "obs_frontend_add_event_callback changed");
+_Static_assert(__builtin_types_compatible_p(__typeof__(&obs_frontend_remove_event_callback),
+					    void (*)(obs_frontend_event_cb, void *)),
+	       "obs_frontend_remove_event_callback changed");
 #elif defined(DSTREAMY_FRONTEND_ABI_CHECK)
 #error "DSTREAMY_FRONTEND_ABI_CHECK is set but obs-frontend-api.h is not on the include path, so the frontend types above go unchecked"
 #endif

@@ -191,7 +191,8 @@ pub fn install() {
     }
 }
 
-/// Ends the control thread and releases the output; call from `obs_module_unload`, before libobs unmaps the plugin.
+/// Ends the control thread and releases the output; call on the frontend's exit event, before `obs_shutdown` stops audio
+/// and video, and again from `obs_module_unload` for hosts without a frontend. Only the first call does anything.
 /// Service calls in flight get [`CLOSING_GRACE`] to finish, a session they brought up is stopped, not streamed,
 /// a live session is stopped like Stop does, and every step is over within [`CLOSING_LIMIT`].
 pub fn shutdown() {

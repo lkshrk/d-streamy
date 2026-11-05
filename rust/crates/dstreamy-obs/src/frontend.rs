@@ -1,6 +1,6 @@
-//! Tools > D-Streamy… through obs-frontend-api, looked up at runtime so a libobs-only host still loads the plugin.
+//! Tools > D-Streamy… and the exit event through obs-frontend-api, looked up at runtime so a libobs-only host still loads the plugin.
 
-use std::ffi::{CStr, c_void};
+use std::ffi::{CStr, c_int, c_void};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +45,8 @@ enum Missing {
 }
 
 const ADD_TOOLS_MENU_ITEM: &str = "obs_frontend_add_tools_menu_item";
+const ADD_EVENT_CALLBACK: &str = "obs_frontend_add_event_callback";
+const REMOVE_EVENT_CALLBACK: &str = "obs_frontend_remove_event_callback";
 const OPEN_SOURCE_PROPERTIES: &str = "obs_frontend_open_source_properties";
 
 impl Frontend {
@@ -78,8 +80,63 @@ impl Frontend {
     }
 }
 
+struct ExitWatch {
+    remove: sys::dstreamy_frontend_event_callback,
+    _host: Library,
+}
+
+static EXIT_WATCH: Mutex<Option<ExitWatch>> = Mutex::new(None);
+/// Set once the frontend sent its exit event, after which its API is gone.
+static EXITED: AtomicBool = AtomicBool::new(false);
+
+/// Shuts the session down on the frontend's exit event, which OBS sends before `obs_shutdown` stops audio and video.
+fn watch_exit() {
+    let Ok(host) = host() else {
+        return;
+    };
+    // SAFETY: wrapper.h asserts these types against obs-frontend-api.h; `_host` keeps the library loaded.
+    let (add, remove) = unsafe {
+        (
+            host.get::<sys::dstreamy_frontend_event_callback>(ADD_EVENT_CALLBACK.as_bytes())
+                .ok()
+                .and_then(|s| *s),
+            host.get::<sys::dstreamy_frontend_event_callback>(REMOVE_EVENT_CALLBACK.as_bytes())
+                .ok()
+                .and_then(|s| *s),
+        )
+    };
+    let (Some(add), Some(remove)) = (add, remove) else {
+        if add.is_some() || remove.is_some() {
+            log::warn(&format!(
+                "OBS frontend lacks {ADD_EVENT_CALLBACK} or {REMOVE_EVENT_CALLBACK}: \
+                 D-Streamy stops its output only when OBS unloads it"
+            ));
+        }
+        return;
+    };
+    EXITED.store(false, Ordering::Release);
+    // SAFETY: module load runs on the UI thread; the callback lives as long as the process.
+    unsafe { add(Some(on_event), ptr::null_mut()) };
+    *EXIT_WATCH.lock().unwrap_or_else(PoisonError::into_inner) = Some(ExitWatch {
+        remove: Some(remove),
+        _host: host,
+    });
+}
+
+extern "C" fn on_event(event: c_int, _private_data: *mut c_void) {
+    guard("frontend event", (), || {
+        if u32::try_from(event) != Ok(sys::DSTREAMY_FRONTEND_EVENT_EXIT) {
+            return;
+        }
+        EXITED.store(true, Ordering::Release);
+        log::info("OBS's frontend is exiting: D-Streamy stops before OBS stops audio and video");
+        crate::session::shutdown();
+    });
+}
+
 /// Finds OBS's frontend; call from `obs_module_load`, on the UI thread.
 pub fn install() {
+    watch_exit();
     let frontend = match Frontend::resolve() {
         Ok(frontend) => frontend,
         Err(Missing::Library) => {
@@ -149,8 +206,17 @@ fn click_when(trigger: PathBuf) {
     *CLICKER.lock().unwrap_or_else(PoisonError::into_inner) = Some((unloading, thread));
 }
 
-/// Ends the test hook's thread; call from `obs_module_unload`.
+/// Stops watching the frontend and ends the test hook's thread; call from `obs_module_unload`.
 pub fn shutdown() {
+    let watch = EXIT_WATCH
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    let remove = watch.and_then(|w| w.remove);
+    if let Some(remove) = remove.filter(|_| !EXITED.load(Ordering::Acquire)) {
+        // SAFETY: the frontend is still up: it never sent its exit event.
+        unsafe { remove(Some(on_event), ptr::null_mut()) };
+    }
     let clicker = CLICKER
         .lock()
         .unwrap_or_else(PoisonError::into_inner)

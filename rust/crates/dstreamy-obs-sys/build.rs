@@ -74,7 +74,7 @@ fn main() {
             "obs_.*|encoder_packet|calldata_t|proc_handler_t|signal_handler_t|signal_callback_t|video_output_info|dstreamy_frontend_.*",
         )
         .allowlist_var(
-            "LIBOBS_API_.*|OBS_OUTPUT_.*|OBS_ENCODER_CAP_.*|OBS_SOURCE_CAP_DISABLED|OBS_SOURCE_AUDIO|DSTREAMY_LOG_.*",
+            "LIBOBS_API_.*|OBS_OUTPUT_.*|OBS_ENCODER_CAP_.*|OBS_SOURCE_CAP_DISABLED|OBS_SOURCE_AUDIO|DSTREAMY_LOG_.*|DSTREAMY_FRONTEND_EVENT_.*",
         )
         .blocklist_item("obs_frontend_.*")
         .blocklist_function(
