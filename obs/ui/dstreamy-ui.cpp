@@ -28,6 +28,7 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 
+#include <cstring>
 #include <memory>
 
 namespace {
@@ -259,21 +260,23 @@ void fill_sources(const QJsonArray &sources)
 			delete box;
 		int indicator = ui.sources->style()->pixelMetric(QStyle::PM_IndicatorWidth) +
 				ui.sources->style()->pixelMetric(QStyle::PM_CheckBoxLabelSpacing);
-		int column = (ui.panel->width() - 48) / 2 - indicator;
+		int scrollbar = ui.scroll->style()->pixelMetric(QStyle::PM_ScrollBarExtent);
+		int column = (ui.panel->width() - 48 - scrollbar) / 2 - indicator;
 		int i = 0;
 		for (const QJsonValue v : sources) {
 			QJsonObject s = v.toObject();
 			QString name = s.value("name").toString();
 			auto *box = new QCheckBox(ui.sources);
-			box->ensurePolished();
-			QString shown = box->fontMetrics().elidedText(name, Qt::ElideRight, column);
-			box->setText(shown.replace(QLatin1Char('&'), QLatin1String("&&")));
 			box->setToolTip(plain_tip(name));
 			box->setAccessibleName(name);
-			box->setAccessibleDescription(name);
 			box->setProperty("name", name);
 			box->setObjectName(QStringLiteral("dstreamy-source"));
 			box->setProperty("uuid", s.value("uuid").toString());
+			box->ensurePolished();
+			QString shown = box->fontMetrics().elidedText(name, Qt::ElideRight, column);
+			if (shown != name)
+				box->setAccessibleDescription(name);
+			box->setText(shown.replace(QLatin1Char('&'), QLatin1String("&&")));
 			QObject::connect(box, &QCheckBox::clicked, box, [box](bool on) {
 				guarded("set_source", [box, on] {
 					if (!ui.active)
@@ -749,7 +752,15 @@ void failed(const char *call)
 void fail_later(const char *call)
 {
 	dstreamy_ui::warn(call);
+	// The panel goes without a hide event the host would see, so the host hears it closed here.
+	bool was_open = ui.active && ui.panel && ui.panel->isVisible() && std::strcmp(call, "panel_closed") != 0;
 	ui.active = false;
+	if (was_open) {
+		try {
+			ui.host.panel_closed(ui.host.ctx);
+		} catch (...) {
+		}
+	}
 	if (failing)
 		return;
 	failing = true;

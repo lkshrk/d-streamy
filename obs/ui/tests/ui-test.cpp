@@ -378,14 +378,17 @@ QList<QCheckBox *> sources()
 	return box ? box->findChildren<QCheckBox *>() : QList<QCheckBox *>();
 }
 
-// Every source row's text fits its column once the layout has settled.
+// Every source row lies inside the scroll area's viewport once the layout has settled: nothing scrolls sideways.
 bool rows_fit()
 {
+	auto *scroll = find<QScrollArea>("dstreamy-sources-scroll");
 	const QList<QCheckBox *> boxes = sources();
+	if (!scroll || boxes.isEmpty() || scroll->widget()->width() > scroll->viewport()->width())
+		return false;
 	for (QCheckBox *box : boxes)
-		if (box->sizeHint().width() > box->width())
+		if (box->mapTo(scroll->viewport(), QPoint(box->width(), 0)).x() > scroll->viewport()->width())
 			return false;
-	return !boxes.isEmpty();
+	return true;
 }
 
 } // namespace
@@ -585,7 +588,8 @@ int main(int argc, char **argv)
 	CHECK(sources().size() == 2 && plain(sources()[0]->toolTip()) == QLatin1String("<i>Mic</i>"));
 	CHECK(status->accessibleDescription() == QString::fromUtf8(tagged.tooltip));
 	CHECK(state && state->accessibleDescription() == QString::fromUtf8(tagged.tooltip));
-	CHECK(sources().size() == 2 && sources()[0]->accessibleDescription() == QLatin1String("<i>Mic</i>"));
+	CHECK(sources().size() == 2 && sources()[0]->accessibleDescription().isEmpty() &&
+	      sources()[0]->accessibleName() == QLatin1String("<i>Mic</i>"));
 	show(view(long_state, audio(true, false)));
 
 	host.null_view = true;
@@ -651,7 +655,9 @@ int main(int argc, char **argv)
 	CHECK(all.size() == 20 && scroll);
 	CHECK(all.size() == 20 && all[0]->text().endsWith(QChar(0x2026)) &&
 	      plain(all[0]->toolTip()) == QString::fromStdString(many[0]) && all[3]->text() == QLatin1String("Music"));
-	CHECK(all.size() == 20 && all[0]->accessibleName() == QString::fromStdString(many[0]));
+	CHECK(all.size() == 20 && all[0]->accessibleName() == QString::fromStdString(many[0]) &&
+	      all[0]->accessibleDescription() == QString::fromStdString(many[0]) &&
+	      all[3]->accessibleDescription().isEmpty());
 	CHECK(scroll && scroll->height() <= 8 * (all[0]->sizeHint().height() + 8) && scroll->height() > 0);
 	CHECK(all.size() == 20 && all[0]->width() <= 160);
 	CHECK(wait_for(rows_fit));
@@ -719,16 +725,19 @@ int main(int argc, char **argv)
 	CHECK(panel() && panel()->isVisible() && all.size() == 20);
 	CHECK(wait_for(rows_fit));
 
+	closed = host.closed;
 	host.throw_view = true;
 	CHECK(wait_for([] { return !find<QToolButton>("dstreamy-status") && !panel(); }));
 	host.throw_view = false;
 	CHECK(fake::warnings == 3 && fake::unwatches == 5);
+	CHECK(host.closed == closed + 1);
 	CHECK(!dstreamy_ui_open_panel());
 
 	host.json = view(idle, audio(false, false));
 	CHECK(dstreamy_ui_load(&good));
 	CHECK(dstreamy_ui_open_panel());
 	tracks = find<QComboBox>("dstreamy-tracks");
+	closed = host.closed;
 	host.throw_track = true;
 	if (tracks)
 		emit tracks->activated(1);
@@ -736,6 +745,7 @@ int main(int argc, char **argv)
 	CHECK(fake::warnings == 4 && !dstreamy_ui_open_panel());
 	CHECK(wait_for([] { return !find<QToolButton>("dstreamy-status") && !panel(); }));
 	CHECK(fake::unwatches == 6);
+	CHECK(host.closed == closed + 1);
 	CHECK(dstreamy_ui_load(&good));
 	dstreamy_ui_unload();
 	CHECK(fake::unwatches == 7);
