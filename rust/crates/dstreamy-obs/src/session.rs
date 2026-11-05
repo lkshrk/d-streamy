@@ -11,7 +11,10 @@ use std::sync::{Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use dstreamy_obs_producer::dock::{Canvas, DockModel, DockState};
+use dstreamy_obs_producer::dock::{
+    Canvas, DockModel, DockState, FIX_AFTER_CLOSING, FIX_LOG, FIX_OUTPUT_SETTING, FIX_PRESS_START,
+    FIX_RESTART_OBS, FIX_START_THEN_STOP, FIX_VIDEO,
+};
 #[cfg(unix)]
 use dstreamy_obs_producer::{
     Endpoint,
@@ -45,7 +48,7 @@ const GONE: &str = "D-Streamy's control thread is not running, so Start and Stop
 type Done = std_mpsc::SyncSender<()>;
 
 enum Job {
-    Lists(Option<String>, Done),
+    Lists(Option<String>, Done, ListsFinished),
     #[cfg(unix)]
     Start(StartRequest, Option<Ownership>, Done),
     #[cfg(unix)]
@@ -107,15 +110,24 @@ fn send(job: Job) -> bool {
     session.as_ref().is_some_and(|s| s.jobs.send(job).is_ok())
 }
 
-/// Queues `job` and waits up to [`UI_WAIT`] for it; the job finishes on its own if the wait runs out.
+/// Whether the UI thread waits for a job; the status-bar panel polls instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    Dialog,
+    No,
+}
+
+/// Queues `job`; with [`Wait::Dialog`] waits up to [`UI_WAIT`], and the job finishes on its own if that runs out.
 /// False when no control thread took it.
-fn send_and_wait(job: impl FnOnce(Done) -> Job) -> bool {
+fn queue(job: impl FnOnce(Done) -> Job, wait: Wait) -> bool {
     let (done, finished) = std_mpsc::sync_channel(1);
     if !send(job(done)) {
         log::warn("the D-Streamy control thread is gone");
         return false;
     }
-    let _ = finished.recv_timeout(UI_WAIT);
+    if wait == Wait::Dialog {
+        let _ = finished.recv_timeout(UI_WAIT);
+    }
     true
 }
 
@@ -128,19 +140,19 @@ fn step<R>(f: impl FnOnce(&mut DockModel) -> R) -> R {
 
 /// Ends a start or stop that can't finish with `message`; a settled state is left alone.
 /// Safe in a button callback: it never refreshes, and the callback's `true` rebuilds the dialog.
-fn settle_pending(message: &str) {
+fn settle_pending(message: &str, fix: &'static str) {
     change(|c, p| {
         c.session(p.write(), |m| {
             if matches!(m.state(), DockState::Starting | DockState::Stopping) {
-                m.abort(message.to_owned());
+                m.abort(message.to_owned(), fix);
             }
         })
     });
 }
 
 /// [`settle_pending`] off the UI thread, where the open dialog must be asked to rebuild.
-fn abort_pending(message: &str) {
-    settle_pending(message);
+fn abort_pending(message: &str, fix: &'static str) {
+    settle_pending(message, fix);
     refresh();
 }
 
@@ -202,7 +214,26 @@ pub fn shutdown() {
 
 /// Loads the server list, and the selected server's channels, for a dialog about to show them.
 pub fn load_lists(guild: Option<String>) {
-    send_and_wait(|done| Job::Lists(guild, done));
+    send_lists(guild, Wait::Dialog);
+}
+
+/// Loads the lists without waiting, for the status-bar panel, which polls; the model shows them loading.
+pub fn request_lists(guild: Option<String>) {
+    send_lists(guild, Wait::No);
+}
+
+/// Ends a list job in the model when dropped: handled, panicked, or never handled.
+struct ListsFinished;
+
+impl Drop for ListsFinished {
+    fn drop(&mut self) {
+        change(|c, _| c.model.lists_finished());
+    }
+}
+
+fn send_lists(guild: Option<String>, wait: Wait) {
+    change(|c, _| c.model.lists_requested());
+    queue(|done| Job::Lists(guild, done, ListsFinished), wait);
 }
 
 fn canvas() -> Option<Canvas> {
@@ -216,14 +247,14 @@ fn canvas() -> Option<Canvas> {
     })
 }
 
-/// The dialog's Start, on the UI thread.
+/// Start from the dialog or the status-bar panel, on the UI thread.
 #[cfg(unix)]
-pub fn start() {
+pub fn start(wait: Wait) {
     let canvas = canvas();
     let begun = change(|c, p| {
         let Some(canvas) = canvas else {
             if c.model.state() == &DockState::Idle {
-                c.model.abort(NO_VIDEO.into());
+                c.model.abort(NO_VIDEO.into(), FIX_VIDEO);
             }
             return Err(NO_VIDEO.to_owned());
         };
@@ -234,31 +265,31 @@ pub fn start() {
     });
     match begun {
         Ok((request, persisted)) => {
-            if !send_and_wait(|done| Job::Start(request, persisted, done)) {
-                settle_pending(GONE);
+            if !queue(|done| Job::Start(request, persisted, done), wait) {
+                settle_pending(GONE, FIX_RESTART_OBS);
             }
         }
         Err(e) => log::warn(&e),
     }
 }
 
-/// The dialog's Stop, on the UI thread.
+/// Stop from the dialog or the status-bar panel, on the UI thread.
 #[cfg(unix)]
-pub fn stop() {
+pub fn stop(wait: Wait) {
     if let Some(ownership) = change(|c, p| c.session(p.write(), |m| m.stop()))
-        && !send_and_wait(|done| Job::Stop(ownership, done))
+        && !queue(|done| Job::Stop(ownership, done), wait)
     {
-        settle_pending(GONE);
+        settle_pending(GONE, FIX_RESTART_OBS);
     }
 }
 
 #[cfg(not(unix))]
-pub fn start() {
+pub fn start(_wait: Wait) {
     log::warn("D-Streamy for OBS doesn't support Windows yet");
 }
 
 #[cfg(not(unix))]
-pub fn stop() {}
+pub fn stop(_wait: Wait) {}
 
 /// The output the dialog starts; the control thread alone creates, starts, stops and releases it.
 struct Output(Option<OutputPtr>);
@@ -291,18 +322,31 @@ impl Output {
         }
         let output = OutputPtr(raw);
         self.0 = Some(output);
+        // SAFETY: a weak reference to the live output, released in `release`.
+        let weak = Watched(unsafe { sys::obs_output_get_weak_output(raw) });
+        if let Some(old) = WATCHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(weak)
+        {
+            // SAFETY: the weak reference this module took.
+            unsafe { sys::obs_weak_output_release(old.0) };
+        }
         Ok(output)
     }
 
-    /// Applies `settings` to the inactive output and starts it; never updates an active output.
-    fn start(&mut self, settings: &Value) -> Result<(), String> {
-        let output = self.get()?;
+    /// Applies `settings` to the inactive output and starts it; a failure comes with the panel's fix.
+    fn start(&mut self, settings: &Value) -> Result<(), (String, &'static str)> {
+        let output = self.get().map_err(|e| (e, FIX_LOG))?;
         // SAFETY: the output is live until `release`, which only this thread calls.
         unsafe {
             if sys::obs_output_active(output.0) {
-                return Err("D-Streamy is still stopping; try again".into());
+                return Err((
+                    "D-Streamy is still stopping; try again".into(),
+                    FIX_PRESS_START,
+                ));
             }
-            let json = CString::new(settings.to_string()).map_err(|e| e.to_string())?;
+            let json = CString::new(settings.to_string()).map_err(|e| (e.to_string(), FIX_LOG))?;
             let data = sys::obs_data_create_from_json(json.as_ptr());
             sys::obs_output_update(output.0, data);
             sys::obs_data_release(data);
@@ -311,9 +355,13 @@ impl Output {
             }
             let error = text(sys::obs_output_get_last_error(output.0));
             Err(if error.is_empty() {
-                "D-Streamy's OBS output did not start; see the OBS log".into()
+                (
+                    "D-Streamy's OBS output did not start; see the OBS log".into(),
+                    FIX_LOG,
+                )
             } else {
-                error
+                // The output's own errors name the OBS setting to change (encoders.rs).
+                (error, FIX_OUTPUT_SETTING)
             })
         }
     }
@@ -362,6 +410,14 @@ impl Output {
     }
 
     fn release(&mut self) {
+        if let Some(weak) = WATCHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            // SAFETY: the weak reference `get` took.
+            unsafe { sys::obs_weak_output_release(weak.0) };
+        }
         if let Some(output) = self.0.take() {
             // SAFETY: release stops an active output first and joins its worker (output.rs `destroy`).
             unsafe {
@@ -374,6 +430,39 @@ impl Output {
                 sys::obs_output_release(output.0);
             }
         }
+    }
+}
+
+/// The control thread's output, for the panel's stats: weak, so reading it never extends the output's life.
+struct Watched(*mut sys::obs_weak_output_t);
+
+// SAFETY: weak references are reference-counted by libobs and usable from any thread.
+unsafe impl Send for Watched {}
+
+static WATCHED: Mutex<Option<Watched>> = Mutex::new(None);
+
+/// The output's counters while it is active: bytes, frames and dropped frames. Cheap; callable on the UI thread.
+pub fn output_counters() -> Option<(u64, u64, u64)> {
+    let strong = WATCHED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        // SAFETY: the weak reference is live while it is in WATCHED; this returns a strong reference or NULL.
+        .map(|w| unsafe { sys::obs_weak_output_get_output(w.0) })?;
+    if strong.is_null() {
+        return None;
+    }
+    // SAFETY: a strong reference taken above, released at once; the getters only read counters.
+    unsafe {
+        let counters = sys::obs_output_active(strong).then(|| {
+            (
+                sys::obs_output_get_total_bytes(strong),
+                u64::try_from(sys::obs_output_get_total_frames(strong)).unwrap_or(0),
+                u64::try_from(sys::obs_output_get_frames_dropped(strong)).unwrap_or(0),
+            )
+        });
+        sys::obs_output_release(strong);
+        counters
     }
 }
 
@@ -431,9 +520,12 @@ fn run(
                 log::warn(&format!(
                     "rolling back the failed D-Streamy control step failed: {again}"
                 ));
-                abort_pending(&format!(
-                    "D-Streamy's control step failed ({message}). See the OBS log, then restart OBS"
-                ));
+                abort_pending(
+                    &format!(
+                        "D-Streamy's control step failed ({message}). See the OBS log, then restart OBS"
+                    ),
+                    FIX_RESTART_OBS,
+                );
             }
         }
     });
@@ -487,7 +579,11 @@ async fn recover(output: &Output, brought: Brought, mut closing: Closing, failur
             if let Some(ownership) = brought {
                 m.claim(ownership);
             }
-            m.output_failed(message, ended);
+            m.output_failed(
+                message,
+                if ended { FIX_LOG } else { FIX_START_THEN_STOP },
+                ended,
+            );
         } else {
             m.stopped(Err(message));
             if ended {
@@ -499,9 +595,12 @@ async fn recover(output: &Output, brought: Brought, mut closing: Closing, failur
 
 #[cfg(not(unix))]
 async fn recover(_output: &Output, _brought: Brought, _closing: Closing, failure: &str) {
-    abort_pending(&format!(
-        "D-Streamy's control step failed ({failure}). See the OBS log, then press Start again"
-    ));
+    abort_pending(
+        &format!(
+            "D-Streamy's control step failed ({failure}). See the OBS log, then press Start again"
+        ),
+        FIX_LOG,
+    );
 }
 
 #[cfg(unix)]
@@ -516,16 +615,17 @@ const STOPPED_WAITING: &str =
 
 async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &mut Brought) {
     match job {
-        Job::Lists(guild, done) => {
+        Job::Lists(guild, done, finished) => {
             if !closing.is_closing() {
                 lists(guild, &mut closing).await;
             }
+            drop(finished);
             let _ = done.try_send(());
         }
         #[cfg(unix)]
         Job::Start(request, persisted, done) => {
             if closing.is_closing() {
-                abort_pending(CLOSING);
+                abort_pending(CLOSING, FIX_AFTER_CLOSING);
             } else {
                 start_session(output, &request, persisted.as_ref(), &mut closing, brought).await;
             }
@@ -623,7 +723,7 @@ async fn end_while_closing(
     }
     step(|m| {
         m.claim(ownership);
-        m.output_failed(CLOSING.into(), ended.is_ok());
+        m.output_failed(CLOSING.into(), FIX_AFTER_CLOSING, ended.is_ok());
     });
 }
 
@@ -638,7 +738,7 @@ async fn start_session(
     let control = match control() {
         Ok(control) => control,
         Err(e) => {
-            step(|m| m.output_failed(e, false));
+            step(|m| m.output_failed(e, FIX_LOG, false));
             return;
         }
     };
@@ -650,7 +750,7 @@ async fn start_session(
         });
         if opened.await.is_none() {
             log::warn(STOPPED_WAITING);
-            abort_pending(CLOSING);
+            abort_pending(CLOSING, FIX_AFTER_CLOSING);
             return;
         }
     }
@@ -665,7 +765,7 @@ async fn start_session(
             match failed.ownership {
                 // The start was sent, so it may still land: its candidate is stopped or kept saved.
                 Some(candidate) => end_while_closing(&control, Some(*candidate), closing).await,
-                None => abort_pending(CLOSING),
+                None => abort_pending(CLOSING, FIX_AFTER_CLOSING),
             }
             return;
         }
@@ -696,7 +796,7 @@ async fn start_session(
             ));
             step(|m| m.started(Ok(started)));
         }
-        Err(message) => {
+        Err((message, fix)) => {
             log::warn(&message);
             let message = match end_unused(&control, ownership.as_ref(), closing).await {
                 Ok(()) => format!("{message}. Fix it, then press Start again"),
@@ -710,12 +810,13 @@ async fn start_session(
                                 "{message}. The Discord session it started is still live ({e}); \
                                  press Start to use it again"
                             ),
+                            fix,
                             false,
                         )
                     });
                 }
             };
-            step(|m| m.output_failed(message, true));
+            step(|m| m.output_failed(message, fix, true));
         }
     }
 }
@@ -790,6 +891,29 @@ mod tests {
     fn closing() -> (watch::Sender<Option<Instant>>, Closing) {
         let (tx, rx) = watch::channel(None);
         (tx, Closing(rx))
+    }
+
+    #[tokio::test]
+    async fn a_list_job_ends_loading_when_dropped_unhandled_or_when_it_panics() {
+        let loading = || with_controls(|c| c.model.loading().0);
+        let (done, _finished) = std_mpsc::sync_channel(1);
+
+        change(|c, _| c.model.lists_requested());
+        let queued = Job::Lists(None, done.clone(), ListsFinished);
+        assert!(loading());
+        drop(queued);
+        assert!(!loading(), "a queued job the control thread never took");
+
+        change(|c, _| c.model.lists_requested());
+        let job = Job::Lists(None, done, ListsFinished);
+        let run: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+            let _job = job;
+            tokio::task::yield_now().await;
+            panic!("a test panic in a list job");
+        });
+        assert!(loading());
+        assert!(AssertUnwindSafe(run).catch_unwind().await.is_err());
+        assert!(!loading(), "a job that panicked");
     }
 
     #[tokio::test]

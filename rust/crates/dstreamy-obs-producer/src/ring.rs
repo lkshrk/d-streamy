@@ -1,6 +1,7 @@
 //! Bounded packet queue from `encoded_packet` to the IPC writer, with `dstreamy_media::external`'s drop policy.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -171,6 +172,8 @@ pub struct Ring {
     max_bytes: usize,
     inner: Mutex<Inner>,
     ready: Notify,
+    /// Payload bytes written to the service since the last reopen.
+    sent: AtomicU64,
 }
 
 impl Default for Ring {
@@ -186,7 +189,17 @@ impl Ring {
             max_bytes,
             inner: Mutex::new(Inner::default()),
             ready: Notify::new(),
+            sent: AtomicU64::new(0),
         }
+    }
+
+    /// The writer sent a packet with `bytes` of payload.
+    pub fn count_sent(&self, bytes: usize) {
+        self.sent.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn sent_bytes(&self) -> u64 {
+        self.sent.load(Ordering::Relaxed)
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -239,6 +252,7 @@ impl Ring {
     /// Empties the ring and accepts packets again, with fresh counters.
     pub fn reopen(&self) {
         *self.lock() = Inner::default();
+        self.sent.store(0, Ordering::Relaxed);
     }
 
     pub fn stats(&self) -> RingStats {
@@ -559,5 +573,16 @@ mod tests {
             "every queued keyframe was evicted by the delta after it"
         );
         assert_stream_follows_the_policy(&got, ring.stats(), N);
+    }
+
+    #[test]
+    fn sent_bytes_count_what_the_writer_sent_until_a_reopen() {
+        let ring = Ring::default();
+        assert_eq!(ring.sent_bytes(), 0);
+        ring.count_sent(1000);
+        ring.count_sent(500);
+        assert_eq!(ring.sent_bytes(), 1500);
+        ring.reopen();
+        assert_eq!(ring.sent_bytes(), 0);
     }
 }

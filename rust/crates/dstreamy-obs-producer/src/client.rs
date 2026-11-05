@@ -229,6 +229,7 @@ async fn write_packets<T>(
             Ok(frame) => frame,
             Err(e) => return WriterEnd::Refused(e),
         };
+        let bytes = frame.payload.len();
         if frame.kind == Kind::Video {
             last_pts_us = frame.pts_us;
         }
@@ -241,6 +242,7 @@ async fn write_packets<T>(
         if let Err(e) = sent {
             return WriterEnd::Failed(format!("writing to the service: {e}"));
         }
+        ring.count_sent(bytes);
         if let Some(pts_us) = keyframe_pts_us {
             log.log(
                 Level::Debug,
@@ -284,7 +286,9 @@ async fn write_packets<T>(
             if frame.kind == Kind::Video {
                 last_pts_us = frame.pts_us;
             }
+            let bytes = frame.payload.len();
             sink.feed(frame).await?;
+            ring.count_sent(bytes);
         }
         sink.send(Frame::end_of_stream(last_pts_us)).await
     };

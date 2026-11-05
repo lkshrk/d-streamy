@@ -78,7 +78,7 @@ impl Frontend {
     }
 }
 
-/// Adds Tools > D-Streamy… when OBS's frontend is present; call from `obs_module_load`, on the UI thread.
+/// Finds OBS's frontend; call from `obs_module_load`, on the UI thread.
 pub fn install() {
     let frontend = match Frontend::resolve() {
         Ok(frontend) => frontend,
@@ -99,7 +99,14 @@ pub fn install() {
             return;
         }
     };
-    let frontend = FRONTEND.get_or_init(|| frontend);
+    FRONTEND.get_or_init(|| frontend);
+}
+
+/// Adds Tools > D-Streamy…: it opens the status-bar panel when that loaded, else the settings dialog. UI thread.
+pub fn add_tools_entry() {
+    let Some(frontend) = FRONTEND.get() else {
+        return;
+    };
     if let Some(add) = frontend.add_tools_menu_item {
         // SAFETY: module load runs on the UI thread; the frontend copies the name.
         unsafe { add(TOOLS_ITEM.as_ptr(), Some(open_settings), ptr::null_mut()) };
@@ -108,6 +115,11 @@ pub fn install() {
             click_when(trigger);
         }
     }
+}
+
+/// Whether [`install`] found OBS's frontend.
+pub fn available() -> bool {
+    FRONTEND.get().is_some()
 }
 
 static CLICKER: Mutex<Option<(Arc<AtomicBool>, JoinHandle<()>)>> = Mutex::new(None);
@@ -151,6 +163,13 @@ pub fn shutdown() {
 
 extern "C" fn open_settings(_private_data: *mut c_void) {
     guard("open_settings", (), || {
+        match crate::ui::open_panel() {
+            Some(true) => return log::debug("Tools > D-Streamy opened the status-bar panel"),
+            Some(false) => log::warn(
+                "Tools > D-Streamy could not show the status-bar panel: it opens the settings dialog",
+            ),
+            None => {}
+        }
         let Some(open) = FRONTEND.get().and_then(|f| f.open_source_properties) else {
             return;
         };

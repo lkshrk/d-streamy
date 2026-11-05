@@ -12,11 +12,9 @@ pub const DEFAULT_BITRATE_KBPS: i64 = 6000;
 pub const BITRATE_KBPS: std::ops::RangeInclusive<i64> = 500..=50_000;
 /// OBS's mixer tracks, one-based.
 pub const AUDIO_TRACKS: std::ops::RangeInclusive<u8> = 1..=6;
-pub const DEFAULT_AUDIO_TRACK: u8 = 1;
+/// The last track, which OBS's default stream and recording settings leave unused.
+pub const DEFAULT_AUDIO_TRACK: u8 = 6;
 pub const AUDIO_TRACK_TITLE: &str = "Discord audio track";
-pub const AUDIO_TRACK_HELP: &str = "D-Streamy sends this OBS mixer track to Discord. New OBS sources feed all tracks \
-     until you change them in Edit › Advanced Audio Properties › Tracks. This does not \
-     change OBS's stream or recording. A change applies on the next Go Live.";
 
 /// OBS's fixed name for a mixer track; D-Streamy keeps no labels of its own.
 pub fn track_name(track: u8) -> String {
@@ -49,6 +47,8 @@ pub struct DockSettings {
     pub start_with_stream: bool,
     /// The OBS mixer track sent to Discord, one-based.
     pub audio_track: u8,
+    /// The track D-Streamy took over; managed only while it equals `audio_track`.
+    pub managed_track: Option<u8>,
     pub owned: Option<Ownership>,
 }
 
@@ -64,6 +64,7 @@ impl Default for DockSettings {
             share_fallback: true,
             start_with_stream: false,
             audio_track: DEFAULT_AUDIO_TRACK,
+            managed_track: None,
             owned: None,
         }
     }
@@ -103,6 +104,7 @@ impl DockSettings {
                 })
                 .and_then(|n| u8::try_from(n).ok())
                 .unwrap_or(d.audio_track),
+            managed_track: field::<u8>(&map, "managed_track").filter(|t| AUDIO_TRACKS.contains(t)),
             owned: field(&map, "owned"),
         }
         .clamped()
@@ -119,6 +121,7 @@ impl DockSettings {
             } else {
                 DEFAULT_AUDIO_TRACK
             },
+            managed_track: self.managed_track.filter(|t| AUDIO_TRACKS.contains(t)),
             ..self
         }
     }
@@ -177,17 +180,66 @@ pub struct Choice {
     pub audio_track: u8,
 }
 
+/// What went wrong: a short headline and fix for the dock, and the full message the dialog shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Problem {
+    pub headline: &'static str,
+    pub fix: &'static str,
+    pub message: String,
+    /// It came from loading the server or channel list, so the next good load clears it.
+    pub lists: bool,
+}
+
+impl Problem {
+    pub fn new(headline: &'static str, fix: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            headline,
+            fix,
+            message: message.into(),
+            lists: false,
+        }
+    }
+
+    pub fn control(error: &ControlError) -> Self {
+        Self {
+            headline: error.headline(),
+            fix: error.fix(),
+            message: error.to_string(),
+            lists: false,
+        }
+    }
+}
+
+const NO_CHANNEL: &str = "No voice channel picked";
+const CANT_START: &str = "Can't start";
+const DIDNT_START: &str = "Didn't start";
+const STOP_UNFINISHED: &str = "Stop didn't finish";
+const STREAM_STOPPED: &str = "Stream stopped";
+
+/// What the dock suggests for a start or stop that couldn't finish; the caller knows the cause.
+pub const FIX_LOG: &str = "See the OBS log";
+pub const FIX_RESTART_OBS: &str = "Restart OBS";
+pub const FIX_AFTER_CLOSING: &str = "Start again after OBS restarts";
+pub const FIX_VIDEO: &str = "Check OBS's Settings › Video";
+pub const FIX_OUTPUT_SETTING: &str = "Change the OBS setting it names";
+pub const FIX_PRESS_START: &str = "Press Start again";
+pub const FIX_START_THEN_STOP: &str = "Press Start, then Stop";
+
+pub const PICK_CHANNEL: &str = "Pick a server and a voice channel first";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockModel {
     settings: DockSettings,
     guilds: Vec<Named>,
     channels: Vec<Named>,
     state: DockState,
-    error: Option<String>,
+    error: Option<Problem>,
     /// The track the running output was started with; set once its start is accepted, cleared when the session ends.
     live_track: Option<u8>,
     /// The track written to the output's settings for the start in progress.
     applying: Option<u8>,
+    /// List load jobs sent and not yet ended; the lists show loading until the last one ends.
+    lists_pending: u32,
 }
 
 impl DockModel {
@@ -200,7 +252,31 @@ impl DockModel {
             error: None,
             live_track: None,
             applying: None,
+            lists_pending: 0,
         }
+    }
+
+    /// A start, stop or settings problem outlives a list load; only a list's own problem goes.
+    fn clear_list_problem(&mut self) {
+        if self.error.as_ref().is_some_and(|p| p.lists) {
+            self.error = None;
+        }
+    }
+
+    /// A list load job was sent.
+    pub fn lists_requested(&mut self) {
+        self.lists_pending += 1;
+    }
+
+    /// A list load job ended, whatever it got.
+    pub fn lists_finished(&mut self) {
+        self.lists_pending = self.lists_pending.saturating_sub(1);
+    }
+
+    /// Whether the server list, and the selected server's channels, are still loading.
+    pub fn loading(&self) -> (bool, bool) {
+        let loading = self.lists_pending > 0;
+        (loading, loading && self.settings.guild_id.is_some())
     }
 
     pub fn live_track(&self) -> Option<u8> {
@@ -228,6 +304,17 @@ impl DockModel {
         true
     }
 
+    /// Whether D-Streamy manages the selected track's source flags.
+    pub fn managed(&self) -> bool {
+        self.settings.managed_track == Some(self.settings.audio_track)
+    }
+
+    /// Marks the selected track as managed and returns it; the caller clears it on every source first.
+    pub fn take_over(&mut self) -> u8 {
+        self.settings.managed_track = Some(self.settings.audio_track);
+        self.settings.audio_track
+    }
+
     /// One line for the settings dialog; `controls` says whether it can start and stop D-Streamy.
     pub fn status_text(&self, controls: bool) -> String {
         let pending = match self.track_status() {
@@ -239,7 +326,7 @@ impl DockModel {
         let live = self.live_track.map(track_name).unwrap_or_default();
         match &self.state {
             DockState::Idle => match (&self.error, controls) {
-                (Some(error), _) => error.clone(),
+                (Some(error), _) => error.message.clone(),
                 (None, true) => "Idle".into(),
                 (None, false) => "Idle — start controls are unavailable".into(),
             },
@@ -261,7 +348,11 @@ impl DockModel {
     }
 
     pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+        self.error.as_ref().map(|p| p.message.as_str())
+    }
+
+    pub fn problem(&self) -> Option<&Problem> {
+        self.error.as_ref()
     }
 
     pub fn guilds(&self) -> &[Named] {
@@ -312,7 +403,7 @@ impl DockModel {
         match result {
             Ok(guilds) => {
                 self.guilds = guilds;
-                self.error = None;
+                self.clear_list_problem();
                 // A saved server the list lacks stays selected and shown until the user picks another.
                 let selected = self.settings.guild_id.clone()?;
                 if self.guilds.iter().any(|g| g.id == selected) {
@@ -323,7 +414,10 @@ impl DockModel {
                 }
             }
             Err(e) => {
-                self.error = Some(e.to_string());
+                self.error = Some(Problem {
+                    lists: true,
+                    ..Problem::control(&e)
+                });
                 None
             }
         }
@@ -349,11 +443,14 @@ impl DockModel {
         match result {
             Ok(channels) => {
                 self.channels = channels;
-                self.error = None;
+                self.clear_list_problem();
             }
             Err(e) => {
                 self.channels.clear();
-                self.error = Some(e.to_string());
+                self.error = Some(Problem {
+                    lists: true,
+                    ..Problem::control(&e)
+                });
             }
         }
     }
@@ -369,11 +466,16 @@ impl DockModel {
     }
 
     /// Ends a start or stop that can no longer finish, or refuses one that can't begin, with `message`.
-    pub fn abort(&mut self, message: String) {
+    pub fn abort(&mut self, message: String, fix: &'static str) {
+        let headline = match self.state {
+            DockState::Starting => DIDNT_START,
+            DockState::Stopping => STOP_UNFINISHED,
+            DockState::Idle | DockState::Live { .. } => CANT_START,
+        };
         self.state = DockState::Idle;
         self.applying = None;
         self.live_track = None;
-        self.error = Some(message);
+        self.error = Some(Problem::new(headline, fix, message));
     }
 
     /// Puts back an ownership a reload replaced, when the file's is older than this one.
@@ -455,16 +557,21 @@ impl DockModel {
             }
             Err(e) => self.error = Some(e.clone()),
         }
-        request
+        request.map_err(|p| p.message)
     }
 
-    fn start_request(&self, canvas: Canvas) -> Result<StartRequest, String> {
+    fn start_request(&self, canvas: Canvas) -> Result<StartRequest, Problem> {
         let (Some(guild_id), Some(channel_id)) =
             (&self.settings.guild_id, &self.settings.channel_id)
         else {
-            return Err("Pick a server and a voice channel first".into());
+            return Err(Problem::new(
+                NO_CHANNEL,
+                "Pick a server and voice channel",
+                PICK_CHANNEL,
+            ));
         };
-        let (fps, _) = target_fps(canvas.fps_num, canvas.fps_den).map_err(|p| p.message())?;
+        let (fps, _) = target_fps(canvas.fps_num, canvas.fps_den)
+            .map_err(|p| Problem::new(CANT_START, FIX_VIDEO, p.message()))?;
         let (width, height) = fit_1080p(canvas.output_width, canvas.output_height);
         Ok(StartRequest {
             guild_id: guild_id.clone(),
@@ -521,20 +628,20 @@ impl DockModel {
                 }
                 self.state = DockState::Idle;
                 self.live_track = None;
-                self.error = Some(failed.error.to_string());
+                self.error = Some(Problem::control(&failed.error));
             }
         }
     }
 
     /// The output refused its start after the service session came up; `session_ended` says whether that session is gone.
-    pub fn output_failed(&mut self, message: String, session_ended: bool) {
+    pub fn output_failed(&mut self, message: String, fix: &'static str, session_ended: bool) {
         if self.state != DockState::Starting {
             return;
         }
         self.state = DockState::Idle;
         self.applying = None;
         self.live_track = None;
-        self.error = Some(message);
+        self.error = Some(Problem::new(DIDNT_START, fix, message));
         if session_ended {
             self.settings.owned = None;
         }
@@ -561,7 +668,7 @@ impl DockModel {
                 self.settings.owned = None;
                 self.error = None;
             }
-            Err(e) => self.error = Some(e),
+            Err(e) => self.error = Some(Problem::new(STOP_UNFINISHED, FIX_START_THEN_STOP, e)),
         }
     }
 
@@ -572,7 +679,8 @@ impl DockModel {
         }
         self.state = DockState::Idle;
         self.live_track = None;
-        self.error = message;
+        self.error =
+            message.map(|m| Problem::new(STREAM_STOPPED, "Press Start to go live again", m));
     }
 
     /// The session's fps for share mode's check, while live.
@@ -587,7 +695,7 @@ impl DockModel {
     pub fn view(&self) -> Value {
         json!({
             "state": self.state,
-            "error": self.error,
+            "error": self.error(),
             "guilds": self.guilds,
             "channels": self.channels,
             "settings": self.settings,
@@ -721,15 +829,15 @@ mod tests {
         };
         assert_eq!(
             s.output_settings(),
-            json!({"mode": "share", "video_encoder": "obs_x264", "bitrate": 6000, "share_fallback": false, "audio_track": 1})
+            json!({"mode": "share", "video_encoder": "obs_x264", "bitrate": 6000, "share_fallback": false, "audio_track": 6})
         );
     }
 
     #[test]
-    fn audio_track_defaults_to_one_and_round_trips() {
+    fn audio_track_defaults_to_six_and_round_trips() {
         let d = DockSettings::default();
-        assert_eq!(d.audio_track, 1);
-        assert_eq!(DockSettings::from_json("{}").audio_track, 1);
+        assert_eq!(d.audio_track, 6);
+        assert_eq!(DockSettings::from_json("{}").audio_track, 6);
         for track in 1..=6u8 {
             let s = DockSettings {
                 audio_track: track,
@@ -742,10 +850,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_audio_track_falls_back_to_one() {
+    fn invalid_audio_track_falls_back_to_six() {
         for bad in ["0", "7", "-1", "256", "2.5", "\"2\"", "null", "true"] {
             let s = with_owned(&format!(r#""audio_track":{bad}"#));
-            assert_eq!(s.audio_track, 1, "{bad}");
+            assert_eq!(s.audio_track, 6, "{bad}");
         }
         assert_eq!(with_owned(r#""audio_track":3.0"#).audio_track, 3);
         let mut m = DockModel::new(DockSettings::default());
@@ -754,7 +862,7 @@ mod tests {
                 audio_track: bad,
                 ..DockSettings::default()
             });
-            assert_eq!(m.settings().audio_track, 1, "{bad}");
+            assert_eq!(m.settings().audio_track, 6, "{bad}");
         }
     }
 
@@ -765,10 +873,10 @@ mod tests {
     }
 
     #[test]
-    fn a_new_dock_is_idle_on_track_1() {
+    fn a_new_dock_is_idle_on_track_6() {
         let m = DockModel::new(DockSettings::default());
         assert_eq!(m.live_track(), None);
-        assert_eq!(m.track_status(), TrackStatus::Idle { selected: 1 });
+        assert_eq!(m.track_status(), TrackStatus::Idle { selected: 6 });
         assert_eq!(
             m.status_text(false),
             "Idle — start controls are unavailable"
@@ -794,7 +902,7 @@ mod tests {
         m.reload(stored);
         assert_eq!(m.persisted(), Some(&ownership(7)), "the live session's own");
         assert_eq!(m.settings().audio_track, 4);
-        assert_eq!(m.live_track(), Some(1));
+        assert_eq!(m.live_track(), Some(6));
     }
 
     #[test]
@@ -848,7 +956,7 @@ mod tests {
         let mut m = picked();
         m.start(canvas()).unwrap();
         m.claim(Some(ownership(7)));
-        m.output_failed("no encoder".into(), false);
+        m.output_failed("no encoder".into(), FIX_OUTPUT_SETTING, false);
         assert_eq!(m.state(), &DockState::Idle);
         assert_eq!(m.error(), Some("no encoder"));
         assert_eq!(m.live_track(), None);
@@ -860,9 +968,9 @@ mod tests {
 
         m.start(canvas()).unwrap();
         m.claim(Some(ownership(8)));
-        m.output_failed("no encoder".into(), true);
+        m.output_failed("no encoder".into(), FIX_OUTPUT_SETTING, true);
         assert_eq!(m.persisted(), None, "its session was stopped");
-        m.output_failed("late".into(), true);
+        m.output_failed("late".into(), FIX_OUTPUT_SETTING, true);
         assert_eq!(m.error(), Some("no encoder"), "ignored once idle");
     }
 
@@ -929,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn tracks_have_fixed_names_and_the_routing_help_is_exact() {
+    fn tracks_have_fixed_names() {
         let names: Vec<String> = AUDIO_TRACKS.map(track_name).collect();
         assert_eq!(
             names,
@@ -938,13 +1046,6 @@ mod tests {
             ]
         );
         assert_eq!(AUDIO_TRACK_TITLE, "Discord audio track");
-        assert_eq!(
-            AUDIO_TRACK_HELP,
-            "D-Streamy sends this OBS mixer track to Discord. New OBS sources feed all tracks \
-             until you change them in Edit › Advanced Audio Properties › Tracks. This does not \
-             change OBS's stream or recording. A change applies on the next Go Live."
-        );
-        assert!(!AUDIO_TRACK_HELP.contains("label"));
     }
 
     #[test]
@@ -1005,7 +1106,7 @@ mod tests {
     fn pick_a_server_clears_the_server_and_its_channel() {
         let mut m = picked();
         assert_eq!(m.choose_guild(None), None);
-        assert_eq!(m.choice(), choice(None, None, 1));
+        assert_eq!(m.choice(), choice(None, None, 6));
         assert!(
             m.channels().is_empty(),
             "the old server's channels are gone"
@@ -1016,14 +1117,14 @@ mod tests {
         );
         assert_eq!(m.choose_guild(None), None, "already cleared");
         assert_eq!(m.choose_guild(Some("h")), Some("h".into()));
-        assert_eq!(m.choice(), choice(Some("h"), None, 1));
+        assert_eq!(m.choice(), choice(Some("h"), None, 6));
     }
 
     #[test]
     fn pick_a_voice_channel_clears_only_the_channel() {
         let mut m = picked();
         assert_eq!(m.choose_channel(None), None);
-        assert_eq!(m.choice(), choice(Some("g"), None, 1));
+        assert_eq!(m.choice(), choice(Some("g"), None, 6));
         assert!(m.lists_channel("d"), "the server's channels stay listed");
         assert_eq!(m.choose_channel(Some("d")), Some("d".into()));
         assert_eq!(
@@ -1107,7 +1208,7 @@ mod tests {
         let mut m = picked();
         m.start(canvas()).unwrap();
         m.claim(Some(ownership(7)));
-        m.abort("the control step failed".into());
+        m.abort("the control step failed".into(), FIX_RESTART_OBS);
         assert_eq!(m.state(), &DockState::Idle);
         assert_eq!(m.status_text(true), "the control step failed");
         assert_eq!(
@@ -1118,7 +1219,7 @@ mod tests {
         m.start(canvas()).unwrap();
         m.started(Ok(started(Some(ownership(7)))));
         m.stop();
-        m.abort("gone".into());
+        m.abort("gone".into(), FIX_RESTART_OBS);
         assert_eq!(m.live_track(), None);
         assert_eq!(m.state(), &DockState::Idle);
     }
@@ -1130,6 +1231,41 @@ mod tests {
         assert_eq!(m.error(), Some("Log in first: run `dstreamy login`"));
         m.guilds_loaded(Ok(vec![named("g")]));
         assert_eq!(m.error(), None);
+    }
+
+    #[test]
+    fn a_good_list_load_keeps_a_start_or_stop_problem() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Err(ControlError::NotRunning("no socket".into()).into()));
+        let problem = m.error().map(str::to_owned);
+        assert!(problem.is_some());
+        m.guilds_loaded(Ok(vec![named("g")]));
+        m.channels_loaded("g", Ok(vec![named("c")]));
+        assert_eq!(
+            m.error().map(str::to_owned),
+            problem,
+            "the panel opening must not hide it"
+        );
+
+        let mut m = picked();
+        m.stop();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(None)));
+        m.stop();
+        m.stopped(Err("timed out".into()));
+        m.guilds_loaded(Ok(vec![named("g")]));
+        assert_eq!(m.error(), Some("timed out"));
+
+        let mut m = picked();
+        m.channels_loaded("g", Err(ControlError::GuildUnavailable));
+        assert!(m.problem().is_some_and(|p| p.lists));
+        m.channels_loaded("g", Ok(vec![named("c")]));
+        assert_eq!(
+            m.error(),
+            None,
+            "a list's own problem goes with the next good load"
+        );
     }
 
     #[test]

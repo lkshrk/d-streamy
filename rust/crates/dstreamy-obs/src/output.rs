@@ -1,6 +1,6 @@
 //! `dstreamy_output`: an encoded A/V output that hands its packets to `dstreamy serve`.
 
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::mem;
 use std::path::PathBuf;
 use std::ptr;
@@ -408,6 +408,23 @@ extern "C" fn get_stats(data: *mut c_void, cd: *mut sys::calldata_t) {
     });
 }
 
+/// `obs_output_get_total_bytes`: the bytes this output sent to the service since its start.
+extern "C" fn output_total_bytes(data: *mut c_void) -> u64 {
+    guard("get_total_bytes", 0, || {
+        // SAFETY: libobs only calls this on a live output, with the pointer create returned.
+        unsafe { state(data) }.shared.ring.sent_bytes()
+    })
+}
+
+/// `obs_output_get_frames_dropped`: video packets the ring dropped because the service fell behind.
+extern "C" fn output_dropped_frames(data: *mut c_void) -> c_int {
+    guard("get_dropped_frames", 0, || {
+        // SAFETY: as in `output_total_bytes`.
+        let dropped = unsafe { state(data) }.shared.ring.stats().dropped_video;
+        c_int::try_from(dropped).unwrap_or(c_int::MAX)
+    })
+}
+
 pub fn register() {
     let info = sys::obs_output_info {
         id: OUTPUT_ID.as_ptr(),
@@ -418,6 +435,8 @@ pub fn register() {
         start: Some(output_start),
         stop: Some(output_stop),
         encoded_packet: Some(output_encoded_packet),
+        get_total_bytes: Some(output_total_bytes),
+        get_dropped_frames: Some(output_dropped_frames),
         get_defaults: Some(encoders::get_defaults),
         get_properties: Some(encoders::get_properties),
         encoded_video_codecs: c"h264".as_ptr(),

@@ -1,5 +1,6 @@
 //! D-Streamy OBS plugin module: the entry points libobs looks up (`libobs/obs-module.c:40-50`).
 
+mod audio;
 mod config;
 mod encoders;
 mod frontend;
@@ -9,6 +10,7 @@ mod log;
 mod output;
 mod session;
 mod settings_source;
+mod ui;
 mod worker;
 
 use std::ptr;
@@ -47,8 +49,15 @@ pub extern "C" fn obs_module_load() -> bool {
         }
         output::register();
         settings_source::register();
+        audio::install();
         session::install();
+        // The managed track must be known before OBS loads the scene collection and creates sources.
+        settings_source::open_config();
         frontend::install();
+        if frontend::available() {
+            ui::install();
+            frontend::add_tools_entry();
+        }
         log::info(&format!("loaded (version {})", env!("CARGO_PKG_VERSION")));
         true
     })
@@ -57,7 +66,9 @@ pub extern "C" fn obs_module_load() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn obs_module_unload() {
     guard("obs_module_unload", (), || {
+        ui::shutdown();
         frontend::shutdown();
+        audio::shutdown();
         session::shutdown();
         log::info("unloaded");
     });

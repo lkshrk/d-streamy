@@ -3,12 +3,16 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem;
 use std::ptr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use dstreamy_obs_producer::dock::{
-    AUDIO_TRACK_HELP, AUDIO_TRACK_TITLE, AUDIO_TRACKS, Choice, DockState, TrackStatus, track_name,
+    AUDIO_TRACK_TITLE, AUDIO_TRACKS, Choice, DEFAULT_AUDIO_TRACK, DockState, TrackStatus,
+    track_name,
 };
 use dstreamy_obs_producer::dock_config::{ConfigError, ConfigState};
+use dstreamy_obs_producer::dock_view::UNSUPPORTED;
+use dstreamy_obs_producer::mixer::{AudioView, audio_view};
 use dstreamy_obs_sys as sys;
 
 use crate::config;
@@ -24,10 +28,6 @@ const AUDIO_TRACK: &CStr = c"audio_track";
 const GUILD: &CStr = c"guild_id";
 const CHANNEL: &CStr = c"channel_id";
 const STATUS: &CStr = c"status";
-
-/// Shown instead of the session status where the plugin has no service client yet.
-const UNSUPPORTED: &str =
-    "D-Streamy for OBS is not supported on Windows yet, so Start and Stop are disabled";
 
 /// The producer model behind every dialog; it outlives each dialog's source.
 struct Controls {
@@ -104,7 +104,7 @@ fn flush((generation, json): (u64, String)) {
 }
 
 /// A dialog opens: the file is read outside the model lock, and not at all while a save is still being written.
-fn open_config() {
+pub fn open_config() {
     let save = {
         let _disk = DISK.lock().unwrap_or_else(PoisonError::into_inner);
         let read = config::load();
@@ -165,6 +165,13 @@ fn forget_dialog(source: *mut sys::obs_source_t) {
         // SAFETY: as above.
         unsafe { sys::obs_weak_source_release(old.0) };
     }
+}
+
+pub fn dialog_open() -> bool {
+    DIALOG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_some()
 }
 
 /// Asks the open dialog, if any, to rebuild itself from the model; callable from any thread, without the model lock.
@@ -276,7 +283,13 @@ extern "C" fn destroy(data: *mut c_void) {
 extern "C" fn get_defaults(settings: *mut sys::obs_data_t) {
     guard("settings get_defaults", (), || {
         // SAFETY: libobs passes the defaults object it owns.
-        unsafe { sys::obs_data_set_default_int(settings, AUDIO_TRACK.as_ptr(), 1) };
+        unsafe {
+            sys::obs_data_set_default_int(
+                settings,
+                AUDIO_TRACK.as_ptr(),
+                i64::from(DEFAULT_AUDIO_TRACK),
+            )
+        };
     });
 }
 
@@ -386,9 +399,110 @@ extern "C" fn track_modified(
         if status_prop.is_null() {
             return false;
         }
-        set_status(status_prop, status(selected_track(settings)));
+        let selected = selected_track(settings);
+        set_status(status_prop, status(selected));
+        if selected.is_some_and(|t| t != AUDIO_BUILT_FOR.load(Ordering::Acquire)) {
+            crate::audio::request_refresh();
+        }
         true
     })
+}
+
+/// The track the open dialog's audio part shows; a different pick rebuilds it.
+static AUDIO_BUILT_FOR: AtomicU8 = AtomicU8::new(0);
+
+const AUDIO_HELP: &CStr = c"audio_help";
+const TAKE_OVER: &CStr = c"take_over";
+const AUDIO_EMPTY: &CStr = c"audio_empty";
+const SOURCE_PREFIX: &str = "source_";
+
+extern "C" fn take_over_clicked(
+    _props: *mut sys::obs_properties_t,
+    _property: *mut sys::obs_property_t,
+    _data: *mut c_void,
+) -> bool {
+    guard("settings take_over", false, || {
+        crate::audio::take_over();
+        crate::audio::request_refresh();
+        false
+    })
+}
+
+extern "C" fn source_toggled(
+    _props: *mut sys::obs_properties_t,
+    property: *mut sys::obs_property_t,
+    settings: *mut sys::obs_data_t,
+) -> bool {
+    guard("settings source_toggled", false, || {
+        // SAFETY: the view passes a live property and its settings; libobs owns the name.
+        let (name, on, written) = unsafe {
+            let name = sys::obs_property_name(property);
+            (
+                text(name),
+                sys::obs_data_get_bool(settings, name),
+                sys::obs_data_has_user_value(settings, name),
+            )
+        };
+        if !written {
+            return false;
+        }
+        if let Some(uuid) = name.strip_prefix(SOURCE_PREFIX) {
+            crate::audio::set_source(uuid, on);
+        }
+        false
+    })
+}
+
+/// Adds the audio part for `track` and writes each checkbox's real state into `settings`.
+///
+/// # Safety
+/// `props` is live and `settings` is live or NULL; libobs copies every string.
+unsafe fn add_audio(props: *mut sys::obs_properties_t, settings: *mut sys::obs_data_t, track: u8) {
+    let sources = crate::audio::sources();
+    let view = with_controls(|c| audio_view(&c.model, track, &sources));
+    AUDIO_BUILT_FOR.store(track, Ordering::Release);
+    // SAFETY: the caller's contract.
+    unsafe {
+        let info = |key: &CStr, text: &str| {
+            let text = c_text(text);
+            sys::obs_properties_add_text(props, key.as_ptr(), text.as_ptr(), sys::OBS_TEXT_INFO);
+        };
+        match view {
+            AudioView::Unmanaged {
+                help, take_over, ..
+            } => {
+                info(AUDIO_HELP, &help);
+                let label = c_text(&take_over);
+                sys::obs_properties_add_button(
+                    props,
+                    TAKE_OVER.as_ptr(),
+                    label.as_ptr(),
+                    Some(take_over_clicked),
+                );
+            }
+            AudioView::Managed {
+                help,
+                sources,
+                empty,
+                ..
+            } => {
+                info(AUDIO_HELP, &help);
+                for row in sources {
+                    let key = c_text(&format!("{SOURCE_PREFIX}{}", row.uuid));
+                    let name = c_text(&row.name);
+                    let checkbox = sys::obs_properties_add_bool(props, key.as_ptr(), name.as_ptr());
+                    // Without the dialog's own settings there is no real state, and defaults would untick all.
+                    if !settings.is_null() {
+                        sys::obs_data_set_bool(settings, key.as_ptr(), row.on);
+                        sys::obs_property_set_modified_callback(checkbox, Some(source_toggled));
+                    }
+                }
+                if let Some(empty) = empty {
+                    info(AUDIO_EMPTY, &empty);
+                }
+            }
+        }
+    }
 }
 
 /// A non-empty string setting.
@@ -416,7 +530,7 @@ extern "C" fn start_clicked(
     _data: *mut c_void,
 ) -> bool {
     guard("settings start", true, || {
-        session::start();
+        session::start(session::Wait::Dialog);
         true
     })
 }
@@ -427,7 +541,7 @@ extern "C" fn stop_clicked(
     _data: *mut c_void,
 ) -> bool {
     guard("settings stop", true, || {
-        session::stop();
+        session::stop(session::Wait::Dialog);
         true
     })
 }
@@ -470,19 +584,16 @@ unsafe fn add_list(
 extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
     guard("settings get_properties", ptr::null_mut(), || {
         let source: *mut sys::obs_source_t = data.cast();
-        let selected = if source.is_null() {
-            None
+        let settings = if source.is_null() {
+            ptr::null_mut()
         } else {
-            // SAFETY: `data` is the source `create` returned; the settings reference is released at once.
-            unsafe {
-                let settings = sys::obs_source_get_settings(source);
-                let track = selected_track(settings);
-                sys::obs_data_release(settings);
-                track
-            }
+            // SAFETY: `data` is the source `create` returned; the reference is released below.
+            unsafe { sys::obs_source_get_settings(source) }
         };
+        let selected = (!settings.is_null())
+            .then(|| selected_track(settings))
+            .flatten();
         let title = c_text(AUDIO_TRACK_TITLE);
-        let help = c_text(AUDIO_TRACK_HELP);
         let (guilds, channels, picked, state) = with_controls(|c| {
             let named = |list: &[dstreamy_obs_producer::control::Named]| {
                 list.iter()
@@ -538,12 +649,10 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                 sys::obs_property_list_add_int(tracks, name.as_ptr(), i64::from(track));
             }
             sys::obs_property_set_modified_callback(tracks, Some(track_modified));
-            sys::obs_properties_add_text(
-                props,
-                c"routing".as_ptr(),
-                help.as_ptr(),
-                sys::OBS_TEXT_INFO,
-            );
+            add_audio(props, settings, selected.unwrap_or(picked.audio_track));
+            if !settings.is_null() {
+                sys::obs_data_release(settings);
+            }
             let buttons: [(&CStr, &CStr, sys::obs_property_clicked_t, bool); 2] = [
                 (
                     c"start",

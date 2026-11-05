@@ -1,4 +1,4 @@
-//! The module config file: the dock settings JSON in libobs's per-module config folder.
+//! The module config file: the D-Streamy settings JSON in libobs's per-module config folder.
 
 use std::ffi::CStr;
 use std::path::PathBuf;

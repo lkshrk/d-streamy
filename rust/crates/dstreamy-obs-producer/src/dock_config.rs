@@ -24,6 +24,23 @@ pub enum ConfigError {
 }
 
 impl ConfigError {
+    pub fn headline(&self) -> &'static str {
+        match self {
+            Self::NoFolder | Self::Failed(_) => "Settings not saved",
+            Self::Corrupt { .. } | Self::Unreadable { .. } => "Settings file unreadable",
+            Self::Symlink { .. } => "Settings file is a link",
+        }
+    }
+
+    pub fn fix(&self) -> &'static str {
+        match self {
+            Self::NoFolder => "Check OBS can write its config",
+            Self::Failed(_) => "See the OBS log",
+            Self::Corrupt { .. } | Self::Unreadable { .. } => "Fix or delete the settings file",
+            Self::Symlink { .. } => "Replace the link with a file",
+        }
+    }
+
     pub fn message(&self, track: u8) -> String {
         let track = track_name(track);
         match self {
@@ -953,7 +970,10 @@ mod tests {
         s.session(|_| Ok(()), |m| m.claim(started(7).ownership));
         s.write_failed(failed());
         assert_eq!(s.error(), Some(&failed()));
-        s.session(|_| Ok(()), |m| m.output_failed("refused".into(), true));
+        s.session(
+            |_| Ok(()),
+            |m| m.output_failed("refused".into(), crate::dock::FIX_LOG, true),
+        );
         s.write_failed(failed());
         open(&mut s, &f);
         assert_eq!(owned(&f), None, "retried over the file's stale 3");

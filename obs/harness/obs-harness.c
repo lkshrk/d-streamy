@@ -73,6 +73,7 @@ const char *restart_output_settings;
 	const char *replace_before_update;
 	const char *update_output_while_active;
 	bool tools_session;
+	bool mixer_session;
 	const char *then_update;
 	const char *tools_expect;
 	const char *tools_stop_after;
@@ -623,6 +624,8 @@ static void usage(void)
 		"  [--tools-exit-while-starting (with --tools-session: close OBS right after the Start click)]\n"
 		"  [--tools-exit-while-live (with --tools-session: close OBS while Live, after --tools-stop-after, instead of Stop)]\n"
 		"  [--settings-cancel (with --settings-update: then Cancel, as OBS's properties dialog does, before reopening)]\n"
+		"  [--mixer-session (with --fake-frontend: create audio sources Music and Voice on all tracks, take the\n"
+		"   Discord track over in the dialog, then tick and untick Music, reporting every source's mixers)]\n"
 		"  [--audio-mixers MASK (route the harness audio source to these mixer tracks only, as Advanced Audio\n"
 		"   Properties > Tracks does: bit 0 is Track 1; default all six)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
@@ -679,6 +682,10 @@ static int parse_args(int argc, char **argv)
 		}
 		if (strcmp(a, "--tools-session") == 0) {
 			args.tools_session = true;
+			continue;
+		}
+		if (strcmp(a, "--mixer-session") == 0) {
+			args.mixer_session = true;
 			continue;
 		}
 		if (strcmp(a, "--tools-wait-end") == 0) {
@@ -882,11 +889,60 @@ static void report_settings_source(void)
 #ifdef __linux__
 static void *fake_frontend;
 
+#define UI_TASKS_MAX 64
+static struct {
+	obs_task_t task;
+	void *param;
+} ui_tasks[UI_TASKS_MAX];
+static size_t ui_task_count;
+static pthread_mutex_t ui_task_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_t ui_thread;
+
+// Like OBS's frontend (Qt::AutoConnection): direct on the main thread, else later on it, in run_ui_tasks.
+static void ui_task_handler(obs_task_t task, void *param, bool wait)
+{
+	if (wait || pthread_equal(pthread_self(), ui_thread)) {
+		task(param);
+		return;
+	}
+	pthread_mutex_lock(&ui_task_mutex);
+	if (ui_task_count < UI_TASKS_MAX) {
+		ui_tasks[ui_task_count].task = task;
+		ui_tasks[ui_task_count].param = param;
+		ui_task_count++;
+	} else {
+		harness_error("more than %d UI tasks queued", UI_TASKS_MAX);
+	}
+	pthread_mutex_unlock(&ui_task_mutex);
+}
+
+static void run_ui_tasks(void)
+{
+	for (;;) {
+		pthread_mutex_lock(&ui_task_mutex);
+		if (!ui_task_count) {
+			pthread_mutex_unlock(&ui_task_mutex);
+			return;
+		}
+		obs_task_t task = ui_tasks[0].task;
+		void *param = ui_tasks[0].param;
+		memmove(ui_tasks, ui_tasks + 1, (ui_task_count - 1) * sizeof(ui_tasks[0]));
+		ui_task_count--;
+		pthread_mutex_unlock(&ui_task_mutex);
+		task(param);
+	}
+}
+
 static bool load_fake_frontend(void)
 {
 	fake_frontend = dlopen(args.fake_frontend, RTLD_NOW | RTLD_GLOBAL);
 	if (!fake_frontend)
 		harness_error("--fake-frontend: %s", dlerror());
+	else {
+		ui_thread = pthread_self();
+		obs_set_ui_task_handler(ui_task_handler);
+	}
 	return fake_frontend != NULL;
 }
 
@@ -896,8 +952,15 @@ static bool (*fake_click)(void);
 static void report_settings_properties(obs_source_t *source, const char *when)
 {
 	obs_properties_t *props = obs_source_properties(source);
+	obs_data_t *values = obs_source_get_settings(source);
 	for (obs_property_t *p = obs_properties_first(props); p; obs_property_next(&p)) {
 		const char *name = obs_property_name(p);
+		// Checkbox names carry a source UUID, which differs per run; tests match them by description.
+		if (obs_property_get_type(p) == OBS_PROPERTY_BOOL) {
+			printf("HARNESS settings_checkbox when=%s desc=%s on=%d\n", when, obs_property_description(p),
+			       obs_data_get_bool(values, name));
+			continue;
+		}
 		printf("HARNESS settings_property when=%s name=%s type=%d enabled=%d desc=%s\n", when, name,
 		       (int)obs_property_get_type(p), obs_property_enabled(p), obs_property_description(p));
 		const char *help = obs_property_long_description(p);
@@ -912,6 +975,7 @@ static void report_settings_properties(obs_source_t *source, const char *when)
 				       obs_property_list_item_int(p, i), obs_property_list_item_name(p, i));
 	}
 	obs_properties_destroy(props);
+	obs_data_release(values);
 	obs_data_t *settings = obs_source_get_settings(source);
 	printf("HARNESS settings_source when=%s audio_track=%lld\n", when, obs_data_get_int(settings, "audio_track"));
 	printf("HARNESS pick when=%s guild_id=%s channel_id=%s\n", when, obs_data_get_string(settings, "guild_id"),
@@ -1121,6 +1185,221 @@ static bool settings_dialog(const char *update)
 	return true;
 }
 
+#define MIXER_SOURCE_ID "harness_mixer_audio"
+#define MIXER_SOURCES 2
+static const char *mixer_source_names[MIXER_SOURCES] = {"Music", "Voice"};
+static obs_source_t *mixer_sources[MIXER_SOURCES];
+
+static const char *mixer_source_get_name(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return "Harness mixer audio";
+}
+
+static void *mixer_source_create(obs_data_t *settings, obs_source_t *source)
+{
+	UNUSED_PARAMETER(settings);
+	return source;
+}
+
+static void mixer_source_destroy(void *data)
+{
+	UNUSED_PARAMETER(data);
+}
+
+// Audio-capable but silent: only its mixer flags matter.
+static struct obs_source_info mixer_source_info = {
+	.id = MIXER_SOURCE_ID,
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_AUDIO,
+	.get_name = mixer_source_get_name,
+	.create = mixer_source_create,
+	.destroy = mixer_source_destroy,
+};
+
+static void report_mixers(const char *when)
+{
+	for (size_t i = 0; i < MIXER_SOURCES; i++)
+		printf("HARNESS mixers when=%s name=%s mixers=%u\n", when, mixer_source_names[i],
+		       obs_source_get_audio_mixers(mixer_sources[i]));
+}
+
+// Like OBSPropertiesView ticking a checkbox: the setting, update, then the property's modified callback.
+static bool tick_source(obs_source_t *dialog, const char *name, bool on)
+{
+	obs_properties_t *props = obs_source_properties(dialog);
+	obs_property_t *box = NULL;
+	for (obs_property_t *p = obs_properties_first(props); p; obs_property_next(&p))
+		if (obs_property_get_type(p) == OBS_PROPERTY_BOOL && strcmp(obs_property_description(p), name) == 0)
+			box = p;
+	if (!box) {
+		harness_error("the dialog has no checkbox for %s", name);
+		obs_properties_destroy(props);
+		return false;
+	}
+	obs_data_t *settings = obs_source_get_settings(dialog);
+	obs_data_set_bool(settings, obs_property_name(box), on);
+	obs_source_update(dialog, settings);
+	click_thread = pthread_self();
+	os_atomic_set_long(&clicking, 1);
+	bool refresh = obs_property_modified(box, settings);
+	os_atomic_set_long(&clicking, 0);
+	printf("HARNESS ticked name=%s on=%d refresh=%d\n", name, on, refresh);
+	obs_data_release(settings);
+	obs_properties_destroy(props);
+	return true;
+}
+
+// Like OBSPropertiesView picking a track in the list: the setting, update, then the list's modified callback.
+static void pick_track(obs_source_t *dialog, int track)
+{
+	obs_properties_t *props = obs_source_properties(dialog);
+	obs_property_t *list = obs_properties_get(props, "audio_track");
+	obs_data_t *settings = obs_source_get_settings(dialog);
+	obs_data_set_int(settings, "audio_track", track);
+	obs_source_update(dialog, settings);
+	click_thread = pthread_self();
+	os_atomic_set_long(&clicking, 1);
+	bool refresh = list && obs_property_modified(list, settings);
+	os_atomic_set_long(&clicking, 0);
+	printf("HARNESS picked track=%d refresh=%d\n", track, refresh);
+	obs_data_release(settings);
+	obs_properties_destroy(props);
+}
+
+static obs_source_t *mixer_dialog;
+static volatile long mixer_views;
+static volatile long mixer_sync_reloads;
+
+// What OBS's properties view shows after a rebuild: the dialog's properties at that moment.
+static void mixer_view_reload(void *param)
+{
+	UNUSED_PARAMETER(param);
+	if (mixer_dialog)
+		report_settings_properties(mixer_dialog, "view");
+	os_atomic_inc_long(&mixer_views);
+}
+
+// Like OBSBasicProperties::UpdateProperties: on the main thread the view rebuilds at once, else later.
+static void on_mixer_update_properties(void *param, calldata_t *cd)
+{
+	UNUSED_PARAMETER(param);
+	UNUSED_PARAMETER(cd);
+	if (os_atomic_load_long(&clicking) && pthread_equal(pthread_self(), click_thread)) {
+		os_atomic_inc_long(&mixer_sync_reloads);
+		os_atomic_inc_long(&click_thread_refreshes);
+	}
+	ui_task_handler(mixer_view_reload, NULL, false);
+}
+
+static bool wait_for_view(long seen, const char *after)
+{
+	for (int i = 0; i < 300; i++) {
+		run_ui_tasks();
+		if (os_atomic_load_long(&mixer_views) > seen) {
+			// Later rebuilds too, so the last view printed is the one a user would end up seeing.
+			for (int j = 0; j < 20; j++) {
+				os_sleep_ms(10);
+				run_ui_tasks();
+			}
+			return true;
+		}
+		os_sleep_ms(10);
+	}
+	harness_error("the dialog was never rebuilt after %s", after);
+	return false;
+}
+
+static bool mixer_session(void)
+{
+	obs_register_source(&mixer_source_info);
+	bool ok = true;
+	for (size_t i = 0; i < MIXER_SOURCES; i++) {
+		mixer_sources[i] = obs_source_create(MIXER_SOURCE_ID, mixer_source_names[i], NULL, NULL);
+		if (!mixer_sources[i]) {
+			harness_error("could not create the %s source", mixer_source_names[i]);
+			ok = false;
+		} else {
+			obs_source_set_audio_mixers(mixer_sources[i], 0x3f);
+		}
+	}
+	obs_source_t *dialog = ok ? open_settings_dialog() : NULL;
+	if (ok && !dialog) {
+		harness_error("the settings dialog did not open");
+		ok = false;
+	}
+	signal_handler_t *signals = dialog ? obs_source_get_signal_handler(dialog) : NULL;
+	if (ok) {
+		mixer_dialog = dialog;
+		signal_handler_connect(signals, "update_properties", on_mixer_update_properties, NULL);
+		report_mixers("start");
+		report_settings_properties(dialog, "unmanaged");
+		long seen = os_atomic_load_long(&mixer_views);
+		click_settings_button(dialog, "take_over");
+		ok = wait_for_view(seen, "the takeover");
+		report_mixers("taken");
+		report_settings_properties(dialog, "managed");
+		ok = ok && tick_source(dialog, "Music", true);
+		run_ui_tasks();
+		report_mixers("ticked");
+		report_settings_properties(dialog, "ticked");
+		// libobs applies the defaults to type-level properties, which untick every checkbox there.
+		printf("HARNESS mixer_step name=type_level\n");
+		obs_properties_destroy(obs_get_source_properties("dstreamy_settings"));
+		run_ui_tasks();
+		report_mixers("type_level");
+		ok = ok && tick_source(dialog, "Music", false);
+		run_ui_tasks();
+		report_mixers("unticked");
+
+		obs_data_t *values = obs_source_get_settings(dialog);
+		int original = (int)obs_data_get_int(values, "audio_track");
+		obs_data_release(values);
+		printf("HARNESS mixer_step name=track5\n");
+		seen = os_atomic_load_long(&mixer_views);
+		pick_track(dialog, 5);
+		ok = ok && wait_for_view(seen, "picking Track 5");
+		printf("HARNESS mixer_step name=track_back\n");
+		seen = os_atomic_load_long(&mixer_views);
+		pick_track(dialog, original);
+		ok = ok && wait_for_view(seen, "picking the track back");
+
+		// Like Edit > Advanced Audio Properties on OBS's UI thread, outside the dialog.
+		printf("HARNESS mixer_step name=external\n");
+		seen = os_atomic_load_long(&mixer_views);
+		obs_source_set_audio_mixers(mixer_sources[1],
+					    obs_source_get_audio_mixers(mixer_sources[1]) | (1u << (original - 1)));
+		ok = ok && wait_for_view(seen, "an outside mixer change");
+		report_mixers("external");
+
+		printf("HARNESS mixer_step name=created\n");
+		obs_source_t *late = obs_source_create(MIXER_SOURCE_ID, "Late", NULL, NULL);
+		obs_data_t *saved = obs_data_create();
+		obs_data_set_string(saved, "id", MIXER_SOURCE_ID);
+		obs_data_set_string(saved, "name", "Saved");
+		obs_data_set_int(saved, "mixers", 0x3f);
+		obs_source_t *loaded = obs_load_source(saved);
+		obs_data_release(saved);
+		printf("HARNESS mixers when=created name=Late mixers=%u\n", late ? obs_source_get_audio_mixers(late) : 0);
+		printf("HARNESS mixers when=loaded name=Saved mixers=%u\n",
+		       loaded ? obs_source_get_audio_mixers(loaded) : 0);
+		obs_source_release(late);
+		obs_source_release(loaded);
+		run_ui_tasks();
+		printf("HARNESS mixer_sync_reloads count=%ld\n", os_atomic_load_long(&mixer_sync_reloads));
+		signal_handler_disconnect(signals, "update_properties", on_mixer_update_properties, NULL);
+		mixer_dialog = NULL;
+	}
+	if (dialog)
+		close_settings_dialog(dialog);
+	run_ui_tasks();
+	for (size_t i = 0; i < MIXER_SOURCES; i++) {
+		obs_source_release(mixer_sources[i]);
+		mixer_sources[i] = NULL;
+	}
+	return ok;
+}
+
 static bool click_fake_frontend(void)
 {
 	int (*items)(const char **) = (int (*)(const char **))dlsym(fake_frontend, "fake_frontend_tools_items");
@@ -1133,6 +1412,8 @@ static bool click_fake_frontend(void)
 	const char *name = NULL;
 	int count = items(&name);
 	printf("HARNESS frontend tools_items=%d name=%s\n", count, name ? name : "");
+	if (args.mixer_session)
+		return mixer_session();
 	if (args.settings_update_while_active || args.tools_session)
 		return true;
 	return settings_dialog(args.settings_update);
@@ -1941,6 +2222,9 @@ cleanup:
 		obs_source_release(audio);
 		while (obs_wait_for_destroy_queue())
 			;
+#ifdef __linux__
+		run_ui_tasks();
+#endif
 		uint64_t shutdown_ns = os_gettime_ns();
 		obs_shutdown();
 		printf("HARNESS obs_shutdown ms=%llu\n", (unsigned long long)((os_gettime_ns() - shutdown_ns) / 1000000));

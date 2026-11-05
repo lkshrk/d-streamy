@@ -30,4 +30,12 @@ add_rust_plugin(
 )
 
 enable_testing()
+
+option(DSTREAMY_UI "Build the D-Streamy status-bar panel (needs Qt6 Widgets and obs-frontend-api)" ON)
+if(DSTREAMY_UI)
+  add_subdirectory(ui)
+else()
+  message(STATUS "DSTREAMY_UI is OFF: the plugin builds without its status-bar panel; Tools > D-Streamy is the way in")
+endif()
+
 add_subdirectory(harness)

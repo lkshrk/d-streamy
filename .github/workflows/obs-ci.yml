@@ -245,6 +245,14 @@ jobs:
           xvfb-run -a -s "-screen 0 1280x720x24" ctest --preset ubuntu-ci-x86_64
           echo "HARNESS=$PWD/build_x86_64/harness/obs-harness" >> "$GITHUB_ENV"
 
+      - name: obs/ builds the plugin without the status-bar panel
+        working-directory: obs
+        run: |
+          cmake --preset ubuntu-ci-x86_64 -B build_no_ui -DCMAKE_PREFIX_PATH="$OBS_PREFIX" -DDSTREAMY_UI=OFF
+          cmake --build build_no_ui --target obs-dstreamy
+          test -f build_no_ui/rundir/obs-dstreamy.so
+          test ! -e build_no_ui/rundir/obs-dstreamy-ui
+
       - name: Plugin workspace settings match rust/Cargo.toml
         run: |
           python3 - <<'PY'
@@ -299,17 +307,37 @@ jobs:
           cp -R "$OBS_TRACES" ../obs/tests/traces
           cargo test --release --locked -p dstreamy-media --test obs_traces
 
-      - name: Frontend with obs-websocket and the plugin's Tools entry
+      - name: Frontend with obs-websocket and the plugin's status-bar panel
         run: |
           set -o pipefail
           export XDG_CONFIG_HOME="$RUNNER_TEMP/obs-config" LIBGL_ALWAYS_SOFTWARE=1
           plugin="$XDG_CONFIG_HOME/obs-studio/plugins/obs-dstreamy"
           mkdir -p "$plugin/bin/64bit" "$plugin/data"
-          cp obs/build_x86_64/rundir/obs-dstreamy.so "$plugin/bin/64bit/"
-          export EXPECT_LOG_LINE="[obs-dstreamy] added Tools > D-Streamy"
+          if find obs/build_x86_64/rundir -maxdepth 1 -name '*.so' ! -name obs-dstreamy.so | grep .; then
+            echo "libobs would try these as modules: only obs-dstreamy.so may sit in the module folder"
+            exit 1
+          fi
+          cp -R obs/build_x86_64/rundir/obs-dstreamy.so obs/build_x86_64/rundir/obs-dstreamy-ui "$plugin/bin/64bit/"
+          # The test-hooks build clicks Tools > D-Streamy once this file exists.
+          touch "$RUNNER_TEMP/open-dialog"
+          export DSTREAMY_TEST_OPEN_DIALOG="$RUNNER_TEMP/open-dialog"
+          export EXPECT_LOG_LINE=$'[obs-dstreamy] added the D-Streamy status-bar panel\n[obs-dstreamy] added Tools > D-Streamy\n[obs-dstreamy] Tools > D-Streamy opened the status-bar panel\n[obs-dstreamy] unloaded'
           xvfb-run -a -s "-screen 0 1920x1080x24" bash obs/tests/frontend/frontend-smoke.sh \
             "$XDG_CONFIG_HOME/obs-studio" "$OBS_LOGS/frontend-stdout.log" "$OBS_PREFIX/bin/obs" \
             | tee "$OBS_LOGS/frontend.log"
+
+      - name: Frontend without the UI library falls back to Tools > D-Streamy
+        run: |
+          set -o pipefail
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/obs-config-no-ui" LIBGL_ALWAYS_SOFTWARE=1
+          plugin="$XDG_CONFIG_HOME/obs-studio/plugins/obs-dstreamy"
+          mkdir -p "$plugin/bin/64bit" "$plugin/data"
+          cp obs/build_x86_64/rundir/obs-dstreamy.so "$plugin/bin/64bit/"
+          export EXPECT_LOG_LINE=$'[obs-dstreamy] added Tools > D-Streamy\n[obs-dstreamy] unloaded'
+          export EXPECT_ABSENT_LOG_LINE='[obs-dstreamy] added the D-Streamy status-bar panel'
+          xvfb-run -a -s "-screen 0 1920x1080x24" bash obs/tests/frontend/frontend-smoke.sh \
+            "$XDG_CONFIG_HOME/obs-studio" "$OBS_LOGS/frontend-no-ui-stdout.log" "$OBS_PREFIX/bin/obs" \
+            | tee "$OBS_LOGS/frontend-no-ui.log"
 
       - name: H.264 encoder settings match obs/tests/encoder-settings
         run: |
@@ -467,6 +495,24 @@ jobs:
             test "$minos" = 12.0 || { echo "$a slice minos $minos, expected 12.0"; exit 1; }
             lipo -archs ../../../harness/RelWithDebInfo/obs-harness | grep -qw "$a"
           done
+          {
+            lipo -archs MacOS/obs-dstreamy-ui.dylib
+            otool -L -arch arm64 MacOS/obs-dstreamy-ui.dylib
+            otool -l -arch arm64 MacOS/obs-dstreamy-ui.dylib | grep -A2 LC_RPATH
+            nm -gU -arch arm64 MacOS/obs-dstreamy-ui.dylib | grep dstreamy_ui_
+          } | tee "$OBS_LOGS/ui-bundle.log"
+          test "$(lipo -archs MacOS/obs-dstreamy-ui.dylib)" = "x86_64 arm64"
+          test "$(otool -D -arch arm64 MacOS/obs-dstreamy-ui.dylib | tail -n 1)" = "@rpath/obs-dstreamy-ui.dylib"
+          grep -q "path @executable_path/../Frameworks" "$OBS_LOGS/ui-bundle.log"
+          # Every dependency must resolve inside OBS.app or the system, never in the build machine's deps folder.
+          if otool -L -arch arm64 MacOS/obs-dstreamy-ui.dylib | tail -n +2 | grep -vE '^[[:space:]]+(@rpath/|/usr/lib/|/System/)'; then
+            echo "obs-dstreamy-ui.dylib links a library outside OBS.app or the system"
+            exit 1
+          fi
+
+      - name: D-Streamy status-bar panel test
+        working-directory: obs
+        run: ctest --test-dir build_macos -C RelWithDebInfo -R dstreamy-ui --output-on-failure
 
       - name: Plugin crate gates
         id: gates
@@ -498,7 +544,7 @@ jobs:
           mkdir -p "$cfg/plugins"
           rm -rf "$cfg/plugins/obs-dstreamy.plugin"
           cp -R obs/build_macos/rundir/obs-dstreamy.plugin "$cfg/plugins/"
-          export EXPECT_LOG_LINE="[obs-dstreamy] added Tools > D-Streamy"
+          export EXPECT_LOG_LINE=$'[obs-dstreamy] added the D-Streamy status-bar panel\n[obs-dstreamy] added Tools > D-Streamy\n[obs-dstreamy] unloaded'
           bash obs/tests/frontend/frontend-smoke.sh "$cfg" "$OBS_LOGS/frontend-stdout.log" \
             "$RUNNER_TEMP/obs-prefix-arm64/OBS.app/Contents/MacOS/OBS" | tee "$OBS_LOGS/frontend.log"
 
@@ -648,11 +694,25 @@ jobs:
             "$DUMPBIN" -nologo -dependents obs/build_x64/rundir/obs-dstreamy.dll
           } | tee "$OBS_LOGS/plugin-dll.log"
           grep -qw obs_module_load "$OBS_LOGS/plugin-dll.log"
+          "$DUMPBIN" -nologo -exports -dependents obs/build_x64/rundir/obs-dstreamy-ui/obs-dstreamy-ui.dll | tee "$OBS_LOGS/ui-dll.log"
+          if find obs/build_x64/rundir -maxdepth 1 -name '*.dll' ! -name obs-dstreamy.dll | grep .; then
+            echo "libobs would try these as modules: only obs-dstreamy.dll may sit in the module folder"
+            exit 1
+          fi
+          grep -qw dstreamy_ui_load "$OBS_LOGS/ui-dll.log"
+          grep -qw dstreamy_ui_unload "$OBS_LOGS/ui-dll.log"
           # obs-frontend-api.dll is looked up at runtime, so a libobs-only host still loads the plugin.
           if grep -qi obs-frontend-api "$OBS_LOGS/plugin-dll.log"; then
             echo "the plugin DLL links obs-frontend-api.dll"
             exit 1
           fi
+
+      - name: D-Streamy status-bar panel test
+        working-directory: obs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          ctest --test-dir build_x64 -C RelWithDebInfo -R dstreamy-ui --output-on-failure
 
       - name: Load and panic tests
         shell: bash
@@ -674,8 +734,8 @@ jobs:
           # Windows OBS looks for plugins under CSIDL_COMMON_APPDATA (35), not %APPDATA% (frontend/widgets/OBSBasic.cpp:149).
           plugin="$(cygpath -u -F 35)/obs-studio/plugins/obs-dstreamy"
           mkdir -p "$plugin/bin/64bit" "$plugin/data"
-          cp "$ws/obs/build_x64/rundir/obs-dstreamy.dll" "$plugin/bin/64bit/"
-          export EXPECT_LOG_LINE="[obs-dstreamy] added Tools > D-Streamy"
+          cp -R "$ws/obs/build_x64/rundir/obs-dstreamy.dll" "$ws/obs/build_x64/rundir/obs-dstreamy-ui" "$plugin/bin/64bit/"
+          export EXPECT_LOG_LINE=$'[obs-dstreamy] added the D-Streamy status-bar panel\n[obs-dstreamy] added Tools > D-Streamy\n[obs-dstreamy] unloaded'
           cd "$(cygpath -u "$OBS_PREFIX")/bin/64bit"
           bash "$ws/obs/tests/frontend/frontend-smoke.sh" "$cfg" "$OBS_LOGS/frontend-stdout.log" ./obs64.exe \
             | tee "$OBS_LOGS/frontend.log"

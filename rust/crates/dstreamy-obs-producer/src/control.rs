@@ -449,6 +449,53 @@ impl ControlError {
             },
         }
     }
+
+    /// A few words naming the problem; the full message says how to fix it.
+    pub fn headline(&self) -> &'static str {
+        match self {
+            Self::NotRunning(_) => "Service not running",
+            Self::Connect(_) => "Can't reach the service",
+            Self::NotLoggedIn => "Not logged in",
+            Self::InvalidToken => "Discord login expired",
+            Self::UnknownGuild => "Server not found",
+            Self::UnknownChannel => "Voice channel not found",
+            Self::GuildUnavailable => "Server unavailable",
+            Self::Locked(_) => "Account in use",
+            Self::Busy { .. } | Self::OtherSource { .. } => "Already live elsewhere",
+            Self::Outdated { .. } => "Service out of date",
+            Self::Stopping | Self::StillStarting | Self::Restarted => "Try again",
+            Self::NoPlace => "Session lost",
+            Self::Refused { .. } => "Service refused",
+            Self::Timeout { .. } => "Service not answering",
+            Self::Abandoned => "Stopped waiting",
+            Self::Protocol(_) => "Unexpected service answer",
+        }
+    }
+
+    /// What to do about it, in a few words; the full message has the details.
+    pub fn fix(&self) -> &'static str {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::NotRunning(_) => "Run `dstreamy service install`",
+            #[cfg(not(target_os = "linux"))]
+            Self::NotRunning(_) => "Run `dstreamy serve`",
+            Self::Connect(_) => "Check that the service runs",
+            Self::NotLoggedIn => "Run `dstreamy login`",
+            Self::InvalidToken => "Run `dstreamy login` again",
+            Self::UnknownGuild => "Pick the server again",
+            Self::UnknownChannel => "Pick the voice channel again",
+            Self::GuildUnavailable => "Try again later",
+            Self::Locked(_) => "Stop the other D-Streamy first",
+            Self::Busy { .. } | Self::OtherSource { .. } => "Stop that stream first",
+            Self::Outdated { .. } => "Update and restart the service",
+            Self::Stopping | Self::StillStarting | Self::Restarted | Self::Abandoned => {
+                "Press Start again"
+            }
+            Self::NoPlace => "Stop it, then press Start",
+            Self::Refused { .. } | Self::Protocol(_) => "See the OBS log",
+            Self::Timeout { .. } => "Check the service, then retry",
+        }
+    }
 }
 
 impl fmt::Display for ControlError {
