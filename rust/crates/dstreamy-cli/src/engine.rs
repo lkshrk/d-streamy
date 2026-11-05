@@ -1,5 +1,6 @@
 //! The command engine behind `dstreamy daemon` and `dstreamy serve`: one Discord connection, at most one stream.
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
@@ -350,6 +351,8 @@ pub struct Engine {
     /// Set before the session starts, so a session that stops at once never leaves it behind.
     place: Mutex<Option<Placed>>,
     conn_seq: std::sync::atomic::AtomicU64,
+    /// The token changed while a session streamed; its connection is replaced once the session is over.
+    stale_token: std::sync::atomic::AtomicBool,
     started_by: Mutex<Option<u64>>,
     external: Mutex<Option<External>>,
     portal: Mutex<Option<PortalBook>>,
@@ -424,6 +427,7 @@ impl Engine {
             running: Mutex::new(None),
             place: Mutex::new(None),
             conn_seq: std::sync::atomic::AtomicU64::new(0),
+            stale_token: std::sync::atomic::AtomicBool::new(false),
             started_by: Mutex::new(None),
             external: Mutex::new(None),
             portal: Mutex::new(None),
@@ -589,16 +593,21 @@ impl Engine {
         self.current().is_some_and(|c| c.live())
     }
 
-    /// The saved token changed: an idle Discord connection made with the old one is closed, so the next opens with it.
+    /// The saved token changed: the Discord connection made with the old one is closed once no session streams on it.
     pub async fn token_changed(&self) {
         let _lifecycle = self.lifecycle.lock().await;
-        if !self.is_live() {
+        if self.is_live() {
+            self.stale_token.store(true, Ordering::Release);
+        } else {
+            self.stale_token.store(false, Ordering::Release);
             self.disconnect_locked().await;
         }
     }
 
     async fn conn(&self) -> Result<Arc<Conn>, CliError> {
-        if let Some(conn) = self.current() {
+        if let Some(conn) = self.current()
+            && !self.stale_token.load(Ordering::Acquire)
+        {
             return Ok(conn);
         }
         let _lifecycle = self.lifecycle.lock().await;
@@ -608,7 +617,12 @@ impl Engine {
     /// Needs `lifecycle` held.
     async fn ensure_conn(&self) -> Result<Arc<Conn>, CliError> {
         if let Some(conn) = self.current() {
-            return Ok(conn);
+            if conn.live() || !self.stale_token.load(Ordering::Acquire) {
+                return Ok(conn);
+            }
+            drop(conn);
+            self.disconnect_locked().await;
+            self.stale_token.store(false, Ordering::Release);
         }
         let engine = self
             .me

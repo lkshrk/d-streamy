@@ -149,14 +149,16 @@ enum Trouble {
 }
 
 impl Trouble {
-    fn error(self) -> CliError {
+    fn error(self, recovery: Recovery) -> CliError {
         let cause = match self {
             Self::SentAway => "the login window kept being sent away from Discord's login",
             Self::NotLoading => "D-Streamy's page in the login window never finished loading",
         };
-        CliError::BrowserLogin(format!(
-            "{cause}, so it was closed. Run the login again, or use the QR code or a token instead"
-        ))
+        let next = match recovery {
+            Recovery::WithTerminal => "Run the login again, or use the QR code or a token instead",
+            Recovery::WindowOnly => "Try the login again",
+        };
+        CliError::BrowserLogin(format!("{cause}, so it was closed. {next}"))
     }
 }
 
@@ -779,7 +781,7 @@ pub fn run(
     #[cfg(target_os = "linux")]
     finish_gtk_work();
     if let Some(trouble) = session.trouble {
-        return Err(trouble.error());
+        return Err(trouble.error(session.recovery));
     }
     outcome.ok_or_else(|| CliError::BrowserLogin("the login window closed unexpectedly".into()))
 }
@@ -1650,9 +1652,21 @@ mod tests {
         ));
         assert_eq!(session.trouble, Some(Trouble::NotLoading));
         assert!(!session.state.is_open());
-        let sent = Trouble::SentAway.error().to_string();
-        let stuck = Trouble::NotLoading.error().to_string();
+        let sent = Trouble::SentAway.error(Recovery::WithTerminal).to_string();
+        let stuck = Trouble::NotLoading
+            .error(Recovery::WithTerminal)
+            .to_string();
         assert!(sent.contains("sent away") && stuck.contains("never finished loading"));
+        assert!(sent.contains("QR code"));
+        let window = Trouble::NotLoading.error(Recovery::WindowOnly).to_string();
+        assert!(
+            window.ends_with("so it was closed. Try the login again"),
+            "{window}"
+        );
+        assert!(
+            !window.contains("QR") && !window.contains("token"),
+            "{window}"
+        );
     }
 
     #[test]

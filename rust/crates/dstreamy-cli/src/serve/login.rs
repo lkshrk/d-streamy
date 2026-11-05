@@ -5,9 +5,11 @@ use std::path::PathBuf;
 use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use dstreamy_core::TOKEN_ENV;
 use dstreamy_ipc::control::{LOGIN_ENV, LOGIN_WINDOW_LIMIT};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::engine::{Engine, Failure, invalid_params};
 use crate::login_capture::CANCELLED_EXIT;
@@ -22,7 +24,19 @@ pub struct LoginParams {
 
 impl LoginParams {
     pub fn parse(value: Value) -> Result<Self, Failure> {
-        serde_json::from_value(value).map_err(invalid_params)
+        let params: Self = serde_json::from_value(value).map_err(invalid_params)?;
+        if let Some(name) = params
+            .env
+            .iter()
+            .flat_map(HashMap::keys)
+            .find(|name| !LOGIN_ENV.contains(&name.as_str()))
+        {
+            return Err(invalid_params(format!(
+                "env may only set {}, not {name}",
+                LOGIN_ENV.join(", ")
+            )));
+        }
+        Ok(params)
     }
 }
 
@@ -30,6 +44,8 @@ pub struct Login {
     ctx: Ctx,
     /// The `dstreamy` that opens the window; `None` without browser login.
     program: Option<PathBuf>,
+    /// The token comes from the environment, which a saved login can't replace.
+    env_token: bool,
     running: AtomicBool,
 }
 
@@ -46,12 +62,13 @@ impl Login {
         Self {
             ctx: ctx.clone(),
             program: program.or_else(own_program),
+            env_token: std::env::var(TOKEN_ENV).is_ok_and(|t| !t.trim().is_empty()),
             running: AtomicBool::new(false),
         }
     }
 
     pub fn available(&self) -> bool {
-        self.program.is_some()
+        self.program.is_some() && !self.env_token
     }
 
     pub async fn run(&self, engine: &Engine, params: LoginParams) -> Result<Value, Failure> {
@@ -61,6 +78,14 @@ impl Login {
                 CliError::BrowserLoginUnavailable.to_string(),
             ));
         };
+        if self.env_token {
+            return Err(Failure::new(
+                "login_unavailable",
+                format!(
+                    "the service takes its token from {TOKEN_ENV}, which a login can't replace: unset it for the service and restart it"
+                ),
+            ));
+        }
         if engine.is_live() {
             return Err(Failure::new(
                 "streaming",
@@ -95,7 +120,7 @@ impl Login {
                 };
             }
         }
-        let child = command.spawn().map_err(|e| {
+        let mut child = command.spawn().map_err(|e| {
             Failure::new(
                 "login_failed",
                 format!(
@@ -105,7 +130,18 @@ impl Login {
             )
         })?;
         tracing::info!("the login window is open");
-        let output = tokio::time::timeout(LOGIN_WINDOW_LIMIT, child.wait_with_output())
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let mut window = Window(Some(child));
+        let finished = async {
+            let child = window.0.as_mut().expect("the window is held until it ends");
+            let (stdout, stderr, status) = tokio::join!(drain(stdout), drain(stderr), child.wait());
+            status.map(|status| Output {
+                status,
+                stdout,
+                stderr,
+            })
+        };
+        let output = tokio::time::timeout(LOGIN_WINDOW_LIMIT, finished)
             .await
             .map_err(|_| {
                 Failure::new(
@@ -117,11 +153,37 @@ impl Login {
                 )
             })?
             .map_err(|e| Failure::new("login_failed", format!("waiting for the login: {e}")))?;
+        window.0 = None;
         let user = outcome(&output)?;
         engine.token_changed().await;
         tracing::info!("logged in from the login window");
         Ok(user)
     }
+}
+
+/// The login child; one dropped before it ended is killed and still reaped, so no zombie is left.
+struct Window(Option<tokio::process::Child>);
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        let _ = child.start_kill();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
+}
+
+async fn drain(pipe: Option<impl AsyncRead + Unpin>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = pipe.read_to_end(&mut bytes).await;
+    }
+    bytes
 }
 
 fn own_program() -> Option<PathBuf> {
@@ -222,6 +284,14 @@ mod tests {
     fn unknown_parameters_are_ignored_and_env_must_be_strings() {
         assert!(LoginParams::parse(json!({"id": "1", "cmd": "login"})).is_ok());
         assert!(LoginParams::parse(json!({"cmd": "login", "env": {"DISPLAY": ":0"}})).is_ok());
+        let foreign =
+            LoginParams::parse(json!({"cmd": "login", "env": {"LD_PRELOAD": "x"}})).unwrap_err();
+        assert_eq!(foreign.code, "invalid_params");
+        assert!(
+            foreign.message.contains("LD_PRELOAD"),
+            "{}",
+            foreign.message
+        );
         let bad = LoginParams::parse(json!({"cmd": "login", "env": {"DISPLAY": 0}})).unwrap_err();
         assert_eq!(bad.code, "invalid_params");
     }

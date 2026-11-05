@@ -445,6 +445,8 @@ impl Connection {
             mpsc::unbounded_channel::<(String, Result<Value, Failure>)>();
         let unanswered: Arc<Mutex<HashMap<u64, String>>> = Arc::default();
         let mut tasks = JoinSet::new();
+        // A login window belongs to the client that asked for it, so it never outlives that client.
+        let mut logins = JoinSet::new();
         let mut next_key = 0u64;
         let mut reading = true;
         let mut stopping = *self.phase.borrow() != Phase::Running;
@@ -464,6 +466,7 @@ impl Connection {
             let unflushed = !writer.write_buffer().is_empty();
             if !reading
                 && tasks.is_empty()
+                && logins.is_empty()
                 && shutdown.is_none()
                 && late_shutdowns.is_empty()
                 && pending.is_empty()
@@ -481,7 +484,9 @@ impl Connection {
                     if !stopping {
                         stopping = true;
                         tasks.abort_all();
+                        logins.abort_all();
                         while tasks.join_next().await.is_some() {}
+                        while logins.join_next().await.is_some() {}
                         while let Ok((id, result)) = replies.try_recv() {
                             pending.push_back(Message::reply(Some(id), result));
                         }
@@ -512,13 +517,17 @@ impl Connection {
                     pending.push_back(Message::reply(Some(id), result));
                 }
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+                Some(_) = logins.join_next(), if !logins.is_empty() => {}
                 _ = wait(&mut shutdown), if shutdown.is_some() => {
                     if let Some((id, _)) = shutdown.take() {
                         pending.push_back(Message::reply(Some(id), Ok(Value::Null)));
                     }
                 }
-                line = reader.next(), if reading && !muted && pending.len() + tasks.len() < MAX_IN_FLIGHT => match line {
-                    None | Some(Err(_)) => reading = false,
+                line = reader.next(), if reading && !muted && pending.len() + tasks.len() + logins.len() < MAX_IN_FLIGHT => match line {
+                    None | Some(Err(_)) => {
+                        reading = false;
+                        logins.abort_all();
+                    }
                     Some(Ok(Err(e))) => {
                         let (id, failure) = malformed(None, &e.to_string());
                         pending.push_back(Message::reply(id, Err(failure)));
@@ -584,7 +593,7 @@ impl Connection {
                                 let login = self.login.clone();
                                 let replies = replies_tx.clone();
                                 let unanswered = unanswered.clone();
-                                tasks.spawn(async move {
+                                logins.spawn(async move {
                                     let result = login.run(&engine, params).await;
                                     if let Some(id) = lock(&unanswered).remove(&key) {
                                         let _ = replies.send((id, result));
@@ -613,10 +622,12 @@ impl Connection {
         };
         match end {
             End::Eof | End::Gone => {
+                drop(logins);
                 let _ = self.orphans.send(tasks);
                 self.drained = None;
             }
             End::Lagged => {
+                drop(logins);
                 let _ = self.orphans.send(tasks);
                 self.drained = None;
                 let failure = Failure::new("lagged", "events were not read in time; disconnecting");
@@ -630,6 +641,7 @@ impl Connection {
                     }
                 }
                 tasks.abort_all();
+                logins.abort_all();
                 while let Ok((id, result)) = replies.try_recv() {
                     pending.push_back(Message::reply(Some(id), result));
                 }

@@ -1011,7 +1011,13 @@ prev=
 for a in "$@"; do [ "$prev" = --config-dir ] && dir=$a; prev=$a; done
 printf '%s\n' "$@" > "$dir/fake-login-args"
 printf 'WAYLAND_DISPLAY=%s\nXAUTHORITY=%s\n' "${{WAYLAND_DISPLAY-unset}}" "${{XAUTHORITY-unset}}" > "$dir/fake-login-env"
-case "$(cat "$dir/fake-login-mode")" in
+mode=$(cat "$dir/fake-login-mode")
+if [ "$mode" = wait ]; then
+  echo $$ > "$dir/fake-login-pid"
+  while [ ! -e "$dir/fake-login-go" ]; do sleep 0.05; done
+  mode=ok
+fi
+case "$mode" in
 ok) umask 077; printf '%s\n' '{MOCK_TOKEN}' > "$dir/token"; echo '{{"id":"1","username":"mock","global_name":null}}'; exit 0;;
 cancel) echo 'error: browser login failed: cancelled' >&2; exit 3;;
 hold) echo $$ > "$dir/fake-login-pid"; exec sleep 30;;
@@ -1029,10 +1035,15 @@ fn login_mode(h: &Harness, mode: &str) {
 }
 
 fn serve_with_login(h: &Harness) -> Service {
+    serve_with_login_env(h, &[])
+}
+
+fn serve_with_login_env(h: &Harness, env: &[(&str, &str)]) -> Service {
     let script = fake_login(h);
+    let mut cmd = h.cmd();
+    cmd.envs(env.iter().copied());
     let s = Service::spawn(
-        h.cmd()
-            .env("XAUTHORITY", "/stale/xauthority")
+        cmd.env("XAUTHORITY", "/stale/xauthority")
             .args([
                 "-v",
                 "serve",
@@ -1055,6 +1066,137 @@ fn serve_with_login(h: &Harness) -> Service {
 
 fn login(env: Value) -> Value {
     json!({"id": "login", "cmd": "login", "env": env})
+}
+
+fn wait_for_pid(h: &Harness) -> u32 {
+    let pid_file = h.dir.path().join("fake-login-pid");
+    let deadline = Instant::now() + T;
+    loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|p| p.trim().parse::<u32>().ok())
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "the login window never opened");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_until_gone(pid: u32, what: &str) {
+    let alive = || {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    let deadline = Instant::now() + T;
+    while alive() {
+        let state = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        assert!(Instant::now() < deadline, "{what}: {state}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn identifies(h: &Harness) -> usize {
+    h.mock
+        .recorded()
+        .ops
+        .iter()
+        .filter(|o| o.is(None, gw::OP_IDENTIFY))
+        .count()
+}
+
+#[test]
+fn a_login_that_lands_while_a_stream_runs_takes_effect_once_it_stops() {
+    let h = Harness::new().logged_in();
+    let s = serve_with_login(&h);
+    login_mode(&h, "wait");
+    let (mut window, _) = h.control();
+    window.send(&login(json!({})));
+    wait_for_pid(&h);
+    let (mut c, _) = h.control();
+    assert_eq!(
+        c.request(&json!({"id": "sub", "cmd": "subscribe"}))["type"],
+        "result"
+    );
+    let started = c.request(&start("test-pattern"));
+    assert_eq!(started["type"], "result", "{started}");
+    c.state("streaming");
+    std::fs::write(h.dir.path().join("fake-login-go"), "").unwrap();
+    assert_eq!(window.reply(Some("login"))["type"], "result");
+    let before = identifies(&h);
+    assert_eq!(
+        c.request(&json!({"id": "g1", "cmd": "guilds"}))["type"],
+        "result"
+    );
+    assert_eq!(identifies(&h), before, "the stream keeps its connection");
+    assert_eq!(
+        c.request(&json!({"id": "stop", "cmd": "stop"}))["type"],
+        "result"
+    );
+    c.state("stopped");
+    assert_eq!(
+        c.request(&json!({"id": "g2", "cmd": "guilds"}))["type"],
+        "result"
+    );
+    assert_eq!(
+        identifies(&h),
+        before + 1,
+        "the next command connects again with the new login"
+    );
+    assert_eq!(
+        c.request(&json!({"id": "g3", "cmd": "guilds"}))["type"],
+        "result"
+    );
+    assert_eq!(identifies(&h), before + 1, "only once");
+    drop((c, window));
+    shutdown_and_exit(&h, s);
+}
+
+#[test]
+fn the_login_window_closes_when_the_client_that_asked_for_it_leaves() {
+    let h = Harness::new();
+    let s = serve_with_login(&h);
+    login_mode(&h, "hold");
+    let (mut first, _) = h.control();
+    first.send(&login(json!({})));
+    let pid = wait_for_pid(&h);
+    let (mut other, _) = h.control();
+    drop(first);
+    wait_until_gone(pid, "the login window outlived its client");
+    login_mode(&h, "ok");
+    let again = other.request(&login(json!({})));
+    assert_eq!(again["type"], "result", "{again}");
+    drop(other);
+    shutdown_and_exit(&h, s);
+}
+
+#[test]
+fn a_token_from_the_environment_rules_out_the_login_window() {
+    let h = Harness::new();
+    let s = serve_with_login_env(&h, &[("DSTREAMY_TOKEN", "env.token")]);
+    let (mut c, hello) = h.control();
+    let features = hello["data"]["features"].as_array().unwrap();
+    assert!(!features.contains(&json!("browser_login")), "{hello}");
+    login_mode(&h, "ok");
+    let refused = c.request(&login(json!({})));
+    assert_eq!(refused["code"], "login_unavailable", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("DSTREAMY_TOKEN"),
+        "{refused}"
+    );
+    assert!(
+        !h.dir.path().join("fake-login-args").exists(),
+        "no window opened"
+    );
+    drop(c);
+    shutdown_and_exit(&h, s);
 }
 
 #[test]
@@ -1163,6 +1305,8 @@ fn malformed_login_parameters_are_invalid() {
     let (mut c, _) = h.control();
     let bad = c.request(&json!({"id": "l", "cmd": "login", "env": {"DISPLAY": 1}}));
     assert_eq!(bad["code"], "invalid_params", "{bad}");
+    let foreign = c.request(&json!({"id": "f", "cmd": "login", "env": {"LD_PRELOAD": "/x.so"}}));
+    assert_eq!(foreign["code"], "invalid_params", "{foreign}");
     drop(c);
     shutdown_and_exit(&h, s);
 }
