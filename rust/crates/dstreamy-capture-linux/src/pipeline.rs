@@ -27,10 +27,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const AUDIO_RETRY_FIRST: Duration = Duration::from_millis(500);
 const AUDIO_RETRY_MAX: Duration = Duration::from_secs(5);
 const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(10);
+const WARNING_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// Longer than pipewiresrc's own 30 s start wait, which its flush cuts short.
 const AUDIO_ABANDON_FLUSH: Duration = Duration::from_secs(35);
-/// Shorter than pulsesrc's 200 ms default, so less audio is held between capture and the pin check.
-const PINNED_BUFFER_TIME_US: u64 = 50_000;
 
 /// Every audio element's name starts with this, so errors of a branch already replaced are still recognised.
 const AUDIO_ELEMENT_PREFIX: &str = "dstreamy-audio-";
@@ -342,6 +341,8 @@ struct Output {
     stop: AtomicBool,
     video_frames: AtomicU64,
     audio_buffers: AtomicU64,
+    /// Warnings the audio elements posted, such as samples dropped because the sink fell behind.
+    audio_warnings: AtomicU64,
     /// The audio branch generation whose stream the server moved off the chosen device, and where to.
     moved: Mutex<Option<(u64, String)>>,
     error: Mutex<Option<String>>,
@@ -354,6 +355,7 @@ impl Output {
             stop: AtomicBool::new(false),
             video_frames: AtomicU64::new(0),
             audio_buffers: AtomicU64::new(0),
+            audio_warnings: AtomicU64::new(0),
             moved: Mutex::new(None),
             error: Mutex::new(None),
         })
@@ -601,33 +603,63 @@ struct AttachJob {
     bin: gst::Bin,
     bus: gst::Bus,
     source: gst::Element,
-    done: std::sync::mpsc::Receiver<Result<(), gst::StateChangeError>>,
-    abandoned: Arc<AtomicBool>,
-    finished: Arc<AtomicBool>,
+    state: Arc<Mutex<JobState>>,
+    started_at: Instant,
+}
+
+/// Who owns the bin once its state change returns: decided under the mutex, so exactly one side stops it.
+enum JobState {
+    Running,
+    /// Given up while running; the start thread stops the bin when its state change returns.
+    Abandoned,
+    Done(Result<(), gst::StateChangeError>),
+    Taken,
 }
 
 impl AttachJob {
     /// Gives the job up without waiting for it: flushes its source until its state change returns.
     fn abandon(self) {
-        self.abandoned.store(true, Ordering::Relaxed);
-        if self.done.try_recv().is_ok() {
+        let previous = std::mem::replace(
+            &mut *self.state.lock().unwrap_or_else(|e| e.into_inner()),
+            JobState::Abandoned,
+        );
+        if let JobState::Done(_) = previous {
+            *self.state.lock().unwrap_or_else(|e| e.into_inner()) = JobState::Taken;
             let bin = self.bin;
             std::thread::spawn(move || {
                 let _ = bin.set_state(gst::State::Null);
             });
             return;
         }
-        let (source, finished) = (self.source, self.finished);
+        let (source, state) = (self.source, self.state);
         std::thread::spawn(move || {
             let deadline = Instant::now() + AUDIO_ABANDON_FLUSH;
-            // Repeated: a flush that lands before the source activates its pad is cleared by that activation.
-            while !finished.load(Ordering::Relaxed) && Instant::now() < deadline {
+            let running = || {
+                matches!(
+                    *state.lock().unwrap_or_else(|e| e.into_inner()),
+                    JobState::Abandoned
+                )
+            };
+            // Repeated: a flush sent before the source's pad is active is dropped by that pad.
+            while running() && Instant::now() < deadline {
                 if let Some(pad) = source.static_pad("src") {
                     pad.send_event(gst::event::FlushStart::new());
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
+    }
+
+    /// The state change's result once it returned, handing the bin to the caller.
+    fn take_result(&self) -> Option<Result<(), gst::StateChangeError>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match std::mem::replace(&mut *state, JobState::Taken) {
+            JobState::Done(result) => Some(result),
+            other => {
+                *state = other;
+                None
+            }
+        }
     }
 
     fn errors(&self) -> Option<gst::Message> {
@@ -639,11 +671,25 @@ impl AttachJob {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restart {
+    DeviceLoss,
+    Fault,
+}
+
+/// A device loss for a source error that means the device went away; any other failure is a fault.
+fn restart_for(msg: Option<&gst::Message>) -> Restart {
+    match msg.map(|m| m.view()) {
+        Some(gst::MessageView::Error(err)) if is_device_loss(err) => Restart::DeviceLoss,
+        _ => Restart::Fault,
+    }
+}
+
 enum Attach {
     Pending,
     Attached,
-    /// Why, and the error message the source posted, if any.
-    Failed(String, Option<gst::Message>),
+    /// Why, and whether retrying can help: a lost device or a start that never returned, not a fault.
+    Failed(String, Restart),
 }
 
 /// The audio chain, which is rebuilt when its source fails so video keeps streaming.
@@ -695,16 +741,13 @@ impl AudioBranch {
             _ => None,
         };
         let pin = match (query, &self.device) {
-            (Some(query), Some(device)) => {
-                set_if_present(&source, "buffer-time", &PINNED_BUFFER_TIME_US.to_string());
-                Some(Pin {
-                    source: source.downgrade(),
-                    device: device.clone(),
-                    generation: self.generation,
-                    query,
-                    tainted: AtomicBool::new(false),
-                })
-            }
+            (Some(query), Some(device)) => Some(Pin {
+                source: source.downgrade(),
+                device: device.clone(),
+                generation: self.generation,
+                query,
+                tainted: AtomicBool::new(false),
+            }),
             _ => None,
         };
         let chain = [
@@ -735,16 +778,18 @@ impl AudioBranch {
         let (bin, source) = self.build(output)?;
         let bus = gst::Bus::new();
         bin.set_bus(Some(&bus));
-        let (tx, done) = std::sync::mpsc::channel();
-        let abandoned = Arc::new(AtomicBool::new(false));
-        let finished = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(JobState::Running));
         let thread = {
-            let (bin, abandoned, finished) = (bin.clone(), abandoned.clone(), finished.clone());
+            let (bin, state) = (bin.clone(), state.clone());
             move || {
                 let started = bin.set_state(gst::State::Paused).map(drop);
-                finished.store(true, Ordering::Relaxed);
-                if abandoned.load(Ordering::Relaxed) || tx.send(started).is_err() {
+                let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                if let JobState::Abandoned = *state {
+                    *state = JobState::Taken;
+                    drop(state);
                     let _ = bin.set_state(gst::State::Null);
+                } else {
+                    *state = JobState::Done(started);
                 }
             }
         };
@@ -756,9 +801,8 @@ impl AudioBranch {
             bin,
             bus,
             source,
-            done,
-            abandoned,
-            finished,
+            state,
+            started_at: Instant::now(),
         });
         Ok(())
     }
@@ -774,27 +818,30 @@ impl AudioBranch {
                 _ => "audio source failed".to_owned(),
             };
             self.job.take().expect("job checked above").abandon();
-            return Attach::Failed(why, Some(msg));
+            return Attach::Failed(why, restart_for(Some(&msg)));
         }
-        let started = match job.done.try_recv() {
-            Err(std::sync::mpsc::TryRecvError::Empty) => return Attach::Pending,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err("the audio start thread ended".to_owned())
+        let Some(started) = job.take_result() else {
+            if job.started_at.elapsed() >= AUDIO_ABANDON_FLUSH {
+                self.job.take().expect("job checked above").abandon();
+                return Attach::Failed(
+                    format!(
+                        "it did not start within {} s",
+                        AUDIO_ABANDON_FLUSH.as_secs()
+                    ),
+                    Restart::DeviceLoss,
+                );
             }
-            Ok(started) => started.map_err(|e| format!("cannot start audio: {e}")),
+            return Attach::Pending;
         };
+        let started = started.map_err(|e| format!("cannot start audio: {e}"));
         let job = self.job.take().expect("job checked above");
         if let Err(why) = started {
             let posted = job.errors();
             let _ = job.bin.set_state(gst::State::Null);
-            return match posted {
-                Some(msg) => match msg.view() {
-                    gst::MessageView::Error(err) => {
-                        Attach::Failed(bus_error_text(err), Some(msg.clone()))
-                    }
-                    _ => Attach::Failed(why, None),
-                },
-                None => Attach::Failed(why, None),
+            let restart = restart_for(posted.as_ref());
+            return match posted.as_ref().map(|m| m.view()) {
+                Some(gst::MessageView::Error(err)) => Attach::Failed(bus_error_text(err), restart),
+                _ => Attach::Failed(why, restart),
             };
         }
         if let Some(msg) = job.errors() {
@@ -803,16 +850,16 @@ impl AudioBranch {
                 gst::MessageView::Error(err) => bus_error_text(err),
                 _ => "audio source failed".to_owned(),
             };
-            return Attach::Failed(why, Some(msg));
+            return Attach::Failed(why, restart_for(Some(&msg)));
         }
         if let Err(e) = pipeline.add(&job.bin) {
             let _ = job.bin.set_state(gst::State::Null);
-            return Attach::Failed(format!("cannot add audio: {e}"), None);
+            return Attach::Failed(format!("cannot add audio: {e}"), Restart::Fault);
         }
         if let Err(e) = job.bin.sync_state_with_parent() {
             let _ = job.bin.set_state(gst::State::Null);
             let _ = pipeline.remove(&job.bin);
-            return Attach::Failed(format!("cannot start audio: {e}"), None);
+            return Attach::Failed(format!("cannot start audio: {e}"), Restart::Fault);
         }
         self.active = Some(job.bin);
         Attach::Attached
@@ -910,6 +957,33 @@ fn is_device_loss(err: &gst::message::Error) -> bool {
                     | R::Close
             )
         )
+}
+
+/// Lets one pipeline warning through per [`WARNING_LOG_INTERVAL`], counting the ones held back.
+#[derive(Debug, Default)]
+struct WarningLog {
+    last: Option<Instant>,
+    held_back: u64,
+}
+
+impl WarningLog {
+    /// `Some` with a note on held-back warnings when this one should be logged.
+    fn note(&mut self, now: Instant) -> Option<String> {
+        if self
+            .last
+            .is_some_and(|last| now < last + WARNING_LOG_INTERVAL)
+        {
+            self.held_back += 1;
+            return None;
+        }
+        self.last = Some(now);
+        let held = std::mem::take(&mut self.held_back);
+        Some(if held > 0 {
+            format!(" ({held} more since the last one logged)")
+        } else {
+            String::new()
+        })
+    }
 }
 
 /// When to rebuild a failed audio branch: soon at first, backing off while the device stays away.
@@ -1321,7 +1395,12 @@ impl Drop for Capture {
 /// Closes the frame channel when the pipeline ends or fails; a lost audio device is reconnected by name instead.
 fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<AudioBranch>) {
     let bus = pipeline.bus().expect("pipeline has a bus");
-    let types = [gst::MessageType::Error, gst::MessageType::Eos];
+    let types = [
+        gst::MessageType::Error,
+        gst::MessageType::Eos,
+        gst::MessageType::Warning,
+    ];
+    let mut warnings = WarningLog::default();
     let mut retry = AudioRetry::default();
     let mut lost = false;
     let mut buffers_at_attach = output.audio_buffers.load(Ordering::Relaxed);
@@ -1357,12 +1436,8 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
                     Attach::Attached => {
                         buffers_at_attach = output.audio_buffers.load(Ordering::Relaxed);
                     }
-                    Attach::Failed(why, msg) => {
-                        let loss = msg.as_ref().is_none_or(|m| match m.view() {
-                            gst::MessageView::Error(err) => is_device_loss(err),
-                            _ => true,
-                        });
-                        if loss {
+                    Attach::Failed(why, restart) => {
+                        if restart == Restart::DeviceLoss {
                             branch.lose(pipeline, &why, lost);
                             lost = true;
                             retry.failed(Instant::now());
@@ -1391,6 +1466,22 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
         let Some(msg) = bus.timed_pop_filtered(BUS_POLL, &types) else {
             continue;
         };
+        if let gst::MessageView::Warning(w) = msg.view() {
+            let from_audio = w
+                .src()
+                .is_some_and(|s| s.name().starts_with(AUDIO_ELEMENT_PREFIX));
+            if from_audio {
+                output.audio_warnings.fetch_add(1, Ordering::Relaxed);
+            }
+            let src = w
+                .src()
+                .map_or_else(|| "pipeline".to_owned(), |s| s.path_string().to_string());
+            if let Some(repeated) = warnings.note(Instant::now()) {
+                let detail = w.debug().map(|d| format!(" ({d})")).unwrap_or_default();
+                tracing::warn!("{src}: {}{detail}{repeated}", w.error());
+            }
+            continue;
+        }
         if let gst::MessageView::Error(err) = msg.view() {
             if let Some(generation) = audio_generation(err)
                 && let Some(branch) = audio.as_mut()
@@ -2312,8 +2403,14 @@ mod tests {
             None,
             AudioOptions::default(),
         );
-        let released = BLOCKING_RELEASED.load(Ordering::SeqCst);
         branch.begin(&output).unwrap();
+        let (source, bin) = {
+            let job = branch.job.as_ref().unwrap();
+            (
+                job.source.clone().downcast::<BlockingSrc>().unwrap(),
+                job.bin.clone(),
+            )
+        };
         std::thread::sleep(Duration::from_millis(200));
         assert!(matches!(branch.poll(&pipeline), Attach::Pending));
         let bus_thread = {
@@ -2336,13 +2433,108 @@ mod tests {
             stopping.elapsed()
         );
         let deadline = Instant::now() + Duration::from_secs(2);
-        while BLOCKING_RELEASED.load(Ordering::SeqCst) == released && Instant::now() < deadline {
+        while bin.current_state() != gst::State::Null && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            BLOCKING_RELEASED.load(Ordering::SeqCst) > released,
+            source.was_flushed(),
             "the abandoned start was never flushed"
         );
+        assert_eq!(
+            bin.current_state(),
+            gst::State::Null,
+            "the abandoned bin was left open"
+        );
+    }
+
+    #[test]
+    fn a_start_abandoned_after_it_returned_is_stopped_too() {
+        init();
+        let (tx, _rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+        let output = Output::new(tx);
+        let mut branch = AudioBranch::new(
+            AudioInput::Test { frames: -1 },
+            &CaptureConfig {
+                audio: true,
+                ..config(320, 240)
+            },
+            None,
+            AudioOptions::default(),
+        );
+        branch.begin(&output).unwrap();
+        let bin = branch.job.as_ref().unwrap().bin.clone();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while bin.current_state() != gst::State::Paused && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(bin.current_state(), gst::State::Paused);
+        branch.abandon();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while bin.current_state() != gst::State::Null && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(bin.current_state(), gst::State::Null);
+    }
+
+    #[test]
+    fn a_tainted_pin_keeps_dropping_after_the_server_reports_the_chosen_device_again() {
+        init();
+        let current = Arc::new(Mutex::new("chosen".to_owned()));
+        let source = make("fakesrc").unwrap();
+        let pin = Pin {
+            source: source.downgrade(),
+            device: "chosen".into(),
+            generation: 1,
+            query: fake_device(&current).device_query.unwrap(),
+            tainted: AtomicBool::new(false),
+        };
+        assert_eq!(pin.admit(), Ok(()));
+        *current.lock().unwrap() = "elsewhere".into();
+        assert_eq!(pin.admit(), Err("elsewhere".to_owned()));
+        *current.lock().unwrap() = "chosen".into();
+        assert!(
+            pin.admit().is_err(),
+            "audio passed again from a source that was moved"
+        );
+        assert!(pin.admit().is_err());
+    }
+
+    #[test]
+    fn only_device_loss_errors_restart_a_failed_rebuild() {
+        init();
+        let message = |name: &str, err: gst::glib::Error| {
+            let fake = make("fakesrc").unwrap();
+            fake.set_property("name", name);
+            gst::message::Error::builder_from_error(err)
+                .src(&fake)
+                .build()
+        };
+        let source = format!("{AUDIO_ELEMENT_PREFIX}3-0");
+        let gone = message(
+            &source,
+            gst::glib::Error::new(gst::ResourceError::NotFound, "x"),
+        );
+        let caps = message(
+            &source,
+            gst::glib::Error::new(gst::CoreError::Negotiation, "x"),
+        );
+        assert_eq!(restart_for(Some(&gone)), Restart::DeviceLoss);
+        assert_eq!(restart_for(Some(&caps)), Restart::Fault);
+        assert_eq!(restart_for(None), Restart::Fault);
+    }
+
+    #[test]
+    fn pipeline_warnings_are_logged_at_most_once_per_interval_with_a_count() {
+        let t0 = Instant::now();
+        let mut log = WarningLog::default();
+        assert_eq!(log.note(t0).as_deref(), Some(""));
+        assert_eq!(log.note(t0 + Duration::from_secs(1)), None);
+        assert_eq!(log.note(t0 + Duration::from_secs(2)), None);
+        assert_eq!(
+            log.note(t0 + WARNING_LOG_INTERVAL).as_deref(),
+            Some(" (2 more since the last one logged)")
+        );
+        assert_eq!(log.note(t0 + WARNING_LOG_INTERVAL * 2).as_deref(), Some(""));
     }
 
     #[test]
@@ -2381,16 +2573,19 @@ mod tests {
         let _ = pipeline.set_state(gst::State::Null);
     }
 
-    pub(super) static BLOCKING_RELEASED: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
-
     glib::wrapper! {
         pub struct BlockingSrc(ObjectSubclass<blocking::BlockingSrc>) @extends gst::Element, gst::Object;
     }
 
+    impl BlockingSrc {
+        fn was_flushed(&self) -> bool {
+            use glib::subclass::types::ObjectSubclassIsExt;
+            *self.imp().released.0.lock().unwrap()
+        }
+    }
+
     /// Stands in for pipewiresrc's start wait: READY to PAUSED blocks until the source pad is flushed.
     mod blocking {
-        use std::sync::atomic::Ordering;
         use std::sync::{Condvar, LazyLock, Mutex};
         use std::time::Duration;
 
@@ -2400,14 +2595,13 @@ mod tests {
 
         pub struct BlockingSrc {
             pad: gst::Pad,
-            released: (Mutex<bool>, Condvar),
+            pub(super) released: (Mutex<bool>, Condvar),
         }
 
         impl BlockingSrc {
             fn release(&self) {
                 *self.released.0.lock().unwrap() = true;
                 self.released.1.notify_all();
-                super::BLOCKING_RELEASED.fetch_add(1, Ordering::SeqCst);
             }
         }
 

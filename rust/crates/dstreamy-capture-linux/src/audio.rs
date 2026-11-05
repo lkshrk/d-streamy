@@ -56,19 +56,40 @@ pub(crate) fn check_known(id: &str, sources: &[AudioSource]) -> Result<(), Media
     )))
 }
 
-/// Errors for an id that pipewire-pulse would read as a device index: it `atoi`s source names.
+/// Errors for an id that pipewire-pulse would read as a device index rather than a name.
 pub(crate) fn check_pulse_name(id: &str) -> Result<(), MediaError> {
-    let rest = id.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
-    let rest = rest.strip_prefix(['+', '-']).unwrap_or(rest);
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if rest[..digits].bytes().any(|b| b != b'0') {
+    if atoi_is_nonzero(id) || is_whole_c_number(id) {
         return Err(MediaError::InvalidConfig(format!(
-            "audio source {id:?} starts with a number, which PulseAudio on PipeWire reads as a \
-             device index, so another device could be captured; rename the device or pick \
+            "audio source {id:?} is or starts with a number, which PulseAudio on PipeWire reads \
+             as a device index, so another device could be captured; rename the device or pick \
              another from `dstreamy audio-sources`"
         )));
     }
     Ok(())
+}
+
+/// C's leading whitespace and sign, which `atoi` and `strtoul` skip.
+fn after_c_sign(id: &str) -> &str {
+    let rest = id.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    rest.strip_prefix(['+', '-']).unwrap_or(rest)
+}
+
+/// What `atoi` makes of a record stream's source name.
+fn atoi_is_nonzero(id: &str) -> bool {
+    let rest = after_c_sign(id);
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    rest[..digits].bytes().any(|b| b != b'0')
+}
+
+/// Whether `strtoul(id, &end, 0)` consumes all of `id`, as `spa_atou32` in pipewire-pulse's device lookup requires.
+fn is_whole_c_number(id: &str) -> bool {
+    let rest = after_c_sign(id);
+    let (digits, radix) = match rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+        Some(hex) => (hex, 16),
+        None if rest.len() > 1 && rest.starts_with('0') => (&rest[1..], 8),
+        None => (rest, 10),
+    };
+    !digits.is_empty() && digits.chars().all(|c| c.is_digit(radix))
 }
 
 /// Errors for a server alias such as `@DEFAULT_SOURCE@`: it names whatever the default is, not one device.
@@ -114,7 +135,11 @@ mod tests {
         assert!(check_pulse_name("0abc").is_ok());
         assert!(check_pulse_name("alsa_input.usb-2").is_ok());
         assert!(check_pulse_name("+0x").is_ok());
-        for id in ["12abc", "3", "007x", "+5x", "-5x", " 5x", "\t\n7"] {
+        assert!(check_pulse_name("0x").is_ok());
+        for id in [
+            "12abc", "3", "007x", "+5x", "-5x", " 5x", "\t\n7", "0", "00", "0x0", "0x1f", "0X1F",
+            "017", "+0", " 0", "08",
+        ] {
             assert!(
                 matches!(check_pulse_name(id), Err(MediaError::InvalidConfig(_))),
                 "{id}"

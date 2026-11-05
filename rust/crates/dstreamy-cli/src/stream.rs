@@ -143,13 +143,16 @@ pub enum AudioNotice {
 #[derive(Debug, Default)]
 pub struct SilenceWarning {
     warned: bool,
-    lost: bool,
+    losses_seen: u64,
+    owe_back_note: bool,
 }
 
 impl SilenceWarning {
+    /// `losses` counts every loss so far, so one that ended between two checks still warns, then notes the return.
     pub fn check(
         &mut self,
         silent_for: Option<Duration>,
+        losses: u64,
         lost: bool,
         source: Option<&str>,
     ) -> Option<AudioNotice> {
@@ -159,10 +162,13 @@ impl SilenceWarning {
                 |id| format!("audio source {id}"),
             )
         };
-        if lost != self.lost {
-            self.lost = lost;
+        let new_loss = losses > self.losses_seen;
+        let back = !new_loss && self.owe_back_note && !lost;
+        if new_loss || back {
+            self.losses_seen = losses;
+            self.owe_back_note = new_loss;
             self.warned = true;
-            return Some(if lost {
+            return Some(if new_loss {
                 AudioNotice::Warn(match source {
                     Some(id) => format!(
                         "audio source {id} disappeared, so viewers hear silence; video keeps \
@@ -179,7 +185,7 @@ impl SilenceWarning {
                 AudioNotice::Note(format!("{} is back; viewers hear it again", device()))
             });
         }
-        if lost {
+        if lost || self.owe_back_note {
             return None;
         }
         let silent = silent_for.is_some_and(|d| d >= SILENCE_WARNING);
@@ -273,8 +279,9 @@ pub async fn run_with(
             () = signals.recv() => break Outcome::Interrupted,
             _ = silence_check.tick(), if activity.is_some() => {
                 let silent_for = activity.as_ref().and_then(|a| a.silent_for());
+                let losses = activity.as_ref().map_or(0, |a| a.losses());
                 let lost = activity.as_ref().is_some_and(|a| a.is_lost());
-                match silence.check(silent_for, lost, audio_source.as_deref()) {
+                match silence.check(silent_for, losses, lost, audio_source.as_deref()) {
                     Some(AudioNotice::Warn(warning)) => out.warn(warning),
                     Some(AudioNotice::Note(note)) => out.note(note),
                     None => {}
@@ -524,16 +531,16 @@ mod tests {
     fn silence_warns_once_per_stretch_and_names_the_device() {
         let mut w = SilenceWarning::default();
         let just_under = SILENCE_WARNING - Duration::from_millis(1);
-        assert_eq!(w.check(None, false, None), None);
-        assert_eq!(w.check(Some(just_under), false, None), None);
-        let Some(AudioNotice::Warn(first)) = w.check(Some(SILENCE_WARNING), false, None) else {
+        assert_eq!(w.check(None, 0, false, None), None);
+        assert_eq!(w.check(Some(just_under), 0, false, None), None);
+        let Some(AudioNotice::Warn(first)) = w.check(Some(SILENCE_WARNING), 0, false, None) else {
             panic!("no warning")
         };
         assert!(first.contains("--audio-source"), "{first}");
-        assert_eq!(w.check(Some(SILENCE_WARNING * 3), false, None), None);
-        assert_eq!(w.check(Some(Duration::ZERO), false, None), None);
+        assert_eq!(w.check(Some(SILENCE_WARNING * 3), 0, false, None), None);
+        assert_eq!(w.check(Some(Duration::ZERO), 0, false, None), None);
         let Some(AudioNotice::Warn(again)) =
-            w.check(Some(SILENCE_WARNING), false, Some("pipeweaver_stream"))
+            w.check(Some(SILENCE_WARNING), 0, false, Some("pipeweaver_stream"))
         else {
             panic!("no warning")
         };
@@ -543,7 +550,7 @@ mod tests {
     #[test]
     fn a_lost_default_output_promises_no_device_and_says_it_follows_the_default() {
         let mut w = SilenceWarning::default();
-        let Some(AudioNotice::Warn(lost)) = w.check(Some(Duration::ZERO), true, None) else {
+        let Some(AudioNotice::Warn(lost)) = w.check(Some(Duration::ZERO), 1, true, None) else {
             panic!("no warning")
         };
         assert!(lost.contains("default output"), "{lost}");
@@ -555,21 +562,46 @@ mod tests {
     fn a_lost_device_is_reported_once_instead_of_as_silence_and_its_return_noted() {
         let mut w = SilenceWarning::default();
         let id = Some("pipeweaver_stream");
-        let Some(AudioNotice::Warn(lost)) = w.check(Some(Duration::ZERO), true, id) else {
+        let Some(AudioNotice::Warn(lost)) = w.check(Some(Duration::ZERO), 1, true, id) else {
             panic!("no warning")
         };
         assert!(lost.contains("pipeweaver_stream disappeared"), "{lost}");
         assert!(lost.contains("never from another"), "{lost}");
-        assert_eq!(w.check(Some(SILENCE_WARNING * 2), true, id), None);
-        let Some(AudioNotice::Note(back)) = w.check(Some(SILENCE_WARNING * 2), false, id) else {
+        assert_eq!(w.check(Some(SILENCE_WARNING * 2), 1, true, id), None);
+        let Some(AudioNotice::Note(back)) = w.check(Some(SILENCE_WARNING * 2), 1, false, id) else {
             panic!("no note")
         };
         assert!(back.contains("is back"), "{back}");
-        assert_eq!(w.check(Some(SILENCE_WARNING * 2), false, id), None);
-        assert_eq!(w.check(Some(Duration::ZERO), false, id), None);
+        assert_eq!(w.check(Some(SILENCE_WARNING * 2), 1, false, id), None);
+        assert_eq!(w.check(Some(Duration::ZERO), 1, false, id), None);
         assert!(matches!(
-            w.check(Some(SILENCE_WARNING), false, id),
+            w.check(Some(SILENCE_WARNING), 1, false, id),
             Some(AudioNotice::Warn(_))
+        ));
+    }
+
+    #[test]
+    fn a_loss_that_ended_between_two_checks_still_warns_then_notes_the_return() {
+        let mut w = SilenceWarning::default();
+        let id = Some("pipeweaver_stream");
+        assert_eq!(w.check(Some(Duration::ZERO), 0, false, id), None);
+        assert!(matches!(
+            w.check(Some(Duration::ZERO), 1, false, id),
+            Some(AudioNotice::Warn(_))
+        ));
+        assert!(matches!(
+            w.check(Some(Duration::ZERO), 1, false, id),
+            Some(AudioNotice::Note(_))
+        ));
+        assert_eq!(w.check(Some(Duration::ZERO), 1, false, id), None);
+        assert!(matches!(
+            w.check(Some(Duration::ZERO), 3, true, id),
+            Some(AudioNotice::Warn(_))
+        ));
+        assert_eq!(w.check(Some(Duration::ZERO), 3, true, id), None);
+        assert!(matches!(
+            w.check(Some(Duration::ZERO), 3, false, id),
+            Some(AudioNotice::Note(_))
         ));
     }
 

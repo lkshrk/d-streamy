@@ -21,6 +21,8 @@ struct Inner {
     silent_since_ms: AtomicU64,
     /// The capture's audio device went away and has not delivered samples since.
     lost: AtomicBool,
+    /// Losses so far, so a reader polling now and then sees a loss that already ended.
+    losses: AtomicU64,
 }
 
 impl Default for AudioActivity {
@@ -29,6 +31,7 @@ impl Default for AudioActivity {
             epoch: Instant::now(),
             silent_since_ms: AtomicU64::new(IDLE),
             lost: AtomicBool::new(false),
+            losses: AtomicU64::new(0),
         }))
     }
 }
@@ -45,7 +48,13 @@ impl AudioActivity {
 
     /// The audio device went away; cleared by the next samples, from the same device once it is back.
     pub fn lost(&self) {
+        self.0.losses.fetch_add(1, Ordering::Relaxed);
         self.0.lost.store(true, Ordering::Relaxed);
+    }
+
+    /// How many times the device was lost since this record was made; it never goes down.
+    pub fn losses(&self) -> u64 {
+        self.0.losses.load(Ordering::Relaxed)
     }
 
     pub fn is_lost(&self) -> bool {
@@ -151,6 +160,11 @@ mod tests {
         a.lost();
         a.stopped();
         assert!(!a.is_lost());
+        assert_eq!(
+            a.losses(),
+            2,
+            "a loss stays counted after the device is back"
+        );
     }
 
     #[test]
