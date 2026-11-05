@@ -8,6 +8,7 @@ namespace fake {
 QMainWindow *window;
 int watches;
 int unwatches;
+int warnings;
 void (*exit_handler)();
 
 void exit()
@@ -34,6 +35,11 @@ void unwatch_exit()
 {
 	fake::exit_handler = nullptr;
 	fake::unwatches++;
+}
+
+void warn(const char *) noexcept
+{
+	fake::warnings++;
 }
 
 } // namespace dstreamy_ui

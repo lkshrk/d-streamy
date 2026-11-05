@@ -4,6 +4,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -18,12 +19,14 @@
 #include <QPushButton>
 #include <QStatusBar>
 #include <QStyleFactory>
+#include <QTextDocument>
 #include <QTimer>
 #include <QToolButton>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -60,6 +63,8 @@ struct Host {
 	int track = 0;
 	std::vector<std::pair<std::string, bool>> ticks;
 	int after_unload = 0;
+	bool throw_view = false;
+	bool throw_load = false;
 } host;
 
 void called()
@@ -72,6 +77,8 @@ char *view_json(void *)
 {
 	called();
 	host.views++;
+	if (host.throw_view)
+		throw std::bad_alloc();
 	if (host.null_view)
 		return nullptr;
 	char *s = static_cast<char *>(std::malloc(host.json.size() + 1));
@@ -101,6 +108,8 @@ dstreamy_ui_host make_host()
 	h.load_lists = [](void *) {
 		called();
 		host.loads++;
+		if (host.throw_load)
+			throw std::bad_alloc();
 	};
 	h.select_guild = [](void *, const char *id) {
 		called();
@@ -289,10 +298,52 @@ bool visible(const char *name)
 	return w && w->isVisible();
 }
 
+// Waits for `done` on a bounded deadline; runners can stall for hundreds of milliseconds.
+template<typename F> bool wait_for(F done, int ms = 10000)
+{
+	QElapsedTimer clock;
+	clock.start();
+	while (!done()) {
+		if (clock.elapsed() > ms)
+			return false;
+		spin(10);
+	}
+	return true;
+}
+
+// Waits until the panel has asked for the view again, so a poll has rendered whatever it got.
+bool polled()
+{
+	int views = host.views;
+	return wait_for([views] { return host.views > views; });
+}
+
 void show(const std::string &json)
 {
 	host.json = json;
-	spin(650);
+	CHECK(polled());
+}
+
+// Tooltips are set as escaped rich text; this is what they show.
+QString plain(const QString &tooltip)
+{
+	QTextDocument doc;
+	doc.setHtml(tooltip);
+	return doc.toPlainText();
+}
+
+// The widgets Tab visits from `first`, in order, until it comes back.
+QStringList tab_chain(QWidget *first)
+{
+	QStringList names;
+	QWidget *w = first;
+	do {
+		if (w->isVisible() && (w->focusPolicy() & Qt::TabFocus))
+			names << (qobject_cast<QCheckBox *>(w) ? QStringLiteral("box:") + w->property("name").toString()
+							       : w->objectName());
+		w = w->nextInFocusChain();
+	} while (w && w != first);
+	return names;
 }
 
 // With DSTREAMY_UI_SHOTS=DIR, saves the open panel as DIR/panel-NAME.png at its natural size.
@@ -306,6 +357,17 @@ void shoot(const char *name)
 	if (!p->grab().save(path))
 		std::fprintf(stderr, "could not save %s\n", qPrintable(path));
 }
+
+// The panel's size when it is shown, before anything can move or resize it again.
+struct ShowSize : QObject {
+	QSize at_show;
+	bool eventFilter(QObject *watched, QEvent *event) override
+	{
+		if (event->type() == QEvent::Show)
+			at_show = static_cast<QWidget *>(watched)->size();
+		return false;
+	}
+};
 
 QList<QCheckBox *> sources()
 {
@@ -328,6 +390,9 @@ int main(int argc, char **argv)
 		dark.setColor(QPalette::Base, QColor(0x16, 0x18, 0x1d));
 		dark.setColor(QPalette::Text, QColor(0xe4, 0xe4, 0xe7));
 		app.setPalette(dark);
+	} else {
+		// Grows the panel when it is polished, so sizing it before polishing shows up below.
+		app.setStyleSheet(QStringLiteral("#dstreamy-panel { border: 8px solid gray; }"));
 	}
 	QMainWindow window;
 	window.setGeometry(0, 0, 800, 600);
@@ -358,14 +423,18 @@ int main(int argc, char **argv)
 	CHECK(fake::watches == 1);
 	auto *status = window.statusBar()->findChild<QToolButton *>("dstreamy-status");
 	CHECK(status && status->text() == QString::fromUtf8("D-Streamy idle ▴"));
-	CHECK(status && status->toolTip() == QString::fromUtf8("Idle · Kids Lounge 🧃\nTrack 6"));
+	CHECK(status && plain(status->toolTip()) == QString::fromUtf8("Idle · Kids Lounge 🧃\nTrack 6"));
 	CHECK(panel() && !panel()->isVisible());
 	CHECK(host.loads == 0);
 
+	ShowSize show_size;
+	if (panel())
+		panel()->installEventFilter(&show_size);
 	status->click();
 	app.processEvents();
 	CHECK(panel() && panel()->isVisible());
 	CHECK(host.loads == 1);
+	CHECK(panel() && show_size.at_show == panel()->size());
 	auto *guilds = find<QComboBox>("dstreamy-guilds");
 	auto *channels = find<QComboBox>("dstreamy-channels");
 	auto *tracks = find<QComboBox>("dstreamy-tracks");
@@ -376,11 +445,14 @@ int main(int argc, char **argv)
 		std::fprintf(stderr, "panel %d,%d %dx%d, status corner %d,%d\n", above.x(), above.y(), above.width(),
 			     above.height(), anchor.x(), anchor.y());
 	CHECK(above.bottom() < anchor.y() && above.right() == anchor.x() - 1);
+	CHECK(polled());
+	CHECK(panel() && panel()->geometry() == above);
 
 	show(view(idle, audio(false, false)));
 	CHECK(guilds->count() == 3 && guilds->currentText() == QLatin1String("Beste Chatgruppe"));
 	CHECK(channels->count() == 2 && channels->currentText() == QString::fromUtf8("Kids Lounge 🧃"));
 	CHECK(tracks->count() == 6 && tracks->currentText() == QLatin1String("Track 6"));
+	CHECK(tracks->accessibleName() == QLatin1String("Discord audio"));
 	emit guilds->activated(2);
 	CHECK(host.guild == "h");
 	emit guilds->activated(0);
@@ -421,8 +493,7 @@ int main(int argc, char **argv)
 	if (boxes.size() == 5)
 		boxes[1]->click();
 	CHECK(!host.ticks.empty() && host.ticks.back() == std::make_pair(std::string("u1"), true));
-	spin(50);
-	CHECK(boxes.size() == 5 && !boxes[1]->isChecked());
+	CHECK(boxes.size() == 5 && wait_for([&] { return !boxes[1]->isChecked(); }));
 	find<QPushButton>("dstreamy-action")->click();
 	CHECK(host.starts == 1);
 
@@ -438,6 +509,9 @@ int main(int argc, char **argv)
 	show(view(idle, warned));
 	CHECK(visible("dstreamy-notices") && visible("dstreamy-release") && visible("dstreamy-sources"));
 	CHECK(text("dstreamy-notice").startsWith(QLatin1String("Track 1 is OBS's")));
+	CHECK((tab_chain(guilds) == QStringList{"dstreamy-guilds", "dstreamy-channels", "dstreamy-tracks",
+						"dstreamy-release", "box:Alerts", "box:Mic", "box:Music",
+						"box:Music-Out", "box:Stream", "dstreamy-action"}));
 	find<QPushButton>("dstreamy-release")->click();
 	CHECK((host.releases == std::vector<int>{1}));
 	show(view(idle, audio(true, false)));
@@ -449,6 +523,9 @@ int main(int argc, char **argv)
 	instead["confirm"] = row;
 	show(view(idle, instead));
 	CHECK(visible("dstreamy-confirm-instead"));
+	CHECK((tab_chain(guilds) == QStringList{"dstreamy-guilds", "dstreamy-channels", "dstreamy-tracks",
+						"dstreamy-confirm-cancel", "dstreamy-confirm-instead",
+						"dstreamy-confirm-ok", "dstreamy-action"}));
 	find<QPushButton>("dstreamy-confirm-instead")->click();
 	CHECK(host.track == 6);
 
@@ -460,7 +537,7 @@ int main(int argc, char **argv)
 
 	show(view(live, audio(true, false)));
 	CHECK(status->text() == QString::fromUtf8("● D-Streamy live ▴"));
-	CHECK(status->toolTip().contains(QString::fromUtf8("6.0 Mbit/s · 60 fps · 12:34 · 0 dropped")));
+	CHECK(plain(status->toolTip()).contains(QString::fromUtf8("6.0 Mbit/s · 60 fps · 12:34 · 0 dropped")));
 	CHECK(text("dstreamy-state") == QString::fromUtf8("Live · 6.0 Mbit/s · 60 fps · 12:34"));
 	CHECK(!guilds->isEnabled() && !channels->isEnabled());
 	CHECK(sources().size() == 5 && sources()[2]->isChecked());
@@ -471,7 +548,8 @@ int main(int argc, char **argv)
 	show(view(attention, audio(true, false)));
 	CHECK(text("dstreamy-state") == QLatin1String("Service not running"));
 	CHECK(visible("dstreamy-fix") && text("dstreamy-fix") == QLatin1String("Run `dstreamy service install`"));
-	CHECK(find<QLabel>("dstreamy-fix")->toolTip().startsWith(QLatin1String("The D-Streamy service is not running")));
+	CHECK(plain(find<QLabel>("dstreamy-fix")->toolTip())
+		      .startsWith(QLatin1String("The D-Streamy service is not running")));
 	CHECK(status->text() == QString::fromUtf8("⚠ D-Streamy ▴"));
 	CHECK(find<QLabel>("dstreamy-mark")->text() == QString::fromUtf8("⚠"));
 	shoot("attention");
@@ -484,14 +562,24 @@ int main(int argc, char **argv)
 	CHECK(state && state->text() == QString::fromUtf8(long_state.line));
 	CHECK(!shown.isEmpty() && shown != state->text() && shown.endsWith(QChar(0x2026)));
 	CHECK(state && !state->wordWrap() && state->height() < 2 * state->fontMetrics().height());
-	CHECK(state && state->toolTip() == QString::fromUtf8(long_state.tooltip));
+	CHECK(state && plain(state->toolTip()) == QString::fromUtf8(long_state.tooltip));
+
+	State tagged = idle;
+	tagged.line = "Idle · <b>Kids</b> & Co";
+	tagged.tooltip = "Idle · <b>Kids</b> & Co\nTrack 6";
+	show(view(tagged, audio(true, false, 6, {"<i>Mic</i>", "Music"})));
+	CHECK(plain(status->toolTip()) == QString::fromUtf8(tagged.tooltip));
+	CHECK(state && plain(state->toolTip()) == QString::fromUtf8(tagged.tooltip));
+	CHECK(state && state->text() == QString::fromUtf8(tagged.line));
+	CHECK(sources().size() == 2 && plain(sources()[0]->toolTip()) == QLatin1String("<i>Mic</i>"));
+	show(view(long_state, audio(true, false)));
 
 	host.null_view = true;
-	spin(650);
+	CHECK(polled());
 	CHECK(state && state->text() == QString::fromUtf8(long_state.line));
 	host.null_view = false;
 	host.json = "not json";
-	spin(650);
+	CHECK(polled());
 	CHECK(state && state->text() == QString::fromUtf8(long_state.line));
 
 	int closed = host.closed;
@@ -503,7 +591,9 @@ int main(int argc, char **argv)
 	status->click();
 	app.processEvents();
 	CHECK(panel() && panel()->isVisible() && host.loads == 2);
-	status->click();
+	CHECK(dstreamy_ui_open_panel());
+	CHECK(panel() && panel()->isVisible() && host.loads == 2);
+	QApplication::sendEvent(panel(), &esc);
 	app.processEvents();
 	CHECK(panel() && !panel()->isVisible());
 
@@ -546,11 +636,13 @@ int main(int argc, char **argv)
 	auto *scroll = find<QScrollArea>("dstreamy-sources-scroll");
 	CHECK(all.size() == 20 && scroll);
 	CHECK(all.size() == 20 && all[0]->text().endsWith(QChar(0x2026)) &&
-	      all[0]->toolTip() == QString::fromStdString(many[0]) && all[3]->text() == QLatin1String("Music"));
+	      plain(all[0]->toolTip()) == QString::fromStdString(many[0]) && all[3]->text() == QLatin1String("Music"));
+	CHECK(all.size() == 20 && all[0]->accessibleName() == QString::fromStdString(many[0]));
 	CHECK(scroll && scroll->height() <= 8 * (all[0]->sizeHint().height() + 8) && scroll->height() > 0);
 	CHECK(all.size() == 20 && all[0]->width() <= 160);
 	CHECK(all.size() == 20 && all[5]->text() == QLatin1String("Mic && Game") &&
-	      all[5]->toolTip() == QLatin1String("Mic & Game"));
+	      plain(all[5]->toolTip()) == QLatin1String("Mic & Game") &&
+	      all[5]->accessibleName() == QLatin1String("Mic & Game"));
 	QRect screen = window.screen()->availableGeometry();
 	CHECK(panel() && panel()->height() <= screen.height());
 	auto *action = find<QPushButton>("dstreamy-action");
@@ -581,6 +673,26 @@ int main(int argc, char **argv)
 	CHECK(!find<QToolButton>("dstreamy-status") && !panel());
 	dstreamy_ui_unload();
 	CHECK(fake::unwatches == 1);
+
+	host.unloaded = false;
+	int watches = fake::watches;
+	host.throw_view = true;
+	CHECK(!dstreamy_ui_load(&good));
+	host.throw_view = false;
+	CHECK(fake::warnings == 1 && fake::watches == watches + 1 && fake::unwatches == 2);
+	CHECK(!find<QToolButton>("dstreamy-status") && !panel());
+	CHECK(dstreamy_ui_load(&good));
+	host.throw_load = true;
+	CHECK(!dstreamy_ui_open_panel());
+	host.throw_load = false;
+	CHECK(fake::warnings == 2 && fake::unwatches == 3);
+	CHECK(!find<QToolButton>("dstreamy-status") && !panel());
+	CHECK(!dstreamy_ui_open_panel());
+	dstreamy_ui_unload();
+	CHECK(fake::unwatches == 3);
+	CHECK(dstreamy_ui_load(&good));
+	dstreamy_ui_unload();
+	CHECK(fake::unwatches == 4);
 
 	if (failures) {
 		std::fprintf(stderr, "dstreamy-ui-test: %d failures\n", failures);

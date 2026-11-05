@@ -23,6 +23,7 @@
 #include <QSignalBlocker>
 #include <QStatusBar>
 #include <QStyle>
+#include <QTextDocument>
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -31,6 +32,12 @@ namespace {
 
 constexpr int poll_ms = 500;
 constexpr int source_rows = 8;
+
+// Tooltips guess rich text from their content, and Discord and source names are user-controlled.
+QString plain_tip(const QString &text)
+{
+	return text.isEmpty() ? text : Qt::convertFromPlainText(text, Qt::WhiteSpaceNormal);
+}
 
 class ElidedLabel : public QLabel {
 public:
@@ -44,7 +51,7 @@ public:
 	void show_text(const QString &text, const QString &tooltip)
 	{
 		setText(text);
-		setToolTip(tooltip.isEmpty() ? text : tooltip);
+		setToolTip(plain_tip(tooltip.isEmpty() ? text : tooltip));
 		update_shown();
 	}
 
@@ -245,7 +252,8 @@ void fill_sources(const QJsonArray &sources)
 			auto *box = new QCheckBox(ui.sources);
 			QString shown = box->fontMetrics().elidedText(name, Qt::ElideRight, column);
 			box->setText(shown.replace(QLatin1Char('&'), QLatin1String("&&")));
-			box->setToolTip(name);
+			box->setToolTip(plain_tip(name));
+			box->setAccessibleName(name);
 			box->setProperty("name", name);
 			box->setObjectName(QStringLiteral("dstreamy-source"));
 			box->setProperty("uuid", s.value("uuid").toString());
@@ -312,13 +320,35 @@ void fill_notices(const QJsonArray &notices)
 	ui.notices->setVisible(!notices.isEmpty());
 }
 
+void order_tabs()
+{
+	QList<QWidget *> order{ui.guilds, ui.channels, ui.tracks};
+	const QList<QPushButton *> releases =
+		ui.notices->findChildren<QPushButton *>(QString(), Qt::FindDirectChildrenOnly);
+	for (QPushButton *b : releases)
+		order << b;
+	order << ui.manage << ui.confirm_cancel << ui.confirm_instead << ui.confirm_ok;
+	const QList<QCheckBox *> boxes = ui.sources->findChildren<QCheckBox *>(QString(), Qt::FindDirectChildrenOnly);
+	for (QCheckBox *box : boxes)
+		order << box;
+	order << ui.action;
+	for (qsizetype i = 1; i < order.size(); i++)
+		QWidget::setTabOrder(order[i - 1], order[i]);
+}
+
 void place_panel()
 {
 	if (!ui.panel || !ui.status || !ui.window)
 		return;
 	bool bar = ui.status->isVisible();
 	QWidget *anchor = bar ? static_cast<QWidget *>(ui.status) : ui.window.data();
-	QRect room = anchor->screen() ? anchor->screen()->availableGeometry() : QRect();
+	QPoint corner = bar ? ui.status->mapToGlobal(QPoint(ui.status->width(), 0))
+			    : ui.window->mapToGlobal(QPoint(ui.window->width() - 8, ui.window->height() - 8));
+	// screen() is the top-level window's screen, which can differ from the one under the corner.
+	QScreen *screen = QGuiApplication::screenAt(corner - QPoint(1, 1));
+	if (!screen)
+		screen = anchor->screen();
+	QRect room = screen ? screen->availableGeometry() : QRect();
 	// Wrapped labels need the height for the panel's fixed width, which adjustSize doesn't ask for.
 	ui.panel->layout()->activate();
 	int width = ui.panel->width();
@@ -328,8 +358,6 @@ void place_panel()
 		height = qMin(height, room.height());
 	ui.panel->resize(width, height);
 	QSize size = ui.panel->size();
-	QPoint corner = bar ? ui.status->mapToGlobal(QPoint(ui.status->width(), 0))
-			    : ui.window->mapToGlobal(QPoint(ui.window->width() - 8, ui.window->height() - 8));
 	int x = corner.x() - size.width();
 	int y = corner.y() - size.height();
 	if (room.isValid()) {
@@ -358,9 +386,9 @@ void render()
 	QJsonObject view = doc.object();
 	QString color = QStringLiteral("color: %1;").arg(tone_color(view.value("tone").toString()));
 	if (ui.status) {
-		ui.status->setText(view.value("status_bar").toString());
+		ui.status->setText(view.value("status_bar").toString().replace(QLatin1Char('&'), QLatin1String("&&")));
 		ui.status->setStyleSheet(color);
-		ui.status->setToolTip(view.value("status_tooltip").toString());
+		ui.status->setToolTip(plain_tip(view.value("status_tooltip").toString()));
 	}
 
 	ui.panel->setProperty("tone", view.value("tone").toString());
@@ -377,6 +405,7 @@ void render()
 
 	QJsonObject audio = view.value("audio").toObject();
 	ui.audio_title->setText(audio.value("title").toString());
+	ui.tracks->setAccessibleName(audio.value("title").toString());
 	fill_tracks(audio);
 	bool managed = audio.value("managed").toBool();
 	QJsonValue confirm = audio.value("confirm");
@@ -404,6 +433,7 @@ void render()
 	QString empty = audio.value("empty").toString();
 	ui.empty->setText(empty);
 	ui.empty->setVisible(managed && !empty.isEmpty());
+	order_tabs();
 
 	QJsonObject button = view.value("button").toObject();
 	ui.action->setText(button.value("label").toString());
@@ -440,9 +470,10 @@ bool open_panel()
 	ui.host.load_lists(ui.host.ctx);
 	ui.shown.clear();
 	render();
+	ui.panel->ensurePolished();
 	place_panel();
 	ui.panel->show();
-	// Showing polishes the panel with the theme, which can change its size.
+	// A window's first show can still offset it by its frame margins.
 	place_panel();
 	ui.panel->raise();
 	ui.panel->activateWindow();
@@ -578,6 +609,7 @@ Panel *build_panel()
 	ui.scroll = new QScrollArea(panel);
 	ui.scroll->setObjectName(QStringLiteral("dstreamy-sources-scroll"));
 	ui.scroll->setFrameShape(QFrame::NoFrame);
+	ui.scroll->setFocusPolicy(Qt::NoFocus);
 	ui.scroll->setWidgetResizable(true);
 	ui.scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 	ui.sources = new QWidget(ui.scroll);
@@ -610,21 +642,16 @@ void teardown()
 }
 
 bool exited;
+bool watching;
 
 void on_exit()
 {
 	exited = true;
+	watching = false;
 	teardown();
 }
 
-} // namespace
-
-uint32_t dstreamy_ui_abi_version(void)
-{
-	return DSTREAMY_UI_ABI_VERSION;
-}
-
-bool dstreamy_ui_load(const struct dstreamy_ui_host *host)
+bool load(const struct dstreamy_ui_host *host)
 {
 	if (ui.active || !host || host->abi_version != DSTREAMY_UI_ABI_VERSION || !host->view_json ||
 	    !host->free_string || !host->start || !host->stop || !host->load_lists || !host->select_guild ||
@@ -652,22 +679,68 @@ bool dstreamy_ui_load(const struct dstreamy_ui_host *host)
 
 	exited = false;
 	dstreamy_ui::watch_exit(on_exit);
+	watching = true;
 	ui.active = true;
 	render();
 	return true;
 }
 
-bool dstreamy_ui_open_panel(void)
-{
-	return open_panel();
-}
-
-void dstreamy_ui_unload(void)
+void unload()
 {
 	// After OBS's exit event the frontend API is gone, so nothing may call it.
 	if (exited)
 		return;
-	if (ui.window)
+	if (watching) {
+		watching = false;
 		dstreamy_ui::unwatch_exit();
+	}
 	teardown();
+}
+
+// An exception must not unwind into the plugin's Rust frames; drop the panel and leave Tools > D-Streamy.
+void failed(const char *call)
+{
+	dstreamy_ui::warn(call);
+	try {
+		unload();
+	} catch (...) {
+		ui.active = false;
+	}
+}
+
+} // namespace
+
+uint32_t dstreamy_ui_abi_version(void)
+{
+	return DSTREAMY_UI_ABI_VERSION;
+}
+
+bool dstreamy_ui_load(const struct dstreamy_ui_host *host)
+{
+	try {
+		return load(host);
+	} catch (...) {
+		failed("dstreamy_ui_load");
+		return false;
+	}
+}
+
+bool dstreamy_ui_open_panel(void)
+{
+	try {
+		return open_panel();
+	} catch (...) {
+		failed("dstreamy_ui_open_panel");
+		return false;
+	}
+}
+
+void dstreamy_ui_unload(void)
+{
+	try {
+		unload();
+	} catch (...) {
+		dstreamy_ui::warn("dstreamy_ui_unload");
+		ui.active = false;
+	}
 }

@@ -1,6 +1,7 @@
 #include "frontend.hpp"
 
 #include <obs-frontend-api.h>
+#include <util/base.h>
 
 #include <QMainWindow>
 #include <QWidget>
@@ -32,6 +33,13 @@ void unwatch_exit()
 {
 	obs_frontend_remove_event_callback(on_event, nullptr);
 	exit_handler = nullptr;
+}
+
+void warn(const char *call) noexcept
+{
+	blog(LOG_WARNING,
+	     "[obs-dstreamy] %s threw: the status-bar panel is gone; Tools > D-Streamy opens the settings dialog",
+	     call);
 }
 
 } // namespace dstreamy_ui
