@@ -332,3 +332,101 @@ async fn an_unanswered_status_counts_against_the_same_cap() {
         began.elapsed()
     );
 }
+
+/// Answers every connection's `hello` with `features`, and each other command with `answer(cmd)`.
+fn answering(features: &[&str], answer: fn(&str) -> Value) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::Builder::new().prefix("ds").tempdir().unwrap();
+    let private = dir.path().join("d");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = private.join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let features: Vec<String> = features.iter().map(|f| (*f).to_owned()).collect();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let features = features.clone();
+            tokio::spawn(async move {
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let command: Value = serde_json::from_str(&line).unwrap();
+                    let mut reply = match command["cmd"].as_str().unwrap() {
+                        "hello" => {
+                            json!({"type": "result", "data": {"protocol": 2, "connection": 1,
+                            "features": features, "status": {"session": null}}})
+                        }
+                        cmd => answer(cmd),
+                    };
+                    reply["id"] = command["id"].clone();
+                    write
+                        .write_all(format!("{reply}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            });
+        }
+    });
+    (dir, path)
+}
+
+const OLD_FEATURES: [&str; 2] = ["start_grace_secs", "status_place"];
+const LOGIN_FEATURES: [&str; 3] = ["start_grace_secs", "status_place", "browser_login"];
+
+fn not_logged_in(_: &str) -> Value {
+    json!({"type": "error", "code": "not_logged_in", "message": "not logged in"})
+}
+
+#[tokio::test]
+async fn a_missing_login_offers_the_window_only_where_serve_has_it() {
+    let (_dir, path) = answering(&LOGIN_FEATURES, not_logged_in);
+    let control = ObsControl::new(Endpoint::new(&path));
+    assert_eq!(
+        control.guilds().await,
+        Err(ControlError::NotLoggedIn { window: true })
+    );
+    let (_dir, path) = answering(&OLD_FEATURES, not_logged_in);
+    let control = ObsControl::new(Endpoint::new(&path));
+    assert_eq!(
+        control.guilds().await,
+        Err(ControlError::NotLoggedIn { window: false })
+    );
+    assert_eq!(
+        control.login().await,
+        Err(ControlError::Outdated {
+            feature: "browser_login"
+        }),
+        "an older serve is never sent a login"
+    );
+}
+
+#[tokio::test]
+async fn the_login_s_outcome_comes_back_as_its_error() {
+    let (_dir, path) = answering(&LOGIN_FEATURES, |cmd| match cmd {
+        "login" => json!({"type": "error", "code": "login_cancelled", "message": "closed"}),
+        _ => json!({"type": "result", "data": null}),
+    });
+    let control = ObsControl::new(Endpoint::new(&path));
+    assert_eq!(control.login().await, Err(ControlError::LoginCancelled));
+    let (_dir, path) = answering(
+        &LOGIN_FEATURES,
+        |_| json!({"type": "error", "code": "login_failed", "message": "no display"}),
+    );
+    let err = ObsControl::new(Endpoint::new(&path))
+        .login()
+        .await
+        .unwrap_err();
+    assert_eq!(err, ControlError::LoginFailed("no display".into()));
+    assert_eq!(
+        err.to_string(),
+        "The login didn't finish (no display); try again"
+    );
+    let (_dir, path) = answering(
+        &LOGIN_FEATURES,
+        |_| json!({"type": "result", "data": {"username": "mock", "global_name": null}}),
+    );
+    assert_eq!(
+        ObsControl::new(Endpoint::new(&path)).login().await,
+        Ok(Some("mock".into()))
+    );
+}

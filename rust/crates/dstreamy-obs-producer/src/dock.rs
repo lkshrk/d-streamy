@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::control::{ControlError, Named, Ownership, StartFailed, StartRequest, Started};
+use crate::control::{ControlError, Named, Ownership, Relogin, StartFailed, StartRequest, Started};
 use crate::settings::{fit_1080p, target_fps};
 
 pub const DEFAULT_VIDEO_ENCODER: &str = "obs_x264";
@@ -213,6 +213,8 @@ pub struct Problem {
     pub message: String,
     /// It came from loading the server or channel list, so the next good load clears it.
     pub lists: bool,
+    /// Serve's login window fixes it.
+    pub login: Option<Relogin>,
 }
 
 impl Problem {
@@ -222,6 +224,7 @@ impl Problem {
             fix,
             message: message.into(),
             lists: false,
+            login: None,
         }
     }
 
@@ -231,9 +234,14 @@ impl Problem {
             fix: error.fix(),
             message: error.to_string(),
             lists: false,
+            login: error.relogin(),
         }
     }
 }
+
+pub const LOGGING_IN: &str = "Logging in…";
+const LOGIN_FAILED: &str = "Login failed";
+pub const WAITING_FOR_LOGIN: &str = "Waiting for login in the browser window…";
 
 const NO_CHANNEL: &str = "No voice channel picked";
 const CANT_START: &str = "Can't start";
@@ -273,6 +281,8 @@ pub struct DockModel {
     released_mixers: u32,
     /// Tracks a dialog's Cancel couldn't put back.
     unrestored_mixers: u32,
+    /// The login window serve opened for this button, until its login ends.
+    logging_in: Option<Relogin>,
 }
 
 impl DockModel {
@@ -290,6 +300,7 @@ impl DockModel {
             adoption_done: false,
             released_mixers: 0,
             unrestored_mixers: 0,
+            logging_in: None,
         }
     }
 
@@ -438,6 +449,7 @@ impl DockModel {
         };
         let live = self.live_track.map(track_name).unwrap_or_default();
         match &self.state {
+            DockState::Idle if self.logging_in() => WAITING_FOR_LOGIN.into(),
             DockState::Idle => match (&self.error, controls) {
                 (Some(error), _) => error.message.clone(),
                 (None, true) => "Idle".into(),
@@ -580,6 +592,57 @@ impl DockModel {
         self.guilds.iter().any(|g| g.id == guild_id)
     }
 
+    /// The login button to show: idle with a problem serve's login window fixes, and no window open yet.
+    pub fn login_offer(&self) -> Option<Relogin> {
+        if self.state != DockState::Idle || self.logging_in.is_some() {
+            return None;
+        }
+        self.error.as_ref().and_then(|p| p.login)
+    }
+
+    pub fn logging_in(&self) -> bool {
+        self.logging_in.is_some()
+    }
+
+    /// The login button was pressed; false when it isn't offered.
+    pub fn begin_login(&mut self) -> bool {
+        let Some(offer) = self.login_offer() else {
+            return false;
+        };
+        self.logging_in = Some(offer);
+        true
+    }
+
+    /// The login window's outcome; true when the lists should load again with the new login.
+    pub fn login_finished(&mut self, result: Result<Option<String>, ControlError>) -> bool {
+        let Some(offer) = self.logging_in.take() else {
+            return false;
+        };
+        match result {
+            Ok(_) => {
+                if self.error.as_ref().is_some_and(|p| p.login.is_some()) {
+                    self.error = None;
+                }
+                true
+            }
+            Err(e) => {
+                self.error = Some(Problem {
+                    lists: true,
+                    login: e.retries_login().then_some(offer),
+                    ..Problem::control(&e)
+                });
+                false
+            }
+        }
+    }
+
+    /// A login that couldn't reach serve's window at all, with `message`.
+    pub fn login_unfinished(&mut self, message: String, fix: &'static str) {
+        if self.logging_in.take().is_some() {
+            self.error = Some(Problem::new(LOGIN_FAILED, fix, message));
+        }
+    }
+
     /// Ends a start or stop that can no longer finish, or refuses one that can't begin, with `message`.
     pub fn abort(&mut self, message: String, fix: &'static str) {
         let headline = match self.state {
@@ -662,6 +725,9 @@ impl DockModel {
     pub fn start(&mut self, canvas: Canvas) -> Result<StartRequest, String> {
         if self.state != DockState::Idle {
             return Err("D-Streamy is already running".into());
+        }
+        if self.logging_in() {
+            return Err("D-Streamy is waiting for the login to finish".into());
         }
         let request = self.start_request(canvas);
         match &request {
@@ -1462,10 +1528,86 @@ mod tests {
     #[test]
     fn load_errors_are_shown() {
         let mut m = DockModel::new(DockSettings::default());
-        m.guilds_loaded(Err(ControlError::NotLoggedIn));
+        m.guilds_loaded(Err(ControlError::NotLoggedIn { window: false }));
         assert_eq!(m.error(), Some("Log in first: run `dstreamy login`"));
+        assert_eq!(
+            m.login_offer(),
+            None,
+            "this serve can't open a login window"
+        );
         m.guilds_loaded(Ok(vec![named("g")]));
         assert_eq!(m.error(), None);
+    }
+
+    #[test]
+    fn a_missing_or_rejected_login_offers_the_login_window() {
+        let mut m = DockModel::new(DockSettings::default());
+        m.guilds_loaded(Err(ControlError::NotLoggedIn { window: true }));
+        assert_eq!(m.login_offer(), Some(Relogin::First));
+        assert_eq!(m.status_text(true), "Log in first: press Log in");
+        m.guilds_loaded(Err(ControlError::InvalidToken { window: true }));
+        assert_eq!(m.login_offer(), Some(Relogin::Again));
+        assert_eq!(Relogin::Again.label(), "Log in again");
+
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Err(ControlError::InvalidToken { window: true }.into()));
+        assert_eq!(m.login_offer(), Some(Relogin::Again), "a failed start too");
+        m.start(canvas()).unwrap();
+        assert_eq!(m.login_offer(), None, "only while idle");
+    }
+
+    #[test]
+    fn the_login_window_waits_then_clears_the_problem() {
+        let mut m = picked();
+        assert!(!m.begin_login(), "nothing to log in for");
+        m.guilds_loaded(Err(ControlError::NotLoggedIn { window: true }));
+        assert!(m.begin_login());
+        assert!(m.logging_in());
+        assert_eq!(m.login_offer(), None, "no second window while one is open");
+        assert!(!m.begin_login());
+        assert_eq!(m.status_text(true), WAITING_FOR_LOGIN);
+        assert!(m.start(canvas()).is_err(), "no start while logging in");
+        assert!(
+            m.login_finished(Ok(Some("Mock".into()))),
+            "reload the lists"
+        );
+        assert!(!m.logging_in());
+        assert_eq!(m.error(), None);
+        assert_eq!(m.status_text(true), "Idle");
+        assert!(!m.login_finished(Ok(None)), "no window was open");
+    }
+
+    #[test]
+    fn a_failed_or_cancelled_login_offers_the_window_again() {
+        let mut m = DockModel::new(DockSettings::default());
+        m.guilds_loaded(Err(ControlError::InvalidToken { window: true }));
+        m.begin_login();
+        assert!(!m.login_finished(Err(ControlError::LoginCancelled)));
+        assert_eq!(m.problem().unwrap().headline, "Login cancelled");
+        assert_eq!(m.problem().unwrap().fix, "Try the login again");
+        assert_eq!(m.login_offer(), Some(Relogin::Again), "keeps its label");
+
+        m.begin_login();
+        m.login_finished(Err(ControlError::LoginFailed("no display".into())));
+        assert_eq!(
+            m.error(),
+            Some("The login didn't finish (no display); try again")
+        );
+        assert_eq!(m.login_offer(), Some(Relogin::Again));
+
+        m.begin_login();
+        m.login_finished(Err(ControlError::Outdated {
+            feature: "browser_login",
+        }));
+        assert_eq!(m.problem().unwrap().fix, "Update and restart the service");
+        assert_eq!(m.login_offer(), None, "the service must change first");
+
+        m.guilds_loaded(Err(ControlError::NotLoggedIn { window: true }));
+        m.begin_login();
+        m.login_finished(Err(ControlError::LoginUnavailable));
+        assert_eq!(m.problem().unwrap().fix, "Run `dstreamy login`");
+        assert_eq!(m.login_offer(), None, "falls back to the command");
     }
 
     #[test]

@@ -79,6 +79,12 @@ pub struct Audio {
     pub notices: Vec<Notice>,
 }
 
+/// Opens serve's login window; it takes the place of the fix line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Login {
+    pub label: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PanelView {
     pub tone: Tone,
@@ -93,6 +99,7 @@ pub struct PanelView {
     pub channels: Choices,
     pub audio: Audio,
     pub button: Button,
+    pub login: Option<Login>,
 }
 
 pub const LOADING: &str = "Loading…";
@@ -240,6 +247,11 @@ pub fn panel_view(
             dock.detail.clone(),
             dock.detail_tooltip.clone(),
         ),
+        Tone::Busy if m.logging_in() => (
+            dock.headline.clone(),
+            dock.detail.clone(),
+            format!("{}\n{}", dock.headline, dock.detail_tooltip),
+        ),
         Tone::Live => (
             format!("Live · {}", dock.detail),
             String::new(),
@@ -252,6 +264,17 @@ pub fn panel_view(
         ),
     };
     let (loading_guilds, loading_channels) = m.loading();
+    let login = controls
+        .then(|| m.login_offer())
+        .flatten()
+        .map(|offer| Login {
+            label: offer.label(),
+        });
+    let state_fix = if login.is_some() {
+        String::new()
+    } else {
+        state_fix
+    };
     PanelView {
         tone: dock.tone,
         mark: dock.mark,
@@ -283,6 +306,7 @@ pub fn panel_view(
         ),
         audio: audio(state, controls, sources, confirming),
         button: dock.button,
+        login,
     }
 }
 
@@ -472,7 +496,8 @@ mod tests {
     fn a_failed_load_ends_loading_and_shows_the_problem() {
         let mut s = ConfigState::default();
         s.model.lists_requested();
-        s.model.guilds_loaded(Err(ControlError::NotLoggedIn));
+        s.model
+            .guilds_loaded(Err(ControlError::NotLoggedIn { window: false }));
         s.model.lists_finished();
         let v = view(&s);
         assert!(!v.guilds.loading);
@@ -481,6 +506,57 @@ mod tests {
         assert_eq!(v.state_fix, "Run `dstreamy login`");
         assert_eq!(v.state_tooltip, "Log in first: run `dstreamy login`");
         assert_eq!(v.status_bar, "⚠ D-Streamy ▴");
+        assert_eq!(v.login, None, "this serve can't open a login window");
+    }
+
+    #[test]
+    fn a_login_button_replaces_the_command_while_serve_can_open_the_window() {
+        let mut s = ConfigState::default();
+        s.model
+            .guilds_loaded(Err(ControlError::NotLoggedIn { window: true }));
+        let v = view(&s);
+        assert_eq!(v.state_line, "Not logged in");
+        assert_eq!(v.state_fix, "", "the button takes the fix line's place");
+        assert_eq!(v.state_tooltip, "Log in first: press Log in");
+        assert_eq!(v.login, Some(Login { label: "Log in" }));
+        assert_eq!(panel_view(&s, false, None, &[], false).login, None);
+
+        s.model
+            .guilds_loaded(Err(ControlError::InvalidToken { window: true }));
+        let v = view(&s);
+        assert_eq!(v.state_line, "Discord login expired");
+        assert_eq!(
+            v.login,
+            Some(Login {
+                label: "Log in again"
+            })
+        );
+
+        assert!(s.model.begin_login());
+        let v = view(&s);
+        assert_eq!(v.tone, Tone::Busy);
+        assert_eq!(v.state_line, "Logging in…");
+        assert_eq!(v.login, None, "hidden while the window is open");
+        assert_eq!(v.status_bar, "D-Streamy logging in… ▴");
+        assert!(!v.button.enabled);
+        assert_eq!(v.state_fix, "Waiting for login in the browser window…");
+
+        s.model.login_finished(Err(ControlError::LoginCancelled));
+        let v = view(&s);
+        assert_eq!(v.state_line, "Login cancelled");
+        assert_eq!(
+            v.login,
+            Some(Login {
+                label: "Log in again"
+            })
+        );
+
+        s.model.begin_login();
+        s.model.login_finished(Ok(Some("Mock".into())));
+        let v = view(&s);
+        assert_eq!(v.tone, Tone::Idle);
+        assert_eq!(v.state_line, "Not set up");
+        assert_eq!(v.login, None);
     }
 
     #[test]
@@ -766,6 +842,7 @@ mod tests {
             "channels",
             "audio",
             "button",
+            "login",
         ] {
             assert!(v.get(key).is_some(), "{key}: {v}");
         }
@@ -773,5 +850,6 @@ mod tests {
         assert_eq!(v["audio"]["sources"][2]["on"], true);
         assert_eq!(v["audio"]["confirm"], Value::Null);
         assert_eq!(v["button"]["action"], "start");
+        assert_eq!(v["login"], Value::Null);
     }
 }

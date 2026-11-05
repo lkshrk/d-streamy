@@ -57,8 +57,19 @@ fn two_guilds() -> MockConfig {
 }
 
 async fn spawn(bin: &Path, config: &Path, mock: &MockDiscord, run: &Path) -> Child {
+    spawn_with(bin, config, mock, run, None).await
+}
+
+async fn spawn_with(
+    bin: &Path,
+    config: &Path,
+    mock: &MockDiscord,
+    run: &Path,
+    login_program: Option<&Path>,
+) -> Child {
     let endpoint = run.join("d").join("s.sock");
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .env_remove("DSTREAMY_TOKEN")
         .env_remove("DSTREAMY_CONFIG_DIR")
         .arg("--config-dir")
@@ -67,9 +78,13 @@ async fn spawn(bin: &Path, config: &Path, mock: &MockDiscord, run: &Path) -> Chi
         .arg(mock.gateway_url())
         .args(["serve", "--skip-platform", "--endpoint"])
         .arg(&endpoint)
-        .stdin(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stdin(Stdio::null());
+    if let Some(program) = login_program {
+        command
+            .args(["--test-hooks", "--login-program"])
+            .arg(program);
+    }
+    let mut child = command.spawn().unwrap();
     let deadline = Instant::now() + T;
     while StdUnixStream::connect(&endpoint).is_err() {
         if let Some(status) = child.try_wait().unwrap() {
@@ -695,12 +710,64 @@ async fn not_logged_in_tells_the_user_to_log_in() {
     let serve = serve!(false);
     let control = serve.control();
     let err = control.guilds().await.unwrap_err();
-    assert_eq!(err.to_string(), "Log in first: run `dstreamy login`");
+    let window = matches!(err, ControlError::NotLoggedIn { window: true });
+    assert_eq!(err, ControlError::NotLoggedIn { window }, "{err:?}");
+    let text = if window {
+        "Log in first: press Log in"
+    } else {
+        "Log in first: run `dstreamy login`"
+    };
+    assert_eq!(err.to_string(), text);
     let err = control
         .start(&request(MOCK_VOICE_CHANNEL_ID), None)
         .await
         .unwrap_err();
-    assert_eq!(err.to_string(), "Log in first: run `dstreamy login`");
+    assert_eq!(err.to_string(), text);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_login_window_logs_serve_in_without_a_restart() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(bin) = dstreamy_bin() else { return };
+    let mock = MockDiscord::start_with(two_guilds()).await.unwrap();
+    let config = tempfile::tempdir().unwrap();
+    std::fs::write(config.path().join("config.toml"), "").unwrap();
+    let run = tempfile::Builder::new().prefix("ds").tempdir().unwrap();
+    let fake = run.path().join("fake-login");
+    let token = config.path().join("token");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$WAYLAND_DISPLAY\" > '{}.env'\n\
+             umask 077; printf '%s\\n' '{MOCK_TOKEN}' > '{}'\n\
+             echo '{{\"username\":\"mock\",\"global_name\":\"Mock User\"}}'\n",
+            token.display(),
+            token.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = spawn_with(&bin, config.path(), &mock, run.path(), Some(&fake)).await;
+    let control = ObsControl::new(Endpoint::new(run.path().join("d").join("s.sock")));
+
+    let err = control.guilds().await.unwrap_err();
+    assert_eq!(err, ControlError::NotLoggedIn { window: true });
+    let mut model = DockModel::new(DockSettings::default());
+    model.guilds_loaded(Err(err));
+    assert!(model.begin_login());
+    let user = control.login().await;
+    assert_eq!(user, Ok(Some("Mock User".into())));
+    assert!(model.login_finished(user));
+    let guilds = control.guilds().await.unwrap();
+    assert!(guilds.iter().any(|g| g.id == MOCK_GUILD_ID), "{guilds:?}");
+    let sent = std::fs::read_to_string(format!("{}.env", token.display())).unwrap();
+    assert_eq!(
+        sent.trim(),
+        std::env::var("WAYLAND_DISPLAY").unwrap_or_default()
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 #[tokio::test]

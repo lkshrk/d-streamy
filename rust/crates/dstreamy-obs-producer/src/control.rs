@@ -11,11 +11,12 @@ use serde_json::{Value, json};
 use crate::types::service_text;
 
 #[cfg(unix)]
-pub use service::{ObsControl, STOP_TIMEOUT};
+pub use service::{LOGIN_TIMEOUT, ObsControl, STOP_TIMEOUT};
 
 /// What a serve must offer beyond protocol 2 as first released.
 pub const STATUS_PLACE: &str = "status_place";
 pub const START_GRACE_SECS: &str = "start_grace_secs";
+pub const BROWSER_LOGIN: &str = "browser_login";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Named {
@@ -393,8 +394,17 @@ impl std::error::Error for StartFailed {}
 pub enum ControlError {
     NotRunning(String),
     Connect(String),
-    NotLoggedIn,
-    InvalidToken,
+    /// `window`: serve can open the login window, so the plugin offers it instead of the command.
+    NotLoggedIn {
+        window: bool,
+    },
+    InvalidToken {
+        window: bool,
+    },
+    LoginCancelled,
+    LoginFailed(String),
+    LoginRunning,
+    LoginUnavailable,
     UnknownGuild,
     UnknownChannel,
     GuildUnavailable,
@@ -428,14 +438,67 @@ pub enum ControlError {
     Protocol(String),
 }
 
+/// The button that opens serve's login window, in place of the `dstreamy login` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relogin {
+    /// No saved login.
+    First,
+    /// Discord rejected the saved one.
+    Again,
+}
+
+impl Relogin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::First => "Log in",
+            Self::Again => "Log in again",
+        }
+    }
+}
+
 impl ControlError {
+    pub fn relogin(&self) -> Option<Relogin> {
+        match self {
+            Self::NotLoggedIn { window: true } => Some(Relogin::First),
+            Self::InvalidToken { window: true } => Some(Relogin::Again),
+            _ => None,
+        }
+    }
+
+    /// After a login that ended with this, the login window may be opened again.
+    pub fn retries_login(&self) -> bool {
+        matches!(
+            self,
+            Self::LoginCancelled
+                | Self::LoginFailed(_)
+                | Self::Timeout { .. }
+                | Self::Restarted
+                | Self::Abandoned
+                | Self::Protocol(_)
+                | Self::Refused { .. }
+        )
+    }
+
+    /// Serve can open the login window, so a missing or rejected login offers it.
+    pub fn with_login_window(self, window: bool) -> Self {
+        match self {
+            Self::NotLoggedIn { .. } => Self::NotLoggedIn { window },
+            Self::InvalidToken { .. } => Self::InvalidToken { window },
+            e => e,
+        }
+    }
+
     /// Maps an `error` reply by its code.
     pub fn from_reply(reply: &Value) -> Self {
         let code = reply["code"].as_str().unwrap_or_default();
         let message = service_text(reply["message"].as_str().unwrap_or_default());
         match code {
-            "not_logged_in" => Self::NotLoggedIn,
-            "invalid_token" => Self::InvalidToken,
+            "not_logged_in" => Self::NotLoggedIn { window: false },
+            "invalid_token" => Self::InvalidToken { window: false },
+            "login_cancelled" => Self::LoginCancelled,
+            "login_failed" => Self::LoginFailed(message),
+            "login_running" => Self::LoginRunning,
+            "login_unavailable" => Self::LoginUnavailable,
             "unknown_guild" => Self::UnknownGuild,
             "unknown_channel" => Self::UnknownChannel,
             "guild_unavailable" => Self::GuildUnavailable,
@@ -455,8 +518,11 @@ impl ControlError {
         match self {
             Self::NotRunning(_) => "Service not running",
             Self::Connect(_) => "Can't reach the service",
-            Self::NotLoggedIn => "Not logged in",
-            Self::InvalidToken => "Discord login expired",
+            Self::NotLoggedIn { .. } | Self::LoginUnavailable => "Not logged in",
+            Self::InvalidToken { .. } => "Discord login expired",
+            Self::LoginCancelled => "Login cancelled",
+            Self::LoginFailed(_) => "Login failed",
+            Self::LoginRunning => "Login window open",
             Self::UnknownGuild => "Server not found",
             Self::UnknownChannel => "Voice channel not found",
             Self::GuildUnavailable => "Server unavailable",
@@ -480,8 +546,12 @@ impl ControlError {
             #[cfg(not(target_os = "linux"))]
             Self::NotRunning(_) => "Run `dstreamy serve`",
             Self::Connect(_) => "Check that the service runs",
-            Self::NotLoggedIn => "Run `dstreamy login`",
-            Self::InvalidToken => "Run `dstreamy login` again",
+            Self::NotLoggedIn { window: true } => "Press Log in",
+            Self::InvalidToken { window: true } => "Press Log in again",
+            Self::LoginCancelled | Self::LoginFailed(_) => "Try the login again",
+            Self::NotLoggedIn { window: false } | Self::LoginUnavailable => "Run `dstreamy login`",
+            Self::InvalidToken { window: false } => "Run `dstreamy login` again",
+            Self::LoginRunning => "Finish the login in its window",
             Self::UnknownGuild => "Pick the server again",
             Self::UnknownChannel => "Pick the voice channel again",
             Self::GuildUnavailable => "Try again later",
@@ -507,10 +577,26 @@ impl fmt::Display for ControlError {
                 crate::START_SERVICE_HINT
             ),
             Self::Connect(e) => write!(f, "Cannot connect to the D-Streamy service: {e}"),
-            Self::NotLoggedIn => f.write_str("Log in first: run `dstreamy login`"),
-            Self::InvalidToken => {
+            Self::NotLoggedIn { window: false } => {
+                f.write_str("Log in first: run `dstreamy login`")
+            }
+            Self::NotLoggedIn { window: true } => f.write_str("Log in first: press Log in"),
+            Self::InvalidToken { window: false } => {
                 f.write_str("Discord rejected the saved login: run `dstreamy login` again")
             }
+            Self::InvalidToken { window: true } => {
+                f.write_str("Discord rejected the saved login: press Log in again")
+            }
+            Self::LoginCancelled => {
+                f.write_str("The login window closed before the login finished; try again")
+            }
+            Self::LoginFailed(m) => write!(f, "The login didn't finish ({m}); try again"),
+            Self::LoginRunning => {
+                f.write_str("A login window is already open: finish the login there")
+            }
+            Self::LoginUnavailable => f.write_str(
+                "This D-Streamy service can't open a login window: run `dstreamy login`",
+            ),
             Self::UnknownGuild => f.write_str("Discord doesn't list that server: pick it again"),
             Self::UnknownChannel => {
                 f.write_str("That server has no such voice channel: pick the channel again")

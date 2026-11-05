@@ -2,7 +2,9 @@
 
 use serde::Serialize;
 
-use crate::dock::{DockModel, DockState, TrackStatus, next_go_live, track_name};
+use crate::dock::{
+    DockModel, DockState, LOGGING_IN, TrackStatus, WAITING_FOR_LOGIN, next_go_live, track_name,
+};
 use crate::dock_config::ConfigState;
 use crate::live::{LiveStats, stats_line, stats_tooltip};
 use crate::mixer::MicGuard;
@@ -119,6 +121,12 @@ pub fn dock_view(
         )
     } else {
         match m.state() {
+            DockState::Idle if m.logging_in() => (
+                Tone::Busy,
+                LOGGING_IN.to_owned(),
+                WAITING_FOR_LOGIN.to_owned(),
+                button(START, Action::Start, false),
+            ),
             DockState::Idle => {
                 let chosen = chosen_channel(m);
                 let blocked = mic.filter(|g| !g.live);
@@ -204,6 +212,7 @@ pub fn dock_view(
         (Tone::Live, _) => ("●", "● D-Streamy live".to_owned()),
         (_, DockState::Starting) => ("●", "D-Streamy starting…".to_owned()),
         (_, DockState::Stopping) => ("●", "D-Streamy stopping…".to_owned()),
+        (Tone::Busy, DockState::Idle) => ("●", "D-Streamy logging in…".to_owned()),
         _ => ("●", "D-Streamy idle".to_owned()),
     };
     DockView {
@@ -436,8 +445,14 @@ mod tests {
         let errors = [
             ControlError::NotRunning("x".into()),
             ControlError::Connect("x".into()),
-            ControlError::NotLoggedIn,
-            ControlError::InvalidToken,
+            ControlError::NotLoggedIn { window: false },
+            ControlError::NotLoggedIn { window: true },
+            ControlError::InvalidToken { window: false },
+            ControlError::InvalidToken { window: true },
+            ControlError::LoginCancelled,
+            ControlError::LoginFailed("x".into()),
+            ControlError::LoginRunning,
+            ControlError::LoginUnavailable,
             ControlError::UnknownGuild,
             ControlError::UnknownChannel,
             ControlError::GuildUnavailable,
@@ -478,7 +493,14 @@ mod tests {
             assert_eq!(v.detail_tooltip, error.to_string());
             assert_short_fix(&v);
         }
-        assert_eq!(ControlError::NotLoggedIn.fix(), "Run `dstreamy login`");
+        assert_eq!(
+            ControlError::NotLoggedIn { window: false }.fix(),
+            "Run `dstreamy login`"
+        );
+        assert_eq!(
+            ControlError::InvalidToken { window: true }.fix(),
+            "Press Log in again"
+        );
         assert_eq!(
             ControlError::UnknownChannel.fix(),
             "Pick the voice channel again"
@@ -623,7 +645,8 @@ mod tests {
         assert!(v.button.enabled);
 
         s.model.start(canvas()).unwrap();
-        s.model.started(Err(ControlError::NotLoggedIn.into()));
+        s.model
+            .started(Err(ControlError::NotLoggedIn { window: false }.into()));
         let v = view(&s);
         assert_eq!(v.headline, "Not logged in");
         assert_eq!(v.detail, "Run `dstreamy login`");

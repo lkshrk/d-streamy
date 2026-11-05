@@ -9,8 +9,9 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use super::{
-    Candidate, ControlError, Instance, Live, Named, Ownership, Resolution, START_GRACE_SECS,
-    STATUS_PLACE, StartFailed, StartRequest, Started, Stopped, owns, resolve, start_in_flight,
+    BROWSER_LOGIN, Candidate, ControlError, Instance, Live, Named, Ownership, Resolution,
+    START_GRACE_SECS, STATUS_PLACE, StartFailed, StartRequest, Started, Stopped, owns, resolve,
+    start_in_flight,
 };
 use crate::client::REPLY_TIMEOUT;
 use crate::types::service_text;
@@ -20,6 +21,10 @@ const SETTLE_POLL: Duration = Duration::from_millis(50);
 
 /// How long a `stop` this plugin sends waits for its reply.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Past the time serve keeps a login window open, so its own answer arrives first.
+pub const LOGIN_TIMEOUT: Duration =
+    dstreamy_ipc::control::LOGIN_WINDOW_LIMIT.saturating_add(Duration::from_secs(30));
 
 /// Talks to `dstreamy serve` over a fresh control connection per call, so nothing outlives a call.
 #[derive(Debug, Clone)]
@@ -184,6 +189,23 @@ impl ObsControl {
         }
     }
 
+    /// Asks serve to open its login window with this process's graphical session; the account's name once logged in.
+    pub async fn login(&self) -> Result<Option<String>, ControlError> {
+        let mut c = self.open().await?;
+        c.require(BROWSER_LOGIN)?;
+        let env: serde_json::Map<String, Value> = dstreamy_ipc::control::LOGIN_ENV
+            .iter()
+            .filter_map(|name| Some(((*name).to_owned(), std::env::var(name).ok()?.into())))
+            .collect();
+        let user = c
+            .call(json!({"cmd": "login", "env": env}), "login", LOGIN_TIMEOUT)
+            .await?;
+        Ok(user["global_name"]
+            .as_str()
+            .or(user["username"].as_str())
+            .map(service_text))
+    }
+
     /// Sends `stop` only while the live session is still the one `ownership` names.
     pub async fn stop(&self, ownership: Option<&Ownership>) -> Result<Stopped, ControlError> {
         let Some(ownership) = ownership else {
@@ -274,11 +296,14 @@ impl Connection {
         })
     }
 
-    fn require(&self, feature: &'static str) -> Result<(), ControlError> {
-        let offered = self.hello["features"]
+    fn offers(&self, feature: &str) -> bool {
+        self.hello["features"]
             .as_array()
-            .is_some_and(|f| f.iter().any(|v| v == feature));
-        if offered {
+            .is_some_and(|f| f.iter().any(|v| v == feature))
+    }
+
+    fn require(&self, feature: &'static str) -> Result<(), ControlError> {
+        if self.offers(feature) {
             Ok(())
         } else {
             Err(ControlError::Outdated { feature })
@@ -321,6 +346,7 @@ impl Connection {
         name: &'static str,
         timeout: Duration,
     ) -> Result<Result<Value, ControlError>, ControlError> {
+        let window = self.offers(BROWSER_LOGIN);
         let wait = async {
             loop {
                 let line = match self.lines.next().await {
@@ -362,6 +388,7 @@ impl Connection {
                 command: name,
                 secs: timeout.as_secs(),
             })?
+            .map(|reply| reply.map_err(|e| e.with_login_window(window)))
     }
 
     /// Waits out a start in flight, which may be our own whose reply was lost, until serve names its starter.
