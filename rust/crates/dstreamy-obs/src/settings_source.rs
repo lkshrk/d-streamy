@@ -493,8 +493,7 @@ fn with_dialog_settings<R>(data: *mut c_void, f: impl FnOnce(*mut sys::obs_data_
 struct SourceSettings(*mut sys::obs_data_t);
 
 impl SourceSettings {
-    /// # Safety
-    /// `source` is NULL or a live source.
+    /// Safety: `source` is NULL or a live source.
     unsafe fn of(source: *mut sys::obs_source_t) -> Self {
         if source.is_null() {
             Self(ptr::null_mut())

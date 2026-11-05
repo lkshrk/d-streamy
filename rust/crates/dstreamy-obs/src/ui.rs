@@ -366,7 +366,6 @@ extern "C" fn panel_closed(_ctx: Ctx) {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::Once;
 
     use dstreamy_obs_producer::control::Named;
     use dstreamy_obs_producer::dock_config::ConfigState;
@@ -392,15 +391,13 @@ pub(crate) mod tests {
 
     /// libobs without video or modules, plus two audio source types: a plain one and a microphone.
     pub(crate) fn libobs() {
-        static STARTED: Once = Once::new();
-        STARTED.call_once(|| {
+        static STARTED: OnceLock<bool> = OnceLock::new();
+        let started = *STARTED.get_or_init(|| {
             // SAFETY: started once for the test process; the registered strings are 'static.
             unsafe {
-                assert!(sys::obs_startup(
-                    c"en-US".as_ptr(),
-                    ptr::null(),
-                    ptr::null_mut()
-                ));
+                if !sys::obs_startup(c"en-US".as_ptr(), ptr::null(), ptr::null_mut()) {
+                    return false;
+                }
                 for id in [PLAIN, MIC] {
                     let info = sys::obs_source_info {
                         id: id.as_ptr(),
@@ -413,8 +410,13 @@ pub(crate) mod tests {
                     };
                     sys::obs_register_source_s(&info, size_of::<sys::obs_source_info>());
                 }
+                true
             }
         });
+        assert!(
+            started,
+            "obs_startup failed; on Linux libobs needs an X display, so run the tests under xvfb-run"
+        );
     }
 
     #[cfg(unix)]

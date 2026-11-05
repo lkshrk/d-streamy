@@ -290,7 +290,8 @@ jobs:
           cargo fmt --all --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo clippy --workspace --all-targets --locked --features test-hooks -- -D warnings
-          cargo test --workspace --locked
+          # obs_startup's hotkeys open an X display.
+          xvfb-run -a -s "-screen 0 1280x720x24" cargo test --workspace --locked
           cargo build --release --locked --target-dir "$RUNNER_TEMP/plugin-without-hooks"
           cmake -DTEST_HOOKS=OFF -DLIBRARY="$RUNNER_TEMP/plugin-without-hooks/release/libdstreamy_obs.so" \
             -P "$GITHUB_WORKSPACE/obs/cmake/common/check_test_hooks.cmake"

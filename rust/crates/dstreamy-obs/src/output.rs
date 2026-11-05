@@ -118,10 +118,7 @@ unsafe fn state<'a>(data: *mut c_void) -> &'a Output {
     unsafe { &*data.cast::<Output>() }
 }
 
-/// Like [`state`], for callbacks libobs makes without checking that create succeeded (obs-output.c:1186,1196).
-///
-/// # Safety
-/// `data` is NULL or the pointer `output_create` returned, not yet destroyed.
+/// Safety: `data` is NULL (libobs calls some callbacks after a failed create) or a live `output_create` pointer.
 unsafe fn state_or_null<'a>(data: *mut c_void) -> Option<&'a Output> {
     // SAFETY: the caller's contract.
     unsafe { data.cast::<Output>().as_ref() }
