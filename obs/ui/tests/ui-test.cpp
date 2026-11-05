@@ -378,6 +378,22 @@ QList<QCheckBox *> sources()
 	return box ? box->findChildren<QCheckBox *>() : QList<QCheckBox *>();
 }
 
+// What a failed row check saw, so a CI failure explains itself.
+void describe_rows(const char *why)
+{
+	auto *scroll = find<QScrollArea>("dstreamy-sources-scroll");
+	const QList<QCheckBox *> boxes = sources();
+	QFont font = boxes.isEmpty() ? QApplication::font() : boxes.first()->font();
+	std::fprintf(stderr, "rows (%s): style=%s font=%s %.1fpt/%dpx panel=%d widget=%d viewport=%d\n", why,
+		     qPrintable(QApplication::style()->name()), qPrintable(font.family()), font.pointSizeF(),
+		     font.pixelSize(), panel() ? panel()->width() : -1, scroll ? scroll->widget()->width() : -1,
+		     scroll ? scroll->viewport()->width() : -1);
+	for (QCheckBox *box : boxes)
+		std::fprintf(stderr, "  %-40s width=%d hint=%d right=%d\n", qPrintable(box->text()), box->width(),
+			     box->sizeHint().width(),
+			     scroll ? box->mapTo(scroll->viewport(), QPoint(box->width(), 0)).x() : -1);
+}
+
 // Every source row lies inside the scroll area's viewport once the layout has settled: nothing scrolls sideways.
 bool rows_fit()
 {
@@ -389,6 +405,26 @@ bool rows_fit()
 		if (box->mapTo(scroll->viewport(), QPoint(box->width(), 0)).x() > scroll->viewport()->width())
 			return false;
 	return true;
+}
+
+bool rows_settle()
+{
+	bool settled = wait_for(rows_fit);
+	if (!settled)
+		describe_rows("a row is outside the viewport");
+	return settled;
+}
+
+// A row shows `name`, or a prefix of it ending in an ellipsis when the font is too wide; '&' is doubled for Qt.
+bool shows(QCheckBox *box, const QString &name)
+{
+	QString text = box->text().replace(QLatin1String("&&"), QLatin1String("&"));
+	if (text == name)
+		return box->accessibleDescription().isEmpty();
+	bool elided = text.endsWith(QChar(0x2026)) && name.startsWith(text.chopped(1));
+	if (!elided)
+		describe_rows(qPrintable(QLatin1String("not shown as ") + name));
+	return elided && box->accessibleDescription() == name;
 }
 
 } // namespace
@@ -588,7 +624,7 @@ int main(int argc, char **argv)
 	CHECK(sources().size() == 2 && plain(sources()[0]->toolTip()) == QLatin1String("<i>Mic</i>"));
 	CHECK(status->accessibleDescription() == QString::fromUtf8(tagged.tooltip));
 	CHECK(state && state->accessibleDescription() == QString::fromUtf8(tagged.tooltip));
-	CHECK(sources().size() == 2 && sources()[0]->accessibleDescription().isEmpty() &&
+	CHECK(sources().size() == 2 && shows(sources()[0], QLatin1String("<i>Mic</i>")) &&
 	      sources()[0]->accessibleName() == QLatin1String("<i>Mic</i>"));
 	show(view(long_state, audio(true, false)));
 
@@ -654,14 +690,13 @@ int main(int argc, char **argv)
 	auto *scroll = find<QScrollArea>("dstreamy-sources-scroll");
 	CHECK(all.size() == 20 && scroll);
 	CHECK(all.size() == 20 && all[0]->text().endsWith(QChar(0x2026)) &&
-	      plain(all[0]->toolTip()) == QString::fromStdString(many[0]) && all[3]->text() == QLatin1String("Music"));
+	      plain(all[0]->toolTip()) == QString::fromStdString(many[0]) && shows(all[3], QLatin1String("Music")));
 	CHECK(all.size() == 20 && all[0]->accessibleName() == QString::fromStdString(many[0]) &&
-	      all[0]->accessibleDescription() == QString::fromStdString(many[0]) &&
-	      all[3]->accessibleDescription().isEmpty());
+	      shows(all[0], QString::fromStdString(many[0])));
 	CHECK(scroll && scroll->height() <= 8 * (all[0]->sizeHint().height() + 8) && scroll->height() > 0);
 	CHECK(all.size() == 20 && all[0]->width() <= 160);
-	CHECK(wait_for(rows_fit));
-	CHECK(all.size() == 20 && all[5]->text() == QLatin1String("Mic && Game") &&
+	CHECK(rows_settle());
+	CHECK(all.size() == 20 && shows(all[5], QLatin1String("Mic & Game")) &&
 	      plain(all[5]->toolTip()) == QLatin1String("Mic & Game") &&
 	      all[5]->accessibleName() == QLatin1String("Mic & Game"));
 	QRect screen = window.screen()->availableGeometry();
@@ -669,6 +704,12 @@ int main(int argc, char **argv)
 	auto *action = find<QPushButton>("dstreamy-action");
 	CHECK(action && panel() && QRect(QPoint(0, 0), panel()->size()).contains(action->geometry()));
 	shoot("many-sources");
+	qApp->setStyleSheet(QStringLiteral("QFrame#dstreamy-panel { border: 14px solid transparent; }"));
+	std::vector<std::string> themed = many;
+	themed[0] += " in a theme with a wide panel border";
+	show(view(idle, audio(true, false, 6, themed)));
+	CHECK(rows_settle());
+	qApp->setStyleSheet(QString());
 	panel()->hide();
 
 	dstreamy_ui_unload();
@@ -723,7 +764,7 @@ int main(int argc, char **argv)
 	app.processEvents();
 	all = sources();
 	CHECK(panel() && panel()->isVisible() && all.size() == 20);
-	CHECK(wait_for(rows_fit));
+	CHECK(rows_settle());
 
 	closed = host.closed;
 	host.throw_view = true;

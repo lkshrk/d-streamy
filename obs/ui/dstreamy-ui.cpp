@@ -20,6 +20,7 @@
 #include <QPushButton>
 #include <QScreen>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QSignalBlocker>
 #include <QStatusBar>
 #include <QStyle>
@@ -247,6 +248,37 @@ void fill_tracks(const QJsonObject &audio)
 			ui.tracks->setCurrentIndex(i);
 }
 
+// The width one of the two source columns gets in the laid-out scroll area, a vertical scrollbar reserved.
+int source_cell(QGridLayout *grid)
+{
+	ui.panel->ensurePolished();
+	ui.panel->layout()->activate();
+	QStyle *style = ui.scroll->style();
+	int bar = qMax(ui.scroll->verticalScrollBar()->sizeHint().width(),
+		       style->pixelMetric(QStyle::PM_ScrollBarExtent));
+	int gap = grid->horizontalSpacing();
+	if (gap < 0)
+		gap = style->pixelMetric(QStyle::PM_LayoutHorizontalSpacing);
+	int viewport = ui.scroll->width() - 2 * ui.scroll->frameWidth() - bar;
+	return (viewport - qMax(gap, 0)) / 2;
+}
+
+// Elides `name` until the box's size hint, which includes the style's indicator and padding, fits `cell`.
+QString fit_text(QCheckBox *box, const QString &name, int cell)
+{
+	int budget = cell;
+	QString shown = name;
+	for (int tries = 0; tries < 8; tries++) {
+		shown = box->fontMetrics().elidedText(name, Qt::ElideRight, qMax(budget, 0));
+		box->setText(QString(shown).replace(QLatin1Char('&'), QLatin1String("&&")));
+		int over = box->sizeHint().width() - cell;
+		if (over <= 0 || budget <= 0)
+			break;
+		budget -= over;
+	}
+	return shown;
+}
+
 void fill_sources(const QJsonArray &sources)
 {
 	QStringList ids;
@@ -258,10 +290,7 @@ void fill_sources(const QJsonArray &sources)
 	if (list != ui.source_list) {
 		for (QCheckBox *box : ui.sources->findChildren<QCheckBox *>(QString(), Qt::FindDirectChildrenOnly))
 			delete box;
-		int indicator = ui.sources->style()->pixelMetric(QStyle::PM_IndicatorWidth) +
-				ui.sources->style()->pixelMetric(QStyle::PM_CheckBoxLabelSpacing);
-		int scrollbar = ui.scroll->style()->pixelMetric(QStyle::PM_ScrollBarExtent);
-		int column = (ui.panel->width() - 48 - scrollbar) / 2 - indicator;
+		int cell = source_cell(grid);
 		int i = 0;
 		for (const QJsonValue v : sources) {
 			QJsonObject s = v.toObject();
@@ -273,10 +302,9 @@ void fill_sources(const QJsonArray &sources)
 			box->setObjectName(QStringLiteral("dstreamy-source"));
 			box->setProperty("uuid", s.value("uuid").toString());
 			box->ensurePolished();
-			QString shown = box->fontMetrics().elidedText(name, Qt::ElideRight, column);
+			QString shown = fit_text(box, name, cell);
 			if (shown != name)
 				box->setAccessibleDescription(name);
-			box->setText(shown.replace(QLatin1Char('&'), QLatin1String("&&")));
 			QObject::connect(box, &QCheckBox::clicked, box, [box](bool on) {
 				guarded("set_source", [box, on] {
 					if (!ui.active)
