@@ -626,10 +626,13 @@ mod tests {
         activity.lost();
         assert!(matches!(check(), Some(AudioNotice::Warn(_))));
         activity.stopped();
+        assert_eq!(check(), None, "a stop is no return");
         activity.started();
+        assert_eq!(check(), None, "nor is a restart without samples");
+        activity.samples([0]);
         assert!(
             matches!(check(), Some(AudioNotice::Note(_))),
-            "the restart ended the loss"
+            "samples after the restart"
         );
         assert_eq!(check(), None);
         activity.lost();
@@ -637,6 +640,19 @@ mod tests {
             panic!("the next loss was not warned")
         };
         assert!(!again.contains("times since"), "{again}");
+    }
+
+    #[test]
+    fn a_loss_then_a_stop_gives_no_back_note() {
+        let mut w = SilenceWarning::default();
+        let activity = dstreamy_media::AudioActivity::default();
+        activity.started();
+        activity.lost();
+        let mut check = || w.check(None, activity.losses(), activity.recoveries(), None);
+        assert!(matches!(check(), Some(AudioNotice::Warn(_))));
+        activity.stopped();
+        assert_eq!(check(), None);
+        assert_eq!(check(), None);
     }
 
     #[test]
