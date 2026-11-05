@@ -245,13 +245,32 @@ jobs:
           xvfb-run -a -s "-screen 0 1280x720x24" ctest --preset ubuntu-ci-x86_64
           echo "HARNESS=$PWD/build_x86_64/harness/obs-harness" >> "$GITHUB_ENV"
 
-      - name: obs/ builds the plugin without the status-bar panel
+      - name: Install layout matches what the plugin looks for
         working-directory: obs
         run: |
-          cmake --preset ubuntu-ci-x86_64 -B build_no_ui -DCMAKE_PREFIX_PATH="$OBS_PREFIX" -DDSTREAMY_UI=OFF
-          cmake --build build_no_ui --target obs-dstreamy
+          stage="$RUNNER_TEMP/stage"
+          cmake --install build_x86_64 --prefix "$stage"
+          find "$stage" -print
+          plugins="$stage/lib/x86_64-linux-gnu/obs-plugins"
+          test -f "$plugins/obs-dstreamy.so"
+          test -f "$plugins/obs-dstreamy-ui/obs-dstreamy-ui.so"
+          if find "$plugins" -maxdepth 1 -name '*.so' ! -name obs-dstreamy.so | grep .; then
+            echo "libobs would try these as modules: only obs-dstreamy.so may sit in the module folder"
+            exit 1
+          fi
+
+      # Qt is hidden from CMake, so ignoring DSTREAMY_UI=OFF fails the configure.
+      - name: obs/ builds without the status-bar panel and without Qt
+        working-directory: obs
+        run: |
+          cmake --preset ubuntu-ci-x86_64 -B build_no_ui -DCMAKE_PREFIX_PATH="$OBS_PREFIX" -DDSTREAMY_UI=OFF \
+            -DCMAKE_DISABLE_FIND_PACKAGE_Qt6=ON
+          cmake --build build_no_ui
           test -f build_no_ui/rundir/obs-dstreamy.so
-          test ! -e build_no_ui/rundir/obs-dstreamy-ui
+          if find build_no_ui -name '*dstreamy-ui*' | grep .; then
+            echo "DSTREAMY_UI=OFF still configured or built the status-bar panel"
+            exit 1
+          fi
 
       - name: Plugin workspace settings match rust/Cargo.toml
         run: |
@@ -491,8 +510,10 @@ jobs:
             fi
           done
           for a in arm64 x86_64; do
-            minos=$(vtool -arch "$a" -show-build MacOS/obs-dstreamy | awk '$1 == "minos" {print $2}')
-            test "$minos" = 12.0 || { echo "$a slice minos $minos, expected 12.0"; exit 1; }
+            for lib in obs-dstreamy obs-dstreamy-ui.dylib; do
+              minos=$(vtool -arch "$a" -show-build "MacOS/$lib" | awk '$1 == "minos" {print $2}')
+              test "$minos" = 12.0 || { echo "$lib $a slice minos $minos, expected 12.0"; exit 1; }
+            done
             lipo -archs ../../../harness/RelWithDebInfo/obs-harness | grep -qw "$a"
           done
           {
@@ -509,6 +530,16 @@ jobs:
             echo "obs-dstreamy-ui.dylib links a library outside OBS.app or the system"
             exit 1
           fi
+
+      - name: Install layout matches what the plugin looks for
+        working-directory: obs
+        run: |
+          stage="$RUNNER_TEMP/stage"
+          cmake --install build_macos --config RelWithDebInfo --prefix "$stage"
+          find "$stage" -print
+          test -f "$stage/obs-dstreamy.plugin/Contents/MacOS/obs-dstreamy"
+          test -f "$stage/obs-dstreamy.plugin/Contents/MacOS/obs-dstreamy-ui.dylib"
+          test -f "$stage/obs-dstreamy.plugin/Contents/Info.plist"
 
       - name: D-Streamy status-bar panel test
         working-directory: obs
@@ -703,9 +734,32 @@ jobs:
           fi
           grep -qw dstreamy_ui_load "$OBS_LOGS/ui-dll.log"
           grep -qw dstreamy_ui_unload "$OBS_LOGS/ui-dll.log"
+          # Imports are bare DLL names that resolve in OBS's folders, never a path on the build machine.
+          sed -n '/has the following dependencies/,/Section contains\|Summary/p' "$OBS_LOGS/ui-dll.log" |
+            grep -v -e 'has the following' -e 'Section contains' -e 'Summary' > "$OBS_LOGS/ui-imports.log"
+          grep -qi 'qt6widgets' "$OBS_LOGS/ui-imports.log"
+          if grep -E '[\\/:]' "$OBS_LOGS/ui-imports.log"; then
+            echo "obs-dstreamy-ui.dll imports a DLL by path"
+            exit 1
+          fi
           # obs-frontend-api.dll is looked up at runtime, so a libobs-only host still loads the plugin.
           if grep -qi obs-frontend-api "$OBS_LOGS/plugin-dll.log"; then
             echo "the plugin DLL links obs-frontend-api.dll"
+            exit 1
+          fi
+
+      - name: Install layout matches what the plugin looks for
+        shell: bash
+        run: |
+          stage="$(cygpath -m "$RUNNER_TEMP")/stage"
+          cmake --install obs/build_x64 --config RelWithDebInfo --prefix "$stage"
+          find "$stage" -print
+          bin="$stage/obs-dstreamy/bin/64bit"
+          for f in obs-dstreamy.dll dstreamy_obs.pdb obs-dstreamy-ui/obs-dstreamy-ui.dll obs-dstreamy-ui/obs-dstreamy-ui.pdb; do
+            test -f "$bin/$f" || { echo "the install lacks obs-dstreamy/bin/64bit/$f"; exit 1; }
+          done
+          if find "$bin" -maxdepth 1 -name '*.dll' ! -name obs-dstreamy.dll | grep .; then
+            echo "libobs would try these as modules: only obs-dstreamy.dll may sit in the module folder"
             exit 1
           fi
 
