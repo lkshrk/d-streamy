@@ -388,6 +388,39 @@ async fn lost_voice_connection_rejoins_with_the_same_source() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_lost_voice_connection_leaves_before_rejoining() {
+    let mut options = options();
+    options.stream.step_timeout = Duration::from_secs(1);
+    let mut f = Fixture::streaming_with(options).await;
+    f.mock.ignore_repeated_joins();
+    assert!(
+        f.mock
+            .drop_voice(VoiceKind::Voice, Some(vo::CLOSE_SESSION_NO_LONGER_VALID))
+    );
+    wait_state(&mut f.state, |s| {
+        matches!(s, SessionState::Reconnecting { .. })
+    })
+    .await;
+    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    f.video_flowing().await;
+
+    let channels: Vec<Option<String>> = f
+        .mock
+        .received_ops()
+        .iter()
+        .filter(|o| o.is(None, gw::OP_VOICE_STATE_UPDATE))
+        .map(|o| o.json().unwrap()["channel_id"].as_str().map(str::to_owned))
+        .collect();
+    let rejoin = channels.len() - 1;
+    assert_eq!(channels[rejoin], Some(MOCK_VOICE_CHANNEL_ID.to_owned()));
+    assert!(
+        channels[1..rejoin].contains(&None),
+        "no leave before the rejoin: {channels:?}"
+    );
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn channel_move_recreates_go_live_without_rejoining() {
     let mut f = Fixture::streaming().await;
     assert!(

@@ -194,6 +194,7 @@ pub(crate) struct State {
     pub kick_during_join: bool,
     pub defer_join: bool,
     pub deferred_join: Option<Value>,
+    pub ignore_repeated_joins: bool,
     pub close_voice_on_stream_create: bool,
     pub reset_voice_on_stream_create: bool,
     pub ignore_stream_creates: usize,

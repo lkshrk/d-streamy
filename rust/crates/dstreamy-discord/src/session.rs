@@ -782,9 +782,15 @@ impl Run {
         self.stream = None;
         self.client.stop_stream();
         if redo == Redo::Voice {
-            self.voice = None;
+            self.drop_voice();
         }
         self.wait(actor, redo, attempt)
+    }
+
+    /// Discord may not answer a join for the channel the account is still in, so the rejoin must follow a leave.
+    fn drop_voice(&mut self) {
+        self.voice = None;
+        self.client.leave_voice();
     }
 
     fn on_connection_event(
@@ -834,7 +840,7 @@ impl Run {
         self.stream = None;
         self.client.stop_stream();
         // A failed stream-only retry may mean voice is gone too; the reference always rejoins.
-        self.voice = None;
+        self.drop_voice();
         Ok(self.wait(actor, Redo::Voice, attempt))
     }
 

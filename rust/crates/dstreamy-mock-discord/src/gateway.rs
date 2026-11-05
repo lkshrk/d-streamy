@@ -282,6 +282,15 @@ pub(crate) fn voice_state_update(shared: &Shared, state: &mut State, d: &Value) 
         debug!("mock gateway: op 4 for unknown voice channel {guild_id}/{channel_id}");
         return;
     }
+    if state.ignore_repeated_joins
+        && state
+            .voice
+            .as_ref()
+            .is_some_and(|v| v.guild_id == guild_id && v.channel_id == channel_id)
+    {
+        debug!("mock gateway: op 4 for the channel the user is already in ignored");
+        return;
+    }
     for payload in std::mem::take(&mut state.before_join_answer) {
         shared.dispatch(state, "VOICE_STATE_UPDATE", payload);
     }

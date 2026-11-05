@@ -250,6 +250,11 @@ impl MockDiscord {
         self.shared.state().kick_during_join = true;
     }
 
+    /// From now on an op 4 for the channel the user is already in gets no answer, so only leaving first gets a new voice server.
+    pub fn ignore_repeated_joins(&self) {
+        self.shared.state().ignore_repeated_joins = true;
+    }
+
     /// Holds the next op 4 that joins a channel unanswered until [`MockDiscord::answer_deferred_join`].
     pub fn defer_next_join(&self) {
         self.shared.state().defer_join = true;
