@@ -8,13 +8,19 @@ use std::sync::{Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use dstreamy_obs_producer::mixer::{AudioSource, with_track};
+use dstreamy_obs_producer::mixer::{
+    AudioSource, MIC_AUX_CHANNELS, MicGuard, is_input_device, mic_guard as guard_for, with_track,
+};
 use dstreamy_obs_sys as sys;
 
 use crate::guard::guard;
 use crate::log;
 use crate::output::text;
 use crate::settings_source::{self, SOURCE_ID, change, with_controls};
+
+/// Where a scene collection's "modules" data keeps D-Streamy's state.
+const COLLECTION_KEY: &CStr = c"dstreamy";
+const MANAGED_MIXERS: &CStr = c"managed_mixers";
 
 /// OBS's global audio channels: Desktop Audio 1 and 2, Mic/Aux 1 to 3, and one more.
 const AUDIO_CHANNELS: std::ops::RangeInclusive<u32> = 1..=6;
@@ -44,6 +50,7 @@ unsafe fn describe(source: *mut sys::obs_source_t) -> Option<AudioSource> {
             uuid,
             name: text(sys::obs_source_get_name(source)),
             mixers: sys::obs_source_get_audio_mixers(source),
+            mic: is_input_device(&text(sys::obs_source_get_unversioned_id(source))),
         })
     }
 }
@@ -70,10 +77,12 @@ pub fn sources() -> Vec<AudioSource> {
         if source.is_null() {
             continue;
         }
-        if let Some(s) = unsafe { describe(source) }
-            && !found.iter().any(|f| f.uuid == s.uuid)
-        {
-            found.push(s);
+        if let Some(mut s) = unsafe { describe(source) } {
+            s.mic |= MIC_AUX_CHANNELS.contains(&channel);
+            match found.iter_mut().find(|f| f.uuid == s.uuid) {
+                Some(f) => f.mic |= s.mic,
+                None => found.push(s),
+            }
         }
         // SAFETY: the reference taken above.
         unsafe { sys::obs_source_release(source) };
@@ -123,39 +132,142 @@ fn set_track(source: *mut sys::obs_source_t, track: u8, on: bool) {
     }
 }
 
-/// Turns the selected track off on every audio source, then marks it managed. On the UI thread.
-pub fn take_over() -> u8 {
-    let track = with_controls(|c| c.model.settings().audio_track);
+/// Turns `track` off on every audio source, then marks it managed in the loaded scene collection. On the UI thread.
+pub fn take_over(track: u8) -> bool {
+    if !cfg!(unix) {
+        log::warn(&format!(
+            "ignored taking over Track {track}: D-Streamy can't change Discord audio on Windows yet"
+        ));
+        return false;
+    }
     let audio = sources();
     for source in &audio {
         with_source(&source.uuid, |s| set_track(s, track, false));
     }
-    change(|c, p| {
-        c.edit(p.write(), |m| {
-            if m.settings().audio_track == track {
-                m.take_over();
-            }
-        })
-    });
+    if !change(|c, _| c.model.take_over(track)) {
+        return false;
+    }
     log::info(&format!(
-        "D-Streamy manages Track {track}: turned it off on {} audio sources",
+        "D-Streamy manages Track {track} in this scene collection: turned it off on {} audio sources",
         audio.len()
     ));
-    track
+    true
 }
 
-/// Turns the managed track on or off for one source. On the UI thread.
-pub fn set_source(uuid: &str, on: bool) {
-    let (track, managed) = with_controls(|c| (c.model.settings().audio_track, c.model.managed()));
-    if !managed {
-        log::warn(&format!(
-            "ignored a tick for Track {track}: D-Streamy doesn't manage it yet"
-        ));
-        return;
+/// Turns managed `track` on or off for one source. On the UI thread.
+pub fn set_source(uuid: &str, track: u8, on: bool) -> bool {
+    if !cfg!(unix) {
+        log::warn("ignored a tick: D-Streamy can't change Discord audio on Windows yet");
+        return false;
     }
-    if !with_source(uuid, |s| set_track(s, track, on)) {
+    if !with_controls(|c| c.model.manages(track)) {
+        log::warn(&format!(
+            "ignored a tick for Track {track}: D-Streamy doesn't manage it in this scene collection"
+        ));
+        return false;
+    }
+    let found = with_source(uuid, |s| set_track(s, track, on));
+    if !found {
         log::warn(&format!("the audio source {uuid} is gone"));
     }
+    found
+}
+
+/// Why Go Live must wait: the next start's track is unmanaged and carries a microphone.
+pub fn mic_guard() -> Option<MicGuard> {
+    let audio = sources();
+    with_controls(|c| guard_for(&c.model, &audio))
+}
+
+/// Each audio source's mixer flags, by UUID.
+pub type Mixers = Vec<(String, u32)>;
+
+pub fn mixers() -> Mixers {
+    sources().into_iter().map(|s| (s.uuid, s.mixers)).collect()
+}
+
+/// Puts `tracks` back as `before` had them and the managed tracks as `managed`; sources added since get OBS's default.
+pub fn restore(before: &[(String, u32)], tracks: u32, managed: u32) {
+    let mut changed = 0;
+    for source in sources() {
+        let old = before.iter().find(|(uuid, _)| *uuid == source.uuid);
+        let wanted = old.map_or(tracks & !managed, |(_, mixers)| mixers & tracks);
+        let next = (source.mixers & !tracks) | wanted;
+        if next != source.mixers {
+            with_source(&source.uuid, |s| {
+                APPLYING.with(|a| a.set(true));
+                // SAFETY: `with_source` holds a reference.
+                unsafe { sys::obs_source_set_audio_mixers(s, next) };
+                APPLYING.with(|a| a.set(false));
+            });
+            changed += 1;
+        }
+    }
+    change(|c, _| c.model.collection_loaded(managed));
+    log::info(&format!(
+        "D-Streamy put back the Discord tracks on {changed} audio sources"
+    ));
+}
+
+/// The frontend loads a scene collection's "modules" data before its sources (`OBSBasic::LoadData`).
+///
+/// # Safety
+/// `modules` is live or NULL.
+pub unsafe fn collection_loading(modules: *mut sys::obs_data_t) {
+    let managed = if modules.is_null() {
+        0
+    } else {
+        // SAFETY: the caller's contract; the object reference is released below.
+        unsafe {
+            let ours = sys::obs_data_get_obj(modules, COLLECTION_KEY.as_ptr());
+            let managed = if ours.is_null() {
+                0
+            } else {
+                sys::obs_data_get_int(ours, MANAGED_MIXERS.as_ptr())
+            };
+            sys::obs_data_release(ours);
+            managed
+        }
+    };
+    let managed = u32::try_from(managed).unwrap_or(0);
+    change(|c, _| c.model.collection_loaded(managed));
+    if managed != 0 {
+        log::info(&format!(
+            "this scene collection's Discord tracks managed by D-Streamy: {managed:#08b}"
+        ));
+    }
+    left_collection();
+}
+
+/// The frontend saves the scene collection; its "modules" data keeps the managed tracks next to the mixer flags.
+///
+/// # Safety
+/// `modules` is live.
+pub unsafe fn collection_saving(modules: *mut sys::obs_data_t) {
+    let managed = with_controls(|c| c.model.managed_mixers());
+    // SAFETY: the caller's contract; libobs copies the key and takes its own reference to the object.
+    unsafe {
+        if managed == 0 {
+            sys::obs_data_erase(modules, COLLECTION_KEY.as_ptr());
+            return;
+        }
+        let ours = sys::obs_data_create();
+        sys::obs_data_set_int(ours, MANAGED_MIXERS.as_ptr(), i64::from(managed));
+        sys::obs_data_set_obj(modules, COLLECTION_KEY.as_ptr(), ours);
+        sys::obs_data_release(ours);
+    }
+}
+
+/// The frontend cleared the scene collection; until another loads, D-Streamy manages no track.
+pub fn collection_cleared() {
+    change(|c, _| c.model.collection_loaded(0));
+    left_collection();
+}
+
+fn left_collection() {
+    settings_source::collection_changed();
+    crate::ui::collection_changed();
+    request_refresh();
 }
 
 struct Refresher {
@@ -235,10 +347,17 @@ extern "C" fn on_created(_data: *mut c_void, cd: *mut sys::calldata_t) {
                     .push(weak);
             }
             // libobs creates every source on all tracks; a scene-collection load restores saved mixers after this.
-            let (managed, track) =
-                with_controls(|c| (c.model.managed(), c.model.settings().audio_track));
-            if managed {
-                set_track(source, track, false);
+            let managed = with_controls(|c| c.model.managed_mixers());
+            if managed != 0 {
+                // SAFETY: the source is live for the signal.
+                unsafe {
+                    let mixers = sys::obs_source_get_audio_mixers(source);
+                    if mixers & managed != 0 {
+                        APPLYING.with(|a| a.set(true));
+                        sys::obs_source_set_audio_mixers(source, mixers & !managed);
+                        APPLYING.with(|a| a.set(false));
+                    }
+                }
             }
             refresh_later();
         }

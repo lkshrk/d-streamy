@@ -1,4 +1,4 @@
-//! Tools > D-Streamy… and the exit event through obs-frontend-api, looked up at runtime so a libobs-only host still loads the plugin.
+//! Tools > D-Streamy…, the exit and scene-collection events through obs-frontend-api, looked up at runtime so a libobs-only host still loads the plugin.
 
 use std::ffi::{CStr, c_int, c_void};
 use std::path::PathBuf;
@@ -47,6 +47,10 @@ enum Missing {
 const ADD_TOOLS_MENU_ITEM: &str = "obs_frontend_add_tools_menu_item";
 const ADD_EVENT_CALLBACK: &str = "obs_frontend_add_event_callback";
 const REMOVE_EVENT_CALLBACK: &str = "obs_frontend_remove_event_callback";
+const ADD_SAVE_CALLBACK: &str = "obs_frontend_add_save_callback";
+const REMOVE_SAVE_CALLBACK: &str = "obs_frontend_remove_save_callback";
+const ADD_PRELOAD_CALLBACK: &str = "obs_frontend_add_preload_callback";
+const REMOVE_PRELOAD_CALLBACK: &str = "obs_frontend_remove_preload_callback";
 const OPEN_SOURCE_PROPERTIES: &str = "obs_frontend_open_source_properties";
 
 impl Frontend {
@@ -80,63 +84,126 @@ impl Frontend {
     }
 }
 
-struct ExitWatch {
-    remove: sys::dstreamy_frontend_event_callback,
+struct Watch {
+    remove_event: sys::dstreamy_frontend_event_callback,
+    remove_save: sys::dstreamy_frontend_save_callback,
+    remove_preload: sys::dstreamy_frontend_save_callback,
     _host: Library,
 }
 
-static EXIT_WATCH: Mutex<Option<ExitWatch>> = Mutex::new(None);
+static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
 /// Set once the frontend sent its exit event, after which its API is gone.
 static EXITED: AtomicBool = AtomicBool::new(false);
 
-/// Shuts the session down on the frontend's exit event, which OBS sends before `obs_shutdown` stops audio and video.
-fn watch_exit() {
+/// # Safety
+/// `T` is the type of the symbol `name`.
+unsafe fn symbol<T: Copy>(host: &Library, name: &str) -> Option<T> {
+    // SAFETY: the caller's contract.
+    unsafe { host.get::<T>(name.as_bytes()) }.ok().map(|s| *s)
+}
+
+/// Follows the frontend's exit, which comes before `obs_shutdown` stops audio and video, and its scene collections.
+fn watch() {
     let Ok(host) = host() else {
         return;
     };
     // SAFETY: wrapper.h asserts these types against obs-frontend-api.h; `_host` keeps the library loaded.
-    let (add, remove) = unsafe {
+    let (add, remove, add_save, remove_save, add_preload, remove_preload) = unsafe {
         (
-            host.get::<sys::dstreamy_frontend_event_callback>(ADD_EVENT_CALLBACK.as_bytes())
-                .ok()
-                .and_then(|s| *s),
-            host.get::<sys::dstreamy_frontend_event_callback>(REMOVE_EVENT_CALLBACK.as_bytes())
-                .ok()
-                .and_then(|s| *s),
+            symbol::<sys::dstreamy_frontend_event_callback>(&host, ADD_EVENT_CALLBACK).flatten(),
+            symbol::<sys::dstreamy_frontend_event_callback>(&host, REMOVE_EVENT_CALLBACK).flatten(),
+            symbol::<sys::dstreamy_frontend_save_callback>(&host, ADD_SAVE_CALLBACK).flatten(),
+            symbol::<sys::dstreamy_frontend_save_callback>(&host, REMOVE_SAVE_CALLBACK).flatten(),
+            symbol::<sys::dstreamy_frontend_save_callback>(&host, ADD_PRELOAD_CALLBACK).flatten(),
+            symbol::<sys::dstreamy_frontend_save_callback>(&host, REMOVE_PRELOAD_CALLBACK)
+                .flatten(),
         )
     };
-    let (Some(add), Some(remove)) = (add, remove) else {
-        if add.is_some() || remove.is_some() {
+    EXITED.store(false, Ordering::Release);
+    let events = match (add, remove) {
+        (Some(add), Some(remove)) => {
+            // SAFETY: module load runs on the UI thread; the callback lives as long as the process.
+            unsafe { add(Some(on_event), ptr::null_mut()) };
+            Some(remove)
+        }
+        (None, None) => None,
+        _ => {
             log::warn(&format!(
                 "OBS frontend lacks {ADD_EVENT_CALLBACK} or {REMOVE_EVENT_CALLBACK}: \
                  D-Streamy stops its output only when OBS unloads it"
             ));
+            None
         }
-        return;
     };
-    EXITED.store(false, Ordering::Release);
-    // SAFETY: module load runs on the UI thread; the callback lives as long as the process.
-    unsafe { add(Some(on_event), ptr::null_mut()) };
-    *EXIT_WATCH.lock().unwrap_or_else(PoisonError::into_inner) = Some(ExitWatch {
-        remove: Some(remove),
+    let collections = match (add_save, remove_save, add_preload, remove_preload) {
+        (Some(add_save), Some(remove_save), Some(add_preload), Some(remove_preload)) => {
+            // SAFETY: as above.
+            unsafe {
+                add_save(Some(on_save), ptr::null_mut());
+                add_preload(Some(on_preload), ptr::null_mut());
+            }
+            Some((remove_save, remove_preload))
+        }
+        (None, None, None, None) => None,
+        _ => {
+            log::warn(
+                "OBS frontend lacks its scene-collection save callbacks: \
+                 the Discord tracks D-Streamy manages are forgotten when OBS quits",
+            );
+            None
+        }
+    };
+    if events.is_none() && collections.is_none() {
+        return;
+    }
+    *WATCH.lock().unwrap_or_else(PoisonError::into_inner) = Some(Watch {
+        remove_event: events,
+        remove_save: collections.map(|c| c.0),
+        remove_preload: collections.map(|c| c.1),
         _host: host,
     });
 }
 
 extern "C" fn on_event(event: c_int, _private_data: *mut c_void) {
-    guard("frontend event", (), || {
-        if u32::try_from(event) != Ok(sys::DSTREAMY_FRONTEND_EVENT_EXIT) {
+    guard("frontend event", (), || match u32::try_from(event) {
+        Ok(sys::DSTREAMY_FRONTEND_EVENT_EXIT) => {
+            EXITED.store(true, Ordering::Release);
+            log::info(
+                "OBS's frontend is exiting: D-Streamy stops before OBS stops audio and video",
+            );
+            crate::session::shutdown();
+        }
+        Ok(sys::DSTREAMY_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP) => {
+            crate::audio::collection_cleared();
+        }
+        _ => {}
+    });
+}
+
+extern "C" fn on_save(data: *mut sys::obs_data_t, saving: bool, _private_data: *mut c_void) {
+    guard("frontend save", (), || {
+        if data.is_null() {
             return;
         }
-        EXITED.store(true, Ordering::Release);
-        log::info("OBS's frontend is exiting: D-Streamy stops before OBS stops audio and video");
-        crate::session::shutdown();
+        if saving {
+            // SAFETY: the frontend passes its live "modules" data.
+            unsafe { crate::audio::collection_saving(data) };
+        } else {
+            crate::audio::request_refresh();
+        }
+    });
+}
+
+extern "C" fn on_preload(data: *mut sys::obs_data_t, _saving: bool, _private_data: *mut c_void) {
+    // SAFETY: the frontend passes the collection's "modules" data, or NULL when it has none.
+    guard("frontend preload", (), || unsafe {
+        crate::audio::collection_loading(data)
     });
 }
 
 /// Finds OBS's frontend; call from `obs_module_load`, on the UI thread.
 pub fn install() {
-    watch_exit();
+    watch();
     let frontend = match Frontend::resolve() {
         Ok(frontend) => frontend,
         Err(Missing::Library) => {
@@ -208,14 +275,20 @@ fn click_when(trigger: PathBuf) {
 
 /// Stops watching the frontend and ends the test hook's thread; call from `obs_module_unload`.
 pub fn shutdown() {
-    let watch = EXIT_WATCH
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
-    let remove = watch.and_then(|w| w.remove);
-    if let Some(remove) = remove.filter(|_| !EXITED.load(Ordering::Acquire)) {
+    let watch = WATCH.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some(w) = watch.filter(|_| !EXITED.load(Ordering::Acquire)) {
         // SAFETY: the frontend is still up: it never sent its exit event.
-        unsafe { remove(Some(on_event), ptr::null_mut()) };
+        unsafe {
+            if let Some(remove) = w.remove_event {
+                remove(Some(on_event), ptr::null_mut());
+            }
+            if let Some(remove) = w.remove_save {
+                remove(Some(on_save), ptr::null_mut());
+            }
+            if let Some(remove) = w.remove_preload {
+                remove(Some(on_preload), ptr::null_mut());
+            }
+        }
     }
     let clicker = CLICKER
         .lock()

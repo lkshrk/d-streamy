@@ -74,6 +74,8 @@ const char *restart_output_settings;
 	const char *update_output_while_active;
 	bool tools_session;
 	bool mixer_session;
+	bool mixer_cancel;
+	bool collection_session;
 	const char *then_update;
 	const char *tools_expect;
 	const char *tools_stop_after;
@@ -626,6 +628,10 @@ static void usage(void)
 		"  [--settings-cancel (with --settings-update: then Cancel, as OBS's properties dialog does, before reopening)]\n"
 		"  [--mixer-session (with --fake-frontend: create audio sources Music and Voice on all tracks, take the\n"
 		"   Discord track over in the dialog, then tick and untick Music, reporting every source's mixers)]\n"
+		"  [--mixer-cancel (with --fake-frontend: take the Discord track over and tick in the dialog, remove and\n"
+		"   add a source, then Cancel, reporting every source's mixers)]\n"
+		"  [--collection-session (with --fake-frontend: take Track 6 over in one scene collection, switch to\n"
+		"   another and back as OBSBasic does, reporting mixers, the saved module data and the dialog)]\n"
 		"  [--audio-mixers MASK (route the harness audio source to these mixer tracks only, as Advanced Audio\n"
 		"   Properties > Tracks does: bit 0 is Track 1; default all six)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
@@ -686,6 +692,14 @@ static int parse_args(int argc, char **argv)
 		}
 		if (strcmp(a, "--mixer-session") == 0) {
 			args.mixer_session = true;
+			continue;
+		}
+		if (strcmp(a, "--mixer-cancel") == 0) {
+			args.mixer_cancel = true;
+			continue;
+		}
+		if (strcmp(a, "--collection-session") == 0) {
+			args.collection_session = true;
 			continue;
 		}
 		if (strcmp(a, "--tools-wait-end") == 0) {
@@ -1160,16 +1174,18 @@ static bool settings_dialog(const char *update)
 	printf("HARNESS frontend opened id=%s public=%d flags=0x%x\n", obs_source_get_id(source), named == source,
 	       obs_source_get_output_flags(source));
 	obs_source_release(named);
-	if (args.report_ui || update)
-		report_settings_properties(source, "open");
-	if (update && args.replace_before_update && !replace_with_file(args.replace_before_update)) {
-		obs_source_release(source);
-		return false;
-	}
+	// OBSBasicProperties copies the settings before its view first asks for the properties.
 	obs_data_t *old_settings = obs_data_create();
 	obs_data_t *opened = obs_source_get_settings(source);
 	obs_data_apply(old_settings, opened);
 	obs_data_release(opened);
+	if (args.report_ui || update)
+		report_settings_properties(source, "open");
+	if (update && args.replace_before_update && !replace_with_file(args.replace_before_update)) {
+		obs_data_release(old_settings);
+		obs_source_release(source);
+		return false;
+	}
 	if (update) {
 		if (!apply_settings_update(source, update)) {
 			obs_data_release(old_settings);
@@ -1352,6 +1368,11 @@ static bool mixer_session(void)
 		long seen = os_atomic_load_long(&mixer_views);
 		click_settings_button(dialog, "take_over");
 		ok = wait_for_view(seen, "the takeover");
+		report_mixers("confirming");
+		report_settings_properties(dialog, "confirming");
+		seen = os_atomic_load_long(&mixer_views);
+		click_settings_button(dialog, "confirm_take_over");
+		ok = ok && wait_for_view(seen, "the takeover's confirm");
 		report_mixers("taken");
 		report_settings_properties(dialog, "managed");
 		ok = ok && tick_source(dialog, "Music", true);
@@ -1415,6 +1436,259 @@ static bool mixer_session(void)
 	return ok;
 }
 
+// OBSBasicProperties: the settings are copied before the view is built, then Cancel clears and updates with them.
+static void cancel_settings_dialog(obs_source_t *dialog, obs_data_t *old_settings)
+{
+	obs_data_t *settings = obs_source_get_settings(dialog);
+	obs_data_clear(settings);
+	obs_data_release(settings);
+	obs_source_update(dialog, old_settings);
+}
+
+static void report_source_mixers(const char *when, obs_source_t *source)
+{
+	printf("HARNESS mixers when=%s name=%s mixers=%u\n", when, obs_source_get_name(source),
+	       obs_source_get_audio_mixers(source));
+}
+
+static bool mixer_cancel(void)
+{
+	obs_register_source(&mixer_source_info);
+	obs_source_t *music = obs_source_create(MIXER_SOURCE_ID, "Music", NULL, NULL);
+	obs_source_t *voice = obs_source_create(MIXER_SOURCE_ID, "Voice", NULL, NULL);
+	obs_source_t *gone = obs_source_create(MIXER_SOURCE_ID, "Gone", NULL, NULL);
+	obs_source_t *late = NULL;
+	obs_source_t *dialog = NULL;
+	bool ok = music && voice && gone;
+	if (!ok)
+		harness_error("could not create the mixer sources");
+	for (obs_source_t **s = (obs_source_t *[]){music, voice, gone, NULL}; ok && *s; s++)
+		obs_source_set_audio_mixers(*s, 0x3f);
+	if (ok)
+		dialog = open_settings_dialog();
+	if (ok && !dialog) {
+		harness_error("the settings dialog did not open");
+		ok = false;
+	}
+	if (ok) {
+		obs_data_t *old_settings = obs_data_create();
+		obs_data_t *opened = obs_source_get_settings(dialog);
+		obs_data_apply(old_settings, opened);
+		obs_data_release(opened);
+		mixer_dialog = dialog;
+		signal_handler_t *signals = obs_source_get_signal_handler(dialog);
+		signal_handler_connect(signals, "update_properties", on_mixer_update_properties, NULL);
+		report_settings_properties(dialog, "open");
+		long seen = os_atomic_load_long(&mixer_views);
+		click_settings_button(dialog, "take_over");
+		ok = wait_for_view(seen, "the takeover");
+		seen = os_atomic_load_long(&mixer_views);
+		click_settings_button(dialog, "confirm_take_over");
+		ok = ok && wait_for_view(seen, "the takeover's confirm");
+		ok = ok && tick_source(dialog, "Music", true);
+		run_ui_tasks();
+		report_source_mixers("changed", music);
+		report_source_mixers("changed", voice);
+		printf("HARNESS mixer_step name=gone_and_late\n");
+		obs_source_remove(gone);
+		obs_source_release(gone);
+		gone = NULL;
+		late = obs_source_create(MIXER_SOURCE_ID, "Late", NULL, NULL);
+		run_ui_tasks();
+		if (late)
+			report_source_mixers("changed", late);
+		printf("HARNESS mixer_step name=cancel\n");
+		cancel_settings_dialog(dialog, old_settings);
+		obs_data_release(old_settings);
+		run_ui_tasks();
+		report_source_mixers("cancelled", music);
+		report_source_mixers("cancelled", voice);
+		if (late)
+			report_source_mixers("cancelled", late);
+		report_settings_properties(dialog, "cancelled");
+		signal_handler_disconnect(signals, "update_properties", on_mixer_update_properties, NULL);
+		mixer_dialog = NULL;
+	}
+	if (dialog)
+		close_settings_dialog(dialog);
+	run_ui_tasks();
+	obs_source_release(music);
+	obs_source_release(voice);
+	obs_source_release(gone);
+	obs_source_release(late);
+	return ok;
+}
+
+// obs-frontend-api.h's enum obs_frontend_event.
+#define FAKE_EVENT_SCENE_COLLECTION_CHANGED 13
+#define FAKE_EVENT_SCENE_COLLECTION_CLEANUP 25
+#define FAKE_EVENT_SCENE_COLLECTION_CHANGING 34
+#define MIC_SOURCE_ID "harness_mic_input_capture"
+#define COLLECTION_SOURCES 2
+
+static struct obs_source_info mic_source_info = {
+	.id = MIC_SOURCE_ID,
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_AUDIO,
+	.get_name = mixer_source_get_name,
+	.create = mixer_source_create,
+	.destroy = mixer_source_destroy,
+};
+
+struct collection {
+	const char *name;
+	obs_data_t *modules;
+	uint32_t mixers[COLLECTION_SOURCES];
+};
+
+static const char *collection_ids[COLLECTION_SOURCES] = {MIC_SOURCE_ID, MIXER_SOURCE_ID};
+static const char *collection_names[COLLECTION_SOURCES] = {"Mic", "Music"};
+static obs_source_t *collection_sources[COLLECTION_SOURCES];
+static void (*fake_save)(obs_data_t *);
+static void (*fake_preload)(obs_data_t *);
+static void (*fake_load)(obs_data_t *);
+static void (*fake_event)(int);
+
+static void report_collection_mixers(const char *when)
+{
+	for (size_t i = 0; i < COLLECTION_SOURCES; i++)
+		if (collection_sources[i])
+			report_source_mixers(when, collection_sources[i]);
+}
+
+// OBSBasic::ClearSceneData: every source is removed, then the cleanup event.
+static void clear_collection(void)
+{
+	for (size_t i = 0; i < COLLECTION_SOURCES; i++) {
+		if (!collection_sources[i])
+			continue;
+		obs_source_remove(collection_sources[i]);
+		obs_source_release(collection_sources[i]);
+		collection_sources[i] = NULL;
+	}
+	fake_event(FAKE_EVENT_SCENE_COLLECTION_CLEANUP);
+}
+
+// OBSBasic::SaveProjectNow: the sources' mixers and the plugins' "modules" data, in one file.
+static void save_collection(struct collection *c)
+{
+	for (size_t i = 0; i < COLLECTION_SOURCES; i++)
+		if (collection_sources[i])
+			c->mixers[i] = obs_source_get_audio_mixers(collection_sources[i]);
+	fake_save(c->modules);
+	obs_data_t *ours = obs_data_get_obj(c->modules, "dstreamy");
+	printf("HARNESS collection_saved name=%s managed_mixers=%lld\n", c->name,
+	       ours ? obs_data_get_int(ours, "managed_mixers") : -1LL);
+	obs_data_release(ours);
+}
+
+// OBSBasic::LoadData: clear, preload, sources with their saved mixers (obs_load_source), load, changed.
+static void load_collection(struct collection *c)
+{
+	clear_collection();
+	fake_preload(c->modules);
+	for (size_t i = 0; i < COLLECTION_SOURCES; i++) {
+		obs_data_t *saved = obs_data_create();
+		obs_data_set_string(saved, "id", collection_ids[i]);
+		obs_data_set_string(saved, "name", collection_names[i]);
+		obs_data_set_int(saved, "mixers", c->mixers[i]);
+		collection_sources[i] = obs_load_source(saved);
+		obs_data_release(saved);
+	}
+	fake_load(c->modules);
+	fake_event(FAKE_EVENT_SCENE_COLLECTION_CHANGED);
+	run_ui_tasks();
+	printf("HARNESS collection_loaded name=%s\n", c->name);
+}
+
+// OBSBasic::ActivateSceneCollection after the changing event.
+static void switch_collection(struct collection *from, struct collection *to)
+{
+	fake_event(FAKE_EVENT_SCENE_COLLECTION_CHANGING);
+	save_collection(from);
+	load_collection(to);
+}
+
+static void report_dialog(const char *when)
+{
+	obs_source_t *dialog = open_settings_dialog();
+	if (!dialog) {
+		harness_error("the settings dialog did not open (%s)", when);
+		return;
+	}
+	report_settings_properties(dialog, when);
+	close_settings_dialog(dialog);
+	run_ui_tasks();
+}
+
+static bool collection_session(void)
+{
+	fake_save = (void (*)(obs_data_t *))dlsym(fake_frontend, "fake_frontend_save");
+	fake_preload = (void (*)(obs_data_t *))dlsym(fake_frontend, "fake_frontend_preload");
+	fake_load = (void (*)(obs_data_t *))dlsym(fake_frontend, "fake_frontend_load");
+	fake_event = (void (*)(int))dlsym(fake_frontend, "fake_frontend_event");
+	if (!fake_save || !fake_preload || !fake_load || !fake_event) {
+		harness_error("--fake-frontend lacks its scene-collection functions");
+		return false;
+	}
+	obs_register_source(&mixer_source_info);
+	obs_register_source(&mic_source_info);
+	struct collection a = {"A", obs_data_create(), {0x3f, 0x3f}};
+	struct collection b = {"B", obs_data_create(), {0x3f, 0x3f}};
+	bool ok = true;
+
+	load_collection(&a);
+	report_collection_mixers("a_loaded");
+	obs_source_t *dialog = open_settings_dialog();
+	if (!dialog) {
+		harness_error("the settings dialog did not open");
+		ok = false;
+	} else {
+		mixer_dialog = dialog;
+		signal_handler_t *signals = obs_source_get_signal_handler(dialog);
+		signal_handler_connect(signals, "update_properties", on_mixer_update_properties, NULL);
+		report_settings_properties(dialog, "a_unmanaged");
+		long seen = os_atomic_load_long(&mixer_views);
+		click_settings_button(dialog, "take_over");
+		ok = wait_for_view(seen, "the takeover");
+		report_collection_mixers("a_confirming");
+		report_settings_properties(dialog, "a_confirming");
+		seen = os_atomic_load_long(&mixer_views);
+		click_settings_button(dialog, "confirm_take_over");
+		ok = ok && wait_for_view(seen, "the takeover's confirm");
+		report_collection_mixers("a_taken");
+		report_settings_properties(dialog, "a_managed");
+		signal_handler_disconnect(signals, "update_properties", on_mixer_update_properties, NULL);
+		mixer_dialog = NULL;
+		close_settings_dialog(dialog);
+		run_ui_tasks();
+	}
+
+	switch_collection(&a, &b);
+	report_collection_mixers("b_loaded");
+	report_dialog("b");
+
+	switch_collection(&b, &a);
+	report_collection_mixers("a_again");
+	report_dialog("a_again");
+
+	printf("HARNESS collection_step name=new\n");
+	fake_event(FAKE_EVENT_SCENE_COLLECTION_CHANGING);
+	save_collection(&a);
+	clear_collection();
+	collection_sources[0] = obs_source_create(MIC_SOURCE_ID, "Mic", NULL, NULL);
+	fake_event(FAKE_EVENT_SCENE_COLLECTION_CHANGED);
+	run_ui_tasks();
+	report_collection_mixers("new");
+	report_dialog("new");
+
+	clear_collection();
+	run_ui_tasks();
+	obs_data_release(a.modules);
+	obs_data_release(b.modules);
+	return ok;
+}
+
 static bool click_fake_frontend(void)
 {
 	int (*items)(const char **) = (int (*)(const char **))dlsym(fake_frontend, "fake_frontend_tools_items");
@@ -1429,6 +1703,10 @@ static bool click_fake_frontend(void)
 	printf("HARNESS frontend tools_items=%d name=%s\n", count, name ? name : "");
 	if (args.mixer_session)
 		return mixer_session();
+	if (args.mixer_cancel)
+		return mixer_cancel();
+	if (args.collection_session)
+		return collection_session();
 	if (args.settings_update_while_active || args.tools_session)
 		return true;
 	return settings_dialog(args.settings_update);

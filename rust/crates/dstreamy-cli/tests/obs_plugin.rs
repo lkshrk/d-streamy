@@ -1123,9 +1123,13 @@ fn a_frontend_without_a_properties_dialog_offers_no_tools_entry() {
 
 /// The status while no service runs at the harness's default endpoint.
 const NO_SERVICE: &str = "The D-Streamy service is not running (no service is listening at ";
-const TAKE_OVER_HELP: &str = "D-Streamy can manage Track 6 for you: it turns Track 6 off on every audio \
-     source, then you tick what Discord hears. This changes Track 6 in Edit \u{203a} Advanced Audio Properties, \
-     so recordings or streams that use Track 6 change too.";
+const TAKE_OVER_HELP: &str =
+    "Discord hears every source on Track 6. Let D-Streamy manage Track 6 to pick sources here.";
+const TAKE_OVER_EFFECT: &str =
+    "Turns Track 6 off on every audio source, also for recordings and streams that use it.";
+/// The dialog's status while the unmanaged Track 6 carries the harness's Mic.
+const MIC_GUARD: &str = "Mic is on Track 6, so Discord would hear it. Let D-Streamy manage Track 6, \
+     or turn Track 6 off for Mic in Edit \u{203a} Advanced Audio Properties.";
 
 fn module_config(dir: &std::path::Path) -> PathBuf {
     dir.join("obs-dstreamy").join("config.json")
@@ -1275,6 +1279,11 @@ fn taking_over_track_6_clears_it_on_every_source_and_a_tick_sets_only_that_bit()
             "HARNESS mixers when=start name=Voice mixers=63",
             "HARNESS settings_property when=unmanaged name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 6",
             "HARNESS settings_click_sync_refreshes name=take_over count=0",
+            "HARNESS mixers when=confirming name=Music mixers=63",
+            "HARNESS mixers when=confirming name=Voice mixers=63",
+            "HARNESS settings_property when=confirming name=confirm_take_over type=8 enabled=1 desc=Manage",
+            "HARNESS settings_property when=confirming name=cancel_take_over type=8 enabled=1 desc=Cancel",
+            "HARNESS settings_click_sync_refreshes name=confirm_take_over count=0",
             "HARNESS mixers when=taken name=Music mixers=31",
             "HARNESS mixers when=taken name=Voice mixers=31",
             "HARNESS settings_checkbox when=managed desc=Music on=0",
@@ -1298,6 +1307,18 @@ fn taking_over_track_6_clears_it_on_every_source_and_a_tick_sets_only_that_bit()
         "{lines:#?}"
     );
     assert!(
+        lines.contains(&format!(
+            "HARNESS settings_property when=confirming name=take_over_effect type=4 enabled=1 desc={TAKE_OVER_EFFECT}"
+        )),
+        "the takeover waits for its confirm: {lines:#?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("HARNESS settings_property when=confirming name=take_over ")),
+        "{lines:#?}"
+    );
+    assert!(
         !lines
             .iter()
             .any(|l| l.starts_with("HARNESS settings_checkbox when=unmanaged")),
@@ -1308,7 +1329,11 @@ fn taking_over_track_6_clears_it_on_every_source_and_a_tick_sets_only_that_bit()
         lines.contains(&"HARNESS mixers when=external name=Voice mixers=63".to_owned()),
         "{lines:#?}"
     );
-    assert_eq!(saved["managed_track"], 6, "{saved}");
+    assert_eq!(
+        saved.get("managed_track"),
+        None,
+        "kept per scene collection: {saved}"
+    );
     assert_eq!(saved["audio_track"], 6, "{saved}");
 }
 
@@ -1333,8 +1358,146 @@ fn a_saved_track_3_stays_and_is_taken_over_on_its_own_bit() {
     );
     assert_dialog_follows(&lines);
     assert_eq!(saved["audio_track"], 3, "{saved}");
-    assert_eq!(saved["managed_track"], 3, "{saved}");
+    assert_eq!(saved.get("managed_track"), None, "{saved}");
     assert_eq!(saved["guild_id"], "g", "{saved}");
+}
+
+/// Runs a harness mode on the settings dialog with the fake frontend; also returns the module config, if saved.
+fn dialog_session(mode: &str) -> (Vec<String>, Option<Value>) {
+    let config = tempfile::tempdir().unwrap();
+    let dir = config.path().to_string_lossy().into_owned();
+    let lib = fake_frontend();
+    let lines = report_ui(&[
+        "--fake-frontend",
+        lib.as_str(),
+        "--module-config",
+        dir.as_str(),
+        mode,
+    ]);
+    let saved = module_config(config.path())
+        .exists()
+        .then(|| read_module_config(config.path()));
+    (lines, saved)
+}
+
+fn start_button(lines: &[String], when: &str) -> Option<bool> {
+    let prefix = format!("HARNESS settings_property when={when} name=start type=8 enabled=");
+    lines
+        .iter()
+        .rfind(|l| l.starts_with(&prefix))
+        .map(|l| l[prefix.len()..].starts_with('1'))
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn the_managed_track_belongs_to_its_scene_collection_and_loads_never_touch_mixers() {
+    let (lines, saved) = dialog_session("--collection-session");
+    assert_lines(
+        &lines,
+        &[
+            "HARNESS mixers when=a_loaded name=Mic mixers=63",
+            "HARNESS mixers when=a_loaded name=Music mixers=63",
+            "HARNESS settings_property when=a_unmanaged name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 6",
+            "HARNESS settings_info when=a_unmanaged name=status kind=1",
+            "HARNESS mixers when=a_confirming name=Mic mixers=63",
+            "HARNESS mixers when=a_taken name=Mic mixers=31",
+            "HARNESS mixers when=a_taken name=Music mixers=31",
+            "HARNESS settings_checkbox when=a_managed desc=Mic on=0",
+            "HARNESS collection_saved name=A managed_mixers=32",
+            "HARNESS collection_loaded name=B",
+            "HARNESS mixers when=b_loaded name=Mic mixers=63",
+            "HARNESS mixers when=b_loaded name=Music mixers=63",
+            "HARNESS settings_property when=b name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 6",
+            "HARNESS collection_saved name=B managed_mixers=-1",
+            "HARNESS mixers when=a_again name=Mic mixers=31",
+            "HARNESS mixers when=a_again name=Music mixers=31",
+            "HARNESS settings_checkbox when=a_again desc=Music on=0",
+            "HARNESS mixers when=new name=Mic mixers=255",
+            "HARNESS settings_property when=new name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 6",
+        ]
+        .map(str::to_owned),
+    );
+    let guard = format!(
+        "HARNESS settings_property when=a_unmanaged name=status type=4 enabled=1 desc={MIC_GUARD}"
+    );
+    assert!(
+        lines.contains(&guard),
+        "the dialog says why Start waits: {lines:#?}"
+    );
+    for (when, enabled) in [
+        ("a_unmanaged", false),
+        ("a_managed", true),
+        ("b", false),
+        ("a_again", true),
+        ("new", false),
+    ] {
+        assert_eq!(
+            start_button(&lines, when),
+            Some(enabled),
+            "{when}: {lines:#?}"
+        );
+    }
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("HARNESS settings_checkbox when=b ")),
+        "B was never taken over: {lines:#?}"
+    );
+    assert_eq!(
+        saved, None,
+        "a takeover is kept in the scene collection, not the module config"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn cancel_puts_back_the_discord_track_the_dialog_changed_on_every_source() {
+    let (lines, _) = dialog_session("--mixer-cancel");
+    assert_lines(
+        &lines,
+        &[
+            "HARNESS mixers when=changed name=Music mixers=63",
+            "HARNESS mixers when=changed name=Voice mixers=31",
+            "HARNESS mixers when=changed name=Late mixers=223",
+            "HARNESS mixers when=cancelled name=Music mixers=63",
+            "HARNESS mixers when=cancelled name=Voice mixers=63",
+            "HARNESS mixers when=cancelled name=Late mixers=255",
+            "HARNESS settings_property when=cancelled name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 6",
+        ]
+        .map(str::to_owned),
+    );
+    assert!(
+        has_plugin_line(
+            &lines,
+            "D-Streamy put back the Discord tracks on 2 audio sources"
+        ),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("HARNESS settings_checkbox when=cancelled ")),
+        "unmanaged again: {lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_config_saved_on_the_old_default_track_1_opens_on_track_6() {
+    let config = tempfile::tempdir().unwrap();
+    write_module_config(config.path(), json!({"audio_track": 1, "guild_id": "g"}));
+    let dir = config.path().to_string_lossy().into_owned();
+    let lib = fake_frontend();
+    let lines = report_ui(&[
+        "--fake-frontend",
+        lib.as_str(),
+        "--module-config",
+        dir.as_str(),
+    ]);
+    assert!(
+        lines.contains(&"HARNESS settings_source when=open audio_track=6".to_owned()),
+        "{lines:#?}"
+    );
 }
 
 #[test]
@@ -1979,7 +2142,8 @@ fn picked_config(track: u8) -> tempfile::TempDir {
     let config = tempfile::tempdir().unwrap();
     write_module_config(
         config.path(),
-        json!({"guild_id": MOCK_GUILD_ID, "channel_id": MOCK_VOICE_CHANNEL_ID, "audio_track": track}),
+        json!({"guild_id": MOCK_GUILD_ID, "channel_id": MOCK_VOICE_CHANNEL_ID, "audio_track": track,
+            "config_version": 2}),
     );
     config
 }

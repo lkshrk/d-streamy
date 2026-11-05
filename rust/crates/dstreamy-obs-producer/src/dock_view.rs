@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::dock::{DockModel, DockState, TrackStatus, track_name};
 use crate::dock_config::ConfigState;
 use crate::live::{LiveStats, stats_line, stats_tooltip};
+use crate::mixer::MicGuard;
 
 /// Shown instead of the session status where the plugin has no service client yet.
 pub const UNSUPPORTED: &str =
@@ -96,8 +97,14 @@ fn chosen_channel(m: &DockModel) -> Option<Option<&str>> {
     )
 }
 
-/// The dock and status bar; `controls`: this platform can start and stop; `live`: the output's stats while live.
-pub fn dock_view(state: &ConfigState, controls: bool, live: Option<&LiveStats>) -> DockView {
+/// The dock and status bar; `controls`: this platform can start and stop; `live`: the output's stats while live;
+/// `blocked`: why Start must wait.
+pub fn dock_view(
+    state: &ConfigState,
+    controls: bool,
+    live: Option<&LiveStats>,
+    blocked: Option<&MicGuard>,
+) -> DockView {
     let m = &state.model;
     let config_error = state.error();
     let config = config_error.map(|e| e.message(m.settings().audio_track));
@@ -114,8 +121,16 @@ pub fn dock_view(state: &ConfigState, controls: bool, live: Option<&LiveStats>) 
         match m.state() {
             DockState::Idle => {
                 let chosen = chosen_channel(m);
-                let start = button(START, Action::Start, chosen.is_some());
-                if let Some(problem) = m.problem() {
+                let start = button(START, Action::Start, chosen.is_some() && blocked.is_none());
+                if let Some(guard) = blocked {
+                    detail_tooltip = Some(guard.message());
+                    (
+                        Tone::Attention,
+                        MicGuard::HEADLINE.to_owned(),
+                        guard.fix(),
+                        start,
+                    )
+                } else if let Some(problem) = m.problem() {
                     detail_tooltip = Some(joined(problem.message.clone(), config.as_deref()));
                     (
                         Tone::Attention,
@@ -257,7 +272,7 @@ mod tests {
     }
 
     fn view(s: &ConfigState) -> DockView {
-        dock_view(s, true, None)
+        dock_view(s, true, None, None)
     }
 
     #[test]
@@ -269,6 +284,28 @@ mod tests {
         assert_eq!(v.button, button(START, Action::Start, false));
         assert_eq!(v.status_bar, "D-Streamy idle");
         assert_eq!(v.mark, "●");
+    }
+
+    #[test]
+    fn a_mic_on_the_unmanaged_track_holds_start_back_with_its_fix() {
+        let guard = MicGuard {
+            track: 6,
+            mics: vec!["Mic/Aux".into()],
+        };
+        let v = dock_view(&picked(), true, None, Some(&guard));
+        assert_eq!(v.tone, Tone::Attention);
+        assert_eq!(v.headline, "Discord would hear your mic");
+        assert_eq!(v.detail, "Let D-Streamy manage Track 6");
+        assert_eq!(v.detail_tooltip, guard.message());
+        assert_eq!(v.button, button(START, Action::Start, false));
+        assert_eq!(v.status_bar, "⚠ D-Streamy");
+        let live = dock_view(&live(), true, None, Some(&guard));
+        assert_eq!(
+            live.tone,
+            Tone::Live,
+            "a running session is never held back"
+        );
+        assert!(live.button.enabled);
     }
 
     #[test]
@@ -467,7 +504,7 @@ mod tests {
             s.open(|| Err(error.clone()), |_| Ok(()));
             views.push(view(&s));
         }
-        views.push(dock_view(&picked(), false, None));
+        views.push(dock_view(&picked(), false, None, None));
         for v in &views {
             assert_short_fix(v);
         }
@@ -570,7 +607,7 @@ mod tests {
 
     #[test]
     fn without_controls_nothing_can_start() {
-        let v = dock_view(&picked(), false, None);
+        let v = dock_view(&picked(), false, None, None);
         assert_eq!(v.tone, Tone::Attention);
         assert_eq!(v.detail, "Start and Stop are disabled");
         assert_eq!(v.detail_tooltip, UNSUPPORTED);
@@ -612,20 +649,20 @@ mod tests {
     fn live_shows_stats_with_the_track_in_the_tooltip() {
         let mut s = live();
         s.model.select_audio_track(3);
-        let v = dock_view(&s, true, Some(&stats(true)));
+        let v = dock_view(&s, true, Some(&stats(true)), None);
         assert_eq!(v.tone, Tone::Live);
         assert_eq!(v.detail, "6.0 Mbit/s · 60 fps · 12:34");
         assert_eq!(
             v.detail_tooltip,
             "6.0 Mbit/s · 60 fps · 12:34 · 0 dropped\nTrack 6 · Track 3 applies on next Go Live"
         );
-        let early = dock_view(&s, true, Some(&stats(false)));
+        let early = dock_view(&s, true, Some(&stats(false)), None);
         assert_eq!(
             early.detail, "12:34",
             "only the uptime before a delta exists"
         );
         assert_eq!(
-            dock_view(&s, true, None).detail,
+            dock_view(&s, true, None, None).detail,
             early.detail_tooltip.lines().nth(1).unwrap()
         );
     }
@@ -633,12 +670,15 @@ mod tests {
     #[test]
     fn stats_only_replace_the_live_line() {
         for s in [picked(), ConfigState::default()] {
-            let v = dock_view(&s, true, Some(&stats(true)));
+            let v = dock_view(&s, true, Some(&stats(true)), None);
             assert_eq!(v, view(&s), "idle ignores stats");
             assert_eq!(v.detail, v.detail_tooltip);
         }
         let mut s = live();
         s.model.stop();
-        assert_eq!(dock_view(&s, true, Some(&stats(true))).detail, "Track 6");
+        assert_eq!(
+            dock_view(&s, true, Some(&stats(true)), None).detail,
+            "Track 6"
+        );
     }
 }

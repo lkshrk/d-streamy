@@ -219,8 +219,6 @@ static SAMPLER: Mutex<Option<Sampler>> = Mutex::new(None);
 static CLOCK: OnceLock<Instant> = OnceLock::new();
 /// The takeover's confirm row is open in the panel.
 static CONFIRMING: AtomicBool = AtomicBool::new(false);
-/// The panel is open: it opens through `load_lists` and reports its closing through `panel_closed`.
-static PANEL_OPEN: AtomicBool = AtomicBool::new(false);
 
 /// Samples D-Streamy's output each time the panel polls; `None` while it isn't active.
 fn live_stats() -> Option<LiveStats> {
@@ -243,8 +241,7 @@ fn live_stats() -> Option<LiveStats> {
 extern "C" fn view_json(_ctx: Ctx) -> *mut c_char {
     guard("panel view", ptr::null_mut(), || {
         let live = live_stats();
-        let listed = PANEL_OPEN.load(Ordering::Acquire) && with_controls(|c| c.model.managed());
-        let sources = if listed {
+        let sources = if cfg!(unix) {
             crate::audio::sources()
         } else {
             Vec::new()
@@ -279,7 +276,6 @@ extern "C" fn stop(_ctx: Ctx) {
 extern "C" fn load_lists(_ctx: Ctx) {
     guard("panel load_lists", (), || {
         CONFIRMING.store(false, Ordering::Release);
-        PANEL_OPEN.store(true, Ordering::Release);
         settings_source::open_config();
         session::request_lists(None);
     });
@@ -320,9 +316,15 @@ extern "C" fn set_track(_ctx: Ctx, track: c_int) {
     });
 }
 
+/// The track the panel's audio part shows: the one Discord hears now while live, else the next start's.
+fn shown_track() -> u8 {
+    with_controls(|c| c.model.heard_track())
+}
+
 extern "C" fn request_take_over(_ctx: Ctx) {
     guard("panel request_take_over", (), || {
-        if !with_controls(|c| c.model.managed()) {
+        let track = shown_track();
+        if cfg!(unix) && !with_controls(|c| c.model.manages(track)) {
             CONFIRMING.store(true, Ordering::Release);
         }
     });
@@ -331,7 +333,7 @@ extern "C" fn request_take_over(_ctx: Ctx) {
 extern "C" fn confirm_take_over(_ctx: Ctx, confirm: bool) {
     guard("panel confirm_take_over", (), || {
         if CONFIRMING.swap(false, Ordering::AcqRel) && confirm {
-            crate::audio::take_over();
+            crate::audio::take_over(shown_track());
         }
     });
 }
@@ -339,14 +341,18 @@ extern "C" fn confirm_take_over(_ctx: Ctx, confirm: bool) {
 extern "C" fn set_source(_ctx: Ctx, uuid: *const c_char, on: bool) {
     guard("panel set_source", (), || {
         if let Some(uuid) = picked(uuid) {
-            crate::audio::set_source(&uuid, on);
+            crate::audio::set_source(&uuid, shown_track(), on);
         }
     });
+}
+
+/// Another scene collection: a takeover confirm opened for the last one no longer applies.
+pub fn collection_changed() {
+    CONFIRMING.store(false, Ordering::Release);
 }
 
 extern "C" fn panel_closed(_ctx: Ctx) {
     guard("panel closed", (), || {
         CONFIRMING.store(false, Ordering::Release);
-        PANEL_OPEN.store(false, Ordering::Release);
     });
 }

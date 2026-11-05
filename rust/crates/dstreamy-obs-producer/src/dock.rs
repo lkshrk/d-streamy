@@ -14,6 +14,10 @@ pub const BITRATE_KBPS: std::ops::RangeInclusive<i64> = 500..=50_000;
 pub const AUDIO_TRACKS: std::ops::RangeInclusive<u8> = 1..=6;
 /// The last track, which OBS's default stream and recording settings leave unused.
 pub const DEFAULT_AUDIO_TRACK: u8 = 6;
+/// The default before config version 2, OBS's own stream and recording track.
+const LEGACY_DEFAULT_TRACK: u8 = 1;
+/// Version 2 moved configs still on the old default Track 1 to Track 6.
+pub const CONFIG_VERSION: u32 = 2;
 pub const AUDIO_TRACK_TITLE: &str = "Discord audio track";
 
 /// OBS's fixed name for a mixer track; D-Streamy keeps no labels of its own.
@@ -47,9 +51,8 @@ pub struct DockSettings {
     pub start_with_stream: bool,
     /// The OBS mixer track sent to Discord, one-based.
     pub audio_track: u8,
-    /// The track D-Streamy took over; managed only while it equals `audio_track`.
-    pub managed_track: Option<u8>,
     pub owned: Option<Ownership>,
+    pub config_version: u32,
 }
 
 impl Default for DockSettings {
@@ -64,8 +67,8 @@ impl Default for DockSettings {
             share_fallback: true,
             start_with_stream: false,
             audio_track: DEFAULT_AUDIO_TRACK,
-            managed_track: None,
             owned: None,
+            config_version: CONFIG_VERSION,
         }
     }
 }
@@ -84,6 +87,7 @@ impl DockSettings {
             map.get(key)
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
         }
+        let version = field::<u32>(&map, "config_version").unwrap_or(0);
         let bitrate = map
             .get("bitrate_kbps")
             .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
@@ -103,9 +107,10 @@ impl DockSettings {
                         .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))
                 })
                 .and_then(|n| u8::try_from(n).ok())
+                .filter(|&t| version >= CONFIG_VERSION || t != LEGACY_DEFAULT_TRACK)
                 .unwrap_or(d.audio_track),
-            managed_track: field::<u8>(&map, "managed_track").filter(|t| AUDIO_TRACKS.contains(t)),
             owned: field(&map, "owned"),
+            config_version: CONFIG_VERSION,
         }
         .clamped()
     }
@@ -121,7 +126,6 @@ impl DockSettings {
             } else {
                 DEFAULT_AUDIO_TRACK
             },
-            managed_track: self.managed_track.filter(|t| AUDIO_TRACKS.contains(t)),
             ..self
         }
     }
@@ -240,6 +244,8 @@ pub struct DockModel {
     applying: Option<u8>,
     /// List load jobs sent and not yet ended; the lists show loading until the last one ends.
     lists_pending: u32,
+    /// The tracks D-Streamy manages in the loaded scene collection, as OBS mixer bits.
+    managed_mixers: u32,
 }
 
 impl DockModel {
@@ -253,6 +259,7 @@ impl DockModel {
             live_track: None,
             applying: None,
             lists_pending: 0,
+            managed_mixers: 0,
         }
     }
 
@@ -304,15 +311,37 @@ impl DockModel {
         true
     }
 
-    /// Whether D-Streamy manages the selected track's source flags.
+    /// Whether D-Streamy manages the selected track's source flags in the loaded scene collection.
     pub fn managed(&self) -> bool {
-        self.settings.managed_track == Some(self.settings.audio_track)
+        self.manages(self.settings.audio_track)
     }
 
-    /// Marks the selected track as managed and returns it; the caller clears it on every source first.
-    pub fn take_over(&mut self) -> u8 {
-        self.settings.managed_track = Some(self.settings.audio_track);
-        self.settings.audio_track
+    pub fn manages(&self, track: u8) -> bool {
+        AUDIO_TRACKS.contains(&track) && self.managed_mixers & (1 << (track - 1)) != 0
+    }
+
+    /// Every track D-Streamy manages in the loaded scene collection, as OBS mixer bits.
+    pub fn managed_mixers(&self) -> u32 {
+        self.managed_mixers
+    }
+
+    /// Marks `track` as managed, keeping the others; the caller clears it on every source first.
+    pub fn take_over(&mut self, track: u8) -> bool {
+        if !AUDIO_TRACKS.contains(&track) {
+            return false;
+        }
+        self.managed_mixers |= 1 << (track - 1);
+        true
+    }
+
+    /// A scene collection was loaded, or left (`0`); its saved mixer bits say which tracks D-Streamy manages there.
+    pub fn collection_loaded(&mut self, managed_mixers: u32) {
+        self.managed_mixers = managed_mixers & ((1 << AUDIO_TRACKS.end()) - 1);
+    }
+
+    /// The track Discord hears now while a session runs, else the one the next Go Live binds.
+    pub fn heard_track(&self) -> u8 {
+        self.live_track.unwrap_or(self.settings.audio_track)
     }
 
     /// One line for the settings dialog; `controls` says whether it can start and stop D-Streamy.
@@ -700,6 +729,7 @@ impl DockModel {
             "channels": self.channels,
             "settings": self.settings,
             "live_track": self.live_track,
+            "managed_mixers": self.managed_mixers,
         })
     }
 }
@@ -847,6 +877,65 @@ mod tests {
             assert_eq!(back.audio_track, track);
             assert_eq!(s.output_settings()["audio_track"], json!(track));
         }
+    }
+
+    #[test]
+    fn a_config_from_before_version_2_on_track_1_moves_to_track_6_once() {
+        for old in [
+            r#"{"audio_track":1,"guild_id":"g"}"#,
+            r#"{"audio_track":1.0}"#,
+            r#"{"audio_track":1,"config_version":1}"#,
+            r#"{"audio_track":1,"config_version":"x"}"#,
+        ] {
+            let s = DockSettings::from_json(old);
+            assert_eq!(s.audio_track, 6, "{old}");
+            assert_eq!(s.config_version, CONFIG_VERSION, "{old}");
+        }
+        assert_eq!(
+            DockSettings::from_json(r#"{"audio_track":1,"guild_id":"g"}"#)
+                .guild_id
+                .as_deref(),
+            Some("g")
+        );
+        for track in 2..=6u8 {
+            let s = DockSettings::from_json(&format!(r#"{{"audio_track":{track}}}"#));
+            assert_eq!(s.audio_track, track, "a picked track stays");
+        }
+        let picked = DockSettings {
+            audio_track: 1,
+            ..DockSettings::default()
+        };
+        let saved = picked.to_json();
+        assert!(saved.contains(r#""config_version":2"#), "{saved}");
+        assert_eq!(
+            DockSettings::from_json(&saved).audio_track,
+            1,
+            "Track 1 picked after the move stays"
+        );
+        assert!(
+            !saved.contains("managed_track"),
+            "the managed track lives in the scene collection: {saved}"
+        );
+    }
+
+    #[test]
+    fn managed_tracks_are_kept_per_track_and_reset_with_the_collection() {
+        let mut m = DockModel::new(DockSettings::default());
+        assert!(!m.managed());
+        assert!(m.take_over(6));
+        assert!(m.take_over(3));
+        assert!(!m.take_over(7));
+        assert_eq!(m.managed_mixers(), 0b10_0100);
+        assert!(m.managed());
+        assert!(m.select_audio_track(3));
+        assert!(m.managed(), "taking over Track 3 kept Track 6");
+        assert!(m.select_audio_track(4));
+        assert!(!m.managed());
+        m.collection_loaded(0);
+        assert!(!m.manages(3) && !m.manages(6));
+        m.collection_loaded(0xffff_ffff);
+        assert_eq!(m.managed_mixers(), 0b11_1111);
+        assert!(!m.manages(0) && !m.manages(7));
     }
 
     #[test]

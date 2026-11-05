@@ -51,7 +51,6 @@ pub extern "C" fn obs_module_load() -> bool {
         settings_source::register();
         audio::install();
         session::install();
-        // The managed track must be known before OBS loads the scene collection and creates sources.
         settings_source::open_config();
         frontend::install();
         if frontend::available() {

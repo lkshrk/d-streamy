@@ -250,6 +250,13 @@ fn canvas() -> Option<Canvas> {
 /// Start from the dialog or the status-bar panel, on the UI thread.
 #[cfg(unix)]
 pub fn start(wait: Wait) {
+    if let Some(guard) = crate::audio::mic_guard()
+        && with_controls(|c| c.model.state() == &DockState::Idle)
+    {
+        log::warn(&format!("Go Live held back: {}", guard.message()));
+        crate::audio::request_refresh();
+        return;
+    }
     let canvas = canvas();
     let begun = change(|c, p| {
         let Some(canvas) = canvas else {

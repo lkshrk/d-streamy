@@ -7,7 +7,7 @@ use crate::dock::{AUDIO_TRACKS, DockState, track_name};
 use crate::dock_config::ConfigState;
 use crate::dock_view::{Button, Tone, dock_view};
 use crate::live::LiveStats;
-use crate::mixer::{AudioSource, AudioView, audio_view};
+use crate::mixer::{AudioSource, AudioView, CANCEL, CONFIRM, audio_view, mic_guard};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Item {
@@ -79,6 +79,7 @@ pub struct PanelView {
 pub const LOADING: &str = "Loading…";
 pub const NOT_SET_UP: &str = "Not set up";
 pub const NOT_SET_UP_FIX: &str = "Pick a server and voice channel below";
+pub const NO_AUDIO_CONTROLS: &str = "D-Streamy can't change Discord audio on Windows yet.";
 
 fn choices(
     list: &[Named],
@@ -114,15 +115,16 @@ fn choices(
     }
 }
 
-fn audio(state: &ConfigState, sources: &[AudioSource], confirming: bool) -> Audio {
+/// The audio part shows the track Discord hears now while live, else the one the next Go Live sends.
+fn audio(state: &ConfigState, controls: bool, sources: &[AudioSource], confirming: bool) -> Audio {
     let m = &state.model;
-    let track = m.settings().audio_track;
-    let t = track_name(track);
+    let selected = m.settings().audio_track;
+    let track = m.heard_track();
     let tracks = AUDIO_TRACKS
         .map(|n| TrackItem {
             track: n,
             name: track_name(n),
-            selected: n == track,
+            selected: n == selected,
         })
         .collect();
     let mut audio = Audio {
@@ -136,17 +138,18 @@ fn audio(state: &ConfigState, sources: &[AudioSource], confirming: bool) -> Audi
         sources: Vec::new(),
         empty: None,
     };
+    if !controls {
+        audio.line = NO_AUDIO_CONTROLS.to_owned();
+        return audio;
+    }
     match audio_view(m, track, sources) {
-        AudioView::Unmanaged { .. } => {
-            audio.line =
-                format!("Discord hears {t}. Let D-Streamy manage it to pick sources here.");
-            audio.manage = format!("Manage {t}");
+        AudioView::Unmanaged { help, effect, .. } => {
+            audio.line = help;
+            audio.manage = format!("Manage {}", track_name(track));
             audio.confirm = confirming.then(|| Confirm {
-                text: format!(
-                    "Turns {t} off on every audio source, also for recordings or VODs that use it."
-                ),
-                ok: "Manage".to_owned(),
-                cancel: "Cancel".to_owned(),
+                text: effect,
+                ok: CONFIRM.to_owned(),
+                cancel: CANCEL.to_owned(),
             });
         }
         AudioView::Managed { sources, empty, .. } => {
@@ -175,7 +178,9 @@ pub fn panel_view(
 ) -> PanelView {
     let m = &state.model;
     let settings = m.settings();
-    let dock = dock_view(state, controls, live);
+    let idle = m.state() == &DockState::Idle;
+    let blocked = (controls && idle).then(|| mic_guard(m, sources)).flatten();
+    let dock = dock_view(state, controls, live, blocked.as_ref());
     let not_set_up =
         dock.tone == Tone::Idle && (settings.guild_id.is_none() || settings.channel_id.is_none());
     let (state_line, state_fix, state_tooltip) = match dock.tone {
@@ -200,7 +205,6 @@ pub fn panel_view(
             format!("{}\n{}", dock.headline, dock.detail_tooltip),
         ),
     };
-    let idle = m.state() == &DockState::Idle;
     let (loading_guilds, loading_channels) = m.loading();
     PanelView {
         tone: dock.tone,
@@ -231,7 +235,7 @@ pub fn panel_view(
             loading_channels,
             idle && settings.guild_id.is_some(),
         ),
-        audio: audio(state, sources, confirming),
+        audio: audio(state, controls, sources, confirming),
         button: dock.button,
     }
 }
@@ -269,9 +273,11 @@ mod tests {
             guild_id: Some("g".into()),
             channel_id: Some("c".into()),
             audio_track: 6,
-            managed_track: managed.then_some(6),
             ..DockSettings::default()
         });
+        if managed {
+            s.model.take_over(6);
+        }
         s.model.guilds_loaded(Ok(vec![
             named("g", "Beste Chatgruppe"),
             named("h", "Other"),
@@ -289,6 +295,7 @@ mod tests {
                 uuid: format!("u{i}"),
                 name: (*name).into(),
                 mixers: if *name == "Music" { 0b10_0000 } else { 0b1 },
+                mic: false,
             })
             .collect()
     }
@@ -439,7 +446,7 @@ mod tests {
         assert_eq!(v.audio.track, 6);
         assert_eq!(
             v.audio.line,
-            "Discord hears Track 6. Let D-Streamy manage it to pick sources here."
+            "Discord hears every source on Track 6. Let D-Streamy manage Track 6 to pick sources here."
         );
         assert_eq!(v.audio.manage, "Manage Track 6");
         assert_eq!(v.audio.confirm, None);
@@ -449,7 +456,7 @@ mod tests {
         assert_eq!(
             v.audio.confirm,
             Some(Confirm {
-                text: "Turns Track 6 off on every audio source, also for recordings or VODs that use it."
+                text: "Turns Track 6 off on every audio source, also for recordings and streams that use it."
                     .into(),
                 ok: "Manage".into(),
                 cancel: "Cancel".into(),
@@ -497,6 +504,91 @@ mod tests {
         );
         let empty = panel_view(&picked(true), true, None, &[], false);
         assert!(empty.audio.empty.is_some());
+    }
+
+    fn mic_on_track_6() -> Vec<AudioSource> {
+        let mut list = sources();
+        list.push(AudioSource {
+            uuid: "mic".into(),
+            name: "Mic/Aux".into(),
+            mixers: 0b11_1111,
+            mic: true,
+        });
+        list
+    }
+
+    fn live(mut s: ConfigState) -> ConfigState {
+        s.model
+            .start(Canvas {
+                fps_num: 30,
+                fps_den: 1,
+                output_width: 1280,
+                output_height: 720,
+            })
+            .unwrap();
+        s.model.claim(None);
+        s.model.started(Ok(Started {
+            ownership: None,
+            channel: "c".into(),
+        }));
+        s
+    }
+
+    #[test]
+    fn a_mic_on_the_unmanaged_track_blocks_go_live_and_says_how_to_fix_it() {
+        let v = panel_view(&picked(false), true, None, &mic_on_track_6(), false);
+        assert_eq!(v.tone, Tone::Attention);
+        assert_eq!(v.state_line, "Discord would hear your mic");
+        assert_eq!(v.state_fix, "Let D-Streamy manage Track 6");
+        assert!(
+            v.state_tooltip
+                .starts_with("Mic/Aux is on Track 6, so Discord would hear it."),
+            "{}",
+            v.state_tooltip
+        );
+        assert!(!v.button.enabled, "Start is held back");
+        assert_eq!(v.audio.manage, "Manage Track 6", "the fix is right there");
+        assert!(
+            v.audio.line.contains("including Mic/Aux"),
+            "{}",
+            v.audio.line
+        );
+
+        let managed = panel_view(&picked(true), true, None, &mic_on_track_6(), false);
+        assert!(managed.button.enabled, "a managed track can go live");
+        let no_mic = view(&picked(false));
+        assert!(no_mic.button.enabled, "nothing to hold back without a mic");
+        let live = panel_view(&live(picked(false)), true, None, &mic_on_track_6(), false);
+        assert_eq!(live.tone, Tone::Live, "a running session is left alone");
+    }
+
+    #[test]
+    fn while_live_the_audio_part_shows_the_track_discord_hears() {
+        let mut s = live(picked(true));
+        assert!(s.model.select_audio_track(3));
+        let v = panel_view(&s, true, None, &sources(), false);
+        assert_eq!(v.audio.track, 6, "Discord still hears Track 6");
+        assert!(v.audio.managed);
+        assert_eq!(v.audio.sources.iter().filter(|s| s.on).count(), 1);
+        let picked: Vec<u8> = v
+            .audio
+            .tracks
+            .iter()
+            .filter(|t| t.selected)
+            .map(|t| t.track)
+            .collect();
+        assert_eq!(picked, [3], "the next Go Live's pick stays selected");
+    }
+
+    #[test]
+    fn without_controls_the_panel_never_offers_to_change_mixers() {
+        let v = panel_view(&picked(false), false, None, &mic_on_track_6(), true);
+        assert_eq!(v.audio.line, NO_AUDIO_CONTROLS);
+        assert_eq!(v.audio.manage, "");
+        assert_eq!(v.audio.confirm, None);
+        assert!(!v.audio.managed);
+        let v = panel_view(&picked(true), false, None, &sources(), false);
+        assert!(v.audio.sources.is_empty() && !v.audio.managed);
     }
 
     #[test]

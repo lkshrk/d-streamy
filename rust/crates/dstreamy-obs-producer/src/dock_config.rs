@@ -517,6 +517,25 @@ mod tests {
     }
 
     #[test]
+    fn an_old_file_on_track_1_opens_on_track_6_and_saves_the_move() {
+        let f = File::new(Some(r#"{"audio_track":1,"guild_id":"g"}"#));
+        let mut s = ConfigState::default();
+        open(&mut s, &f);
+        assert_eq!(s.model.settings().audio_track, 6);
+        s.edit(f.write(), |m| m.choose_guild(Some("h")));
+        let saved: Value = serde_json::from_str(&f.text.borrow().clone().unwrap()).unwrap();
+        assert_eq!(saved["config_version"], 2);
+        assert_eq!(saved["audio_track"], 6);
+        assert!(s.select_audio_track(1, f.write()));
+        open(&mut s, &f);
+        assert_eq!(
+            s.model.settings().audio_track,
+            1,
+            "a later pick of Track 1 stays"
+        );
+    }
+
+    #[test]
     fn a_read_error_keeps_the_model_and_is_shown() {
         let mut s = ConfigState::default();
         s.model.select_audio_track(3);
@@ -616,11 +635,11 @@ mod tests {
             assert!(s.select_audio_track(5, |_| panic!("{unusable}: blocked")));
             s.open(read, |_| panic!("{unusable}: still blocked"));
             assert_eq!(s.model.settings().audio_track, 5, "{unusable}");
-            let f = File::new(Some(r#"{"audio_track":1}"#));
+            let f = File::new(Some(r#"{"audio_track":2}"#));
             open(&mut s, &f);
             assert_eq!(
                 s.model.settings().audio_track,
-                1,
+                2,
                 "{unusable}: the repaired file is loaded"
             );
             assert_eq!(s.error(), None);

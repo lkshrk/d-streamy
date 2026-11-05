@@ -7,6 +7,7 @@
 
 typedef void (*obs_frontend_cb)(void *private_data);
 typedef void (*obs_frontend_event_cb)(int event, void *private_data);
+typedef void (*obs_frontend_save_cb)(obs_data_t *save_data, bool saving, void *private_data);
 
 // OBS_FRONTEND_EVENT_EXIT in obs-frontend-api.h.
 #define FAKE_FRONTEND_EVENT_EXIT 17
@@ -23,6 +24,15 @@ static struct {
 } event_callbacks[EVENT_CALLBACKS_MAX];
 static size_t event_callback_count;
 static bool exited;
+
+struct save_callbacks {
+	struct {
+		obs_frontend_save_cb callback;
+		void *private_data;
+	} list[EVENT_CALLBACKS_MAX];
+	size_t count;
+};
+static struct save_callbacks save_callbacks, preload_callbacks;
 
 EXPORT void obs_frontend_add_tools_menu_item(const char *name, obs_frontend_cb callback, void *private_data)
 {
@@ -106,6 +116,81 @@ EXPORT size_t fake_frontend_exit(void)
 	for (size_t i = event_callback_count; i > 0; i--)
 		event_callbacks[i - 1].callback(FAKE_FRONTEND_EVENT_EXIT, event_callbacks[i - 1].private_data);
 	event_callback_count = 0;
+	save_callbacks.count = 0;
+	preload_callbacks.count = 0;
 	exited = true;
 	return count;
+}
+
+static void add_save_callback(struct save_callbacks *to, obs_frontend_save_cb callback, void *private_data)
+{
+	if (!callbacks_valid("obs_frontend_add_save_callback"))
+		return;
+	if (to->count < EVENT_CALLBACKS_MAX) {
+		to->list[to->count].callback = callback;
+		to->list[to->count].private_data = private_data;
+		to->count++;
+	}
+}
+
+static void remove_save_callback(struct save_callbacks *from, obs_frontend_save_cb callback, void *private_data)
+{
+	if (!callbacks_valid("obs_frontend_remove_save_callback"))
+		return;
+	for (size_t i = 0; i < from->count; i++) {
+		if (from->list[i].callback != callback || from->list[i].private_data != private_data)
+			continue;
+		memmove(from->list + i, from->list + i + 1, (from->count - i - 1) * sizeof(from->list[0]));
+		from->count--;
+		return;
+	}
+}
+
+EXPORT void obs_frontend_add_save_callback(obs_frontend_save_cb callback, void *private_data)
+{
+	add_save_callback(&save_callbacks, callback, private_data);
+}
+
+EXPORT void obs_frontend_remove_save_callback(obs_frontend_save_cb callback, void *private_data)
+{
+	remove_save_callback(&save_callbacks, callback, private_data);
+}
+
+EXPORT void obs_frontend_add_preload_callback(obs_frontend_save_cb callback, void *private_data)
+{
+	add_save_callback(&preload_callbacks, callback, private_data);
+}
+
+EXPORT void obs_frontend_remove_preload_callback(obs_frontend_save_cb callback, void *private_data)
+{
+	remove_save_callback(&preload_callbacks, callback, private_data);
+}
+
+// OBSStudioAPI::on_save, on_preload and on_load: newest callback first.
+static void run_save_callbacks(struct save_callbacks *callbacks, obs_data_t *data, bool saving)
+{
+	for (size_t i = callbacks->count; i > 0; i--)
+		callbacks->list[i - 1].callback(data, saving, callbacks->list[i - 1].private_data);
+}
+
+EXPORT void fake_frontend_save(obs_data_t *modules)
+{
+	run_save_callbacks(&save_callbacks, modules, true);
+}
+
+EXPORT void fake_frontend_preload(obs_data_t *modules)
+{
+	run_save_callbacks(&preload_callbacks, modules, false);
+}
+
+EXPORT void fake_frontend_load(obs_data_t *modules)
+{
+	run_save_callbacks(&save_callbacks, modules, false);
+}
+
+// OBSStudioAPI::on_event, without OBSBasic's disableSaving filter.
+EXPORT void fake_frontend_event(int event)
+{
+	for (size_t i = event_callback_count; i > 0; i--)
+		event_callbacks[i - 1].callback(event, event_callbacks[i - 1].private_data);
 }

@@ -348,8 +348,9 @@ void render()
 	bool confirming = confirm.isObject();
 	ui.audio_line->setText(audio.value("line").toString());
 	ui.audio_line->setVisible(!managed && !confirming);
-	ui.manage->setText(audio.value("manage").toString());
-	ui.manage->setVisible(!managed && !confirming);
+	QString manage = audio.value("manage").toString();
+	ui.manage->setText(manage);
+	ui.manage->setVisible(!managed && !confirming && !manage.isEmpty());
 	ui.confirm_row->setVisible(confirming);
 	if (confirming) {
 		QJsonObject c = confirm.toObject();
