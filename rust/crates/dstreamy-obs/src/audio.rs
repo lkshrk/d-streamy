@@ -10,9 +10,11 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use dstreamy_obs_producer::mixer::{
-    AudioSource, MIC_AUX_CHANNELS, MicGuard, is_input_device, mic_guard as guard_for,
-    restored_managed, restored_mixers, track_bit, with_track,
+    AudioSource, MIC_AUX_CHANNELS, is_input_device, restored_managed, restored_mixers, track_bit,
+    with_track,
 };
+#[cfg(unix)]
+use dstreamy_obs_producer::mixer::{MicGuard, mic_guard as guard_for};
 use dstreamy_obs_sys as sys;
 
 use crate::guard::guard;
@@ -176,6 +178,7 @@ pub fn set_source(uuid: &str, track: u8, on: bool) -> bool {
 }
 
 /// Why Go Live must wait: the next start's track is unmanaged and carries a microphone.
+#[cfg(unix)]
 pub fn mic_guard() -> Option<MicGuard> {
     let audio = sources();
     with_controls(|c| guard_for(&c.model, &audio))
