@@ -28,6 +28,8 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 
+#include <memory>
+
 namespace {
 
 constexpr int poll_ms = 500;
@@ -51,7 +53,9 @@ public:
 	void show_text(const QString &text, const QString &tooltip)
 	{
 		setText(text);
-		setToolTip(plain_tip(tooltip.isEmpty() ? text : tooltip));
+		const QString &tip = tooltip.isEmpty() ? text : tooltip;
+		setToolTip(plain_tip(tip));
+		setAccessibleDescription(tip);
 		update_shown();
 	}
 
@@ -88,6 +92,17 @@ private:
 };
 
 void panel_hidden();
+void fail_later(const char *call);
+
+// A slot runs from Qt's event loop, where an exception would end OBS; drop the panel instead.
+template<typename F> void guarded(const char *call, F &&body)
+{
+	try {
+		body();
+	} catch (...) {
+		fail_later(call);
+	}
+}
 
 class Panel : public QFrame {
 public:
@@ -111,7 +126,7 @@ protected:
 	void hideEvent(QHideEvent *event) override
 	{
 		QFrame::hideEvent(event);
-		panel_hidden();
+		guarded("panel_closed", panel_hidden);
 	}
 };
 
@@ -156,7 +171,7 @@ void rerender()
 {
 	ui.shown.clear();
 	if (ui.status)
-		QTimer::singleShot(0, ui.status, [] { render(); });
+		QTimer::singleShot(0, ui.status, [] { guarded("render", render); });
 }
 
 void panel_hidden()
@@ -250,19 +265,23 @@ void fill_sources(const QJsonArray &sources)
 			QJsonObject s = v.toObject();
 			QString name = s.value("name").toString();
 			auto *box = new QCheckBox(ui.sources);
+			box->ensurePolished();
 			QString shown = box->fontMetrics().elidedText(name, Qt::ElideRight, column);
 			box->setText(shown.replace(QLatin1Char('&'), QLatin1String("&&")));
 			box->setToolTip(plain_tip(name));
 			box->setAccessibleName(name);
+			box->setAccessibleDescription(name);
 			box->setProperty("name", name);
 			box->setObjectName(QStringLiteral("dstreamy-source"));
 			box->setProperty("uuid", s.value("uuid").toString());
 			QObject::connect(box, &QCheckBox::clicked, box, [box](bool on) {
-				if (!ui.active)
-					return;
-				ui.host.set_source(ui.host.ctx, box->property("uuid").toString().toUtf8().constData(),
-						   on);
-				rerender();
+				guarded("set_source", [box, on] {
+					if (!ui.active)
+						return;
+					QByteArray uuid = box->property("uuid").toString().toUtf8();
+					ui.host.set_source(ui.host.ctx, uuid.constData(), on);
+					rerender();
+				});
 			});
 			grid->addWidget(box, i / 2, i % 2);
 			i++;
@@ -310,10 +329,12 @@ void fill_notices(const QJsonArray &notices)
 		b->setText(release.toObject().value("label").toString());
 		int track = release.toObject().value("track").toInt();
 		QObject::connect(b, &QPushButton::clicked, b, [track] {
-			if (!ui.active)
-				return;
-			ui.host.release_track(ui.host.ctx, track);
-			rerender();
+			guarded("release_track", [track] {
+				if (!ui.active)
+					return;
+				ui.host.release_track(ui.host.ctx, track);
+				rerender();
+			});
 		});
 		rows->addWidget(b, 0, Qt::AlignLeft);
 	}
@@ -388,7 +409,9 @@ void render()
 	if (ui.status) {
 		ui.status->setText(view.value("status_bar").toString().replace(QLatin1Char('&'), QLatin1String("&&")));
 		ui.status->setStyleSheet(color);
-		ui.status->setToolTip(plain_tip(view.value("status_tooltip").toString()));
+		QString tip = view.value("status_tooltip").toString();
+		ui.status->setToolTip(plain_tip(tip));
+		ui.status->setAccessibleDescription(tip);
 	}
 
 	ui.panel->setProperty("tone", view.value("tone").toString());
@@ -443,7 +466,7 @@ void render()
 	if (ui.panel->isVisible()) {
 		place_panel();
 		// Rows shown or hidden above settle their layout only once events run.
-		QTimer::singleShot(0, ui.panel, [] { place_panel(); });
+		QTimer::singleShot(0, ui.panel, [] { guarded("place_panel", place_panel); });
 	}
 }
 
@@ -468,12 +491,12 @@ bool open_panel()
 		return true;
 	}
 	ui.host.load_lists(ui.host.ctx);
+	ui.panel->ensurePolished();
 	ui.shown.clear();
 	render();
-	ui.panel->ensurePolished();
 	place_panel();
 	ui.panel->show();
-	// A window's first show can still offset it by its frame margins.
+	// The offscreen platform moves a new window by its emulated frame on first show.
 	place_panel();
 	ui.panel->raise();
 	ui.panel->activateWindow();
@@ -491,16 +514,20 @@ void toggle_panel()
 void choose(QComboBox *box, void (*callback)(void *, const char *))
 {
 	QObject::connect(box, &QComboBox::activated, box, [box, callback](int index) {
-		if (!ui.active)
-			return;
-		callback(ui.host.ctx, box->itemData(index).toString().toUtf8().constData());
-		rerender();
+		guarded("select", [box, callback, index] {
+			if (!ui.active)
+				return;
+			QByteArray id = box->itemData(index).toString().toUtf8();
+			callback(ui.host.ctx, id.constData());
+			rerender();
+		});
 	});
 }
 
 Panel *build_panel()
 {
-	auto *panel = new Panel();
+	auto owner = std::make_unique<Panel>();
+	Panel *panel = owner.get();
 	auto *rows = new QVBoxLayout(panel);
 
 	auto *state = new QHBoxLayout();
@@ -543,10 +570,12 @@ Panel *build_panel()
 	ui.tracks = new QComboBox(panel);
 	ui.tracks->setObjectName(QStringLiteral("dstreamy-tracks"));
 	QObject::connect(ui.tracks, &QComboBox::activated, ui.tracks, [](int index) {
-		if (!ui.active)
-			return;
-		ui.host.set_track(ui.host.ctx, ui.tracks->itemData(index).toInt());
-		rerender();
+		guarded("set_track", [index] {
+			if (!ui.active)
+				return;
+			ui.host.set_track(ui.host.ctx, ui.tracks->itemData(index).toInt());
+			rerender();
+		});
 	});
 	audio->addWidget(ui.audio_title);
 	audio->addStretch(1);
@@ -565,10 +594,12 @@ Panel *build_panel()
 	rows->addWidget(ui.audio_line);
 	ui.manage = button("dstreamy-manage", panel);
 	QObject::connect(ui.manage, &QPushButton::clicked, ui.manage, [] {
-		if (!ui.active)
-			return;
-		ui.host.request_take_over(ui.host.ctx);
-		rerender();
+		guarded("request_take_over", [] {
+			if (!ui.active)
+				return;
+			ui.host.request_take_over(ui.host.ctx);
+			rerender();
+		});
 	});
 	rows->addWidget(ui.manage, 0, Qt::AlignLeft);
 
@@ -584,20 +615,24 @@ Panel *build_panel()
 	ui.confirm_cancel = button("dstreamy-confirm-cancel", ui.confirm_row);
 	auto answer = [](QPushButton *b, bool yes) {
 		QObject::connect(b, &QPushButton::clicked, b, [yes] {
-			if (!ui.active)
-				return;
-			ui.host.confirm_take_over(ui.host.ctx, yes);
-			rerender();
+			guarded("confirm_take_over", [yes] {
+				if (!ui.active)
+					return;
+				ui.host.confirm_take_over(ui.host.ctx, yes);
+				rerender();
+			});
 		});
 	};
 	answer(ui.confirm_ok, true);
 	answer(ui.confirm_cancel, false);
 	ui.confirm_instead = button("dstreamy-confirm-instead", ui.confirm_row);
 	QObject::connect(ui.confirm_instead, &QPushButton::clicked, ui.confirm_instead, [] {
-		if (!ui.active)
-			return;
-		ui.host.set_track(ui.host.ctx, ui.confirm_instead->property("track").toInt());
-		rerender();
+		guarded("set_track", [] {
+			if (!ui.active)
+				return;
+			ui.host.set_track(ui.host.ctx, ui.confirm_instead->property("track").toInt());
+			rerender();
+		});
 	});
 	answers->addStretch(1);
 	answers->addWidget(ui.confirm_cancel);
@@ -624,10 +659,10 @@ Panel *build_panel()
 
 	ui.action = button("dstreamy-action", panel);
 	ui.action->setEnabled(false);
-	QObject::connect(ui.action, &QPushButton::clicked, ui.action, [] { press(); });
+	QObject::connect(ui.action, &QPushButton::clicked, ui.action, [] { guarded("start_stop", press); });
 	rows->addWidget(ui.action, 0, Qt::AlignRight);
 	panel->setFixedWidth(320);
-	return panel;
+	return owner.release();
 }
 
 void teardown()
@@ -643,6 +678,7 @@ void teardown()
 
 bool exited;
 bool watching;
+bool failing;
 
 void on_exit()
 {
@@ -656,28 +692,29 @@ bool load(const struct dstreamy_ui_host *host)
 	if (ui.active || !host || host->abi_version != DSTREAMY_UI_ABI_VERSION || !host->view_json ||
 	    !host->free_string || !host->start || !host->stop || !host->load_lists || !host->select_guild ||
 	    !host->select_channel || !host->set_track || !host->request_take_over || !host->confirm_take_over ||
-	    !host->set_source || !host->panel_closed || !host->release_track)
+	    !host->set_source || !host->panel_closed || !host->release_track || failing)
 		return false;
 	QMainWindow *window = dstreamy_ui::main_window();
 	if (!window)
 		return false;
+	exited = false;
 
 	ui.host = *host;
 	ui.window = window;
 	ui.panel = build_panel();
+	ui.panel->ensurePolished();
 
 	ui.status = new QToolButton();
 	ui.status->setObjectName(QStringLiteral("dstreamy-status"));
 	ui.status->setAutoRaise(true);
-	QObject::connect(ui.status, &QToolButton::clicked, ui.status, [] { toggle_panel(); });
+	QObject::connect(ui.status, &QToolButton::clicked, ui.status, [] { guarded("open_panel", toggle_panel); });
 	window->statusBar()->addPermanentWidget(ui.status);
 
 	ui.timer = new QTimer(ui.status);
 	ui.timer->setInterval(poll_ms);
-	QObject::connect(ui.timer, &QTimer::timeout, ui.status, [] { render(); });
+	QObject::connect(ui.timer, &QTimer::timeout, ui.status, [] { guarded("render", render); });
 	ui.timer->start();
 
-	exited = false;
 	dstreamy_ui::watch_exit(on_exit);
 	watching = true;
 	ui.active = true;
@@ -706,6 +743,23 @@ void failed(const char *call)
 	} catch (...) {
 		ui.active = false;
 	}
+}
+
+// The throwing slot may belong to a widget teardown deletes, so the teardown waits for the event loop.
+void fail_later(const char *call)
+{
+	dstreamy_ui::warn(call);
+	ui.active = false;
+	if (failing)
+		return;
+	failing = true;
+	QTimer::singleShot(0, QCoreApplication::instance(), [] {
+		failing = false;
+		try {
+			unload();
+		} catch (...) {
+		}
+	});
 }
 
 } // namespace

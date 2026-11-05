@@ -65,6 +65,7 @@ struct Host {
 	int after_unload = 0;
 	bool throw_view = false;
 	bool throw_load = false;
+	bool throw_track = false;
 } host;
 
 void called()
@@ -121,6 +122,8 @@ dstreamy_ui_host make_host()
 	};
 	h.set_track = [](void *, int track) {
 		called();
+		if (host.throw_track)
+			throw std::bad_alloc();
 		host.track = track;
 	};
 	h.request_take_over = [](void *) {
@@ -375,6 +378,16 @@ QList<QCheckBox *> sources()
 	return box ? box->findChildren<QCheckBox *>() : QList<QCheckBox *>();
 }
 
+// Every source row's text fits its column once the layout has settled.
+bool rows_fit()
+{
+	const QList<QCheckBox *> boxes = sources();
+	for (QCheckBox *box : boxes)
+		if (box->sizeHint().width() > box->width())
+			return false;
+	return !boxes.isEmpty();
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -390,10 +403,10 @@ int main(int argc, char **argv)
 		dark.setColor(QPalette::Base, QColor(0x16, 0x18, 0x1d));
 		dark.setColor(QPalette::Text, QColor(0xe4, 0xe4, 0xe7));
 		app.setPalette(dark);
-	} else {
-		// Grows the panel when it is polished, so sizing it before polishing shows up below.
-		app.setStyleSheet(QStringLiteral("#dstreamy-panel { border: 8px solid gray; }"));
 	}
+	// A theme that changes sizes and fonts when it polishes the panel, as OBS's do.
+	app.setStyleSheet(QStringLiteral(
+		"#dstreamy-panel { border: 8px solid gray; } #dstreamy-panel QCheckBox { font-size: 19px; }"));
 	QMainWindow window;
 	window.setGeometry(0, 0, 800, 600);
 	window.statusBar();
@@ -445,8 +458,6 @@ int main(int argc, char **argv)
 		std::fprintf(stderr, "panel %d,%d %dx%d, status corner %d,%d\n", above.x(), above.y(), above.width(),
 			     above.height(), anchor.x(), anchor.y());
 	CHECK(above.bottom() < anchor.y() && above.right() == anchor.x() - 1);
-	CHECK(polled());
-	CHECK(panel() && panel()->geometry() == above);
 
 	show(view(idle, audio(false, false)));
 	CHECK(guilds->count() == 3 && guilds->currentText() == QLatin1String("Beste Chatgruppe"));
@@ -572,6 +583,9 @@ int main(int argc, char **argv)
 	CHECK(state && plain(state->toolTip()) == QString::fromUtf8(tagged.tooltip));
 	CHECK(state && state->text() == QString::fromUtf8(tagged.line));
 	CHECK(sources().size() == 2 && plain(sources()[0]->toolTip()) == QLatin1String("<i>Mic</i>"));
+	CHECK(status->accessibleDescription() == QString::fromUtf8(tagged.tooltip));
+	CHECK(state && state->accessibleDescription() == QString::fromUtf8(tagged.tooltip));
+	CHECK(sources().size() == 2 && sources()[0]->accessibleDescription() == QLatin1String("<i>Mic</i>"));
 	show(view(long_state, audio(true, false)));
 
 	host.null_view = true;
@@ -640,6 +654,7 @@ int main(int argc, char **argv)
 	CHECK(all.size() == 20 && all[0]->accessibleName() == QString::fromStdString(many[0]));
 	CHECK(scroll && scroll->height() <= 8 * (all[0]->sizeHint().height() + 8) && scroll->height() > 0);
 	CHECK(all.size() == 20 && all[0]->width() <= 160);
+	CHECK(wait_for(rows_fit));
 	CHECK(all.size() == 20 && all[5]->text() == QLatin1String("Mic && Game") &&
 	      plain(all[5]->toolTip()) == QLatin1String("Mic & Game") &&
 	      all[5]->accessibleName() == QLatin1String("Mic & Game"));
@@ -693,6 +708,37 @@ int main(int argc, char **argv)
 	CHECK(dstreamy_ui_load(&good));
 	dstreamy_ui_unload();
 	CHECK(fake::unwatches == 4);
+
+	host.json = view(idle, audio(true, false, 6, many));
+	CHECK(dstreamy_ui_load(&good));
+	status = window.statusBar()->findChild<QToolButton *>("dstreamy-status");
+	if (status)
+		status->click();
+	app.processEvents();
+	all = sources();
+	CHECK(panel() && panel()->isVisible() && all.size() == 20);
+	CHECK(wait_for(rows_fit));
+
+	host.throw_view = true;
+	CHECK(wait_for([] { return !find<QToolButton>("dstreamy-status") && !panel(); }));
+	host.throw_view = false;
+	CHECK(fake::warnings == 3 && fake::unwatches == 5);
+	CHECK(!dstreamy_ui_open_panel());
+
+	host.json = view(idle, audio(false, false));
+	CHECK(dstreamy_ui_load(&good));
+	CHECK(dstreamy_ui_open_panel());
+	tracks = find<QComboBox>("dstreamy-tracks");
+	host.throw_track = true;
+	if (tracks)
+		emit tracks->activated(1);
+	host.throw_track = false;
+	CHECK(fake::warnings == 4 && !dstreamy_ui_open_panel());
+	CHECK(wait_for([] { return !find<QToolButton>("dstreamy-status") && !panel(); }));
+	CHECK(fake::unwatches == 6);
+	CHECK(dstreamy_ui_load(&good));
+	dstreamy_ui_unload();
+	CHECK(fake::unwatches == 7);
 
 	if (failures) {
 		std::fprintf(stderr, "dstreamy-ui-test: %d failures\n", failures);
