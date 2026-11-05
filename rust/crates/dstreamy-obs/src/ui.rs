@@ -198,7 +198,7 @@ pub fn open_panel() -> Option<bool> {
 
 /// A panel that didn't show, or threw while opening, is closed for the host's state too.
 fn opened(shown: bool) {
-    if !shown {
+    if !shown && panel_open() {
         panel_closed(ptr::null_mut());
     }
 }
@@ -646,6 +646,9 @@ pub(crate) mod tests {
         assert!(panel_open());
         opened(false);
         assert!(!panel_open() && !confirming());
+        change(|c, _| c.model.restore_failed(1 << 5));
+        opened(false);
+        assert_ne!(with_controls(|c| c.model.unrestored_mixers()), 0);
         reset();
     }
 
