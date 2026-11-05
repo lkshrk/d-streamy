@@ -26,7 +26,7 @@ const PACING_SLACK_US: i64 = 20_000;
 const JITTER_MARGIN_US: i64 = 10_000;
 const STALL_TICK: Duration = Duration::from_millis(2);
 const STALL_MIN: Duration = Duration::from_millis(10);
-// The A/V median needs 10 unique payloads; the restart trace repeats frames 9 and 11 later, so 15 frames leave 13.
+// The A/V median needs MIN_MEDIAN_FRAMES unique payloads; the restart trace repeats frames 9 and 11 later, so 15 frames leave 13.
 const MIN_BASELINE_FRAMES: usize = 15;
 /// The fewest matched frames a median lag is taken from.
 const MIN_MEDIAN_FRAMES: usize = 10;
@@ -558,17 +558,14 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
     let canary = StallCanary::start(&h.rt);
     let mut serve = h.serve();
     let mut c = h.external_session();
+    let window = send_window(Instant::now(), &want);
     let p = h.replay(dir, &[]);
     let id = p.attached();
-    let sending_from = Instant::now();
     c.source("producing", |e| {
         e["state"] == "producing" && e["attachment"] == id
     });
     let (frames, packets) = (want.video.len(), want.audio.len());
-    let dts = || want.video.iter().chain(&want.audio).map(|s| s.dts_usec);
-    let span =
-        Duration::from_micros((dts().max().unwrap_or(0) - dts().min().unwrap_or(0)).unsigned_abs());
-    let deadline = Instant::now() + span + T;
+    let deadline = Instant::now() + (window.1 - window.0) + T;
     let mut sent_plis = 0;
     let recorded = loop {
         if plis && sent_plis < 40 && h.rt.block_on(h.mock.send_pli(VoiceKind::Stream)) {
@@ -590,15 +587,14 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
                 producer_audio(&r).len(),
                 r.dropped_frames
             );
+            let stalls: Vec<Stall> = canary
+                .stalls()
+                .into_iter()
+                .filter(|&(from, to)| to > window.0 && from < window.1)
+                .collect();
             match c.try_status() {
-                Ok(s) => match serve_drops(&s, &canary.stalls()) {
-                    Some(drops)
-                        if stalls_fill_queue(
-                            &canary.stalls(),
-                            (sending_from, sending_from + span),
-                            want.fps,
-                        ) =>
-                    {
+                Ok(s) => match serve_drops(&s, &stalls, window.0) {
+                    Some(drops) if overflow_explained(&s, &stalls, window, want.fps) => {
                         return Err(Stalled(format!("{counts}; {drops}")));
                     }
                     Some(drops) => panic!("{counts}; {drops}"),
@@ -652,16 +648,49 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
     .map(drop)
 }
 
-/// Whether stalls of at least a frame while the trace was being sent add up to serve's video queue, which it then drops to a keyframe by design.
+/// From just before the producer starts until the trace's last frame is due, at its dts pace.
+fn send_window(before_replay: Instant, want: &Expected) -> (Instant, Instant) {
+    let dts = || want.video.iter().chain(&want.audio).map(|s| s.dts_usec);
+    let span = dts().max().unwrap_or(0) - dts().min().unwrap_or(0);
+    (
+        before_replay,
+        before_replay + Duration::from_micros(span.unsigned_abs()),
+    )
+}
+
+/// Serve's drops came from its video queue overflowing, not from send or transport errors, and stalls explain the overflow.
+fn overflow_explained(
+    status: &Value,
+    stalls: &[Stall],
+    window: (Instant, Instant),
+    fps: i64,
+) -> bool {
+    let stats = &status["stats"];
+    stats["last_error"].is_null()
+        && stats["keyframe_requests"].as_u64().is_some_and(|n| n > 0)
+        && stalls_fill_queue(stalls, window, fps)
+}
+
+/// Whether stalls of at least a frame inside `window`, close enough together, add up to serve's video queue.
 fn stalls_fill_queue(stalls: &[Stall], (first, last): (Instant, Instant), fps: i64) -> bool {
     let frame = Duration::from_micros((1_000_000 / fps.max(1)) as u64);
     let queue = frame * StreamOptions::default().max_queued_video as u32;
-    let stalled: Duration = stalls
+    let mut clipped: Vec<Stall> = stalls
         .iter()
         .filter(|&&(from, to)| to - from >= frame)
-        .map(|&(from, to)| to.min(last).saturating_duration_since(from.max(first)))
-        .sum();
-    stalled >= queue
+        .map(|&(from, to)| (from.max(first), to.min(last)))
+        .filter(|&(from, to)| to > from)
+        .collect();
+    clipped.sort();
+    clipped.iter().any(|&(start, _)| {
+        let reach = start + queue * 2;
+        let stalled: Duration = clipped
+            .iter()
+            .filter(|&&(from, _)| from >= start && from < reach)
+            .map(|&(from, to)| to.min(reach) - from)
+            .sum();
+        stalled >= queue
+    })
 }
 
 fn annotation(line: &str) -> String {
@@ -1114,14 +1143,14 @@ fn stall_summary(stalls: &[Stall], origin: Instant) -> String {
 }
 
 /// Serve's own drops to a keyframe, which a stall that overfills its video queue causes by design.
-fn serve_drops(status: &Value, stalls: &[Stall]) -> Option<String> {
+fn serve_drops(status: &Value, stalls: &[Stall], origin: Instant) -> Option<String> {
     let dropped = status["stats"]["video_frames_dropped"]
         .as_u64()
         .filter(|&n| n > 0)?;
-    let origin = stalls.first().map_or_else(Instant::now, |s| s.0);
     Some(format!(
-        "serve dropped {dropped} video frames to a keyframe ({} keyframe requests); {}",
+        "serve dropped {dropped} video frames ({} keyframe requests, last error {}); {}",
         status["stats"]["keyframe_requests"],
+        status["stats"]["last_error"],
         stall_summary(stalls, origin)
     ))
 }
@@ -1135,10 +1164,11 @@ fn wait_or_drops<V>(
     f: impl FnMut(&Recorded) -> Option<V>,
 ) -> V {
     h.rt.block_on(h.mock.wait_for(T, f)).unwrap_or_else(|| {
-        let drops = c
-            .try_status()
-            .ok()
-            .and_then(|s| serve_drops(&s, &canary.stalls()));
+        let drops = c.try_status().ok().and_then(|s| {
+            let stalls = canary.stalls();
+            let origin = stalls.first().map_or_else(Instant::now, |s| s.0);
+            serve_drops(&s, &stalls, origin)
+        });
         match drops {
             Some(drops) => panic!("mock never saw {what}; {drops}"),
             None => panic!("mock never saw {what}"),
@@ -1207,7 +1237,9 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
 
     let (v1, v2) = split(&stream_video(&recorded), |v| v.received_at, reattached);
     let (a1, a2) = split(&producer_audio(&recorded), |a| a.received_at, reattached);
-    let drops = serve_drops(&c.status(), &canary.stalls());
+    let stalls = canary.stalls();
+    let origin = stalls.first().map_or_else(Instant::now, |s| s.0);
+    let drops = serve_drops(&c.status(), &stalls, origin);
     assert!(
         is_keyframe(&v2[0].data),
         "first video after the gap is not an IDR; {drops:?}; stalls {:?}",
@@ -1312,15 +1344,30 @@ fn serve_drops_make_a_replay_inconclusive_only_after_stalls_that_fill_its_queue(
         ),
         "stalls shorter than a frame cannot fill the queue however many"
     );
-    assert!(fills(
-        &[
-            stall(100, 80),
-            stall(400, 115),
-            stall(900, 34),
-            stall(1500, 46)
-        ],
-        30
-    ));
+    assert!(
+        !fills(
+            &[
+                stall(100, 80),
+                stall(400, 115),
+                stall(900, 34),
+                stall(1500, 46)
+            ],
+            30
+        ),
+        "scattered stalls drain between each other"
+    );
+    assert!(
+        fills(&[stall(100, 150), stall(350, 150)], 30),
+        "two stalls within twice the queue's length add up"
+    );
+    assert!(
+        !fills(&[stall(100, 150), stall(1_000, 150)], 30),
+        "two stalls further apart do not"
+    );
+    assert!(
+        fills(&[stall(-100, 388)], 30),
+        "the part of a stall straddling the start counts"
+    );
     assert!(
         !fills(&[stall(5_100, 400), stall(-200, 250)], 30),
         "stalls outside the time the trace was sent do not count"
@@ -1356,6 +1403,63 @@ fn stall_summaries_are_short_and_relative() {
     );
     let many: Vec<Stall> = (0..20).map(|i| at(i * 100, 20)).collect();
     assert!(stall_summary(&many, start).ends_with(", …)"));
+    let twelve: Vec<Stall> = (0..12).map(|i| at(i * 100, 20)).collect();
+    let all = stall_summary(&twelve, start);
+    assert!(all.ends_with("+1100/20)"), "{all}");
+}
+
+#[test]
+fn the_send_window_starts_before_the_replay_and_spans_the_trace() {
+    let sent = |dts_usec| Sent {
+        key: Vec::new(),
+        pts_us: dts_usec,
+        dts_usec,
+    };
+    let want = Expected {
+        fps: 30,
+        video: vec![sent(1_000), sent(2_000_000)],
+        audio: vec![sent(-20_000), sent(4_980_000)],
+    };
+    let before = Instant::now();
+    let (from, to) = send_window(before, &want);
+    assert_eq!(from, before);
+    assert_eq!(to - from, Duration::from_secs(5));
+}
+
+#[test]
+fn only_queue_overflow_without_errors_is_excused() {
+    let origin = Instant::now();
+    let window = (origin, origin + Duration::from_secs(5));
+    let long = [(
+        origin + Duration::from_secs(1),
+        origin + Duration::from_millis(1_300),
+    )];
+    let status = |last_error: Value, requests: u64| serde_json::json!({"stats": {"last_error": last_error, "keyframe_requests": requests, "video_frames_dropped": 40}});
+    assert!(overflow_explained(
+        &status(Value::Null, 2),
+        &long,
+        window,
+        30
+    ));
+    assert!(
+        !overflow_explained(
+            &status(Value::String("write failed".into()), 2),
+            &long,
+            window,
+            30
+        ),
+        "drops with a send or transport error are not overflow"
+    );
+    assert!(
+        !overflow_explained(&status(Value::Null, 0), &long, window, 30),
+        "an overflow asks for a keyframe"
+    );
+    assert!(!overflow_explained(
+        &status(Value::Null, 2),
+        &[],
+        window,
+        30
+    ));
 }
 
 #[test]
