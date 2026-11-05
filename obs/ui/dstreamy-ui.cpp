@@ -189,13 +189,13 @@ void fill(QComboBox *box, const QJsonObject &choices)
 	QSignalBlocker block(box);
 	QJsonArray items = choices.value("items").toArray();
 	QString key = choices.value("placeholder").toString();
-	for (const QJsonValue &v : items)
+	for (const QJsonValue v : items)
 		key += QLatin1Char('\n') + v.toObject().value("id").toString() + QLatin1Char('\t') +
 		       v.toObject().value("name").toString();
 	if (box->property("filled").toString() != key) {
 		box->clear();
 		box->addItem(choices.value("placeholder").toString(), QString());
-		for (const QJsonValue &v : items)
+		for (const QJsonValue v : items)
 			box->addItem(v.toObject().value("name").toString(), v.toObject().value("id").toString());
 		box->setProperty("filled", key);
 	}
@@ -213,7 +213,7 @@ void fill_tracks(const QJsonObject &audio)
 	QJsonArray tracks = audio.value("tracks").toArray();
 	if (ui.tracks->count() != tracks.size()) {
 		ui.tracks->clear();
-		for (const QJsonValue &v : tracks)
+		for (const QJsonValue v : tracks)
 			ui.tracks->addItem(v.toObject().value("name").toString(), v.toObject().value("track").toInt());
 	}
 	for (int i = 0; i < tracks.size(); i++)
@@ -224,7 +224,7 @@ void fill_tracks(const QJsonObject &audio)
 void fill_sources(const QJsonArray &sources)
 {
 	QStringList ids;
-	for (const QJsonValue &v : sources)
+	for (const QJsonValue v : sources)
 		ids << v.toObject().value("uuid").toString() + QLatin1Char('\n') +
 				v.toObject().value("name").toString();
 	QString list = ids.join(QLatin1Char('\n'));
@@ -236,7 +236,7 @@ void fill_sources(const QJsonArray &sources)
 				ui.sources->style()->pixelMetric(QStyle::PM_CheckBoxLabelSpacing);
 		int column = (ui.panel->width() - 48) / 2 - indicator;
 		int i = 0;
-		for (const QJsonValue &v : sources) {
+		for (const QJsonValue v : sources) {
 			QJsonObject s = v.toObject();
 			QString name = s.value("name").toString();
 			auto *box = new QCheckBox(ui.sources);
@@ -266,7 +266,7 @@ void fill_sources(const QJsonArray &sources)
 		ui.scroll->setFixedHeight(rows ? rows * row + (rows - 1) * qMax(spacing, 0) : 0);
 	}
 	const QList<QCheckBox *> boxes = ui.sources->findChildren<QCheckBox *>();
-	for (const QJsonValue &v : sources) {
+	for (const QJsonValue v : sources) {
 		QJsonObject s = v.toObject();
 		for (QCheckBox *box : boxes) {
 			if (box->property("uuid").toString() == s.value("uuid").toString()) {
@@ -502,14 +502,16 @@ Panel *build_panel()
 	auto *answers = new QHBoxLayout();
 	ui.confirm_ok = button("dstreamy-confirm-ok", ui.confirm_row);
 	ui.confirm_cancel = button("dstreamy-confirm-cancel", ui.confirm_row);
-	for (auto [b, yes] : {std::pair{ui.confirm_ok.data(), true}, std::pair{ui.confirm_cancel.data(), false}}) {
+	auto answer = [](QPushButton *b, bool yes) {
 		QObject::connect(b, &QPushButton::clicked, b, [yes] {
 			if (!ui.active)
 				return;
 			ui.host.confirm_take_over(ui.host.ctx, yes);
 			rerender();
 		});
-	}
+	};
+	answer(ui.confirm_ok, true);
+	answer(ui.confirm_cancel, false);
 	answers->addStretch(1);
 	answers->addWidget(ui.confirm_cancel);
 	answers->addWidget(ui.confirm_ok);
