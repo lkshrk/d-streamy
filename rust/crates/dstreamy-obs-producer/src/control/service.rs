@@ -259,7 +259,12 @@ impl ObsControl {
                 "hello",
                 REPLY_TIMEOUT,
             )
-            .await?;
+            .await
+            // serve also closes unanswered when flooded, so a closed hello never proves it gone.
+            .map_err(|e| match e {
+                ControlError::NotRunning(m) => ControlError::Protocol(m),
+                e => e,
+            })?;
         c.require(STATUS_PLACE)?;
         // The path names whichever serve bound it last, so it must be the same file on both sides of the hello.
         if self.instance() != Some(before) {

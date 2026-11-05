@@ -622,7 +622,6 @@ impl Engine {
             }
             drop(conn);
             self.disconnect_locked().await;
-            self.stale_token.store(false, Ordering::Release);
         }
         let engine = self
             .me
@@ -644,6 +643,7 @@ impl Engine {
             seq,
         });
         *lock(&self.conn) = Some(conn.clone());
+        self.stale_token.store(false, Ordering::Release);
         Ok(conn)
     }
 
@@ -998,6 +998,7 @@ impl Engine {
         let Some(conn) = lock(&self.conn).take() else {
             return;
         };
+        self.stale_token.store(false, Ordering::Release);
         match Arc::try_unwrap(conn) {
             Ok(Conn {
                 client,

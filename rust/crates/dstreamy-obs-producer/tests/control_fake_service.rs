@@ -430,3 +430,32 @@ async fn the_login_s_outcome_comes_back_as_its_error() {
         Ok(Some("mock".into()))
     );
 }
+
+#[tokio::test]
+async fn a_hello_left_unanswered_keeps_the_ownership_for_a_later_stop() {
+    let dir = tempfile::Builder::new().prefix("ds").tempdir().unwrap();
+    let private = dir.path().join("d");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = private.join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        }
+    });
+    let ownership = Ownership {
+        connections: vec![Candidate { id: 1, fps: None }],
+        guild_id: "g".into(),
+        channel_id: "c".into(),
+        instance: None,
+    };
+    let stopped = ObsControl::new(Endpoint::new(&path))
+        .stop(Some(&ownership))
+        .await;
+    assert!(
+        matches!(stopped, Err(ControlError::Protocol(_))),
+        "a flooded serve closes unanswered, so the session may still run: {stopped:?}"
+    );
+}

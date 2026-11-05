@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use dstreamy_core::TOKEN_ENV;
@@ -71,7 +72,7 @@ impl Login {
         self.program.is_some() && !self.env_token
     }
 
-    pub async fn run(&self, engine: &Engine, params: LoginParams) -> Result<Value, Failure> {
+    pub async fn run(&self, engine: &Arc<Engine>, params: LoginParams) -> Result<Value, Failure> {
         let Some(program) = &self.program else {
             return Err(Failure::new(
                 "login_unavailable",
@@ -155,7 +156,9 @@ impl Login {
             .map_err(|e| Failure::new("login_failed", format!("waiting for the login: {e}")))?;
         window.0 = None;
         let user = outcome(&output)?;
-        engine.token_changed().await;
+        // Detached, so a client leaving now can't cancel it and leave the old token's connection open.
+        let engine = engine.clone();
+        let _ = tokio::spawn(async move { engine.token_changed().await }).await;
         tracing::info!("logged in from the login window");
         Ok(user)
     }
