@@ -220,7 +220,7 @@ pub fn changed_since(before: &[(String, u32)], touched: u32, managed_at_open: u3
 /// Puts the `touched` tracks back as they were when a dialog opened; the managed tracks too.
 pub fn restore(before: &[(String, u32)], touched: u32, managed_at_open: u32) {
     let (managed, plan) = revert_plan(before, touched, managed_at_open);
-    change(|c, _| c.model.collection_loaded(managed));
+    change(|c, _| c.model.restore_managed(managed));
     for (uuid, next) in &plan {
         with_source(uuid, |s| {
             APPLYING.with(|a| a.set(true));
@@ -325,6 +325,7 @@ pub fn collection_loaded() {
             (None, _) => {}
         }
     }
+    settings_source::collection_loaded();
     request_refresh();
 }
 
@@ -382,15 +383,15 @@ pub fn request_refresh() {
     }
 }
 
-/// Runs `settings_source::settle` on the UI thread after the current UI call returns.
-pub fn request_settle() {
+/// Runs `settings_source::settle` on the UI thread after the current UI call returns; false when it can't.
+pub fn request_settle() -> bool {
     let sent = REFRESHER
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .as_ref()
         .is_some_and(|r| r.requests.send(Request::Settle).is_ok());
     if sent {
-        return;
+        return true;
     }
     let queued = std::thread::Builder::new()
         .name("dstreamy settle".into())
@@ -398,12 +399,13 @@ pub fn request_settle() {
         .spawn(|| unsafe {
             sys::obs_queue_task(sys::OBS_TASK_UI, Some(settle_task), ptr::null_mut(), false)
         });
-    if let Err(e) = queued {
+    if let Err(e) = &queued {
         log::warn(&format!(
             "cannot queue the settings dialog's Cancel ({e}): its Discord track changes stay; \
              undo them in Edit › Advanced Audio Properties"
         ));
     }
+    queued.is_ok()
 }
 
 extern "C" fn settle_task(_param: *mut c_void) {

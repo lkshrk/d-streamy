@@ -320,24 +320,31 @@ extern "C" fn request_take_over(_ctx: Ctx) {
 
 extern "C" fn confirm_take_over(_ctx: Ctx, confirm: bool) {
     guard("panel confirm_take_over", (), || {
-        if CONFIRMING.swap(false, Ordering::AcqRel) && confirm {
-            crate::audio::take_over(shown_track());
+        if CONFIRMING.swap(false, Ordering::AcqRel)
+            && confirm
+            && crate::audio::take_over(shown_track())
+        {
+            settings_source::mixers_changed();
         }
     });
 }
 
 extern "C" fn set_source(_ctx: Ctx, uuid: *const c_char, on: bool) {
     guard("panel set_source", (), || {
-        if let Some(uuid) = picked(uuid) {
-            crate::audio::set_source(&uuid, shown_track(), on);
+        if let Some(uuid) = picked(uuid)
+            && crate::audio::set_source(&uuid, shown_track(), on)
+        {
+            settings_source::mixers_changed();
         }
     });
 }
 
 extern "C" fn release_track(_ctx: Ctx, track: c_int) {
     guard("panel release_track", (), || {
-        if let Ok(track) = u8::try_from(track) {
-            crate::audio::release(track);
+        if let Ok(track) = u8::try_from(track)
+            && crate::audio::release(track)
+        {
+            settings_source::mixers_changed();
         }
     });
 }
@@ -350,11 +357,15 @@ pub fn collection_changed() {
 extern "C" fn panel_closed(_ctx: Ctx) {
     guard("panel closed", (), || {
         CONFIRMING.store(false, Ordering::Release);
+        change(|c, _| {
+            c.model.forget_released();
+            c.model.forget_unrestored();
+        });
     });
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Once;
 
     use dstreamy_obs_producer::control::Named;
@@ -363,7 +374,7 @@ mod tests {
 
     use super::*;
 
-    const PLAIN: &CStr = c"dstreamy_test_audio";
+    pub(crate) const PLAIN: &CStr = c"dstreamy_test_audio";
     const MIC: &CStr = c"dstreamy_test_input_capture";
 
     extern "C" fn test_name(_type_data: *mut c_void) -> *const c_char {
@@ -380,7 +391,7 @@ mod tests {
     extern "C" fn test_destroy(_data: *mut c_void) {}
 
     /// libobs without video or modules, plus two audio source types: a plain one and a microphone.
-    fn libobs() {
+    pub(crate) fn libobs() {
         static STARTED: Once = Once::new();
         STARTED.call_once(|| {
             // SAFETY: started once for the test process; the registered strings are 'static.
@@ -407,11 +418,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    struct Source(*mut sys::obs_source_t);
+    pub(crate) struct Source(pub(crate) *mut sys::obs_source_t);
 
     #[cfg(unix)]
     impl Source {
-        fn new(id: &CStr, name: &CStr) -> Self {
+        pub(crate) fn new(id: &CStr, name: &CStr) -> Self {
             // SAFETY: libobs is started and `id` is registered; the reference is released on drop.
             let source = unsafe {
                 sys::obs_source_create(id.as_ptr(), name.as_ptr(), ptr::null_mut(), ptr::null_mut())
@@ -420,12 +431,12 @@ mod tests {
             Self(source)
         }
 
-        fn uuid(&self) -> CString {
+        pub(crate) fn uuid(&self) -> CString {
             // SAFETY: a live source.
             CString::new(unsafe { text(sys::obs_source_get_uuid(self.0)) }).unwrap()
         }
 
-        fn on(&self, track: u8) -> bool {
+        pub(crate) fn on(&self, track: u8) -> bool {
             // SAFETY: a live source.
             let mixers = unsafe { sys::obs_source_get_audio_mixers(self.0) };
             mixers & (1 << (track - 1)) != 0
@@ -463,7 +474,7 @@ mod tests {
         CONFIRMING.load(Ordering::Acquire)
     }
 
-    fn reset() {
+    pub(crate) fn reset() {
         CONFIRMING.store(false, Ordering::Release);
         change(|c, _| *c = ConfigState::default());
     }

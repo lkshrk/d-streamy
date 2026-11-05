@@ -12,6 +12,7 @@ typedef void (*obs_frontend_save_cb)(obs_data_t *save_data, bool saving, void *p
 // OBS_FRONTEND_EVENT_EXIT in obs-frontend-api.h.
 #define FAKE_FRONTEND_EVENT_EXIT 17
 #define FAKE_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP 25
+#define FAKE_FRONTEND_EVENT_SCRIPTING_SHUTDOWN 36
 #define EVENT_CALLBACKS_MAX 8
 
 static char *item_name;
@@ -25,6 +26,7 @@ static struct {
 } event_callbacks[EVENT_CALLBACKS_MAX];
 static size_t event_callback_count;
 static bool exited;
+static bool (*close_dialogs)(void);
 
 struct save_callbacks {
 	struct {
@@ -44,12 +46,21 @@ EXPORT void obs_frontend_add_tools_menu_item(const char *name, obs_frontend_cb c
 	item_data = private_data;
 }
 
+// The harness's model of OBSBasic::CloseDialogs and of closing the open properties dialog: false if it stays.
+EXPORT void fake_frontend_set_close_dialogs(bool (*close)(void))
+{
+	close_dialogs = close;
+}
+
 #ifndef FAKE_FRONTEND_INCOMPLETE
-// Holds a reference like OBSBasicProperties' OBSSource member does.
+// OBSBasic::CreatePropertiesWindow: close the open dialog or give up, then hold a reference and build the view.
 EXPORT void obs_frontend_open_source_properties(obs_source_t *source)
 {
+	if (close_dialogs && !close_dialogs())
+		return;
 	obs_source_release(opened);
 	opened = obs_source_get_ref(source);
+	obs_properties_destroy(obs_source_properties(source));
 }
 #endif
 
@@ -110,13 +121,18 @@ EXPORT void obs_frontend_remove_event_callback(obs_frontend_event_cb callback, v
 	}
 }
 
-// OBSBasic::closeWindow: saveAll, ClearSceneData with its cleanup event, the exit event, then the API is gone.
+// OBSBasic::closeWindow: saveAll, scripting shutdown, ClearSceneData (CloseDialogs, cleanup), exit, API gone.
 EXPORT size_t fake_frontend_exit(void)
 {
 	obs_data_t *modules = obs_data_create();
 	for (size_t i = save_callbacks.count; i > 0; i--)
 		save_callbacks.list[i - 1].callback(modules, true, save_callbacks.list[i - 1].private_data);
 	obs_data_release(modules);
+	for (size_t i = event_callback_count; i > 0; i--)
+		event_callbacks[i - 1].callback(FAKE_FRONTEND_EVENT_SCRIPTING_SHUTDOWN,
+						event_callbacks[i - 1].private_data);
+	if (close_dialogs)
+		close_dialogs();
 	size_t count = event_callback_count;
 	for (size_t i = event_callback_count; i > 0; i--)
 		event_callbacks[i - 1].callback(FAKE_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP,

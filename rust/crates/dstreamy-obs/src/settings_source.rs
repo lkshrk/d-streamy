@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use dstreamy_obs_producer::dock::{
@@ -160,7 +160,8 @@ fn watch_dialog(source: *mut sys::obs_source_t) {
     }
 }
 
-fn forget_dialog(source: *mut sys::obs_source_t) {
+/// False when `source` isn't the dialog [`refresh`] rebuilds.
+fn forget_dialog(source: *mut sys::obs_source_t) -> bool {
     let mut dialog = DIALOG.lock().unwrap_or_else(PoisonError::into_inner);
     // SAFETY: both pointers are live; the weak reference is this module's own.
     let ours = dialog
@@ -169,6 +170,114 @@ fn forget_dialog(source: *mut sys::obs_source_t) {
     if ours && let Some(old) = dialog.take() {
         // SAFETY: as above.
         unsafe { sys::obs_weak_source_release(old.0) };
+    }
+    ours
+}
+
+/// The open dialog's source, as a strong reference released on drop.
+struct DialogSource(*mut sys::obs_source_t);
+
+impl DialogSource {
+    fn get() -> Option<Self> {
+        let source = DIALOG
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            // SAFETY: the weak reference is live while it is in DIALOG; this returns a strong reference or NULL.
+            .map(|d| unsafe { sys::obs_weak_source_get_source(d.0) });
+        source.filter(|s| !s.is_null()).map(Self)
+    }
+}
+
+impl Drop for DialogSource {
+    fn drop(&mut self) {
+        // SAFETY: the strong reference taken in `get`.
+        unsafe { sys::obs_source_release(self.0) };
+    }
+}
+
+/// Set while Tools > D-Streamy opens a dialog, which OBS shows only once the open one closes.
+static OPENING: AtomicBool = AtomicBool::new(false);
+
+/// A dialog created while another was open; it takes over once OBS builds its view.
+struct Successor(*mut sys::obs_source_t);
+
+// SAFETY: the pointer is only compared, and dereferenced on the UI thread while Tools > D-Streamy holds it.
+unsafe impl Send for Successor {}
+
+static SUCCESSOR: Mutex<Option<Successor>> = Mutex::new(None);
+
+struct Opening;
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        OPENING.store(false, Ordering::Release);
+        SUCCESSOR
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+}
+
+/// Runs Tools > D-Streamy's create and open: a dialog already open stays in charge until OBS closes it.
+pub fn opening<R>(f: impl FnOnce() -> R) -> R {
+    OPENING.store(true, Ordering::Release);
+    let _done = Opening;
+    f()
+}
+
+fn take_successor(source: *mut sys::obs_source_t) -> bool {
+    let mut successor = SUCCESSOR.lock().unwrap_or_else(PoisonError::into_inner);
+    let ours = successor.as_ref().is_some_and(|s| s.0 == source);
+    if ours {
+        successor.take();
+    }
+    ours
+}
+
+fn successor() -> Option<*mut sys::obs_source_t> {
+    SUCCESSOR
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|s| s.0)
+}
+
+/// `source` becomes the dialog that refreshes, confirms and undoes, with what it shows now.
+fn activate(source: *mut sys::obs_source_t) {
+    watch_dialog(source);
+    let (choice, managed) = with_controls(|c| (c.model.choice(), c.model.managed_mixers()));
+    let mixers = cfg!(unix).then(crate::audio::mixers);
+    CONFIRMING.store(0, Ordering::Release);
+    OPENED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(Opened {
+            source,
+            choice,
+            mixers,
+            managed,
+            touched: 0,
+        });
+}
+
+/// Writes the model's picks into a dialog's settings.
+///
+/// # Safety
+/// `settings` is live.
+unsafe fn write_picks(settings: *mut sys::obs_data_t) {
+    let picked = with_controls(|c| c.model.settings().clone());
+    // SAFETY: the caller's contract; libobs copies the strings.
+    unsafe {
+        sys::obs_data_set_int(
+            settings,
+            AUDIO_TRACK.as_ptr(),
+            i64::from(picked.audio_track),
+        );
+        for (key, value) in [(GUILD, picked.guild_id), (CHANNEL, picked.channel_id)] {
+            let value = c_text(&value.unwrap_or_default());
+            sys::obs_data_set_string(settings, key.as_ptr(), value.as_ptr());
+        }
     }
 }
 
@@ -181,18 +290,9 @@ pub fn dialog_open() -> bool {
 
 /// Asks the open dialog, if any, to rebuild itself from the model; callable from any thread, without the model lock.
 pub fn refresh() {
-    let source = DIALOG
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .as_ref()
-        // SAFETY: the weak reference is live while it is in DIALOG; this returns a strong reference or NULL.
-        .map(|d| unsafe { sys::obs_weak_source_get_source(d.0) });
-    if let Some(source) = source.filter(|s| !s.is_null()) {
-        // SAFETY: a strong reference taken above; OBS's properties view reloads on its own thread.
-        unsafe {
-            sys::obs_source_update_properties(source);
-            sys::obs_source_release(source);
-        }
+    if let Some(source) = DialogSource::get() {
+        // SAFETY: a strong reference; OBS's properties view reloads on its own thread.
+        unsafe { sys::obs_source_update_properties(source.0) };
     }
 }
 
@@ -258,36 +358,16 @@ extern "C" fn create(
     source: *mut sys::obs_source_t,
 ) -> *mut c_void {
     guard("settings create", source.cast(), || {
-        watch_dialog(source);
         open_config();
         let guild = with_controls(|c| c.model.settings().guild_id.clone());
         session::load_lists(guild);
-        let picked = with_controls(|c| c.model.settings().clone());
-        let (choice, managed) = with_controls(|c| (c.model.choice(), c.model.managed_mixers()));
-        let mixers = cfg!(unix).then(crate::audio::mixers);
-        CONFIRMING.store(0, Ordering::Release);
-        OPENED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(Opened {
-                source,
-                choice,
-                mixers,
-                managed,
-                touched: 0,
-            });
-        // SAFETY: libobs passes the new source's settings, which it owns; it copies the strings.
-        unsafe {
-            sys::obs_data_set_int(
-                settings,
-                AUDIO_TRACK.as_ptr(),
-                i64::from(picked.audio_track),
-            );
-            for (key, value) in [(GUILD, picked.guild_id), (CHANNEL, picked.channel_id)] {
-                let value = c_text(&value.unwrap_or_default());
-                sys::obs_data_set_string(settings, key.as_ptr(), value.as_ptr());
-            }
+        if OPENING.load(Ordering::Acquire) && dialog_open() {
+            *SUCCESSOR.lock().unwrap_or_else(PoisonError::into_inner) = Some(Successor(source));
+        } else {
+            activate(source);
         }
+        // SAFETY: libobs passes the new source's settings, which it owns.
+        unsafe { write_picks(settings) };
         // libobs treats a null data pointer as a failed create.
         source.cast()
     })
@@ -296,11 +376,14 @@ extern "C" fn create(
 extern "C" fn destroy(data: *mut c_void) {
     guard("settings destroy", (), || {
         let source: *mut sys::obs_source_t = data.cast();
+        take_successor(source);
         OPENED
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|o| o.source != source);
-        forget_dialog(source);
+        if forget_dialog(source) {
+            change(|c, _| c.model.forget_released());
+        }
     });
 }
 
@@ -335,30 +418,67 @@ static OPENED: Mutex<Vec<Opened>> = Mutex::new(Vec::new());
 
 /// The open dialogs changed `track`; `settings` records whether any change still stands.
 fn touch(track: u8, settings: *mut sys::obs_data_t) {
-    let opened: Vec<_> = OPENED
+    for o in OPENED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .iter_mut()
-        .map(|o| {
-            o.touched |= track_bit(track);
-            (o.mixers.clone(), o.touched, o.managed)
-        })
-        .collect();
-    let changed = opened.iter().any(|(mixers, touched, managed)| {
-        mixers
-            .as_ref()
-            .is_some_and(|m| crate::audio::changed_since(m, *touched, *managed))
-    });
+    {
+        o.touched |= track_bit(track);
+    }
+    if let Some(dialog) = DialogSource::get() {
+        // SAFETY: the caller passes the dialog's live settings or NULL.
+        unsafe { write_changed(dialog.0, settings) };
+    }
+}
+
+/// Whether a mixer change the dialog of `source` made still stands.
+fn changed(source: *mut sys::obs_source_t) -> bool {
+    let opened = OPENED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|o| o.source == source)
+        .map(|o| (o.mixers.clone(), o.touched, o.managed));
+    opened.is_some_and(|(mixers, touched, managed)| {
+        touched != 0
+            && mixers
+                .as_ref()
+                .is_some_and(|m| crate::audio::changed_since(m, touched, managed))
+    })
+}
+
+/// # Safety
+/// `settings` is the live settings of `source`'s dialog, or NULL; call on the UI thread, where OBS's view uses them.
+unsafe fn write_changed(source: *mut sys::obs_source_t, settings: *mut sys::obs_data_t) {
     if settings.is_null() {
         return;
     }
-    // SAFETY: the caller passes the dialog's live settings.
+    let changed = changed(source);
+    // SAFETY: the caller's contract.
     unsafe {
         if changed {
             sys::obs_data_set_int(settings, CHANGED.as_ptr(), 1);
-        } else {
+        } else if sys::obs_data_has_user_value(settings, CHANGED.as_ptr()) {
             sys::obs_data_unset_user_value(settings, CHANGED.as_ptr());
         }
+    }
+}
+
+/// Brings the open dialog's Save or Discard question in line with its mixer changes. On the UI thread.
+fn sync_changed() {
+    if let Some(source) = DialogSource::get() {
+        // SAFETY: a strong reference to a live source.
+        let settings = unsafe { SourceSettings::of(source.0) };
+        // SAFETY: the dialog's live settings, on the UI thread.
+        unsafe { write_changed(source.0, settings.0) };
+    }
+}
+
+/// The panel changed the Discord tracks: the open dialog's checkboxes and close question follow. On the UI thread.
+pub fn mixers_changed() {
+    if dialog_open() {
+        sync_changed();
+        crate::audio::request_refresh();
     }
 }
 
@@ -412,7 +532,6 @@ impl Drop for Properties {
     }
 }
 
-/// The track in a button's name after `prefix`.
 fn button_track(property: *mut sys::obs_property_t, prefix: &str) -> Option<u8> {
     // SAFETY: the view passes a live property; libobs owns the name.
     let name = unsafe { text(sys::obs_property_name(property)) };
@@ -422,6 +541,11 @@ fn button_track(property: *mut sys::obs_property_t, prefix: &str) -> Option<u8> 
 /// Another scene collection: the mixer flags the open dialogs saw are gone, and so is a takeover confirm.
 pub fn collection_changed() {
     CONFIRMING.store(0, Ordering::Release);
+    keep_mixer_changes();
+}
+
+/// The open dialogs' mixer changes stay as they are: no Cancel or Discard puts them back.
+fn keep_mixer_changes() {
     for o in OPENED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -434,6 +558,47 @@ pub fn collection_changed() {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .take();
+    sync_changed();
+}
+
+/// OBS saves the collection, then closes the dialog: its mixer changes stay, and closing asks only about picks.
+pub fn collection_leaving() {
+    let kept = OPENED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|o| o.touched != 0);
+    keep_mixer_changes();
+    if kept {
+        log::info(
+            "OBS saves the scene collection with the Discord track changes made in the open D-Streamy dialog: \
+             they stay, whatever the dialog's close asks",
+        );
+    }
+}
+
+/// Another scene collection's sources loaded: an open dialog's Cancel can put back what changes from now on.
+pub fn collection_loaded() {
+    if OPENED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty()
+    {
+        return;
+    }
+    let (mixers, managed) = (
+        cfg!(unix).then(crate::audio::mixers),
+        with_controls(|c| c.model.managed_mixers()),
+    );
+    for o in OPENED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter_mut()
+    {
+        o.mixers = mixers.clone();
+        o.managed = managed;
+        o.touched = 0;
+    }
 }
 
 thread_local! {
@@ -490,7 +655,29 @@ fn restore_picks(source: *mut sys::obs_source_t, opened: &Choice) {
             touched: o.touched,
         });
     *REVERTING.lock().unwrap_or_else(PoisonError::into_inner) = pending;
-    crate::audio::request_settle();
+    if let Some(next) = successor() {
+        // Tools > D-Streamy is replacing this dialog, so only its Discard, never an edit, can reach here.
+        settle_pending();
+        // SAFETY: Tools > D-Streamy holds the successor while OBS closes this dialog; OBS copies its settings later.
+        unsafe { write_picks(SourceSettings::of(next).0) };
+    } else if !crate::audio::request_settle() {
+        settle_failed();
+    }
+}
+
+/// The Cancel's mixer part can't wait for the call to return: its touched tracks stay, and the views say so.
+fn settle_failed() {
+    let Some(pending) = REVERTING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+    else {
+        return;
+    };
+    if pending.touched != 0 {
+        change(|c, _| c.model.restore_failed(pending.touched));
+        crate::audio::request_refresh();
+    }
 }
 
 /// On the UI thread once the call that armed it returned: a Cancel puts back the Discord tracks the dialog changed.
@@ -553,7 +740,8 @@ extern "C" fn update(data: *mut c_void, settings: *mut sys::obs_data_t) {
             .iter()
             .find(|o| o.source == source)
             .map(|o| o.choice.clone());
-        // SAFETY: as above. OBS's Defaults clears every user value; Cancel and Discard put the opened ones back.
+        // OBS's Defaults clears every user value; Cancel and Discard put the opened ones back.
+        // SAFETY: as above.
         let defaults = !unsafe { sys::obs_data_has_user_value(settings, AUDIO_TRACK.as_ptr()) };
         if defaults {
             REVERTING
@@ -783,11 +971,16 @@ extern "C" fn source_toggled(
     })
 }
 
-/// Adds the audio part for `track` and writes each checkbox's real state into `settings`.
+/// Adds the audio part for `track` and writes each checkbox's real state into `settings`; `kept`: the opened pick.
 ///
 /// # Safety
 /// `props` is live and `settings` is live or NULL; libobs copies every string.
-unsafe fn add_audio(props: *mut sys::obs_properties_t, settings: *mut sys::obs_data_t, track: u8) {
+unsafe fn add_audio(
+    props: *mut sys::obs_properties_t,
+    settings: *mut sys::obs_data_t,
+    track: u8,
+    kept: Option<u8>,
+) {
     AUDIO_BUILT_FOR.store(track, Ordering::Release);
     // SAFETY: the caller's contract.
     unsafe {
@@ -811,8 +1004,12 @@ unsafe fn add_audio(props: *mut sys::obs_properties_t, settings: *mut sys::obs_d
             return;
         }
         let sources = crate::audio::sources();
-        let (view, warnings) =
-            with_controls(|c| (audio_view(&c.model, track, &sources), notices(&c.model)));
+        let (view, warnings) = with_controls(|c| {
+            (
+                audio_view(&c.model, track, &sources),
+                notices(&c.model, &sources, kept),
+            )
+        });
         for (i, warning) in warnings.into_iter().enumerate() {
             note(
                 &c_text(&format!("audio_note_{i}")),
@@ -953,10 +1150,22 @@ unsafe fn add_list(
 
 extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
     guard("settings get_properties", ptr::null_mut(), || {
+        let source: *mut sys::obs_source_t = data.cast();
+        if !source.is_null() && take_successor(source) {
+            activate(source);
+        }
         // SAFETY: `data` is the source `create` returned.
-        let owned = unsafe { SourceSettings::of(data.cast()) };
+        let owned = unsafe { SourceSettings::of(source) };
         let settings = owned.0;
+        // SAFETY: OBS builds a dialog's view on the UI thread, from the settings it shows.
+        unsafe { write_changed(source, settings) };
         RELOADING.with(|r| r.set(true));
+        let kept = OPENED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|o| o.source == source)
+            .map(|o| o.choice.audio_track);
         let selected = (!settings.is_null())
             .then(|| selected_track(settings))
             .flatten();
@@ -1022,6 +1231,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                 props,
                 settings,
                 shown_track(selected.unwrap_or(picked.audio_track)),
+                kept,
             );
             drop(owned);
             let buttons: [(&CStr, &CStr, sys::obs_property_clicked_t, bool); 2] = [
@@ -1064,4 +1274,257 @@ pub fn register() {
     };
     // SAFETY: libobs copies `info` (`obs-module.c:956-1052`); the strings it points to are 'static.
     unsafe { sys::obs_register_source_s(&info, mem::size_of::<sys::obs_source_info>()) };
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::sync::Once;
+
+    use super::*;
+    use crate::ui::tests::{PLAIN, Source, libobs, reset};
+
+    fn registered() {
+        libobs();
+        static REGISTERED: Once = Once::new();
+        REGISTERED.call_once(register);
+    }
+
+    fn forget_dialogs() {
+        OPENED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        REVERTING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        SUCCESSOR
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        CONFIRMING.store(0, Ordering::Release);
+        let old = DIALOG.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(old) = old {
+            // SAFETY: the weak reference this module took.
+            unsafe { sys::obs_weak_source_release(old.0) };
+        }
+    }
+
+    /// A settings source as Tools > D-Streamy creates it, released like OBS's dialog drops it.
+    struct Dialog(*mut sys::obs_source_t);
+
+    impl Dialog {
+        fn create() -> Self {
+            // SAFETY: the type is registered; libobs runs `create` before returning.
+            let source = unsafe {
+                sys::obs_source_create_private(
+                    SOURCE_ID.as_ptr(),
+                    SOURCE_NAME.as_ptr(),
+                    ptr::null_mut(),
+                )
+            };
+            assert!(!source.is_null());
+            Self(source)
+        }
+
+        fn settings(&self) -> SourceSettings {
+            // SAFETY: a live source.
+            unsafe { SourceSettings::of(self.0) }
+        }
+
+        /// What OBS's properties dialog does while it is built and on Cancel or Discard: a copy, then the view.
+        fn copy(&self) -> *mut sys::obs_data_t {
+            // SAFETY: a fresh object and the source's live settings.
+            unsafe {
+                let copy = sys::obs_data_create();
+                sys::obs_data_apply(copy, self.settings().0);
+                copy
+            }
+        }
+
+        fn build(&self) {
+            // SAFETY: a live source; the properties are destroyed at once.
+            unsafe { sys::obs_properties_destroy(sys::obs_source_properties(self.0)) };
+        }
+
+        fn changed(&self) -> bool {
+            // SAFETY: the source's live settings.
+            unsafe { sys::obs_data_has_user_value(self.settings().0, CHANGED.as_ptr()) }
+        }
+
+        fn audio_track(&self) -> i64 {
+            // SAFETY: as above.
+            unsafe { sys::obs_data_get_int(self.settings().0, AUDIO_TRACK.as_ptr()) }
+        }
+
+        fn is_the_dialog(&self) -> bool {
+            DialogSource::get().is_some_and(|d| d.0 == self.0)
+        }
+
+        /// Ticks the checkbox of `source` as OBS's view does: the value, then its modified callback.
+        fn tick(&self, source: &Source, on: bool) {
+            let key = c_text(&format!(
+                "{SOURCE_PREFIX}{}",
+                source.uuid().to_str().unwrap()
+            ));
+            // SAFETY: live properties and settings; the properties are destroyed after the callback.
+            unsafe {
+                let props = sys::obs_source_properties(self.0);
+                let checkbox = sys::obs_properties_get(props, key.as_ptr());
+                assert!(!checkbox.is_null(), "no checkbox for the source");
+                let settings = self.settings();
+                sys::obs_data_set_bool(settings.0, key.as_ptr(), on);
+                source_toggled(props, checkbox, settings.0);
+                sys::obs_properties_destroy(props);
+            }
+        }
+
+        fn take_over(&self) {
+            self.build();
+            take_over_clicked(ptr::null_mut(), ptr::null_mut(), self.0.cast());
+            confirm_take_over_clicked(ptr::null_mut(), ptr::null_mut(), self.0.cast());
+        }
+    }
+
+    impl Drop for Dialog {
+        fn drop(&mut self) {
+            // SAFETY: the reference taken in `create`; libobs destroys the source on its destruction thread.
+            unsafe {
+                sys::obs_source_release(self.0);
+                while sys::obs_wait_for_destroy_queue() {}
+            }
+        }
+    }
+
+    fn start() -> std::sync::MutexGuard<'static, ()> {
+        let serial = crate::serial();
+        registered();
+        reset();
+        forget_dialogs();
+        change(|c, _| {
+            c.model.select_audio_track(6);
+        });
+        serial
+    }
+
+    #[test]
+    fn the_close_question_follows_the_dialog_s_mixer_changes_whoever_undoes_them() {
+        let _serial = start();
+        change(|c, _| c.model.take_over(6));
+        let desktop = Source::new(PLAIN, c"Desktop");
+        let dialog = Dialog::create();
+        dialog.build();
+        assert!(!dialog.changed());
+        dialog.tick(&desktop, false);
+        assert!(!desktop.on(6));
+        assert!(dialog.changed(), "a tick that stands makes X ask");
+
+        assert!(crate::audio::set_source(
+            desktop.uuid().to_str().unwrap(),
+            6,
+            true
+        ));
+        mixers_changed();
+        assert!(
+            !dialog.changed(),
+            "the panel put the tick back, so X closes quietly"
+        );
+
+        dialog.tick(&desktop, false);
+        assert!(dialog.changed());
+        collection_leaving();
+        assert!(
+            !dialog.changed(),
+            "OBS saves the collection with the change before it closes the dialog"
+        );
+        assert!(!desktop.on(6), "the change stays");
+        dialog.tick(&desktop, true);
+        assert!(
+            !dialog.changed(),
+            "no Cancel could put back a change already saved"
+        );
+
+        collection_loaded();
+        dialog.tick(&desktop, false);
+        assert!(
+            dialog.changed(),
+            "changes after another collection loaded can be undone again"
+        );
+        collection_changed();
+        assert!(!dialog.changed());
+        drop((dialog, desktop));
+        reset();
+    }
+
+    #[test]
+    fn reopening_while_a_dialog_is_open_leaves_it_in_charge_until_obs_closes_it() {
+        let _serial = start();
+        let desktop = Source::new(PLAIN, c"Desktop");
+        let first = Dialog::create();
+        let opened = first.copy();
+        first.build();
+        assert!(first.is_the_dialog());
+        first.take_over();
+        assert!(!desktop.on(6) && with_controls(|c| c.model.manages(6)));
+        // SAFETY: the dialog's live settings, as OBS's view edits them.
+        unsafe {
+            sys::obs_data_set_int(first.settings().0, AUDIO_TRACK.as_ptr(), 3);
+            sys::obs_source_update(first.0, first.settings().0);
+        }
+        assert_eq!(with_controls(|c| c.model.settings().audio_track), 3);
+        CONFIRMING.store(3, Ordering::Release);
+
+        opening(|| {
+            let second = Dialog::create();
+            assert_eq!(successor(), Some(second.0));
+            assert!(first.is_the_dialog());
+        });
+        assert!(
+            first.is_the_dialog(),
+            "the close was cancelled, so the open dialog keeps refreshing"
+        );
+        assert_eq!(
+            CONFIRMING.load(Ordering::Acquire),
+            3,
+            "and keeps its confirm row"
+        );
+        assert_eq!(successor(), None);
+
+        let second = opening(|| {
+            let second = Dialog::create();
+            assert_eq!(second.audio_track(), 3);
+            // SAFETY: OBS's Discard: an update with the copy taken when the dialog opened.
+            unsafe { sys::obs_source_update(first.0, opened) };
+            assert!(
+                desktop.on(6),
+                "the Discard put the track back before the new dialog looked"
+            );
+            assert!(!with_controls(|c| c.model.manages(6)));
+            assert_eq!(
+                second.audio_track(),
+                6,
+                "the new dialog opens with the picks put back"
+            );
+            second.build();
+            assert!(second.is_the_dialog());
+            second
+        });
+        let snapshot = OPENED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|o| o.source == second.0)
+            .map(|o| (o.choice.audio_track, o.touched));
+        assert_eq!(snapshot, Some((6, 0)));
+        assert_eq!(CONFIRMING.load(Ordering::Acquire), 0);
+        drop(first);
+        assert!(
+            second.is_the_dialog(),
+            "the old dialog going away later changes nothing"
+        );
+        // SAFETY: the copy made above.
+        unsafe { sys::obs_data_release(opened) };
+        drop((second, desktop));
+        reset();
+    }
 }

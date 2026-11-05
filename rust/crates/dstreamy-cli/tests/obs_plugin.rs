@@ -1496,6 +1496,8 @@ fn cancel_puts_back_the_discord_track_the_dialog_changed_on_every_source() {
             "HARNESS check_settings when=taken differ=1",
             "HARNESS check_settings when=managed_ok differ=1",
             "HARNESS mixers when=defaults name=Music mixers=63",
+            "HARNESS settings_source when=defaults audio_track=6",
+            "HARNESS pick when=defaults guild_id= channel_id=",
             "HARNESS settings_checkbox when=defaults desc=Music on=1",
             "HARNESS mixers when=kept name=Music mixers=63",
             "HARNESS settings_checkbox when=managed_open desc=Music on=1",
@@ -1516,6 +1518,12 @@ fn cancel_puts_back_the_discord_track_the_dialog_changed_on_every_source() {
         "Music, Voice and Late: {lines:#?}"
     );
     assert!(
+        mixer_step(&lines, "managed")
+            .iter()
+            .any(|l| l.starts_with("HARNESS picked track=4 ")),
+        "Defaults has a pick to put back: {lines:#?}"
+    );
+    assert!(
         !lines
             .iter()
             .any(|l| l.starts_with("HARNESS settings_checkbox when=cancelled ")),
@@ -1523,24 +1531,47 @@ fn cancel_puts_back_the_discord_track_the_dialog_changed_on_every_source() {
     );
 }
 
+/// A read-only folder, writable again when dropped, so a failing test doesn't leave it read-only.
+struct ReadOnly(PathBuf);
+
+impl ReadOnly {
+    /// `None` when this user (root) can write it anyway.
+    fn new(folder: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let guard = Self(folder.to_owned());
+        std::fs::write(folder.join("probe"), "")
+            .is_err()
+            .then_some(guard)
+    }
+}
+
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
 /// The adopt mode, A's Mic on `mic_mixers`; `None` when `read_only` can't stop this user (root) writing.
-fn adopt_with(saved: Value, mic_mixers: u32, read_only: bool) -> Option<(Vec<String>, Value)> {
-    use std::os::unix::fs::PermissionsExt;
+fn adopt_with(
+    saved: Value,
+    mic_mixers: u32,
+    read_only: bool,
+    extra: &[&str],
+) -> Option<(Vec<String>, Value)> {
     let config = tempfile::tempdir().unwrap();
     write_module_config(config.path(), saved);
     let folder = module_config(config.path()).parent().unwrap().to_owned();
-    let mode = |m| std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(m)).unwrap();
-    if read_only {
-        mode(0o555);
-        if std::fs::write(folder.join("probe"), "").is_ok() {
-            mode(0o755);
-            return None;
-        }
-    }
+    let _read_only = if read_only {
+        Some(ReadOnly::new(&folder)?)
+    } else {
+        None
+    };
     let dir = config.path().to_string_lossy().into_owned();
     let lib = fake_frontend();
     let mixers = mic_mixers.to_string();
-    let lines = report_ui(&[
+    let mut args = vec![
         "--fake-frontend",
         lib.as_str(),
         "--module-config",
@@ -1548,15 +1579,14 @@ fn adopt_with(saved: Value, mic_mixers: u32, read_only: bool) -> Option<(Vec<Str
         "--collection-adopt",
         "--adopt-mic-mixers",
         mixers.as_str(),
-    ]);
-    if read_only {
-        mode(0o755);
-    }
+    ];
+    args.extend_from_slice(extra);
+    let lines = report_ui(&args);
     Some((lines, read_module_config(config.path())))
 }
 
 fn adopt(saved: Value, mic_mixers: u32) -> (Vec<String>, Value) {
-    adopt_with(saved, mic_mixers, false).expect("a writable config")
+    adopt_with(saved, mic_mixers, false, &[]).expect("a writable config")
 }
 
 #[test]
@@ -1619,9 +1649,12 @@ fn a_legacy_managed_track_with_a_mic_on_it_stays_unmanaged_so_go_live_waits() {
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn an_unsaved_adoption_is_not_repeated_in_the_next_collection() {
-    let Some((lines, saved)) =
-        adopt_with(json!({"audio_track": 6, "managed_track": 6}), 0x1f, true)
-    else {
+    let Some((lines, saved)) = adopt_with(
+        json!({"audio_track": 6, "managed_track": 6}),
+        0x1f,
+        true,
+        &["--adopt-stale-reload"],
+    ) else {
         eprintln!("skipped: this user can write a read-only folder");
         return;
     };
@@ -1629,10 +1662,30 @@ fn an_unsaved_adoption_is_not_repeated_in_the_next_collection() {
         &lines,
         &[
             "HARNESS collection_saved name=A managed_mixers=32",
+            "HARNESS check_settings when=corrupt differ=0",
+            "HARNESS check_settings when=repaired differ=0",
+            "HARNESS mixers when=b_adopt name=Mic mixers=31",
             "HARNESS settings_property when=b_adopt name=take_over type=8 enabled=1 desc=Manage Track 6",
             "HARNESS collection_saved name=B managed_mixers=-1",
         ]
         .map(str::to_owned),
+    );
+    let unreadable = |when: &str| {
+        let prefix = format!("HARNESS settings_property when={when} name=status ");
+        lines
+            .iter()
+            .any(|l| l.starts_with(&prefix) && l.contains("Couldn't read D-Streamy's settings"))
+    };
+    assert!(unreadable("corrupt"), "{lines:#?}");
+    assert!(
+        !unreadable("repaired"),
+        "the repaired file, still naming managed_track, was loaded again: {lines:#?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("HARNESS settings_checkbox when=b_adopt ")),
+        "B has no mic on Track 6, yet the reloaded file's managed_track is not adopted again: {lines:#?}"
     );
     assert_eq!(
         saved["managed_track"], 6,
@@ -1686,11 +1739,20 @@ fn track_1_confirms_its_cost_and_another_managed_track_can_be_let_go() {
             "HARNESS settings_checkbox when=instead desc=Music on=0",
             "HARNESS mixers when=three name=Mic mixers=27",
             "HARNESS mixers when=three name=Music mixers=27",
-            "HARNESS settings_property when=three name=release_6 type=8 enabled=1 desc=Stop managing Track 6",
-            "HARNESS settings_info when=three name=audio_note_0 kind=1",
+            "HARNESS settings_source when=reopened audio_track=3",
+            "HARNESS settings_property when=reopened name=release_6 type=8 enabled=1 desc=Stop managing Track 6",
+            "HARNESS settings_info when=reopened name=audio_note_0 kind=1",
             "HARNESS mixers when=released name=Mic mixers=27",
             "HARNESS mixers when=released name=Music mixers=27",
+            "HARNESS settings_property when=released name=audio_note_0 type=4 enabled=1 desc=D-Streamy no longer \
+             manages Track 6. It is still off on Mic and Music: turn it back on in Edit \u{203a} Advanced Audio \
+             Properties for those that need it.",
+            "HARNESS mixers when=released name=Late mixers=251",
             "HARNESS settings_property when=six_again name=take_over type=8 enabled=1 desc=Manage Track 6",
+            "HARNESS settings_source when=cancelled audio_track=3",
+            "HARNESS settings_property when=cancelled name=release_6 type=8 enabled=1 desc=Stop managing Track 6",
+            "HARNESS mixers when=cancelled name=Mic mixers=27",
+            "HARNESS mixers when=cancelled name=Late mixers=219",
         ]
         .map(str::to_owned),
     );
@@ -1702,10 +1764,82 @@ fn track_1_confirms_its_cost_and_another_managed_track_can_be_let_go() {
         "{lines:#?}"
     );
     assert!(
-        !lines.iter().any(|l| l
-            .starts_with("HARNESS settings_property when=released name=release_")
-            || l.starts_with("HARNESS settings_property when=released name=audio_note")),
+        !lines
+            .iter()
+            .any(|l| l.starts_with("HARNESS settings_property when=three name=release_")),
+        "Track 6 was the dialog's pick when it opened, so browsing away doesn't offer to let it go: {lines:#?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("HARNESS settings_property when=released name=release_")),
         "nothing left to let go: {lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn mixer_changes_obs_saves_before_closing_the_dialog_stay_and_only_picks_are_asked_about() {
+    let (lines, _) = dialog_session("--collection-close");
+    assert_lines(
+        &lines,
+        &[
+            "HARNESS check_settings when=kept_before differ=1",
+            "HARNESS collection_saved name=A managed_mixers=32",
+            "HARNESS close_dialog differ=0 choice=none",
+            "HARNESS mixers when=a_kept name=Mic mixers=31",
+            "HARNESS mixers when=a_kept name=Music mixers=63",
+            "HARNESS settings_checkbox when=a_kept desc=Music on=1",
+            "HARNESS check_settings when=a_kept differ=0",
+            "HARNESS close_dialog differ=1 choice=discard",
+            "HARNESS settings_source when=b_discarded audio_track=6",
+            "HARNESS mixers when=a_discarded name=Mic mixers=63",
+            "HARNESS close_dialog differ=1 choice=cancel",
+            "HARNESS check_settings when=b_cancel_back differ=0",
+            "HARNESS mixers when=b_taken name=Mic mixers=31",
+            "HARNESS check_settings when=b_taken differ=1",
+            "HARNESS mixers when=b_cancelled name=Mic mixers=63",
+            "HARNESS mixers when=b_cancelled name=Music mixers=63",
+            "HARNESS settings_property when=b_cancelled name=take_over type=8 enabled=1 desc=Manage Track 6",
+            "HARNESS check_settings when=exit_before differ=1",
+        ]
+        .map(str::to_owned),
+    );
+    let at = |want: &str| lines.iter().rposition(|l| l == want);
+    assert!(
+        at("HARNESS close_dialog differ=0 choice=none")
+            > at("HARNESS check_settings when=exit_before differ=1"),
+        "OBS saved the takeover at exit, so closing asks nothing: {lines:#?}"
+    );
+    assert!(
+        has_plugin_line(&lines, "they stay, whatever the dialog's close asks"),
+        "{lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn reopening_the_dialog_keeps_the_open_one_on_cancel_and_starts_fresh_on_discard() {
+    let (lines, _) = dialog_session("--reopen-session");
+    assert_lines(
+        &lines,
+        &[
+            "HARNESS settings_property when=first_confirming name=confirm_take_over type=8 enabled=1 desc=Manage",
+            "HARNESS close_dialog differ=1 choice=cancel",
+            "HARNESS reopened opened=0",
+            "HARNESS mixers when=cancelled name=Music mixers=27",
+            "HARNESS settings_checkbox when=first_after desc=Music on=0",
+            "HARNESS close_dialog differ=1 choice=discard",
+            "HARNESS reopened opened=1",
+            "HARNESS mixers when=discarded name=Music mixers=63",
+            "HARNESS settings_source when=second audio_track=6",
+            "HARNESS settings_property when=second name=take_over type=8 enabled=1 desc=Manage Track 6",
+            "HARNESS check_settings when=second differ=0",
+            "HARNESS settings_property when=second_confirming name=confirm_take_over type=8 enabled=1 desc=Manage",
+            "HARNESS mixers when=second_cancelled name=Music mixers=63",
+            "HARNESS settings_source when=second_cancelled audio_track=6",
+        ]
+        .map(str::to_owned),
     );
 }
 
@@ -2144,7 +2278,7 @@ fn tools_start_binds_the_chosen_track_and_stop_ends_the_session() {
     );
     assert_eq!(
         status_line(&lines, "live_updated"),
-        "Live on Track 3 \u{2014} Track 5 applies on next Go Live"
+        "Live on Track 3 \u{2014} Discord hears Track 5 from the next Go Live"
     );
     assert!(
         lines

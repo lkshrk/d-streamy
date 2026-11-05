@@ -44,7 +44,6 @@ pub struct Confirm {
     pub instead: Option<TrackAction>,
 }
 
-/// A button that acts on one track.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TrackAction {
     pub track: u8,
@@ -163,7 +162,7 @@ fn audio(state: &ConfigState, controls: bool, sources: &[AudioSource], confirmin
         audio.line = NO_AUDIO_CONTROLS.to_owned();
         return audio;
     }
-    audio.notices = notices(m)
+    audio.notices = notices(m, sources, None)
         .into_iter()
         .map(|n| Notice {
             text: n.text,

@@ -176,6 +176,11 @@ extern "C" fn on_event(event: c_int, _private_data: *mut c_void) {
         Ok(sys::DSTREAMY_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP) => {
             crate::audio::collection_cleared();
         }
+        // Both come right before OBS saves the collection (or just saved it) and closes every dialog.
+        Ok(
+            sys::DSTREAMY_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING
+            | sys::DSTREAMY_FRONTEND_EVENT_SCRIPTING_SHUTDOWN,
+        ) => settings_source::collection_leaving(),
         _ => {}
     });
 }
@@ -309,22 +314,24 @@ extern "C" fn open_settings(_private_data: *mut c_void) {
         let Some(open) = FRONTEND.get().and_then(|f| f.open_source_properties) else {
             return;
         };
-        // SAFETY: the type is registered at module load; a null settings object is allowed.
-        let source = unsafe {
-            sys::obs_source_create_private(
-                settings_source::SOURCE_ID.as_ptr(),
-                settings_source::SOURCE_NAME.as_ptr(),
-                ptr::null_mut(),
-            )
-        };
-        if source.is_null() {
-            log::warn("could not create the D-Streamy settings source");
-            return;
-        }
-        // SAFETY: the properties dialog takes its own reference, so this one is released at once.
-        unsafe {
-            open(source);
-            sys::obs_source_release(source);
-        }
+        settings_source::opening(|| {
+            // SAFETY: the type is registered at module load; a null settings object is allowed.
+            let source = unsafe {
+                sys::obs_source_create_private(
+                    settings_source::SOURCE_ID.as_ptr(),
+                    settings_source::SOURCE_NAME.as_ptr(),
+                    ptr::null_mut(),
+                )
+            };
+            if source.is_null() {
+                log::warn("could not create the D-Streamy settings source");
+                return;
+            }
+            // SAFETY: a dialog OBS opens takes its own reference, so this one is released at once.
+            unsafe {
+                open(source);
+                sys::obs_source_release(source);
+            }
+        });
     });
 }

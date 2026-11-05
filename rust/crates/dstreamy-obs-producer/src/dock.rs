@@ -25,6 +25,11 @@ pub fn track_name(track: u8) -> String {
     format!("Track {track}")
 }
 
+/// A track picked while live, which only the next start uses.
+pub fn next_go_live(track: u8) -> String {
+    format!("Discord hears {} from the next Go Live", track_name(track))
+}
+
 /// serve refuses a longer per-start grace (ADR 0004).
 pub const MAX_GRACE_SECS: u64 = 3600;
 
@@ -264,6 +269,10 @@ pub struct DockModel {
     managed_mixers: u32,
     /// The legacy managed track was settled this session; a stale file can't bring it back.
     adoption_done: bool,
+    /// Tracks let go of since the panel or dialog opened; their sources may still have them off.
+    released_mixers: u32,
+    /// Tracks a dialog's Cancel couldn't put back.
+    unrestored_mixers: u32,
 }
 
 impl DockModel {
@@ -279,6 +288,8 @@ impl DockModel {
             lists_pending: 0,
             managed_mixers: 0,
             adoption_done: false,
+            released_mixers: 0,
+            unrestored_mixers: 0,
         }
     }
 
@@ -349,13 +360,46 @@ impl DockModel {
         if !AUDIO_TRACKS.contains(&track) {
             return false;
         }
-        self.managed_mixers |= 1 << (track - 1);
+        let bit = 1 << (track - 1);
+        self.managed_mixers |= bit;
+        self.released_mixers &= !bit;
+        self.unrestored_mixers &= !bit;
         true
     }
 
     /// A scene collection was loaded, or left (`0`); its saved mixer bits say which tracks D-Streamy manages there.
     pub fn collection_loaded(&mut self, managed_mixers: u32) {
+        self.restore_managed(managed_mixers);
+        self.released_mixers = 0;
+        self.unrestored_mixers = 0;
+    }
+
+    /// A Cancel put the managed tracks back as they were.
+    pub fn restore_managed(&mut self, managed_mixers: u32) {
         self.managed_mixers = managed_mixers & ((1 << AUDIO_TRACKS.end()) - 1);
+        self.released_mixers &= !self.managed_mixers;
+    }
+
+    pub fn released_mixers(&self) -> u32 {
+        self.released_mixers
+    }
+
+    /// The panel or dialog that showed the released tracks' follow-up closed.
+    pub fn forget_released(&mut self) {
+        self.released_mixers = 0;
+    }
+
+    pub fn unrestored_mixers(&self) -> u32 {
+        self.unrestored_mixers
+    }
+
+    /// A dialog's Cancel couldn't put back `mixers`; the panel and dialog say so until the panel closes.
+    pub fn restore_failed(&mut self, mixers: u32) {
+        self.unrestored_mixers |= mixers & ((1 << AUDIO_TRACKS.end()) - 1);
+    }
+
+    pub fn forget_unrestored(&mut self) {
+        self.unrestored_mixers = 0;
     }
 
     /// The legacy managed track, once a session: the first scene collection that loads decides about it.
@@ -366,11 +410,19 @@ impl DockModel {
 
     /// Lets go of a managed track Discord doesn't get; no mixer flag changes. False when there is nothing to let go.
     pub fn release(&mut self, track: u8) -> bool {
-        if !self.manages(track) || track == self.heard_track() {
+        if !self.manages(track) || self.gets(track) {
             return false;
         }
-        self.managed_mixers &= !(1 << (track - 1));
+        let bit = 1 << (track - 1);
+        self.managed_mixers &= !bit;
+        self.released_mixers |= bit;
+        self.unrestored_mixers &= !bit;
         true
+    }
+
+    /// Discord hears `track` now, or the next Go Live sends it.
+    pub fn gets(&self, track: u8) -> bool {
+        track == self.heard_track() || track == self.settings.audio_track
     }
 
     /// The track Discord hears now while a session runs, else the one the next Go Live binds.
@@ -381,9 +433,7 @@ impl DockModel {
     /// One line for the settings dialog; `controls` says whether it can start and stop D-Streamy.
     pub fn status_text(&self, controls: bool) -> String {
         let pending = match self.track_status() {
-            TrackStatus::Pending { next, .. } => {
-                format!(" — {} applies on next Go Live", track_name(next))
-            }
+            TrackStatus::Pending { next, .. } => format!(" — {}", next_go_live(next)),
             _ => String::new(),
         };
         let live = self.live_track.map(track_name).unwrap_or_default();
@@ -1173,7 +1223,7 @@ mod tests {
         assert_eq!(m.track_status(), TrackStatus::Pending { live: 2, next: 5 });
         assert_eq!(
             m.status_text(false),
-            "Live on Track 2 — Track 5 applies on next Go Live"
+            "Live on Track 2 — Discord hears Track 5 from the next Go Live"
         );
         with_track(&mut m, 2);
         assert_eq!(m.track_status(), TrackStatus::Live { track: 2 });

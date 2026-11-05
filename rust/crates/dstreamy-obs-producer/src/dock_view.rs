@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use crate::dock::{DockModel, DockState, TrackStatus, track_name};
+use crate::dock::{DockModel, DockState, TrackStatus, next_go_live, track_name};
 use crate::dock_config::ConfigState;
 use crate::live::{LiveStats, stats_line, stats_tooltip};
 use crate::mixer::MicGuard;
@@ -77,11 +77,9 @@ fn with_dot(first: String, second: Option<&str>) -> String {
 fn track_line(m: &DockModel) -> String {
     match m.track_status() {
         TrackStatus::Idle { selected: track } | TrackStatus::Live { track } => track_name(track),
-        TrackStatus::Pending { live, next } => format!(
-            "{} · {} applies on next Go Live",
-            track_name(live),
-            track_name(next)
-        ),
+        TrackStatus::Pending { live, next } => {
+            format!("{} · {}", track_name(live), next_go_live(next))
+        }
     }
 }
 
@@ -399,7 +397,10 @@ mod tests {
         assert_eq!(v.status_bar, "● D-Streamy live");
 
         s.model.select_audio_track(4);
-        assert_eq!(view(&s).detail, "Track 6 · Track 4 applies on next Go Live");
+        assert_eq!(
+            view(&s).detail,
+            "Track 6 · Discord hears Track 4 from the next Go Live"
+        );
     }
 
     #[test]
@@ -687,7 +688,7 @@ mod tests {
         assert_eq!(v.detail, "6.0 Mbit/s · 60 fps · 12:34");
         assert_eq!(
             v.detail_tooltip,
-            "6.0 Mbit/s · 60 fps · 12:34 · 0 dropped\nTrack 6 · Track 3 applies on next Go Live"
+            "6.0 Mbit/s · 60 fps · 12:34 · 0 dropped\nTrack 6 · Discord hears Track 3 from the next Go Live"
         );
         let early = dock_view(&s, true, Some(&stats(false)), None);
         assert_eq!(
