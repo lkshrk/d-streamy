@@ -1764,10 +1764,11 @@ fn track_1_confirms_its_cost_and_another_managed_track_can_be_let_go() {
         "{lines:#?}"
     );
     assert!(
-        !lines
-            .iter()
-            .any(|l| l.starts_with("HARNESS settings_property when=three name=release_")),
-        "Track 6 was the dialog's pick when it opened, so browsing away doesn't offer to let it go: {lines:#?}"
+        lines.contains(
+            &"HARNESS settings_property when=three name=release_6 type=8 enabled=1 desc=Stop managing Track 6"
+                .to_owned()
+        ),
+        "a Cancel would manage the opened pick again, so letting it go is offered at once: {lines:#?}"
     );
     assert!(
         !lines
@@ -1791,6 +1792,12 @@ fn mixer_changes_obs_saves_before_closing_the_dialog_stay_and_only_picks_are_ask
             "HARNESS mixers when=a_kept name=Music mixers=63",
             "HARNESS settings_checkbox when=a_kept desc=Music on=1",
             "HARNESS check_settings when=a_kept differ=0",
+            "HARNESS check_settings when=autosaved differ=0",
+            "HARNESS check_settings when=autosave_rebuilt differ=1",
+            "HARNESS collection_loaded name=D",
+            "HARNESS mixers when=d_loaded name=Music mixers=31",
+            "HARNESS collection_loaded name=R",
+            "HARNESS mixers when=r_loaded name=Music mixers=63",
             "HARNESS close_dialog differ=1 choice=discard",
             "HARNESS settings_source when=b_discarded audio_track=6",
             "HARNESS mixers when=a_discarded name=Mic mixers=63",
@@ -1805,16 +1812,46 @@ fn mixer_changes_obs_saves_before_closing_the_dialog_stay_and_only_picks_are_ask
         ]
         .map(str::to_owned),
     );
-    let at = |want: &str| lines.iter().rposition(|l| l == want);
+    let leaving = "the Discord track changes made in the open D-Streamy dialog stay";
+    for (step, closes) in [
+        ("duplicate", "none"),
+        ("rename", "none"),
+        ("switch_discard", "discard"),
+    ] {
+        let lines = collection_step(&lines, step);
+        let close = format!(
+            "HARNESS close_dialog differ={} choice={closes}",
+            u8::from(closes != "none")
+        );
+        assert!(lines.contains(&close), "{step}: {lines:#?}");
+    }
+    assert!(
+        has_plugin_line(collection_step(&lines, "switch_discard"), leaving),
+        "the switch's changing event keeps the dialog's changes before the Discard: {lines:#?}"
+    );
+    let exit = collection_step(&lines, "exit");
+    let at = |want: &str| exit.iter().position(|l| l == want);
     assert!(
         at("HARNESS close_dialog differ=0 choice=none")
             > at("HARNESS check_settings when=exit_before differ=1"),
-        "OBS saved the takeover at exit, so closing asks nothing: {lines:#?}"
+        "OBS saved the takeover at exit, so closing asks nothing: {exit:#?}"
     );
-    assert!(
-        has_plugin_line(&lines, "they stay, whatever the dialog's close asks"),
-        "{lines:#?}"
-    );
+    assert!(has_plugin_line(exit, leaving), "{exit:#?}");
+}
+
+/// The lines between a collection run's `step` marker and the next marker.
+fn collection_step<'a>(lines: &'a [String], step: &str) -> &'a [String] {
+    let marker = format!("HARNESS collection_step name={step}");
+    let start = lines
+        .iter()
+        .position(|l| *l == marker)
+        .unwrap_or_else(|| panic!("no {marker}: {lines:#?}"))
+        + 1;
+    let end = lines[start..]
+        .iter()
+        .position(|l| l.starts_with("HARNESS collection_step "))
+        .map_or(lines.len(), |n| start + n);
+    &lines[start..end]
 }
 
 #[test]

@@ -1142,11 +1142,25 @@ static obs_data_t *copy_settings(obs_source_t *dialog)
 	return copy;
 }
 
-static obs_source_t *open_settings_dialog(void)
+// A Tools > D-Streamy click, then the event loop: a closed dialog is deleted, then the new view's queued build.
+static obs_source_t *open_settings_dialog_copying(obs_data_t **copy)
 {
 	if (!fake_click())
 		return NULL;
-	return fake_take_opened();
+	obs_source_t *dialog = fake_take_opened();
+	if (dialog && copy)
+		*copy = copy_settings(dialog);
+	delete_closed_dialog();
+	while (obs_wait_for_destroy_queue())
+		;
+	if (dialog)
+		obs_properties_destroy(obs_source_properties(dialog));
+	return dialog;
+}
+
+static obs_source_t *open_settings_dialog(void)
+{
+	return open_settings_dialog_copying(NULL);
 }
 
 // Closes the dialog: drops the reference the fake frontend held and checks nothing else keeps the source.
@@ -1162,12 +1176,12 @@ static void close_settings_dialog(obs_source_t *source)
 // Tools > D-Streamy with OBS's close question modelled; NULL when the open dialog stayed and none opened.
 static obs_source_t *open_tracked_dialog(void)
 {
-	obs_source_t *dialog = open_settings_dialog();
+	obs_data_t *copy = NULL;
+	obs_source_t *dialog = open_settings_dialog_copying(&copy);
 	if (dialog) {
 		open_dialog = dialog;
-		open_dialog_copy = copy_settings(dialog);
+		open_dialog_copy = copy;
 	}
-	delete_closed_dialog();
 	return dialog;
 }
 
@@ -1793,6 +1807,8 @@ static void clear_collection(void)
 	release_collection_sources();
 	fake_event(FAKE_EVENT_SCENE_COLLECTION_CLEANUP);
 	delete_closed_dialog();
+	while (obs_wait_for_destroy_queue())
+		;
 }
 
 // OBSBasic::SaveProjectNow: the sources' mixers and the plugins' "modules" data, in one file.
@@ -2051,6 +2067,38 @@ static bool collection_close_session(void)
 	switch_collection(&b, &a);
 	report_collection_mixers("a_kept");
 	ok = report_dialog("a_kept") && ok;
+
+	// OBSBasic::SetupDuplicateSceneCollection and SetupRenameSceneCollection: save, copy, load, no changing event.
+	printf("HARNESS collection_step name=duplicate\n");
+	dialog = open_tracked_dialog();
+	watch_dialog_views(dialog);
+	ok = tick_source(dialog, "Music", false) && ok;
+	run_ui_tasks();
+	save_collection(&a);
+	check_settings(dialog, open_dialog_copy, "autosaved");
+	long seen = os_atomic_load_long(&mixer_views);
+	ok = wait_for_view(seen, "an autosave") && ok;
+	check_settings(dialog, open_dialog_copy, "autosave_rebuilt");
+	unwatch_dialog_views(dialog);
+	save_collection(&a);
+	struct collection d = {"D", obs_data_create(), {a.mixers[0], a.mixers[1]}};
+	obs_data_apply(d.modules, a.modules);
+	load_collection(&d);
+	report_collection_mixers("d_loaded");
+	printf("HARNESS collection_step name=rename\n");
+	dialog = open_tracked_dialog();
+	watch_dialog_views(dialog);
+	ok = tick_source(dialog, "Music", true) && ok;
+	run_ui_tasks();
+	unwatch_dialog_views(dialog);
+	save_collection(&d);
+	struct collection r = {"R", obs_data_create(), {d.mixers[0], d.mixers[1]}};
+	obs_data_apply(r.modules, d.modules);
+	load_collection(&r);
+	report_collection_mixers("r_loaded");
+	switch_collection(&r, &a);
+	obs_data_release(d.modules);
+	obs_data_release(r.modules);
 
 	printf("HARNESS collection_step name=switch_discard\n");
 	dialog = open_tracked_dialog();

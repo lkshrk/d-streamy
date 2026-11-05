@@ -207,6 +207,11 @@ static SAMPLER: Mutex<Option<Sampler>> = Mutex::new(None);
 static CLOCK: OnceLock<Instant> = OnceLock::new();
 /// The takeover's confirm row is open in the panel.
 static CONFIRMING: AtomicBool = AtomicBool::new(false);
+static PANEL_OPEN: AtomicBool = AtomicBool::new(false);
+
+pub fn panel_open() -> bool {
+    PANEL_OPEN.load(Ordering::Acquire)
+}
 
 /// Samples D-Streamy's output each time the panel polls; `None` while it isn't active.
 fn live_stats() -> Option<LiveStats> {
@@ -229,6 +234,9 @@ fn live_stats() -> Option<LiveStats> {
 extern "C" fn view_json(_ctx: Ctx) -> *mut c_char {
     guard("panel view", ptr::null_mut(), || {
         let live = live_stats();
+        if cfg!(unix) {
+            settings_source::recheck_unrestored();
+        }
         let sources = if cfg!(unix) {
             crate::audio::sources()
         } else {
@@ -263,6 +271,7 @@ extern "C" fn stop(_ctx: Ctx) {
 
 extern "C" fn load_lists(_ctx: Ctx) {
     guard("panel load_lists", (), || {
+        PANEL_OPEN.store(true, Ordering::Release);
         CONFIRMING.store(false, Ordering::Release);
         settings_source::open_config();
         session::request_lists(None);
@@ -357,10 +366,11 @@ pub fn collection_changed() {
 extern "C" fn panel_closed(_ctx: Ctx) {
     guard("panel closed", (), || {
         CONFIRMING.store(false, Ordering::Release);
-        change(|c, _| {
-            c.model.forget_released();
-            c.model.forget_unrestored();
-        });
+        PANEL_OPEN.store(false, Ordering::Release);
+        if !settings_source::dialog_open() {
+            change(|c, _| c.model.forget_released());
+        }
+        settings_source::forget_unrestored();
     });
 }
 

@@ -384,16 +384,16 @@ impl DockModel {
         self.released_mixers
     }
 
-    /// The panel or dialog that showed the released tracks' follow-up closed.
+    /// The views that showed the released tracks' follow-ups closed; Track 1's stays, as the stream still misses it.
     pub fn forget_released(&mut self) {
-        self.released_mixers = 0;
+        self.released_mixers &= 1;
     }
 
     pub fn unrestored_mixers(&self) -> u32 {
         self.unrestored_mixers
     }
 
-    /// A dialog's Cancel couldn't put back `mixers`; the panel and dialog say so until the panel closes.
+    /// A dialog's Cancel couldn't put back `mixers`; the panel and dialog say so until it is sorted out.
     pub fn restore_failed(&mut self, mixers: u32) {
         self.unrestored_mixers |= mixers & ((1 << AUDIO_TRACKS.end()) - 1);
     }

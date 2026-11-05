@@ -172,44 +172,45 @@ pub struct Notice {
     pub release: Option<u8>,
 }
 
-/// Warnings about managed tracks Discord doesn't get and Track 1, then follow-ups; `kept`: the dialog's opened pick.
-pub fn notices(model: &DockModel, sources: &[AudioSource], kept: Option<u8>) -> Vec<Notice> {
+/// Warnings about managed tracks Discord doesn't get and about Track 1, then the follow-ups of earlier actions.
+pub fn notices(model: &DockModel, sources: &[AudioSource]) -> Vec<Notice> {
     let six = track_name(DEFAULT_AUDIO_TRACK);
-    let gets = |t: u8| model.gets(t) || kept == Some(t);
+    let back = "then turn it back on in Edit › Advanced Audio Properties where needed.";
     let mut shown: Vec<Notice> = AUDIO_TRACKS
-        .filter(|&t| model.manages(t) && (t == 1 || !gets(t)))
+        .filter(|&t| model.manages(t) && (t == 1 || !model.gets(t)))
         .map(|track| {
             let t = track_name(track);
-            let back = "then turn it back on in Edit › Advanced Audio Properties for the sources that need it.";
+            let next = model.settings().audio_track;
             let text = match track {
-                1 if gets(1) => {
-                    let first = format!(
-                        "{t} is OBS's streaming and recording track, and D-Streamy manages it for Discord, so new \
-                         sources start without it."
-                    );
-                    let then = if !model.gets(1) {
-                        format!("To stop managing {t}, click OK and open Tools › D-Streamy again.")
-                    } else if model.live_track() == Some(1) && model.settings().audio_track != 1 {
-                        format!("After this stream, stop managing {t} here.")
-                    } else if model.live_track() == Some(1) {
-                        format!("After this stream, pick {six} for Discord, manage it, then stop managing {t}.")
-                    } else {
-                        format!("Pick {six} for Discord, manage it, then stop managing {t}.")
+                1 if model.gets(1) => {
+                    let then = match (model.live_track() == Some(1), next) {
+                        (false, _) => format!("Pick {six} for Discord, manage it, then stop managing {t}."),
+                        (true, 1) => format!(
+                            "Pick {six} for the next Go Live now; after this stream, manage it and stop managing {t}."
+                        ),
+                        (true, n) if model.manages(n) => format!("After this stream, stop managing {t} here."),
+                        (true, n) => format!(
+                            "After this stream, manage {} and stop managing {t}.",
+                            track_name(n)
+                        ),
                     };
-                    format!("{first} {then}")
+                    format!(
+                        "{t} is OBS's streaming and recording track, and D-Streamy manages it for Discord, so new \
+                         sources start without it. {then}"
+                    )
                 }
                 1 => format!(
                     "{t} is OBS's streaming and recording track, and D-Streamy still manages it, so new sources \
                      start without it. Stop managing {t}, {back}"
                 ),
                 _ => format!(
-                    "D-Streamy also manages {t}, so new sources start without it. Discord doesn't get {t}, so you \
-                     can stop managing it, {back}"
+                    "D-Streamy also manages {t}, which Discord doesn't get, so new sources start without it. Stop \
+                     managing it, {back}"
                 ),
             };
             Notice {
                 text,
-                release: (!gets(track)).then_some(track),
+                release: (!model.gets(track)).then_some(track),
             }
         })
         .collect();
@@ -360,7 +361,7 @@ pub fn audio_view(model: &DockModel, track: u8, sources: &[AudioSource]) -> Audi
             help: unmanaged_line(track, live, sources),
             take_over: take_over_label(track),
             effect: take_over_effect(track, live),
-            instead: (track == 1 && model.live_track().is_none()).then_some(DEFAULT_AUDIO_TRACK),
+            instead: (track == 1 && !live).then_some(DEFAULT_AUDIO_TRACK),
         };
     }
     let mut rows: Vec<SourceRow> = sources
@@ -645,7 +646,7 @@ mod tests {
     fn track_1_stays_a_warning_with_a_way_out_whatever_discord_gets() {
         let mut m = model(6, Some(1));
         m.take_over(6);
-        let shown = notices(&m, &[], None);
+        let shown = notices(&m, &[]);
         assert_eq!(shown.len(), 1, "{shown:?}");
         assert_eq!(shown[0].release, Some(1));
         assert!(
@@ -662,7 +663,7 @@ mod tests {
         );
 
         let on_1 = model(1, Some(1));
-        let shown = notices(&on_1, &[], None);
+        let shown = notices(&on_1, &[]);
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].release, None, "Discord gets Track 1");
         assert_eq!(
@@ -673,16 +674,15 @@ mod tests {
 
         let mut other = model(6, Some(6));
         other.take_over(3);
-        let shown = notices(&other, &[], None);
+        let shown = notices(&other, &[]);
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].release, Some(3));
         assert_eq!(
             shown[0].text,
-            "D-Streamy also manages Track 3, so new sources start without it. Discord doesn't get Track 3, so \
-             you can stop managing it, then turn it back on in Edit › Advanced Audio Properties for the sources \
-             that need it."
+            "D-Streamy also manages Track 3, which Discord doesn't get, so new sources start without it. Stop \
+             managing it, then turn it back on in Edit › Advanced Audio Properties where needed."
         );
-        assert!(notices(&model(6, Some(6)), &[], None).is_empty());
+        assert!(notices(&model(6, Some(6)), &[]).is_empty());
         assert_eq!(release_label(3), "Stop managing Track 3");
     }
 
@@ -717,6 +717,23 @@ mod tests {
 
     #[test]
     fn while_live_track_1_offers_no_other_track_and_says_what_waits_for_the_stream_to_end() {
+        let mut on_six = live_on(picked(6, None));
+        on_six.select_audio_track(1);
+        let AudioView::Unmanaged {
+            effect, instead, ..
+        } = audio_view(&on_six, 1, &[])
+        else {
+            panic!()
+        };
+        assert_eq!(
+            instead,
+            Some(6),
+            "live on Track 6, the pick for the next Go Live can still change"
+        );
+        assert!(
+            effect.ends_with("Use Track 6 for Discord instead."),
+            "{effect}"
+        );
         let live = live_on(picked(1, None));
         let AudioView::Unmanaged {
             effect, instead, ..
@@ -731,13 +748,13 @@ mod tests {
              so your stream and recordings lose their audio, and Discord goes silent until you tick what it hears."
         );
         let mut managed = live_on(picked(1, Some(1)));
-        let text = |m: &DockModel| notices(m, &[], None).remove(0);
+        let text = |m: &DockModel| notices(m, &[]).remove(0);
         let shown = text(&managed);
         assert_eq!(shown.release, None);
         assert!(
             shown
                 .text
-                .ends_with("After this stream, pick Track 6 for Discord, manage it, then stop managing Track 1."),
+                .ends_with("Pick Track 6 for the next Go Live now; after this stream, manage it and stop managing Track 1."),
             "{}",
             shown.text
         );
@@ -747,9 +764,17 @@ mod tests {
         assert!(
             shown
                 .text
-                .ends_with("After this stream, stop managing Track 1 here."),
+                .ends_with("After this stream, manage Track 6 and stop managing Track 1."),
             "{}",
             shown.text
+        );
+        managed.take_over(6);
+        assert!(
+            text(&managed)
+                .text
+                .ends_with("After this stream, stop managing Track 1 here."),
+            "{}",
+            text(&managed).text
         );
         assert!(!managed.release(1));
     }
@@ -759,20 +784,17 @@ mod tests {
         let mut m = live_on(picked(6, Some(6)));
         m.select_audio_track(3);
         m.take_over(3);
-        assert!(
-            notices(&m, &[], None).is_empty(),
-            "the next Go Live uses Track 3"
-        );
+        assert!(notices(&m, &[]).is_empty(), "the next Go Live uses Track 3");
         assert!(!m.release(3), "the next Go Live's track stays managed");
         assert!(!m.release(6), "the live track stays managed");
         m.take_over(4);
-        let shown = notices(&m, &[], None);
+        let shown = notices(&m, &[]);
         assert_eq!(shown.len(), 1, "{shown:?}");
         assert_eq!(shown[0].release, Some(4));
         assert!(m.release(4));
         m.select_audio_track(5);
         assert_eq!(
-            notices(&m, &[], None)
+            notices(&m, &[])
                 .iter()
                 .map(|n| n.release)
                 .collect::<Vec<_>>(),
@@ -791,7 +813,7 @@ mod tests {
             source("d", "Desktop", 0b11_1111),
         ];
         assert!(m.release(1));
-        let shown = notices(&m, &off, None);
+        let shown = notices(&m, &off);
         assert_eq!(shown.len(), 1, "{shown:?}");
         assert_eq!(shown[0].release, None);
         assert_eq!(
@@ -800,29 +822,37 @@ mod tests {
              recordings miss them. Turn Track 1 back on for them in Edit › Advanced Audio Properties."
         );
         assert!(
-            notices(&m, &[source("d", "Desktop", 0b11_1111)], None).is_empty(),
+            notices(&m, &[source("d", "Desktop", 0b11_1111)]).is_empty(),
             "nothing has it off any more"
         );
         let many: Vec<AudioSource> = (0..5)
             .map(|i| source(&format!("{i}"), &format!("S{i}"), 0))
             .collect();
         assert!(
-            notices(&m, &many, None)[0]
+            notices(&m, &many)[0]
                 .text
                 .contains("still off on S0, S1, S2 and 2 more,"),
             "{:?}",
-            notices(&m, &many, None)
+            notices(&m, &many)
         );
         m.forget_released();
+        assert_eq!(
+            notices(&m, &off).len(),
+            1,
+            "the stream still misses them after the views close"
+        );
+        m.take_over(1);
         assert!(
-            notices(&m, &off, None).is_empty(),
-            "the panel or dialog closed"
+            notices(&m, &off)
+                .iter()
+                .all(|n| !n.text.contains("no longer"))
         );
 
+        let mut m = model(6, Some(6));
         m.take_over(3);
         m.release(3);
         assert!(
-            notices(&m, &[source("m", "Mic", 0b11_1011)], None)[0]
+            notices(&m, &[source("m", "Mic", 0b11_1011)])[0]
                 .text
                 .starts_with(
                     "D-Streamy no longer manages Track 3. It is still off on Mic: turn it back on"
@@ -830,11 +860,18 @@ mod tests {
         );
         m.take_over(3);
         assert!(
-            notices(&m, &[source("m", "Mic", 0b11_1011)], None)
+            notices(&m, &[source("m", "Mic", 0b11_1011)])
                 .iter()
                 .all(|n| n.release == Some(3)),
             "managed again"
         );
+        m.release(3);
+        m.forget_released();
+        assert!(
+            notices(&m, &[source("m", "Mic", 0b11_1011)]).is_empty(),
+            "other tracks' follow-ups end with the views that showed them"
+        );
+        m.take_over(3);
         m.release(3);
         m.restore_managed(track_bit(6) | track_bit(3));
         assert_eq!(m.released_mixers(), 0, "a Cancel brought it back");
@@ -844,31 +881,10 @@ mod tests {
     }
 
     #[test]
-    fn the_dialog_s_opened_pick_is_not_offered_for_release_while_browsing() {
-        let m = model(5, Some(6));
-        assert!(
-            notices(&m, &[], Some(6)).is_empty(),
-            "Track 6 was Discord's when the dialog opened"
-        );
-        assert_eq!(notices(&m, &[], None)[0].release, Some(6));
-        let mut one = model(6, Some(1));
-        one.take_over(6);
-        let shown = notices(&one, &[], Some(1));
-        assert_eq!(shown[0].release, None);
-        assert!(
-            shown[0]
-                .text
-                .ends_with("To stop managing Track 1, click OK and open Tools › D-Streamy again."),
-            "{}",
-            shown[0].text
-        );
-    }
-
-    #[test]
     fn a_cancel_that_could_not_undo_says_which_track_to_check() {
         let mut m = model(6, Some(6));
         m.restore_failed(track_bit(6));
-        let shown = notices(&m, &[], None);
+        let shown = notices(&m, &[]);
         assert_eq!(
             shown,
             [Notice {
@@ -879,7 +895,7 @@ mod tests {
             }]
         );
         m.forget_unrestored();
-        assert!(notices(&m, &[], None).is_empty());
+        assert!(notices(&m, &[]).is_empty());
         m.restore_failed(track_bit(3));
         m.take_over(3);
         assert_eq!(m.unrestored_mixers(), 0, "taken over again");
@@ -887,7 +903,15 @@ mod tests {
 
     #[test]
     fn the_mic_check_names_what_it_cannot_see() {
-        assert!(MIC_CHECK.contains("not video capture devices such as webcams and capture cards"));
+        let guard = mic_guard(&model(6, None), &[mic("m", "Mic", 0b11_1111)]).unwrap();
+        assert!(
+            guard.tooltip().ends_with(
+                "D-Streamy checks microphones and Mic/Aux sources, not video capture devices such as webcams \
+                 and capture cards."
+            ),
+            "{}",
+            guard.tooltip()
+        );
     }
 
     #[test]

@@ -334,6 +334,7 @@ pub fn collection_loaded() {
 /// # Safety
 /// `modules` is live.
 pub unsafe fn collection_saving(modules: *mut sys::obs_data_t) {
+    settings_source::collection_saved();
     let managed = with_controls(|c| c.model.managed_mixers());
     // SAFETY: the caller's contract; libobs copies the key and takes its own reference to the object.
     unsafe {

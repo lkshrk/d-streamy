@@ -73,10 +73,13 @@ fn with_dot(first: String, second: Option<&str>) -> String {
     }
 }
 
-/// The track a session uses, and the one the next Go Live will use when they differ.
-fn track_line(m: &DockModel) -> String {
+/// The track a session uses, and the one the next Go Live will use when they differ; `short` fits the panel.
+fn track_line(m: &DockModel, short: bool) -> String {
     match m.track_status() {
         TrackStatus::Idle { selected: track } | TrackStatus::Live { track } => track_name(track),
+        TrackStatus::Pending { live, next } if short => {
+            format!("{} · next: {}", track_name(live), track_name(next))
+        }
         TrackStatus::Pending { live, next } => {
             format!("{} · {}", track_name(live), next_go_live(next))
         }
@@ -145,15 +148,15 @@ pub fn dock_view(
                             "Not set up".to_owned(),
                             "Pick a server and voice channel".to_owned(),
                         ),
-                        Some(Some(name)) => (format!("Idle · {name}"), track_line(m)),
-                        Some(None) => ("Idle".to_owned(), track_line(m)),
+                        Some(Some(name)) => (format!("Idle · {name}"), track_line(m, true)),
+                        Some(None) => ("Idle".to_owned(), track_line(m, true)),
                     };
                     (Tone::Idle, headline, detail, start)
                 }
             }
             busy_or_live => {
-                let short = with_dot(track_line(m), config_error.map(|e| e.headline()));
-                let full = with_dot(track_line(m), config.as_deref());
+                let short = with_dot(track_line(m, true), config_error.map(|e| e.headline()));
+                let full = with_dot(track_line(m, false), config.as_deref());
                 let (detail, tooltip) = match (busy_or_live, live) {
                     (DockState::Live { .. }, Some(stats)) => (
                         stats_line(stats),
@@ -397,8 +400,9 @@ mod tests {
         assert_eq!(v.status_bar, "● D-Streamy live");
 
         s.model.select_audio_track(4);
+        assert_eq!(view(&s).detail, "Track 6 · next: Track 4");
         assert_eq!(
-            view(&s).detail,
+            view(&s).detail_tooltip,
             "Track 6 · Discord hears Track 4 from the next Go Live"
         );
     }
@@ -697,7 +701,7 @@ mod tests {
         );
         assert_eq!(
             dock_view(&s, true, None, None).detail,
-            early.detail_tooltip.lines().nth(1).unwrap()
+            "Track 6 · next: Track 3"
         );
     }
 

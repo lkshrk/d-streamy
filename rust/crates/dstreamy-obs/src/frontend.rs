@@ -176,7 +176,7 @@ extern "C" fn on_event(event: c_int, _private_data: *mut c_void) {
         Ok(sys::DSTREAMY_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP) => {
             crate::audio::collection_cleared();
         }
-        // Both come right before OBS saves the collection (or just saved it) and closes every dialog.
+        // Both come before OBS leaves the collection or quits and closes every dialog.
         Ok(
             sys::DSTREAMY_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING
             | sys::DSTREAMY_FRONTEND_EVENT_SCRIPTING_SHUTDOWN,
@@ -328,9 +328,16 @@ extern "C" fn open_settings(_private_data: *mut c_void) {
                 return;
             }
             // SAFETY: a dialog OBS opens takes its own reference, so this one is released at once.
-            unsafe {
+            let opened = unsafe {
+                let weak = sys::obs_source_get_weak_source(source);
                 open(source);
                 sys::obs_source_release(source);
+                let opened = !sys::obs_weak_source_expired(weak);
+                sys::obs_weak_source_release(weak);
+                opened
+            };
+            if !opened {
+                settings_source::not_opened(source);
             }
         });
     });

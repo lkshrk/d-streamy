@@ -162,7 +162,7 @@ fn audio(state: &ConfigState, controls: bool, sources: &[AudioSource], confirmin
         audio.line = NO_AUDIO_CONTROLS.to_owned();
         return audio;
     }
-    audio.notices = notices(m, sources, None)
+    audio.notices = notices(m, sources)
         .into_iter()
         .map(|n| Notice {
             text: n.text,
