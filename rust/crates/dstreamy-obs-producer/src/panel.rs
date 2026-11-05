@@ -7,7 +7,10 @@ use crate::dock::{AUDIO_TRACKS, DockState, track_name};
 use crate::dock_config::ConfigState;
 use crate::dock_view::{Button, Tone, dock_view};
 use crate::live::LiveStats;
-use crate::mixer::{AudioSource, AudioView, CONFIRM, NOT_NOW, audio_view, mic_guard};
+use crate::mixer::{
+    AudioSource, AudioView, CONFIRM, NOT_NOW, audio_view, instead_label, mic_guard, notices,
+    release_label,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Item {
@@ -37,6 +40,22 @@ pub struct Confirm {
     pub text: String,
     pub ok: String,
     pub cancel: String,
+    /// A track to pick instead of this takeover.
+    pub instead: Option<TrackAction>,
+}
+
+/// A button that acts on one track.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrackAction {
+    pub track: u8,
+    pub label: String,
+}
+
+/// A warning shown above the audio part whatever the Discord track is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Notice {
+    pub text: String,
+    pub release: Option<TrackAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -52,12 +71,13 @@ pub struct Audio {
     pub track: u8,
     pub tracks: Vec<TrackItem>,
     pub managed: bool,
-    /// Shown instead of the checkboxes while the track is unmanaged, and above them for a warning.
+    /// What Discord hears from the track shown: above the takeover, or above the checkboxes.
     pub line: String,
     pub manage: String,
     pub confirm: Option<Confirm>,
     pub sources: Vec<Source>,
     pub empty: Option<String>,
+    pub notices: Vec<Notice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -137,29 +157,50 @@ fn audio(state: &ConfigState, controls: bool, sources: &[AudioSource], confirmin
         confirm: None,
         sources: Vec::new(),
         empty: None,
+        notices: Vec::new(),
     };
     if !controls {
         audio.line = NO_AUDIO_CONTROLS.to_owned();
         return audio;
     }
+    audio.notices = notices(m)
+        .into_iter()
+        .map(|n| Notice {
+            text: n.text,
+            release: n.release.map(|track| TrackAction {
+                track,
+                label: release_label(track),
+            }),
+        })
+        .collect();
     match audio_view(m, track, sources) {
-        AudioView::Unmanaged { help, effect, .. } => {
+        AudioView::Unmanaged {
+            help,
+            take_over,
+            effect,
+            instead,
+            ..
+        } => {
             audio.line = help;
-            audio.manage = format!("Manage {}", track_name(track));
+            audio.manage = take_over;
             audio.confirm = confirming.then(|| Confirm {
                 text: effect,
                 ok: CONFIRM.to_owned(),
                 cancel: NOT_NOW.to_owned(),
+                instead: instead.map(|track| TrackAction {
+                    track,
+                    label: instead_label(track),
+                }),
             });
         }
         AudioView::Managed {
+            help,
             sources,
             empty,
-            note,
             ..
         } => {
             audio.managed = true;
-            audio.line = note.unwrap_or_default();
+            audio.line = help;
             audio.sources = sources
                 .into_iter()
                 .map(|s| Source {
@@ -452,7 +493,7 @@ mod tests {
         assert_eq!(v.audio.track, 6);
         assert_eq!(
             v.audio.line,
-            "Discord hears every source on Track 6. Let D-Streamy manage Track 6 to pick sources here."
+            "Discord would hear every source on Track 6. Manage Track 6 to pick sources here."
         );
         assert_eq!(v.audio.manage, "Manage Track 6");
         assert_eq!(v.audio.confirm, None);
@@ -466,8 +507,40 @@ mod tests {
                     .into(),
                 ok: "Manage".into(),
                 cancel: "Not now".into(),
+                instead: None,
             })
         );
+        let mut on_1 = picked(false);
+        on_1.model.select_audio_track(1);
+        let v = panel_view(&on_1, true, None, &sources(), true);
+        assert_eq!(
+            v.audio.confirm.and_then(|c| c.instead),
+            Some(TrackAction {
+                track: 6,
+                label: "Use Track 6 instead".into()
+            })
+        );
+    }
+
+    #[test]
+    fn other_managed_tracks_show_as_warnings_with_stop_managing() {
+        let mut s = picked(true);
+        s.model.take_over(1);
+        let v = view(&s);
+        assert_eq!(v.audio.notices.len(), 1);
+        assert_eq!(
+            v.audio.notices[0].release,
+            Some(TrackAction {
+                track: 1,
+                label: "Stop managing Track 1".into()
+            })
+        );
+        assert!(
+            v.audio
+                .line
+                .starts_with("Discord would hear the ticked sources on Track 6.")
+        );
+        assert!(view(&picked(true)).audio.notices.is_empty());
     }
 
     #[test]
@@ -545,7 +618,7 @@ mod tests {
         let v = panel_view(&picked(false), true, None, &mic_on_track_6(), false);
         assert_eq!(v.tone, Tone::Attention);
         assert_eq!(v.state_line, "Discord would hear Mic/Aux");
-        assert_eq!(v.state_fix, "Let D-Streamy manage Track 6");
+        assert_eq!(v.state_fix, "Manage Track 6");
         assert!(
             v.state_tooltip
                 .starts_with("Mic/Aux is on Track 6, so Discord would hear it."),
@@ -567,7 +640,7 @@ mod tests {
         let leak = panel_view(&live(picked(false)), true, None, &mic_on_track_6(), false);
         assert_eq!(leak.tone, Tone::Attention, "Discord hears the mic now");
         assert_eq!(leak.state_line, "Discord hears Mic/Aux");
-        assert_eq!(leak.state_fix, "Let D-Streamy manage Track 6");
+        assert_eq!(leak.state_fix, "Manage Track 6");
         assert_eq!(leak.status_bar, "⚠ D-Streamy live ▴");
         assert!(leak.button.enabled, "Stop stays");
         assert_eq!(
@@ -587,18 +660,15 @@ mod tests {
         s.model.take_over(1);
         let v = view(&s);
         assert!(v.audio.managed);
+        assert_eq!(v.audio.notices.len(), 1);
         assert!(
-            v.audio
-                .line
+            v.audio.notices[0]
+                .text
                 .starts_with("Track 1 is OBS's streaming and recording track"),
-            "{}",
-            v.audio.line
+            "{:?}",
+            v.audio.notices
         );
-        assert_eq!(
-            view(&picked(true)).audio.line,
-            "",
-            "Track 6 needs no warning"
-        );
+        assert_eq!(v.audio.notices[0].release, None, "Discord gets Track 1");
     }
 
     #[test]

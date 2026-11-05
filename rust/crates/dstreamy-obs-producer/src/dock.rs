@@ -262,6 +262,8 @@ pub struct DockModel {
     lists_pending: u32,
     /// The tracks D-Streamy manages in the loaded scene collection, as OBS mixer bits.
     managed_mixers: u32,
+    /// The legacy managed track was settled this session; a stale file can't bring it back.
+    adoption_done: bool,
 }
 
 impl DockModel {
@@ -276,6 +278,7 @@ impl DockModel {
             applying: None,
             lists_pending: 0,
             managed_mixers: 0,
+            adoption_done: false,
         }
     }
 
@@ -355,9 +358,19 @@ impl DockModel {
         self.managed_mixers = managed_mixers & ((1 << AUDIO_TRACKS.end()) - 1);
     }
 
-    /// The legacy managed track, once: the first scene collection that loads takes it.
+    /// The legacy managed track, once a session: the first scene collection that loads decides about it.
     pub fn take_adoption(&mut self) -> Option<u8> {
+        self.adoption_done = true;
         self.settings.adopt_managed_track.take()
+    }
+
+    /// Lets go of a managed track Discord doesn't get; no mixer flag changes. False when there is nothing to let go.
+    pub fn release(&mut self, track: u8) -> bool {
+        if !self.manages(track) || track == self.heard_track() {
+            return false;
+        }
+        self.managed_mixers &= !(1 << (track - 1));
+        true
     }
 
     /// The track Discord hears now while a session runs, else the one the next Go Live binds.
@@ -425,10 +438,12 @@ impl DockModel {
             )
         };
         let guild_changed = guild_id != self.settings.guild_id;
+        let adopt = settings.adopt_managed_track.filter(|_| !self.adoption_done);
         self.settings = DockSettings {
             guild_id,
             channel_id,
             owned: self.settings.owned.take(),
+            adopt_managed_track: adopt,
             ..settings
         };
         if !guild_changed {
@@ -972,6 +987,12 @@ mod tests {
         );
         assert_eq!(m.take_adoption(), Some(6));
         assert_eq!(m.take_adoption(), None, "once");
+        m.reload(s_with_adoption());
+        assert_eq!(
+            m.settings().adopt_managed_track,
+            None,
+            "a file that couldn't be saved doesn't bring it back"
+        );
         let saved = m.settings().to_json();
         assert_eq!(DockSettings::from_json(&saved).adopt_managed_track, None);
         assert!(!saved.contains("managed_track\":6"), "{saved}");
@@ -979,6 +1000,18 @@ mod tests {
 
     fn s_with_adoption() -> DockSettings {
         DockSettings::from_json(r#"{"audio_track":6,"managed_track":6}"#)
+    }
+
+    #[test]
+    fn only_a_managed_track_discord_doesnt_get_can_be_let_go() {
+        let mut m = DockModel::new(DockSettings::default());
+        m.take_over(6);
+        m.take_over(1);
+        assert!(!m.release(6), "Discord gets Track 6");
+        assert!(!m.release(3), "not managed");
+        assert!(m.release(1));
+        assert_eq!(m.managed_mixers(), 0b10_0000);
+        assert!(!m.release(1), "once");
     }
 
     #[test]

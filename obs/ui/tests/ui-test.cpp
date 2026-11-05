@@ -54,6 +54,7 @@ struct Host {
 	int take_overs = 0;
 	int closed = 0;
 	std::vector<bool> confirms;
+	std::vector<int> releases;
 	std::string guild = "-";
 	std::string channel = "-";
 	int track = 0;
@@ -128,6 +129,10 @@ dstreamy_ui_host make_host()
 	h.panel_closed = [](void *) {
 		called();
 		host.closed++;
+	};
+	h.release_track = [](void *, int track) {
+		called();
+		host.releases.push_back(track);
 	};
 	return h;
 }
@@ -330,14 +335,17 @@ int main(int argc, char **argv)
 	window.show();
 	fake::window = &window;
 
-	CHECK(dstreamy_ui_abi_version() == 3);
+	CHECK(dstreamy_ui_abi_version() == 4);
 	dstreamy_ui_host good = make_host();
 	CHECK(!dstreamy_ui_load(nullptr));
 	dstreamy_ui_host old = good;
-	old.abi_version = 2;
+	old.abi_version = 3;
 	CHECK(!dstreamy_ui_load(&old));
 	dstreamy_ui_host partial = good;
 	partial.panel_closed = nullptr;
+	CHECK(!dstreamy_ui_load(&partial));
+	partial = good;
+	partial.release_track = nullptr;
 	CHECK(!dstreamy_ui_load(&partial));
 	fake::window = nullptr;
 	CHECK(!dstreamy_ui_load(&good));
@@ -422,6 +430,27 @@ int main(int argc, char **argv)
 	noted["line"] = QStringLiteral("Track 1 is OBS's streaming and recording track");
 	show(view(idle, noted));
 	CHECK(visible("dstreamy-audio-line") && visible("dstreamy-sources") && !visible("dstreamy-manage"));
+
+	QJsonObject warned = audio(true, false);
+	warned["notices"] =
+		QJsonArray{QJsonObject{{"text", "Track 1 is OBS's streaming and recording track"},
+				       {"release", QJsonObject{{"track", 1}, {"label", "Stop managing Track 1"}}}}};
+	show(view(idle, warned));
+	CHECK(visible("dstreamy-notices") && visible("dstreamy-release") && visible("dstreamy-sources"));
+	CHECK(text("dstreamy-notice").startsWith(QLatin1String("Track 1 is OBS's")));
+	find<QPushButton>("dstreamy-release")->click();
+	CHECK((host.releases == std::vector<int>{1}));
+	show(view(idle, audio(true, false)));
+	CHECK(!visible("dstreamy-notices"));
+
+	QJsonObject instead = audio(false, true);
+	QJsonObject row = instead["confirm"].toObject();
+	row["instead"] = QJsonObject{{"track", 6}, {"label", "Use Track 6 instead"}};
+	instead["confirm"] = row;
+	show(view(idle, instead));
+	CHECK(visible("dstreamy-confirm-instead"));
+	find<QPushButton>("dstreamy-confirm-instead")->click();
+	CHECK(host.track == 6);
 
 	QJsonObject no_controls = audio(false, false);
 	no_controls["manage"] = QString();

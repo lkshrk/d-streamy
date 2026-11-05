@@ -1124,11 +1124,11 @@ fn a_frontend_without_a_properties_dialog_offers_no_tools_entry() {
 /// The status while no service runs at the harness's default endpoint.
 const NO_SERVICE: &str = "The D-Streamy service is not running (no service is listening at ";
 const TAKE_OVER_HELP: &str =
-    "Discord hears every source on Track 6. Let D-Streamy manage Track 6 to pick sources here.";
+    "Discord would hear every source on Track 6. Manage Track 6 to pick sources here.";
 const TAKE_OVER_EFFECT: &str =
     "Turns Track 6 off on every audio source, also for recordings and streams that use it.";
 /// The dialog's status while the unmanaged Track 6 carries the harness's Mic.
-const MIC_GUARD: &str = "Mic is on Track 6, so Discord would hear it. Let D-Streamy manage Track 6, \
+const MIC_GUARD: &str = "Mic is on Track 6, so Discord would hear it. Manage Track 6, \
      or turn Track 6 off for Mic in Edit \u{203a} Advanced Audio Properties.";
 
 fn module_config(dir: &std::path::Path) -> PathBuf {
@@ -1193,7 +1193,7 @@ fn the_settings_dialog_offers_a_server_a_channel_tracks_1_to_6_and_start_while_i
             "HARNESS settings_property when=open name=audio_help type=4 enabled=1 desc={TAKE_OVER_HELP}"
         ),
         "HARNESS settings_info when=open name=audio_help kind=0".to_owned(),
-        "HARNESS settings_property when=open name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 6"
+        "HARNESS settings_property when=open name=take_over type=8 enabled=1 desc=Manage Track 6"
             .to_owned(),
         "HARNESS settings_property when=open name=start type=8 enabled=1 desc=Start".to_owned(),
         "HARNESS settings_property when=open name=stop type=8 enabled=0 desc=Stop".to_owned(),
@@ -1257,7 +1257,7 @@ fn assert_dialog_follows(lines: &[String]) {
     );
     assert!(
         mixer_step(lines, "track5").contains(
-            &"HARNESS settings_property when=view name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 5"
+            &"HARNESS settings_property when=view name=take_over type=8 enabled=1 desc=Manage Track 5"
                 .to_owned()
         ),
         "a picked track shows its own takeover: {lines:#?}"
@@ -1281,7 +1281,7 @@ fn taking_over_track_6_clears_it_on_every_source_and_a_tick_sets_only_that_bit()
         &[
             "HARNESS mixers when=start name=Music mixers=63",
             "HARNESS mixers when=start name=Voice mixers=63",
-            "HARNESS settings_property when=unmanaged name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 6",
+            "HARNESS settings_property when=unmanaged name=take_over type=8 enabled=1 desc=Manage Track 6",
             "HARNESS settings_click_sync_refreshes name=take_over count=0",
             "HARNESS mixers when=confirming name=Music mixers=63",
             "HARNESS mixers when=confirming name=Voice mixers=63",
@@ -1349,7 +1349,7 @@ fn a_saved_track_3_stays_and_is_taken_over_on_its_own_bit() {
         &lines,
         &[
             "HARNESS settings_source when=unmanaged audio_track=3",
-            "HARNESS settings_property when=unmanaged name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 3",
+            "HARNESS settings_property when=unmanaged name=take_over type=8 enabled=1 desc=Manage Track 3",
             "HARNESS mixers when=taken name=Music mixers=59",
             "HARNESS mixers when=taken name=Voice mixers=59",
             "HARNESS mixers when=ticked name=Music mixers=63",
@@ -1401,13 +1401,13 @@ fn the_managed_track_belongs_to_its_scene_collection_and_loads_never_touch_mixer
         &[
             "HARNESS mixers when=a_loaded name=Mic mixers=63",
             "HARNESS mixers when=a_loaded name=Music mixers=63",
-            "HARNESS settings_property when=a_unmanaged name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 6",
+            "HARNESS settings_property when=a_unmanaged name=take_over type=8 enabled=1 desc=Manage Track 6",
             "HARNESS settings_info when=a_unmanaged name=status kind=1",
             "HARNESS mixers when=a_confirming name=Mic mixers=63",
             "HARNESS settings_property when=a_confirming name=cancel_take_over type=8 enabled=1 desc=Not now",
             "HARNESS mixers when=a_not_now name=Mic mixers=63",
             "HARNESS mixers when=a_not_now name=Music mixers=63",
-            "HARNESS settings_property when=a_not_now name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 6",
+            "HARNESS settings_property when=a_not_now name=take_over type=8 enabled=1 desc=Manage Track 6",
             "HARNESS mixers when=a_taken name=Mic mixers=31",
             "HARNESS mixers when=a_taken name=Music mixers=31",
             "HARNESS settings_checkbox when=a_managed desc=Mic on=0",
@@ -1417,13 +1417,13 @@ fn the_managed_track_belongs_to_its_scene_collection_and_loads_never_touch_mixer
             "HARNESS collection_loaded name=B",
             "HARNESS mixers when=b_loaded name=Mic mixers=63",
             "HARNESS mixers when=b_loaded name=Music mixers=63",
-            "HARNESS settings_property when=b name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 6",
+            "HARNESS settings_property when=b name=take_over type=8 enabled=1 desc=Manage Track 6",
             "HARNESS check_settings when=b differ=0",
             "HARNESS settings_property when=b_confirming name=confirm_take_over type=8 enabled=1 desc=Manage",
             "HARNESS collection_saved name=B managed_mixers=-1",
             "HARNESS collection_loaded name=C",
             "HARNESS mixers when=c_loaded name=Mic mixers=63",
-            "HARNESS settings_property when=c name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 6",
+            "HARNESS settings_property when=c name=take_over type=8 enabled=1 desc=Manage Track 6",
             "HARNESS mixers when=c_after name=Mic mixers=63",
             "HARNESS mixers when=c_after name=Music mixers=63",
             "HARNESS collection_saved name=C managed_mixers=-1",
@@ -1433,7 +1433,7 @@ fn the_managed_track_belongs_to_its_scene_collection_and_loads_never_touch_mixer
             "HARNESS settings_checkbox when=a_again desc=Music on=1",
             "HARNESS check_settings when=a_again differ=0",
             "HARNESS mixers when=new name=Mic mixers=255",
-            "HARNESS settings_property when=new name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 6",
+            "HARNESS settings_property when=new name=take_over type=8 enabled=1 desc=Manage Track 6",
             "HARNESS check_settings when=new differ=0",
             "HARNESS collection_saved name=new managed_mixers=-1",
         ]
@@ -1491,10 +1491,17 @@ fn cancel_puts_back_the_discord_track_the_dialog_changed_on_every_source() {
             "HARNESS mixers when=cancelled name=Music mixers=63",
             "HARNESS mixers when=cancelled name=Voice mixers=31",
             "HARNESS mixers when=cancelled name=Late mixers=255",
-            "HARNESS settings_property when=cancelled name=take_over type=8 enabled=1 desc=Let D-Streamy manage Track 6",
+            "HARNESS settings_property when=cancelled name=take_over type=8 enabled=1 desc=Manage Track 6",
+            "HARNESS check_settings when=confirming differ=0",
+            "HARNESS check_settings when=taken differ=1",
+            "HARNESS check_settings when=managed_ok differ=1",
+            "HARNESS mixers when=defaults name=Music mixers=63",
+            "HARNESS settings_checkbox when=defaults desc=Music on=1",
             "HARNESS mixers when=kept name=Music mixers=63",
             "HARNESS settings_checkbox when=managed_open desc=Music on=1",
+            "HARNESS check_settings when=ticked_back differ=0",
             "HARNESS mixers when=managed_ticked name=Music mixers=31",
+            "HARNESS check_settings when=managed_ticked differ=1",
             "HARNESS check_settings when=managed_cancelled differ=0",
             "HARNESS mixers when=managed_cancelled name=Music mixers=63",
             "HARNESS settings_checkbox when=managed_cancelled desc=Music on=1",
@@ -1516,34 +1523,61 @@ fn cancel_puts_back_the_discord_track_the_dialog_changed_on_every_source() {
     );
 }
 
-fn adopt(saved: Value) -> (Vec<String>, Value) {
+/// The adopt mode, A's Mic on `mic_mixers`; `None` when `read_only` can't stop this user (root) writing.
+fn adopt_with(saved: Value, mic_mixers: u32, read_only: bool) -> Option<(Vec<String>, Value)> {
+    use std::os::unix::fs::PermissionsExt;
     let config = tempfile::tempdir().unwrap();
     write_module_config(config.path(), saved);
+    let folder = module_config(config.path()).parent().unwrap().to_owned();
+    let mode = |m| std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(m)).unwrap();
+    if read_only {
+        mode(0o555);
+        if std::fs::write(folder.join("probe"), "").is_ok() {
+            mode(0o755);
+            return None;
+        }
+    }
     let dir = config.path().to_string_lossy().into_owned();
     let lib = fake_frontend();
+    let mixers = mic_mixers.to_string();
     let lines = report_ui(&[
         "--fake-frontend",
         lib.as_str(),
         "--module-config",
         dir.as_str(),
         "--collection-adopt",
+        "--adopt-mic-mixers",
+        mixers.as_str(),
     ]);
-    (lines, read_module_config(config.path()))
+    if read_only {
+        mode(0o755);
+    }
+    Some((lines, read_module_config(config.path())))
+}
+
+fn adopt(saved: Value, mic_mixers: u32) -> (Vec<String>, Value) {
+    adopt_with(saved, mic_mixers, false).expect("a writable config")
 }
 
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn a_track_managed_before_the_upgrade_is_adopted_by_the_first_collection_without_touching_mixers() {
-    let (lines, saved) = adopt(json!({"audio_track": 6, "managed_track": 6, "guild_id": "g"}));
+    let (lines, saved) = adopt(
+        json!({"audio_track": 6, "managed_track": 6, "guild_id": "g"}),
+        0x1f,
+    );
     assert_lines(
         &lines,
         &[
-            "HARNESS mixers when=a_loaded name=Mic mixers=63",
+            "HARNESS mixers when=a_loaded name=Mic mixers=31",
             "HARNESS mixers when=a_loaded name=Music mixers=63",
-            "HARNESS settings_checkbox when=adopted desc=Mic on=1",
+            "HARNESS settings_checkbox when=adopted desc=Mic on=0",
             "HARNESS settings_checkbox when=adopted desc=Music on=1",
             "HARNESS check_settings when=adopted differ=0",
             "HARNESS collection_saved name=A managed_mixers=32",
+            "HARNESS mixers when=b_adopt name=Mic mixers=63",
+            "HARNESS settings_property when=b_adopt name=take_over type=8 enabled=1 desc=Manage Track 6",
+            "HARNESS collection_saved name=B managed_mixers=-1",
         ]
         .map(str::to_owned),
     );
@@ -1559,23 +1593,120 @@ fn a_track_managed_before_the_upgrade_is_adopted_by_the_first_collection_without
 
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_legacy_managed_track_with_a_mic_on_it_stays_unmanaged_so_go_live_waits() {
+    let (lines, saved) = adopt(json!({"audio_track": 3, "managed_track": 3}), 0x1f);
+    assert_lines(
+        &lines,
+        &[
+            "HARNESS mixers when=a_loaded name=Mic mixers=31",
+            "HARNESS settings_property when=adopted name=take_over type=8 enabled=1 desc=Manage Track 3",
+            "HARNESS collection_saved name=A managed_mixers=-1",
+        ]
+        .map(str::to_owned),
+    );
+    assert_eq!(start_button(&lines, "adopted"), Some(false), "{lines:#?}");
+    assert!(
+        has_plugin_line(&lines, "but Mic is on it here, so Track 3 stays unmanaged"),
+        "{lines:#?}"
+    );
+    assert_eq!(
+        saved.get("adopt_managed_track"),
+        None,
+        "decided once: {saved}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn an_unsaved_adoption_is_not_repeated_in_the_next_collection() {
+    let Some((lines, saved)) =
+        adopt_with(json!({"audio_track": 6, "managed_track": 6}), 0x1f, true)
+    else {
+        eprintln!("skipped: this user can write a read-only folder");
+        return;
+    };
+    assert_lines(
+        &lines,
+        &[
+            "HARNESS collection_saved name=A managed_mixers=32",
+            "HARNESS settings_property when=b_adopt name=take_over type=8 enabled=1 desc=Manage Track 6",
+            "HARNESS collection_saved name=B managed_mixers=-1",
+        ]
+        .map(str::to_owned),
+    );
+    assert_eq!(
+        saved["managed_track"], 6,
+        "the read-only file was never written: {saved}"
+    );
+    assert!(
+        has_plugin_line(&lines, "Couldn't save D-Streamy's settings"),
+        "{lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn a_deliberate_track_1_takeover_stays_on_track_1_and_says_what_it_costs() {
-    let (lines, saved) = adopt(json!({"audio_track": 1, "managed_track": 1}));
+    let (lines, saved) = adopt(json!({"audio_track": 1, "managed_track": 1}), 0x3e);
     assert_lines(
         &lines,
         &[
             "HARNESS settings_source when=adopted audio_track=1",
+            "HARNESS settings_info when=adopted name=audio_note_0 kind=1",
             "HARNESS collection_saved name=A managed_mixers=1",
         ]
         .map(str::to_owned),
     );
     assert!(
         lines.iter().any(|l| l.starts_with(
-            "HARNESS settings_property when=adopted name=audio_note type=4 enabled=1 desc=Track 1 is OBS's streaming and recording track"
+            "HARNESS settings_property when=adopted name=audio_note_0 type=4 enabled=1 desc=Track 1 is OBS's \
+             streaming and recording track, and D-Streamy manages it for Discord"
         )),
         "{lines:#?}"
     );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("HARNESS settings_property when=adopted name=release_")),
+        "Discord gets Track 1, so it can't be let go here: {lines:#?}"
+    );
     assert_eq!(saved["audio_track"], 1, "{saved}");
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn track_1_confirms_its_cost_and_another_managed_track_can_be_let_go() {
+    let (lines, _) = dialog_session("--release-session");
+    assert_lines(
+        &lines,
+        &[
+            "HARNESS settings_info when=track1_confirming name=take_over_effect kind=1",
+            "HARNESS settings_property when=track1_confirming name=instead_6 type=8 enabled=1 desc=Use Track 6 instead",
+            "HARNESS settings_source when=instead audio_track=6",
+            "HARNESS settings_checkbox when=instead desc=Music on=0",
+            "HARNESS mixers when=three name=Mic mixers=27",
+            "HARNESS mixers when=three name=Music mixers=27",
+            "HARNESS settings_property when=three name=release_6 type=8 enabled=1 desc=Stop managing Track 6",
+            "HARNESS settings_info when=three name=audio_note_0 kind=1",
+            "HARNESS mixers when=released name=Mic mixers=27",
+            "HARNESS mixers when=released name=Music mixers=27",
+            "HARNESS settings_property when=six_again name=take_over type=8 enabled=1 desc=Manage Track 6",
+        ]
+        .map(str::to_owned),
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with(
+            "HARNESS settings_property when=track1_confirming name=take_over_effect type=4 enabled=1 \
+             desc=Track 1 is OBS's streaming and recording track: managing it turns it off on every audio source"
+        )),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l
+            .starts_with("HARNESS settings_property when=released name=release_")
+            || l.starts_with("HARNESS settings_property when=released name=audio_note")),
+        "nothing left to let go: {lines:#?}"
+    );
 }
 
 #[test]
@@ -2331,6 +2462,52 @@ fn a_server_change_in_the_dialog_never_keeps_the_old_servers_channel() {
     assert_eq!(saved["guild_id"], OTHER_GUILD_ID, "{saved}");
     assert_eq!(saved["channel_id"], Value::Null, "{saved}");
     assert_eq!(saved["audio_track"], 2, "{saved}");
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn while_live_the_dialog_shows_the_heard_track_and_warns_about_a_mic_on_it() {
+    let h = Harness::new("");
+    let _serve = default_serve(&h);
+    let config = picked_config(4);
+    let (status, lines) = tools_run(
+        &h,
+        config.path(),
+        &[
+            "--live-mic",
+            "--settings-update-while-active",
+            r#"{"audio_track": 2}"#,
+            "--tools-expect",
+            "Mic is on Track 2, so Discord would hear it.",
+            "--seconds",
+            "30",
+            "--until-video",
+            "30",
+        ],
+    )
+    .finish();
+    passed(status, &lines);
+    let leak = "Mic is on Track 4, so Discord hears it now. Manage Track 4, \
+                or turn Track 4 off for Mic in Edit \u{203a} Advanced Audio Properties.";
+    assert_lines(
+        &lines,
+        &[
+            format!("HARNESS settings_property when=live_mic name=status type=4 enabled=1 desc={leak}"),
+            "HARNESS settings_info when=live_mic name=status kind=1".to_owned(),
+            "HARNESS settings_property when=live_mic name=take_over type=8 enabled=1 desc=Manage Track 4"
+                .to_owned(),
+            "HARNESS settings_property when=live_updated name=take_over type=8 enabled=1 desc=Manage Track 4"
+                .to_owned(),
+            "HARNESS live_pick_refreshes count=0".to_owned(),
+        ],
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with(
+            "HARNESS settings_property when=live_mic name=audio_help type=4 enabled=1 \
+             desc=Discord hears every source on Track 4 (live), including Mic."
+        )),
+        "{lines:#?}"
+    );
 }
 
 #[test]

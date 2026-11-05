@@ -182,14 +182,11 @@ extern "C" fn on_event(event: c_int, _private_data: *mut c_void) {
 
 extern "C" fn on_save(data: *mut sys::obs_data_t, saving: bool, _private_data: *mut c_void) {
     guard("frontend save", (), || {
-        if data.is_null() {
-            return;
-        }
-        if saving {
+        if !saving {
+            crate::audio::collection_loaded();
+        } else if !data.is_null() {
             // SAFETY: the frontend passes its live "modules" data.
             unsafe { crate::audio::collection_saving(data) };
-        } else {
-            crate::audio::request_refresh();
         }
     });
 }

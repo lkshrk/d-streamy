@@ -19,7 +19,7 @@ use crate::session::{self, Wait};
 use crate::settings_source::{self, change, with_controls};
 
 /// `DSTREAMY_UI_ABI_VERSION` in `obs/ui/dstreamy-ui.h`.
-const ABI_VERSION: u32 = 3;
+const ABI_VERSION: u32 = 4;
 
 // libobs scans the module's own folder for modules, never this subfolder; macOS's bundle folder isn't scanned.
 #[cfg(not(target_os = "macos"))]
@@ -52,6 +52,7 @@ struct Host {
     confirm_take_over: Option<extern "C" fn(Ctx, bool)>,
     set_source: Option<extern "C" fn(Ctx, *const c_char, bool)>,
     panel_closed: Option<extern "C" fn(Ctx)>,
+    release_track: Option<extern "C" fn(Ctx, c_int)>,
 }
 
 type Version = unsafe extern "C" fn() -> u32;
@@ -177,6 +178,7 @@ pub fn install() -> bool {
         confirm_take_over: Some(confirm_take_over),
         set_source: Some(set_source),
         panel_closed: Some(panel_closed),
+        release_track: Some(release_track),
     };
     // SAFETY: on the UI thread, with a host the library copies.
     if unsafe { load(&host) } {
@@ -342,6 +344,14 @@ extern "C" fn set_source(_ctx: Ctx, uuid: *const c_char, on: bool) {
     guard("panel set_source", (), || {
         if let Some(uuid) = picked(uuid) {
             crate::audio::set_source(&uuid, shown_track(), on);
+        }
+    });
+}
+
+extern "C" fn release_track(_ctx: Ctx, track: c_int) {
+    guard("panel release_track", (), || {
+        if let Ok(track) = u8::try_from(track) {
+            crate::audio::release(track);
         }
     });
 }

@@ -128,6 +128,8 @@ struct Ui {
 	QPointer<QLabel> confirm_text;
 	QPointer<QPushButton> confirm_ok;
 	QPointer<QPushButton> confirm_cancel;
+	QPointer<QPushButton> confirm_instead;
+	QPointer<QWidget> notices;
 	QPointer<QScrollArea> scroll;
 	QPointer<QWidget> sources;
 	QPointer<QLabel> empty;
@@ -135,6 +137,7 @@ struct Ui {
 	QByteArray shown;
 	QString pressed;
 	QString source_list;
+	QString notice_list;
 };
 
 Ui ui;
@@ -277,6 +280,38 @@ void fill_sources(const QJsonArray &sources)
 	}
 }
 
+void fill_notices(const QJsonArray &notices)
+{
+	QString list = QString::fromUtf8(QJsonDocument(notices).toJson(QJsonDocument::Compact));
+	if (list == ui.notice_list)
+		return;
+	ui.notice_list = list;
+	for (QWidget *w : ui.notices->findChildren<QWidget *>(QString(), Qt::FindDirectChildrenOnly))
+		delete w;
+	auto *rows = static_cast<QVBoxLayout *>(ui.notices->layout());
+	for (const QJsonValue v : notices) {
+		QJsonObject n = v.toObject();
+		QLabel *text = label("dstreamy-notice", ui.notices, "text-warning");
+		text->setWordWrap(true);
+		text->setText(n.value("text").toString());
+		rows->addWidget(text);
+		QJsonValue release = n.value("release");
+		if (!release.isObject())
+			continue;
+		QPushButton *b = button("dstreamy-release", ui.notices);
+		b->setText(release.toObject().value("label").toString());
+		int track = release.toObject().value("track").toInt();
+		QObject::connect(b, &QPushButton::clicked, b, [track] {
+			if (!ui.active)
+				return;
+			ui.host.release_track(ui.host.ctx, track);
+			rerender();
+		});
+		rows->addWidget(b, 0, Qt::AlignLeft);
+	}
+	ui.notices->setVisible(!notices.isEmpty());
+}
+
 void place_panel()
 {
 	if (!ui.panel || !ui.status || !ui.window)
@@ -358,7 +393,12 @@ void render()
 		ui.confirm_text->setText(c.value("text").toString());
 		ui.confirm_ok->setText(c.value("ok").toString());
 		ui.confirm_cancel->setText(c.value("cancel").toString());
+		QJsonObject instead = c.value("instead").toObject();
+		ui.confirm_instead->setText(instead.value("label").toString());
+		ui.confirm_instead->setProperty("track", instead.value("track").toInt());
+		ui.confirm_instead->setVisible(!instead.isEmpty());
 	}
+	fill_notices(audio.value("notices").toArray());
 	ui.scroll->setVisible(managed);
 	fill_sources(audio.value("sources").toArray());
 	QString empty = audio.value("empty").toString();
@@ -482,6 +522,13 @@ Panel *build_panel()
 	audio->addWidget(ui.tracks);
 	rows->addLayout(audio);
 
+	ui.notices = new QWidget(panel);
+	ui.notices->setObjectName(QStringLiteral("dstreamy-notices"));
+	auto *notice_rows = new QVBoxLayout(ui.notices);
+	notice_rows->setContentsMargins(0, 0, 0, 0);
+	ui.notices->setVisible(false);
+	rows->addWidget(ui.notices);
+
 	ui.audio_line = label("dstreamy-audio-line", panel, "text-muted");
 	ui.audio_line->setWordWrap(true);
 	rows->addWidget(ui.audio_line);
@@ -514,8 +561,16 @@ Panel *build_panel()
 	};
 	answer(ui.confirm_ok, true);
 	answer(ui.confirm_cancel, false);
+	ui.confirm_instead = button("dstreamy-confirm-instead", ui.confirm_row);
+	QObject::connect(ui.confirm_instead, &QPushButton::clicked, ui.confirm_instead, [] {
+		if (!ui.active)
+			return;
+		ui.host.set_track(ui.host.ctx, ui.confirm_instead->property("track").toInt());
+		rerender();
+	});
 	answers->addStretch(1);
 	answers->addWidget(ui.confirm_cancel);
+	answers->addWidget(ui.confirm_instead);
 	answers->addWidget(ui.confirm_ok);
 	confirm->addLayout(answers);
 	rows->addWidget(ui.confirm_row);
@@ -574,7 +629,7 @@ bool dstreamy_ui_load(const struct dstreamy_ui_host *host)
 	if (ui.active || !host || host->abi_version != DSTREAMY_UI_ABI_VERSION || !host->view_json ||
 	    !host->free_string || !host->start || !host->stop || !host->load_lists || !host->select_guild ||
 	    !host->select_channel || !host->set_track || !host->request_take_over || !host->confirm_take_over ||
-	    !host->set_source || !host->panel_closed)
+	    !host->set_source || !host->panel_closed || !host->release_track)
 		return false;
 	QMainWindow *window = dstreamy_ui::main_window();
 	if (!window)

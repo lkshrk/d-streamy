@@ -13,7 +13,10 @@ use dstreamy_obs_producer::dock::{
 };
 use dstreamy_obs_producer::dock_config::{ConfigError, ConfigState};
 use dstreamy_obs_producer::dock_view::UNSUPPORTED;
-use dstreamy_obs_producer::mixer::{AudioView, CONFIRM, NOT_NOW, audio_view, mic_guard, track_bit};
+use dstreamy_obs_producer::mixer::{
+    AudioView, CONFIRM, NOT_NOW, audio_view, instead_label, mic_guard, notices, release_label,
+    track_bit,
+};
 use dstreamy_obs_producer::panel::NO_AUDIO_CONTROLS;
 use dstreamy_obs_sys as sys;
 
@@ -330,15 +333,57 @@ unsafe impl Send for Opened {}
 
 static OPENED: Mutex<Vec<Opened>> = Mutex::new(Vec::new());
 
-/// The open dialogs changed `track` on some source.
-fn touch(track: u8) {
-    for o in OPENED
+/// The open dialogs changed `track`; `settings` records whether any change still stands.
+fn touch(track: u8, settings: *mut sys::obs_data_t) {
+    let opened: Vec<_> = OPENED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .iter_mut()
-    {
-        o.touched |= track_bit(track);
+        .map(|o| {
+            o.touched |= track_bit(track);
+            (o.mixers.clone(), o.touched, o.managed)
+        })
+        .collect();
+    let changed = opened.iter().any(|(mixers, touched, managed)| {
+        mixers
+            .as_ref()
+            .is_some_and(|m| crate::audio::changed_since(m, *touched, *managed))
+    });
+    if settings.is_null() {
+        return;
     }
+    // SAFETY: the caller passes the dialog's live settings.
+    unsafe {
+        if changed {
+            sys::obs_data_set_int(settings, CHANGED.as_ptr(), 1);
+        } else {
+            sys::obs_data_unset_user_value(settings, CHANGED.as_ptr());
+        }
+    }
+}
+
+/// Runs `f` with a clicked dialog's settings, or NULL; `data` is the source `create` returned.
+fn with_dialog_settings<R>(data: *mut c_void, f: impl FnOnce(*mut sys::obs_data_t) -> R) -> R {
+    let source: *mut sys::obs_source_t = data.cast();
+    let settings = if source.is_null() {
+        ptr::null_mut()
+    } else {
+        // SAFETY: OBS passes the clicked source's data, which is the source itself; released below.
+        unsafe { sys::obs_source_get_settings(source) }
+    };
+    let result = f(settings);
+    if !settings.is_null() {
+        // SAFETY: the reference taken above.
+        unsafe { sys::obs_data_release(settings) };
+    }
+    result
+}
+
+/// The track in a button's name after `prefix`.
+fn button_track(property: *mut sys::obs_property_t, prefix: &str) -> Option<u8> {
+    // SAFETY: the view passes a live property; libobs owns the name.
+    let name = unsafe { text(sys::obs_property_name(property)) };
+    name.strip_prefix(prefix)?.parse().ok()
 }
 
 /// Another scene collection: the mixer flags the open dialogs saw are gone, and so is a takeover confirm.
@@ -417,6 +462,11 @@ fn restore_picks(source: *mut sys::obs_source_t, opened: &Choice) {
 
 /// On the UI thread once the call that armed it returned: a Cancel puts back the Discord tracks the dialog changed.
 pub fn settle() {
+    settle_pending();
+    log::debug("settled the settings dialog's pending Cancel");
+}
+
+fn settle_pending() {
     let Some(pending) = REVERTING
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -434,6 +484,20 @@ pub fn settle() {
         current.unwrap_or((pending.touched, pending.mixers, pending.managed));
     if let Some(mixers) = mixers.filter(|_| touched != 0) {
         crate::audio::restore(&mixers, touched, managed);
+        let (now, managed) = (
+            crate::audio::mixers(),
+            with_controls(|c| c.model.managed_mixers()),
+        );
+        // A dialog opened while this one closed saw the flags before they were put back.
+        for o in OPENED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter_mut()
+            .filter(|o| o.source != pending.source && o.touched == 0)
+        {
+            o.mixers = Some(now.clone());
+            o.managed = managed;
+        }
         crate::audio::request_refresh();
     }
 }
@@ -456,7 +520,14 @@ extern "C" fn update(data: *mut c_void, settings: *mut sys::obs_data_t) {
             .iter()
             .find(|o| o.source == source)
             .map(|o| o.choice.clone());
-        if let Some(opened) = opened.filter(|o| Some(o) == shown.as_ref()) {
+        // SAFETY: as above. OBS's Defaults clears every user value; Cancel and Discard put the opened ones back.
+        let defaults = !unsafe { sys::obs_data_has_user_value(settings, AUDIO_TRACK.as_ptr()) };
+        if defaults {
+            REVERTING
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+        } else if let Some(opened) = opened.filter(|o| Some(o) == shown.as_ref()) {
             restore_picks(source, &opened);
             return;
         }
@@ -556,7 +627,10 @@ const TAKE_OVER_EFFECT: &CStr = c"take_over_effect";
 const CONFIRM_TAKE_OVER: &CStr = c"confirm_take_over";
 const CANCEL_TAKE_OVER: &CStr = c"cancel_take_over";
 const AUDIO_EMPTY: &CStr = c"audio_empty";
-const AUDIO_NOTE: &CStr = c"audio_note";
+const RELEASE_PREFIX: &str = "release_";
+const INSTEAD_PREFIX: &str = "instead_";
+/// A user value only while the dialog's mixer changes stand, so closing with X asks Save or Discard like OBS does.
+const CHANGED: &CStr = c"dstreamy_mixers_changed";
 const SOURCE_PREFIX: &str = "source_";
 
 // Each button returns false and rebuilds from another thread: a rebuild inside the click frees the button.
@@ -575,13 +649,55 @@ extern "C" fn take_over_clicked(
 extern "C" fn confirm_take_over_clicked(
     _props: *mut sys::obs_properties_t,
     _property: *mut sys::obs_property_t,
-    _data: *mut c_void,
+    data: *mut c_void,
 ) -> bool {
     guard("settings confirm_take_over", false, || {
         let track = CONFIRMING.swap(0, Ordering::AcqRel);
         if track != 0 && crate::audio::take_over(track) {
-            touch(track);
+            with_dialog_settings(data, |settings| touch(track, settings));
         }
+        crate::audio::request_refresh();
+        false
+    })
+}
+
+extern "C" fn release_clicked(
+    _props: *mut sys::obs_properties_t,
+    property: *mut sys::obs_property_t,
+    data: *mut c_void,
+) -> bool {
+    guard("settings release", false, || {
+        if let Some(track) = button_track(property, RELEASE_PREFIX)
+            && crate::audio::release(track)
+        {
+            with_dialog_settings(data, |settings| touch(track, settings));
+        }
+        false
+    })
+}
+
+/// Picks another track for Discord instead of a takeover, as the track list would.
+extern "C" fn instead_clicked(
+    _props: *mut sys::obs_properties_t,
+    property: *mut sys::obs_property_t,
+    data: *mut c_void,
+) -> bool {
+    guard("settings instead", false, || {
+        let Some(track) = button_track(property, INSTEAD_PREFIX) else {
+            return false;
+        };
+        CONFIRMING.store(0, Ordering::Release);
+        with_dialog_settings(data, |settings| {
+            if !settings.is_null() {
+                // SAFETY: the dialog's live settings.
+                unsafe { sys::obs_data_set_int(settings, AUDIO_TRACK.as_ptr(), i64::from(track)) };
+            }
+        });
+        change(|c, p| {
+            config_step(c, |c| {
+                c.select_audio_track(track, p.write());
+            })
+        });
         crate::audio::request_refresh();
         false
     })
@@ -622,7 +738,13 @@ extern "C" fn source_toggled(
         if let Some(uuid) = name.strip_prefix(SOURCE_PREFIX)
             && crate::audio::set_source(uuid, track, on)
         {
-            touch(track);
+            let key = c_text(&name);
+            // SAFETY: the view's live settings; a default holds the tick, so only CHANGED says it changed.
+            unsafe {
+                sys::obs_data_unset_user_value(settings, key.as_ptr());
+                sys::obs_data_set_default_bool(settings, key.as_ptr(), on);
+            }
+            touch(track, settings);
         }
         false
     })
@@ -636,10 +758,17 @@ unsafe fn add_audio(props: *mut sys::obs_properties_t, settings: *mut sys::obs_d
     AUDIO_BUILT_FOR.store(track, Ordering::Release);
     // SAFETY: the caller's contract.
     unsafe {
-        let info = |key: &CStr, text: &str| {
+        let note = |key: &CStr, text: &str, kind: sys::obs_text_info_type| {
             let text = c_text(text);
-            sys::obs_properties_add_text(props, key.as_ptr(), text.as_ptr(), sys::OBS_TEXT_INFO);
+            let p = sys::obs_properties_add_text(
+                props,
+                key.as_ptr(),
+                text.as_ptr(),
+                sys::OBS_TEXT_INFO,
+            );
+            sys::obs_property_text_set_info_type(p, kind);
         };
+        let info = |key: &CStr, text: &str| note(key, text, sys::OBS_TEXT_INFO_NORMAL);
         let button = |key: &CStr, label: &str, clicked: sys::obs_property_clicked_t| {
             let label = c_text(label);
             sys::obs_properties_add_button(props, key.as_ptr(), label.as_ptr(), clicked);
@@ -649,18 +778,35 @@ unsafe fn add_audio(props: *mut sys::obs_properties_t, settings: *mut sys::obs_d
             return;
         }
         let sources = crate::audio::sources();
-        let view = with_controls(|c| audio_view(&c.model, track, &sources));
+        let (view, warnings) =
+            with_controls(|c| (audio_view(&c.model, track, &sources), notices(&c.model)));
+        for (i, warning) in warnings.into_iter().enumerate() {
+            note(
+                &c_text(&format!("audio_note_{i}")),
+                &warning.text,
+                sys::OBS_TEXT_INFO_WARNING,
+            );
+            if let Some(release) = warning.release {
+                let key = c_text(&format!("{RELEASE_PREFIX}{release}"));
+                button(&key, &release_label(release), Some(release_clicked));
+            }
+        }
         match view {
             AudioView::Unmanaged {
                 help,
                 take_over,
                 effect,
+                instead,
                 ..
             } => {
                 info(AUDIO_HELP, &help);
                 if CONFIRMING.load(Ordering::Acquire) == track {
-                    info(TAKE_OVER_EFFECT, &effect);
+                    note(TAKE_OVER_EFFECT, &effect, sys::OBS_TEXT_INFO_WARNING);
                     button(CONFIRM_TAKE_OVER, CONFIRM, Some(confirm_take_over_clicked));
+                    if let Some(other) = instead {
+                        let key = c_text(&format!("{INSTEAD_PREFIX}{other}"));
+                        button(&key, &instead_label(other), Some(instead_clicked));
+                    }
                     button(CANCEL_TAKE_OVER, NOT_NOW, Some(cancel_take_over_clicked));
                 } else {
                     button(TAKE_OVER, &take_over, Some(take_over_clicked));
@@ -670,13 +816,9 @@ unsafe fn add_audio(props: *mut sys::obs_properties_t, settings: *mut sys::obs_d
                 help,
                 sources,
                 empty,
-                note,
                 ..
             } => {
                 info(AUDIO_HELP, &help);
-                if let Some(note) = note {
-                    info(AUDIO_NOTE, &note);
-                }
                 for row in sources {
                     let key = c_text(&format!("{SOURCE_PREFIX}{}", row.uuid));
                     let name = c_text(&row.name);

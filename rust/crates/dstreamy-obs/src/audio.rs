@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::ffi::{CStr, CString, c_void};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -187,34 +188,67 @@ pub fn mixers() -> Mixers {
     sources().into_iter().map(|s| (s.uuid, s.mixers)).collect()
 }
 
+/// What a Cancel would set: the managed tracks, and each source whose flags change.
+fn revert_plan(
+    before: &[(String, u32)],
+    touched: u32,
+    managed_at_open: u32,
+) -> (u32, Vec<(String, u32)>) {
+    let managed =
+        with_controls(|c| restored_managed(c.model.managed_mixers(), managed_at_open, touched));
+    let sources = sources()
+        .into_iter()
+        .filter_map(|source| {
+            let old = before
+                .iter()
+                .find(|(uuid, _)| *uuid == source.uuid)
+                .map(|(_, mixers)| *mixers);
+            let next = restored_mixers(source.mixers, old, touched, managed);
+            (next != source.mixers).then_some((source.uuid, next))
+        })
+        .collect();
+    (managed, sources)
+}
+
+/// Whether the `touched` tracks or the managed tracks differ from when a dialog opened.
+pub fn changed_since(before: &[(String, u32)], touched: u32, managed_at_open: u32) -> bool {
+    let current = with_controls(|c| c.model.managed_mixers());
+    let (managed, sources) = revert_plan(before, touched, managed_at_open);
+    managed != current || !sources.is_empty()
+}
+
 /// Puts the `touched` tracks back as they were when a dialog opened; the managed tracks too.
 pub fn restore(before: &[(String, u32)], touched: u32, managed_at_open: u32) {
-    let managed = change(|c, _| {
-        let managed = restored_managed(c.model.managed_mixers(), managed_at_open, touched);
-        c.model.collection_loaded(managed);
-        managed
-    });
-    let mut changed = 0;
-    for source in sources() {
-        let old = before
-            .iter()
-            .find(|(uuid, _)| *uuid == source.uuid)
-            .map(|(_, mixers)| *mixers);
-        let next = restored_mixers(source.mixers, old, touched, managed);
-        if next != source.mixers {
-            with_source(&source.uuid, |s| {
-                APPLYING.with(|a| a.set(true));
-                // SAFETY: `with_source` holds a reference.
-                unsafe { sys::obs_source_set_audio_mixers(s, next) };
-                APPLYING.with(|a| a.set(false));
-            });
-            changed += 1;
-        }
+    let (managed, plan) = revert_plan(before, touched, managed_at_open);
+    change(|c, _| c.model.collection_loaded(managed));
+    for (uuid, next) in &plan {
+        with_source(uuid, |s| {
+            APPLYING.with(|a| a.set(true));
+            // SAFETY: `with_source` holds a reference.
+            unsafe { sys::obs_source_set_audio_mixers(s, *next) };
+            APPLYING.with(|a| a.set(false));
+        });
     }
     log::info(&format!(
-        "D-Streamy put back the Discord tracks on {changed} audio sources"
+        "D-Streamy put back the Discord tracks on {} audio sources",
+        plan.len()
     ));
 }
+
+/// Lets go of a managed track Discord doesn't get; mixer flags stay as they are. On the UI thread.
+pub fn release(track: u8) -> bool {
+    let released = change(|c, _| c.model.release(track));
+    if released {
+        log::info(&format!(
+            "D-Streamy stopped managing Track {track}: new sources keep it, and no source changed"
+        ));
+        request_refresh();
+    }
+    released
+}
+
+/// The loaded collection had no D-Streamy data; the legacy managed track waits for its sources.
+static ADOPTION_CANDIDATE: AtomicBool = AtomicBool::new(false);
 
 /// The frontend loads a scene collection's "modules" data before its sources (`OBSBasic::LoadData`).
 ///
@@ -233,27 +267,65 @@ pub unsafe fn collection_loading(modules: *mut sys::obs_data_t) {
             saved
         }
     };
-    let (managed, adopted) = change(|c, p| {
-        let adopted = c.edit(p.write(), |m| m.take_adoption());
-        let managed = match (saved, adopted) {
-            (Some(saved), _) => u32::try_from(saved).unwrap_or(0),
-            (None, Some(track)) => track_bit(track),
-            (None, None) => 0,
-        };
+    let managed = saved.map_or(0, |v| u32::try_from(v).unwrap_or(0));
+    let dropped = change(|c, p| {
         c.model.collection_loaded(managed);
-        (managed, adopted.filter(|_| saved.is_none()))
+        let pending = c.model.settings().adopt_managed_track.is_some();
+        (saved.is_some() && pending)
+            .then(|| c.edit(p.write(), |m| m.take_adoption()))
+            .flatten()
     });
-    if let Some(track) = adopted {
+    ADOPTION_CANDIDATE.store(saved.is_none(), Ordering::Release);
+    if let Some(track) = dropped {
         log::info(&format!(
-            "D-Streamy managed Track {track} before it kept this per scene collection: \
-             this scene collection keeps it, its mixer flags unchanged"
+            "this scene collection has its own Discord tracks, so Track {track}, managed before \
+             D-Streamy kept that per scene collection, is not adopted"
         ));
-    } else if managed != 0 {
+    }
+    if managed != 0 {
         log::info(&format!(
             "this scene collection's Discord tracks managed by D-Streamy: {managed:#08b}"
         ));
     }
     left_collection();
+}
+
+/// The frontend loaded the collection's sources: the legacy managed track is adopted unless a mic is on it.
+pub fn collection_loaded() {
+    if ADOPTION_CANDIDATE.swap(false, Ordering::AcqRel)
+        && with_controls(|c| c.model.settings().adopt_managed_track.is_some())
+    {
+        let audio = sources();
+        let (track, mics) = change(|c, p| {
+            let track = c.edit(p.write(), |m| m.take_adoption());
+            let mics: Vec<String> = track
+                .map(|t| {
+                    audio
+                        .iter()
+                        .filter(|s| s.mic && s.mixers & track_bit(t) != 0)
+                        .map(|s| s.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(t) = track.filter(|_| mics.is_empty()) {
+                c.model.take_over(t);
+            }
+            (track, mics)
+        });
+        match (track, mics.is_empty()) {
+            (Some(t), true) => log::info(&format!(
+                "D-Streamy managed Track {t} before it kept this per scene collection: this scene \
+                 collection keeps it, its mixer flags unchanged"
+            )),
+            (Some(t), false) => log::warn(&format!(
+                "D-Streamy managed Track {t} before it kept this per scene collection, but {} is on it \
+                 here, so Track {t} stays unmanaged and Go Live waits until it is sorted out",
+                mics.join(", ")
+            )),
+            (None, _) => {}
+        }
+    }
+    request_refresh();
 }
 
 /// The frontend saves the scene collection; its "modules" data keeps the managed tracks next to the mixer flags.
@@ -277,6 +349,7 @@ pub unsafe fn collection_saving(modules: *mut sys::obs_data_t) {
 
 /// The frontend cleared the scene collection; until another loads, D-Streamy manages no track.
 pub fn collection_cleared() {
+    ADOPTION_CANDIDATE.store(false, Ordering::Release);
     change(|c, _| c.model.collection_loaded(0));
     left_collection();
 }
@@ -311,9 +384,25 @@ pub fn request_refresh() {
 
 /// Runs `settings_source::settle` on the UI thread after the current UI call returns.
 pub fn request_settle() {
-    let refresher = REFRESHER.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(r) = refresher.as_ref() {
-        let _ = r.requests.send(Request::Settle);
+    let sent = REFRESHER
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|r| r.requests.send(Request::Settle).is_ok());
+    if sent {
+        return;
+    }
+    let queued = std::thread::Builder::new()
+        .name("dstreamy settle".into())
+        // SAFETY: queued from another thread, so OBS runs it later on its UI thread.
+        .spawn(|| unsafe {
+            sys::obs_queue_task(sys::OBS_TASK_UI, Some(settle_task), ptr::null_mut(), false)
+        });
+    if let Err(e) = queued {
+        log::warn(&format!(
+            "cannot queue the settings dialog's Cancel ({e}): its Discord track changes stay; \
+             undo them in Edit › Advanced Audio Properties"
+        ));
     }
 }
 
