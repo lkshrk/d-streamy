@@ -5,9 +5,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use dstreamy_media::{
-    AudioEncoder, AudioFrame, CaptureConfig, CropRect, EncodedVideoFrame, FRAME_CHANNEL_CAPACITY,
-    FrameReceiver, MediaError, MediaFrame, OPUS_CHANNELS, OPUS_FRAME_DURATION_US,
-    OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE, OpusEncoder, VideoCodec,
+    AudioActivity, AudioEncoder, AudioFrame, CaptureConfig, CropRect, EncodedVideoFrame,
+    FRAME_CHANNEL_CAPACITY, FrameReceiver, MediaError, MediaFrame, OPUS_CHANNELS,
+    OPUS_FRAME_DURATION_US, OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE, OpusEncoder, VideoCodec,
 };
 use gstreamer as gst;
 
@@ -40,9 +40,9 @@ pub(crate) enum VideoInput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AudioInput {
-    /// `pulsesrc` on the default sink's monitor, served by pipewire-pulse.
+    /// `pulsesrc`, served by pipewire-pulse; captures the default sink's monitor unless a device is chosen.
     PulseMonitor,
-    /// `pipewiresrc` capturing the default sink.
+    /// `pipewiresrc`; captures the default sink unless a device is chosen.
     PipeWireSink,
     #[cfg(test)]
     Test { frames: i32 },
@@ -234,20 +234,36 @@ fn video_source(input: &VideoInput, fps: u32) -> Result<Vec<gst::Element>, Media
     }
 }
 
-fn audio_source(input: AudioInput) -> Result<gst::Element, MediaError> {
+/// Where `pipewiresrc` should capture `device`, a pulse source name: a sink's monitor or a source.
+pub(crate) fn pipewire_target(device: Option<&str>) -> (Option<&str>, bool) {
+    match device {
+        None => (None, true),
+        Some(name) => match name.strip_suffix(".monitor") {
+            Some(sink) => (Some(sink), true),
+            None => (Some(name), false),
+        },
+    }
+}
+
+fn audio_source(input: AudioInput, device: Option<&str>) -> Result<gst::Element, MediaError> {
     match input {
         AudioInput::PulseMonitor => {
             let src = make("pulsesrc")?;
-            src.set_property("device", "@DEFAULT_MONITOR@");
+            src.set_property("device", device.unwrap_or("@DEFAULT_MONITOR@"));
             Ok(src)
         }
         AudioInput::PipeWireSink => {
             let src = make("pipewiresrc")?;
-            let props = gst::Structure::builder("props")
-                .field("stream.capture.sink", "true")
-                .field("media.category", "Capture")
-                .build();
-            src.set_property("stream-properties", props);
+            let (target, capture_sink) = pipewire_target(device);
+            let mut props = gst::Structure::builder("props").field("media.category", "Capture");
+            if capture_sink {
+                props = props.field("stream.capture.sink", "true");
+            }
+            if let Some(target) = target {
+                props = props.field("target.object", target);
+                set_if_present(&src, "target-object", target);
+            }
+            src.set_property("stream-properties", props.build());
             Ok(src)
         }
         #[cfg(test)]
@@ -403,7 +419,10 @@ impl AudioPacketizer {
     }
 }
 
-fn audio_sink(output: Arc<Output>) -> Result<gst_app::AppSink, MediaError> {
+fn audio_sink(
+    output: Arc<Output>,
+    activity: Option<AudioActivity>,
+) -> Result<gst_app::AppSink, MediaError> {
     let mut packetizer = AudioPacketizer {
         encoder: OpusEncoder::new(AUDIO_BITRATE_BPS)?,
         pending: Vec::with_capacity(OPUS_FRAME_SAMPLES * OPUS_CHANNELS * 2),
@@ -418,6 +437,15 @@ fn audio_sink(output: Arc<Output>) -> Result<gst_app::AppSink, MediaError> {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                    if let Some(activity) = &activity {
+                        activity.samples(
+                            map.as_slice()
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .map(|b| i16::from_le_bytes(*b)),
+                        );
+                    }
                     let frames = packetizer
                         .push(map.as_slice(), running_time_us(&sample, buffer))
                         .map_err(|_| gst::FlowError::Error)?;
@@ -457,6 +485,7 @@ fn build(
     config: &CaptureConfig,
     spec: &EncoderSpec,
     output: &Arc<Output>,
+    activity: Option<&AudioActivity>,
 ) -> Result<Built, MediaError> {
     let pipeline = gst::Pipeline::new();
 
@@ -522,11 +551,11 @@ fn build(
         let volume = make("volume")?;
         volume.set_property("volume", f64::from(config.audio_gain));
         audio_chain = vec![
-            audio_source(input)?,
+            audio_source(input, config.audio_source.as_deref())?,
             make("audioconvert")?,
             volume,
             make("audioresample")?,
-            audio_sink(output.clone())?.upcast(),
+            audio_sink(output.clone(), activity.cloned())?.upcast(),
         ];
         link_chain(&pipeline, &audio_chain)?;
     }
@@ -608,11 +637,23 @@ pub(crate) struct Capture {
 
 impl Capture {
     /// Blocking: builds and starts the pipeline, falling back through `candidates` on failure.
+    #[cfg(test)]
     pub(crate) fn start(
         video: VideoInput,
         audio: Option<AudioInput>,
         config: &CaptureConfig,
         candidates: &[EncoderSpec],
+    ) -> Result<(Self, FrameReceiver), MediaError> {
+        Self::start_with(video, audio, config, candidates, None)
+    }
+
+    /// Like `start`; `activity` hears every captured audio sample.
+    pub(crate) fn start_with(
+        video: VideoInput,
+        audio: Option<AudioInput>,
+        config: &CaptureConfig,
+        candidates: &[EncoderSpec],
+        activity: Option<&AudioActivity>,
     ) -> Result<(Self, FrameReceiver), MediaError> {
         if candidates.is_empty() {
             return Err(MediaError::Unsupported(format!(
@@ -624,7 +665,7 @@ impl Capture {
         for spec in candidates {
             // A channel per candidate, so frames of a failed attempt never reach the receiver.
             let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
-            match Self::try_start(&video, audio, config, spec, Output::new(tx)) {
+            match Self::try_start(&video, audio, config, spec, Output::new(tx), activity) {
                 Ok(capture) => return Ok((capture, rx)),
                 Err(StartError::Fatal(e)) => return Err(e),
                 Err(StartError::Retry(e)) => last_err = Some(e),
@@ -639,8 +680,9 @@ impl Capture {
         config: &CaptureConfig,
         spec: &EncoderSpec,
         output: Arc<Output>,
+        activity: Option<&AudioActivity>,
     ) -> Result<Self, StartError> {
-        let built = build(video, audio, config, spec, &output).map_err(|e| match e {
+        let built = build(video, audio, config, spec, &output, activity).map_err(|e| match e {
             MediaError::InvalidConfig(_) => StartError::Fatal(e),
             e => StartError::Retry(e),
         })?;
@@ -1034,6 +1076,55 @@ mod tests {
             assert_eq!(pair[1].pts_us - pair[0].pts_us, OPUS_FRAME_DURATION_US);
         }
         assert!(audio.iter().all(|a| !a.data.is_empty()));
+    }
+
+    /// How long the audio had been silent when a tone capture after `quiet` of silence ended.
+    fn silence_after_tone(gain: f32, quiet: Duration) -> (Duration, Duration) {
+        init();
+        let cfg = CaptureConfig {
+            audio: true,
+            audio_gain: gain,
+            ..config(320, 240)
+        };
+        let video = VideoInput::Test {
+            width: 320,
+            height: 240,
+            frames: 30,
+        };
+        let activity = AudioActivity::default();
+        activity.started();
+        let begun = Instant::now();
+        std::thread::sleep(quiet);
+        let audio = Some(AudioInput::Test { frames: 50 });
+        let (capture, rx) =
+            Capture::start_with(video, audio, &cfg, &x264(&cfg), Some(&activity)).unwrap();
+        drain(capture, rx);
+        (activity.silent_for().unwrap(), begun.elapsed())
+    }
+
+    #[test]
+    fn audio_activity_hears_the_tone_but_not_a_muted_one() {
+        let quiet = Duration::from_millis(300);
+        let (silent, elapsed) = silence_after_tone(1.0, quiet);
+        assert!(silent + quiet < elapsed, "{silent:?} of {elapsed:?}");
+        let (silent, elapsed) = silence_after_tone(0.0, quiet);
+        assert!(
+            silent + Duration::from_millis(50) >= elapsed,
+            "{silent:?} of {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn pipewire_targets_a_sink_for_monitors_and_the_node_for_sources() {
+        assert_eq!(pipewire_target(None), (None, true));
+        assert_eq!(
+            pipewire_target(Some("pipeweaver_music.monitor")),
+            (Some("pipeweaver_music"), true)
+        );
+        assert_eq!(
+            pipewire_target(Some("pipeweaver_stream")),
+            (Some("pipeweaver_stream"), false)
+        );
     }
 
     fn drain(capture: Capture, mut rx: FrameReceiver) -> Vec<MediaFrame> {

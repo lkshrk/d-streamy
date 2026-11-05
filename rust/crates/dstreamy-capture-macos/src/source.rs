@@ -79,6 +79,13 @@ impl CaptureSource for MacCaptureSource {
     }
 
     async fn start(&mut self, config: CaptureConfig) -> Result<FrameReceiver, MediaError> {
+        if config.audio_source.is_some() {
+            return Err(MediaError::InvalidConfig(
+                "choosing an audio source is not supported on macOS, which captures system audio; \
+                 remove audio_source from config.toml and leave out --audio-source"
+                    .into(),
+            ));
+        }
         match &self.running {
             Some(running) if running.pipeline.failure().is_none() => {
                 return Err(MediaError::AlreadyRunning);

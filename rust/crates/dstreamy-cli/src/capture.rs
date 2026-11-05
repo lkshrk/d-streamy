@@ -2,11 +2,49 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use dstreamy_core::{Config, ConfigError, ConfigPaths};
 use dstreamy_media::{
-    CaptureSource, CaptureTarget, MediaError, TEST_PATTERN_TARGET_ID, TargetKind, TestPatternSource,
+    AudioSource, AudioSourceKind, CaptureSource, CaptureTarget, MediaError, TEST_PATTERN_TARGET_ID,
+    TargetKind, TestPatternSource,
 };
 use serde::Serialize;
 
 use crate::CliError;
+
+#[derive(Debug, Serialize)]
+pub struct AudioSourceRow {
+    pub id: String,
+    pub kind: &'static str,
+    pub name: String,
+}
+
+impl From<AudioSource> for AudioSourceRow {
+    fn from(s: AudioSource) -> Self {
+        Self {
+            id: s.id,
+            kind: match s.kind {
+                AudioSourceKind::Output => "output",
+                AudioSourceKind::Input => "input",
+            },
+            name: s.name,
+        }
+    }
+}
+
+/// The audio devices a stream may capture; empty where the platform picks its own.
+pub async fn audio_sources() -> Result<Vec<AudioSource>, CliError> {
+    match platform_source(None, &PortalToken::default()) {
+        Some(source) => Ok(source.list_audio_sources().await?),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Errors unless `id` names a listed audio source; an empty list cannot rule anything out.
+pub fn check_audio_source(id: &str, sources: &[AudioSource]) -> Result<(), CliError> {
+    if !id.trim().is_empty() && (sources.is_empty() || sources.iter().any(|s| s.id == id)) {
+        Ok(())
+    } else {
+        Err(CliError::UnknownAudioSource(id.to_owned()))
+    }
+}
 
 /// The id of the one Linux target; the portal dialog picks the window or monitor.
 pub const PORTAL_TARGET_ID: &str = "portal";
@@ -96,7 +134,10 @@ fn platform_source(
 mod linux {
     use async_trait::async_trait;
     use dstreamy_capture_linux::LinuxCaptureSource;
-    use dstreamy_media::{CaptureConfig, CaptureSource, CaptureTarget, FrameReceiver, MediaError};
+    use dstreamy_media::{
+        AudioActivity, AudioSource, CaptureConfig, CaptureSource, CaptureTarget, FrameReceiver,
+        MediaError,
+    };
 
     use super::PortalToken;
 
@@ -109,6 +150,14 @@ mod linux {
     impl CaptureSource for TokenReporting {
         async fn list_targets(&self) -> Result<Vec<CaptureTarget>, MediaError> {
             self.inner.list_targets().await
+        }
+
+        async fn list_audio_sources(&self) -> Result<Vec<AudioSource>, MediaError> {
+            self.inner.list_audio_sources().await
+        }
+
+        fn audio_activity(&self) -> Option<AudioActivity> {
+            self.inner.audio_activity()
         }
 
         async fn start(&mut self, config: CaptureConfig) -> Result<FrameReceiver, MediaError> {

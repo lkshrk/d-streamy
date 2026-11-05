@@ -14,3 +14,21 @@ pub struct CaptureTarget {
     pub width: u32,
     pub height: u32,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AudioSourceKind {
+    /// What plays on an output device.
+    Output,
+    /// A microphone, line-in or virtual source.
+    Input,
+}
+
+/// An audio device a backend can capture; `id` is what [`CaptureConfig::audio_source`] takes.
+///
+/// [`CaptureConfig::audio_source`]: crate::CaptureConfig::audio_source
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioSource {
+    pub id: String,
+    pub kind: AudioSourceKind,
+    pub name: String,
+}

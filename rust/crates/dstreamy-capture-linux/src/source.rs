@@ -2,10 +2,12 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use async_trait::async_trait;
 use dstreamy_media::{
-    CaptureConfig, CaptureSource, CaptureTarget, FrameReceiver, MediaError, TargetKind,
+    AudioActivity, AudioSource, CaptureConfig, CaptureSource, CaptureTarget, FrameReceiver,
+    MediaError, TargetKind,
 };
 use gstreamer as gst;
 
+use crate::audio;
 use crate::pipeline::{self, AudioInput, Capture, VideoInput};
 use crate::portal::{PortalSources, PortalStream};
 
@@ -17,6 +19,7 @@ pub struct LinuxCaptureSource {
     sources: PortalSources,
     restore_token: Option<String>,
     running: Option<Running>,
+    activity: AudioActivity,
 }
 
 /// Fields drop in order: the pipeline stops before its PipeWire fd closes and the portal session ends.
@@ -38,6 +41,7 @@ impl LinuxCaptureSource {
             sources: PortalSources::default(),
             restore_token: None,
             running: None,
+            activity: AudioActivity::default(),
         }
     }
 
@@ -93,6 +97,16 @@ impl CaptureSource for LinuxCaptureSource {
         }])
     }
 
+    async fn list_audio_sources(&self) -> Result<Vec<AudioSource>, MediaError> {
+        tokio::task::spawn_blocking(audio::audio_sources)
+            .await
+            .map_err(|e| MediaError::Backend(e.to_string()))?
+    }
+
+    fn audio_activity(&self) -> Option<AudioActivity> {
+        Some(self.activity.clone())
+    }
+
     async fn start(&mut self, config: CaptureConfig) -> Result<FrameReceiver, MediaError> {
         if self.running.is_some() {
             return Err(MediaError::AlreadyRunning);
@@ -114,6 +128,9 @@ impl CaptureSource for LinuxCaptureSource {
             )));
         }
         let audio = if config.audio {
+            if let Some(id) = config.audio_source.as_deref() {
+                audio::check_known(id, &self.list_audio_sources().await.unwrap_or_default())?;
+            }
             Some(
                 AudioInput::select(&pipeline::available_factories()).ok_or_else(|| {
                     MediaError::Unsupported("neither pulsesrc nor pipewiresrc installed".into())
@@ -127,6 +144,10 @@ impl CaptureSource for LinuxCaptureSource {
         // Replaced even by none and even if the pipeline fails: the portal spends the token it was given.
         self.restore_token.clone_from(&portal.restore_token);
         let (node_id, size) = (portal.node_id, portal.size);
+        let activity = config.audio.then(|| self.activity.clone());
+        if let Some(activity) = &activity {
+            activity.started();
+        }
         // The portal moves into the task so a cancelled start cannot end the session under a starting pipeline.
         let (started, pipewire_fd, portal) = tokio::task::spawn_blocking(move || {
             let video = VideoInput::PipeWire {
@@ -135,7 +156,7 @@ impl CaptureSource for LinuxCaptureSource {
                 size,
             };
             (
-                Capture::start(video, audio, &config, &candidates),
+                Capture::start_with(video, audio, &config, &candidates, activity.as_ref()),
                 fd,
                 portal,
             )
@@ -152,6 +173,7 @@ impl CaptureSource for LinuxCaptureSource {
                 Ok(rx)
             }
             Err(e) => {
+                self.activity.stopped();
                 portal.close().await;
                 Err(e)
             }
@@ -159,6 +181,7 @@ impl CaptureSource for LinuxCaptureSource {
     }
 
     async fn stop(&mut self) -> Result<(), MediaError> {
+        self.activity.stopped();
         let Some(Running {
             capture,
             _pipewire_fd: pipewire_fd,

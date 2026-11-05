@@ -1,5 +1,6 @@
 //! Capture and encode abstractions shared by every D-Streamy capture backend.
 
+mod activity;
 pub mod annexb;
 mod encoder;
 mod error;
@@ -12,6 +13,7 @@ mod source;
 mod target;
 mod test_pattern;
 
+pub use activity::{AudioActivity, SILENCE_PEAK};
 pub use encoder::{AudioEncoder, I420Frame, VideoEncoder};
 pub use error::MediaError;
 pub use external::{
@@ -28,5 +30,5 @@ pub use h264::OpenH264Encoder;
 pub use ingest::{Ingest, IngestError};
 pub use opus::OpusEncoder;
 pub use source::{CaptureConfig, CaptureSource, CropRect, FRAME_CHANNEL_CAPACITY, FrameReceiver};
-pub use target::{CaptureTarget, TargetKind};
+pub use target::{AudioSource, AudioSourceKind, CaptureTarget, TargetKind};
 pub use test_pattern::{TEST_PATTERN_TARGET_ID, TestPatternSource};

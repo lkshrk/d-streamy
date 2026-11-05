@@ -392,7 +392,12 @@ async fn start(
     }
     let picked = capture::source_for(&request.target_id, restore_token.clone())
         .map_err(|e| e.to_string())?;
-    let capture = stream::capture_config(&request.target_id, &request.stream, request.crop);
+    let capture = stream::capture_config(
+        &request.target_id,
+        &request.stream,
+        request.crop,
+        config.audio_source.clone(),
+    );
     l.portal = Some(PortalBook::new(restore_token, picked.portal_token));
     stream::start(
         &l.session,

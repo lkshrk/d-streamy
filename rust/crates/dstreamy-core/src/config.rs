@@ -51,6 +51,9 @@ pub struct Config {
     pub target: Option<CaptureTarget>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crop: Option<CropRect>,
+    /// The audio device to capture; unset captures what plays on the default output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_source: Option<String>,
     #[serde(skip_serializing_if = "ServeConfig::is_default")]
     pub serve: ServeConfig,
 }
@@ -239,6 +242,7 @@ mod tests {
                 restore_token: Some("tok-123".into()),
             }),
             crop: Some(CropRect::new(10, 20, 800, 600)),
+            audio_source: Some("pipeweaver_stream".into()),
             serve: ServeConfig {
                 grace_secs: 10,
                 idle: IdleSetting::None,

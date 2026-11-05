@@ -51,6 +51,9 @@ pub struct StreamArgs {
     /// Audio gain (0.0-3.0)
     #[arg(long)]
     pub gain: Option<f32>,
+    /// Audio device to capture, see `dstreamy audio-sources`; by default what plays on the default output
+    #[arg(long, value_name = "ID")]
+    pub audio_source: Option<String>,
 }
 
 pub fn parse_crop(s: &str) -> Result<CropRect, String> {
@@ -91,8 +94,15 @@ impl StreamArgs {
         Ok(config)
     }
 
-    fn capture_config(&self, stream: &StreamConfig, crop: Option<CropRect>) -> CaptureConfig {
-        capture_config(&self.target, stream, crop)
+    fn capture_config(&self, stream: &StreamConfig, config: &Config) -> CaptureConfig {
+        capture_config(
+            &self.target,
+            stream,
+            self.crop.or(config.crop),
+            self.audio_source
+                .clone()
+                .or_else(|| config.audio_source.clone()),
+        )
     }
 }
 
@@ -100,6 +110,7 @@ pub fn capture_config(
     target: &str,
     stream: &StreamConfig,
     crop: Option<CropRect>,
+    audio_source: Option<String>,
 ) -> CaptureConfig {
     CaptureConfig {
         target_id: Some(target.to_owned()),
@@ -113,7 +124,44 @@ pub fn capture_config(
             Codec::H265 => VideoCodec::H265,
         },
         audio: true,
+        audio_source,
         audio_gain: stream.audio_gain,
+    }
+}
+
+/// How long captured audio may stay silent before the stream warns about it.
+pub const SILENCE_WARNING: Duration = Duration::from_secs(10);
+const SILENCE_CHECK: Duration = Duration::from_secs(1);
+
+/// Warns once per stretch of silence that lasts [`SILENCE_WARNING`].
+#[derive(Debug, Default)]
+pub struct SilenceWarning {
+    warned: bool,
+}
+
+impl SilenceWarning {
+    pub fn check(&mut self, silent_for: Option<Duration>, source: Option<&str>) -> Option<String> {
+        let silent = silent_for.is_some_and(|d| d >= SILENCE_WARNING);
+        if !silent {
+            self.warned = false;
+            return None;
+        }
+        if self.warned {
+            return None;
+        }
+        self.warned = true;
+        let secs = SILENCE_WARNING.as_secs();
+        Some(match source {
+            Some(id) => format!(
+                "no sound from audio source {id} for {secs} s, so viewers hear silence; \
+                 `dstreamy audio-sources` lists the other devices"
+            ),
+            None => format!(
+                "no sound on the default output for {secs} s, so viewers hear silence; \
+                 if your apps play on another device, pick it with --audio-source \
+                 (see `dstreamy audio-sources`)"
+            ),
+        })
     }
 }
 
@@ -138,13 +186,20 @@ pub async fn run_with(
     if let Some(warning) = stream.codec.viewer_warning() {
         out.warn(warning);
     }
-    let capture = args.capture_config(&stream, args.crop.or(config.crop));
+    let capture = args.capture_config(&stream, &config);
     let _lock = SessionLock::acquire(&ctx.paths)?;
     let restore_token = capture::restore_token(&config);
     let capture::Picked {
         source,
         portal_token,
     } = capture::source_for(&args.target, restore_token.clone())?;
+    let audio_source = capture.audio_source.clone();
+    if let Some(id) = &audio_source {
+        capture::check_audio_source(id, &source.list_audio_sources().await.unwrap_or_default())?;
+    }
+    let activity = source.audio_activity();
+    let mut silence = SilenceWarning::default();
+    let mut silence_check = tokio::time::interval(SILENCE_CHECK);
 
     let client = Arc::new(discord::connect(ctx, Persistence::Long).await?);
     let channels = match discord::voice_channels(&client, &args.guild).await {
@@ -173,6 +228,12 @@ pub async fn run_with(
     let outcome = loop {
         tokio::select! {
             () = signals.recv() => break Outcome::Interrupted,
+            _ = silence_check.tick(), if activity.is_some() => {
+                let silent_for = activity.as_ref().and_then(|a| a.silent_for());
+                if let Some(warning) = silence.check(silent_for, audio_source.as_deref()) {
+                    out.warn(warning);
+                }
+            }
             event = events.recv() => match event {
                 Ok(event) => {
                     print_event(out, &event);
@@ -333,6 +394,7 @@ mod tests {
             res: None,
             bitrate: None,
             gain: None,
+            audio_source: None,
         }
     }
 
@@ -381,12 +443,65 @@ mod tests {
             codec: Codec::H265,
             audio_gain: 1.5,
         };
-        let c = args().capture_config(&stream, Some(CropRect::new(1, 2, 30, 40)));
+        let config = Config {
+            crop: Some(CropRect::new(1, 2, 30, 40)),
+            audio_source: Some("pipeweaver_stream".into()),
+            ..Config::default()
+        };
+        let c = args().capture_config(&stream, &config);
         assert_eq!(c.target_id.as_deref(), Some("test-pattern"));
         assert_eq!((c.width, c.height, c.fps), (1600, 900, 60));
         assert_eq!(c.bitrate_bps, 8_000_000);
         assert_eq!(c.codec, VideoCodec::H265);
         assert_eq!(c.audio_gain, 1.5);
         assert_eq!(c.crop, Some(CropRect::new(1, 2, 30, 40)));
+        assert_eq!(c.audio_source.as_deref(), Some("pipeweaver_stream"));
+    }
+
+    #[test]
+    fn the_audio_source_flag_overrides_the_config_file() {
+        let config = Config {
+            audio_source: Some("pipeweaver_stream".into()),
+            ..Config::default()
+        };
+        let a = StreamArgs {
+            audio_source: Some("pipeweaver_music.monitor".into()),
+            ..args()
+        };
+        let c = a.capture_config(&StreamConfig::default(), &config);
+        assert_eq!(c.audio_source.as_deref(), Some("pipeweaver_music.monitor"));
+        let c = args().capture_config(&StreamConfig::default(), &Config::default());
+        assert_eq!(c.audio_source, None);
+    }
+
+    #[test]
+    fn silence_warns_once_per_stretch_and_names_the_device() {
+        let mut w = SilenceWarning::default();
+        let just_under = SILENCE_WARNING - Duration::from_millis(1);
+        assert_eq!(w.check(None, None), None);
+        assert_eq!(w.check(Some(just_under), None), None);
+        let first = w.check(Some(SILENCE_WARNING), None).unwrap();
+        assert!(first.contains("--audio-source"), "{first}");
+        assert_eq!(w.check(Some(SILENCE_WARNING * 3), None), None);
+        assert_eq!(w.check(Some(Duration::ZERO), None), None);
+        let again = w
+            .check(Some(SILENCE_WARNING), Some("pipeweaver_stream"))
+            .unwrap();
+        assert!(again.contains("pipeweaver_stream"), "{again}");
+    }
+
+    #[test]
+    fn audio_sources_are_checked_against_the_list_when_there_is_one() {
+        use dstreamy_media::{AudioSource, AudioSourceKind};
+        let listed = [AudioSource {
+            id: "pipeweaver_stream".into(),
+            kind: AudioSourceKind::Input,
+            name: "PipeWeaver Stream".into(),
+        }];
+        assert!(capture::check_audio_source("pipeweaver_stream", &listed).is_ok());
+        let err = capture::check_audio_source("nope", &listed).unwrap_err();
+        assert!(err.to_string().contains("dstreamy audio-sources"), "{err}");
+        assert!(capture::check_audio_source("anything", &[]).is_ok());
+        assert!(capture::check_audio_source("", &[]).is_err());
     }
 }

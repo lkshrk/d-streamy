@@ -71,6 +71,10 @@ enum Command {
         #[arg(long, hide = true)]
         skip_platform: bool,
     },
+    /// List the audio devices `stream --audio-source` can capture
+    ///
+    /// Without --audio-source, a stream captures what plays on the default output.
+    AudioSources,
     /// Go Live in a voice channel until interrupted
     Stream(stream::StreamArgs),
     /// Pick a channel and target, adjust settings and watch stream health interactively
@@ -259,6 +263,7 @@ async fn run(
         Command::Guilds => guilds(ctx, out).await,
         Command::Channels { guild } => channels(ctx, out, &guild).await,
         Command::Targets { skip_platform } => targets(out, !skip_platform).await,
+        Command::AudioSources => audio_sources(out).await,
         Command::Stream(args) => stream::run(ctx, out, args).await,
         Command::Daemon { skip_platform } => {
             let opts = daemon::Options {
@@ -539,6 +544,28 @@ async fn targets(out: &Out, include_platform: bool) -> Result<ExitCode, CliError
                 };
                 vec![t.id.clone(), t.kind.to_owned(), size, title]
             })
+            .collect();
+        out.raw(&table(&cells));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn audio_sources(out: &Out) -> Result<ExitCode, CliError> {
+    let rows: Vec<capture::AudioSourceRow> = capture::audio_sources()
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    if out.json {
+        out.json_line(&rows);
+    } else if rows.is_empty() {
+        out.note(
+            "no audio sources to choose from; streams capture what plays on the default output",
+        );
+    } else {
+        let cells: Vec<Vec<String>> = rows
+            .iter()
+            .map(|s| vec![s.id.clone(), s.kind.to_owned(), s.name.clone()])
             .collect();
         out.raw(&table(&cells));
     }

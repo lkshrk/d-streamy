@@ -183,7 +183,9 @@ impl From<CliError> for Failure {
     fn from(e: CliError) -> Self {
         let code = match &e {
             CliError::Config(_) | CliError::ServeConfig(_) => "config",
-            CliError::InvalidStreamConfig(_) | CliError::EmptyToken => "invalid_params",
+            CliError::InvalidStreamConfig(_)
+            | CliError::EmptyToken
+            | CliError::UnknownAudioSource(_) => "invalid_params",
             CliError::NotLoggedIn => {
                 return Self::new("not_logged_in", "not logged in; send set_token first");
             }
@@ -260,6 +262,8 @@ pub struct StartParams {
     pub resolution: Option<Resolution>,
     pub bitrate_kbps: Option<u32>,
     pub gain: Option<f32>,
+    /// Replaces the config file's `audio_source` for this session.
+    pub audio_source: Option<String>,
     /// Replaces `[serve] grace_secs` for this external session only.
     pub grace_secs: Option<u64>,
 }
@@ -300,6 +304,7 @@ struct Running {
     target: String,
     stream: StreamConfig,
     crop: Option<CropRect>,
+    audio_source: Option<String>,
     external: bool,
 }
 
@@ -316,9 +321,15 @@ impl Running {
             target: self.target.clone(),
             stream,
             crop: p.crop.or(self.crop),
+            audio_source: self.audio_source.clone(),
             external: self.external,
         };
-        let capture = stream::capture_config(&next.target, &next.stream, next.crop);
+        let capture = stream::capture_config(
+            &next.target,
+            &next.stream,
+            next.crop,
+            next.audio_source.clone(),
+        );
         Ok((next, capture))
     }
 }
@@ -816,7 +827,16 @@ impl Engine {
                 (picked.source, picked.portal_token, None)
             }
         };
-        let capture = stream::capture_config(&p.target, &settings, p.crop);
+        let audio_source = p.audio_source.or(config.audio_source);
+        if let Some(id) = &audio_source
+            && handle.is_none()
+        {
+            capture::check_audio_source(
+                id,
+                &source.list_audio_sources().await.unwrap_or_default(),
+            )?;
+        }
+        let capture = stream::capture_config(&p.target, &settings, p.crop, audio_source.clone());
         {
             let mut hold = lock(&self.session_lock);
             if hold.lock.is_none() {
@@ -854,6 +874,7 @@ impl Engine {
             target: p.target,
             stream: settings,
             crop: p.crop,
+            audio_source,
             external,
         });
         Ok(Value::Null)
@@ -1063,6 +1084,7 @@ mod tests {
             target: "display:1".into(),
             stream: StreamConfig::default(),
             crop: None,
+            audio_source: Some("pipeweaver_stream".into()),
             external: false,
         };
         let crop = CropRect::new(10, 20, 640, 360);
@@ -1079,6 +1101,7 @@ mod tests {
         assert_eq!(capture.crop, Some(crop));
         assert_eq!(capture.target_id.as_deref(), Some("display:1"));
         assert_eq!(capture.fps, running.stream.fps.get());
+        assert_eq!(capture.audio_source.as_deref(), Some("pipeweaver_stream"));
         assert_eq!(next.crop, Some(crop));
 
         let (next, capture) = next
@@ -1202,6 +1225,7 @@ mod tests {
                 resolution: Some(Resolution::new(320, 180).unwrap()),
                 bitrate_kbps: Some(1000),
                 gain: None,
+                audio_source: None,
                 grace_secs: None,
             }
         }

@@ -60,6 +60,8 @@ pub enum CliError {
     UnknownChannel { guild: String, channel: String },
     #[error("screen capture is not supported on this platform; use --target test-pattern")]
     NoPlatformCapture,
+    #[error("unknown audio source {0:?}; see `dstreamy audio-sources`")]
+    UnknownAudioSource(String),
     #[error(transparent)]
     Media(#[from] MediaError),
     #[error("a stream is already running")]

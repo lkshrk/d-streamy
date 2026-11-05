@@ -1,0 +1,96 @@
+use dstreamy_media::{AudioSource, AudioSourceKind, MediaError};
+use gstreamer as gst;
+use gstreamer::prelude::*;
+
+/// Audio sources `pulsesrc` can capture, monitors of output devices first.
+pub(crate) fn audio_sources() -> Result<Vec<AudioSource>, MediaError> {
+    gst::init().map_err(|e| MediaError::Backend(format!("GStreamer init: {e}")))?;
+    let Some(factory) = gst::DeviceProviderFactory::find("pulsedeviceprovider") else {
+        return Ok(Vec::new());
+    };
+    let provider = factory.get().ok_or_else(|| {
+        MediaError::Backend("cannot create the PulseAudio device provider".into())
+    })?;
+    let mut sources: Vec<AudioSource> = provider
+        .devices()
+        .iter()
+        .filter(|d| d.device_class().starts_with("Audio/Source"))
+        .filter_map(|device| {
+            let element = device.create_element(None).ok()?;
+            element.find_property("device")?;
+            let id = element.property::<Option<String>>("device")?;
+            let monitor = device
+                .properties()
+                .and_then(|p| p.get::<String>("device.class").ok())
+                .is_some_and(|class| class == "monitor");
+            Some(AudioSource {
+                id,
+                kind: if monitor {
+                    AudioSourceKind::Output
+                } else {
+                    AudioSourceKind::Input
+                },
+                name: device.display_name().to_string(),
+            })
+        })
+        .collect();
+    sort(&mut sources);
+    Ok(sources)
+}
+
+fn sort(sources: &mut [AudioSource]) {
+    sources.sort_by(|a, b| {
+        let rank = |s: &AudioSource| s.kind != AudioSourceKind::Output;
+        rank(a).cmp(&rank(b)).then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+/// Errors unless `id` is one of `sources`; an empty list means the devices are unknown.
+pub(crate) fn check_known(id: &str, sources: &[AudioSource]) -> Result<(), MediaError> {
+    // An empty device makes pulsesrc capture the default input, the microphone.
+    if !id.trim().is_empty() && (sources.is_empty() || sources.iter().any(|s| s.id == id)) {
+        return Ok(());
+    }
+    Err(MediaError::InvalidConfig(format!(
+        "unknown audio source {id:?}"
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(id: &str, kind: AudioSourceKind, name: &str) -> AudioSource {
+        AudioSource {
+            id: id.into(),
+            kind,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn outputs_come_first_then_by_name() {
+        let mut sources = vec![
+            source("mic", AudioSourceKind::Input, "Mic"),
+            source("b.monitor", AudioSourceKind::Output, "Monitor of B"),
+            source("stream", AudioSourceKind::Input, "Alpha Stream"),
+            source("a.monitor", AudioSourceKind::Output, "Monitor of A"),
+        ];
+        sort(&mut sources);
+        let ids: Vec<&str> = sources.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["a.monitor", "b.monitor", "stream", "mic"]);
+    }
+
+    #[test]
+    fn only_listed_sources_are_accepted_when_the_list_is_known() {
+        let sources = [source("stream", AudioSourceKind::Input, "Stream")];
+        assert!(check_known("stream", &sources).is_ok());
+        assert!(matches!(
+            check_known("nope", &sources),
+            Err(MediaError::InvalidConfig(_))
+        ));
+        assert!(check_known("anything", &[]).is_ok());
+        assert!(check_known("", &[]).is_err());
+        assert!(check_known(" ", &sources).is_err());
+    }
+}
