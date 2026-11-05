@@ -68,6 +68,8 @@ pub struct StreamStats {
     pub audio_frames_dropped: u64,
     pub bytes_sent: u64,
     pub keyframe_requests: u64,
+    /// Times the video queue was full and video was dropped to the next keyframe.
+    pub video_queue_overflows: u64,
     /// PLI or FIR packets from viewers, each forwarded as a keyframe request.
     pub viewer_keyframe_requests: u64,
     /// Keyframes requested because DAVE became ready on the attached connection.

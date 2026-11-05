@@ -37,6 +37,7 @@ impl StatsState {
     fn apply(&mut self, effects: Effects) {
         self.stats.video_frames_dropped += effects.dropped_video;
         self.stats.audio_frames_dropped += effects.dropped_audio;
+        self.stats.video_queue_overflows += u64::from(effects.video_overflow);
     }
 
     // Frames written between two watch reads share one time; the fps window and intervals blur only then.

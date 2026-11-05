@@ -1,11 +1,14 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Samples at or below this magnitude count as silence: about -60 dBFS.
 pub const SILENCE_PEAK: u16 = 32;
 
 const IDLE: u64 = u64::MAX;
+
+/// The tracing target of a capture's audio device loss and return, which `dstreamy stream` reports itself.
+pub const AUDIO_DEVICE_TARGET: &str = "dstreamy::audio_device";
 
 /// When captured audio last carried sound; every clone observes the same capture.
 #[derive(Debug, Clone)]
@@ -16,6 +19,12 @@ struct Inner {
     epoch: Instant,
     /// Milliseconds after `epoch` since which the audio has been silent; `IDLE` while not capturing.
     silent_since_ms: AtomicU64,
+    /// The capture's audio device went away and has not delivered samples since.
+    lost: AtomicBool,
+    /// Losses so far, so a reader polling now and then sees a loss that already ended.
+    losses: AtomicU64,
+    /// Returns of a lost device, counted like `losses`.
+    recoveries: AtomicU64,
 }
 
 impl Default for AudioActivity {
@@ -23,6 +32,9 @@ impl Default for AudioActivity {
         Self(Arc::new(Inner {
             epoch: Instant::now(),
             silent_since_ms: AtomicU64::new(IDLE),
+            lost: AtomicBool::new(false),
+            losses: AtomicU64::new(0),
+            recoveries: AtomicU64::new(0),
         }))
     }
 }
@@ -34,6 +46,33 @@ impl AudioActivity {
 
     pub fn stopped(&self) {
         self.0.silent_since_ms.store(IDLE, Ordering::Relaxed);
+    }
+
+    /// Ends a loss once samples arrive again; a stop or restart alone does not bring a device back.
+    fn clear_lost(&self) {
+        if self.0.lost.swap(false, Ordering::Relaxed) {
+            self.0.recoveries.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The audio device went away; cleared by the next samples, from the same device once it is back.
+    pub fn lost(&self) {
+        self.0.losses.fetch_add(1, Ordering::Relaxed);
+        self.0.lost.store(true, Ordering::Relaxed);
+    }
+
+    /// How many times the device was lost since this record was made; it never goes down.
+    pub fn losses(&self) -> u64 {
+        self.0.losses.load(Ordering::Relaxed)
+    }
+
+    /// How many times a lost device delivered samples again.
+    pub fn recoveries(&self) -> u64 {
+        self.0.recoveries.load(Ordering::Relaxed)
+    }
+
+    pub fn is_lost(&self) -> bool {
+        self.0.lost.load(Ordering::Relaxed)
     }
 
     /// Records a block of interleaved samples; sound restarts the silence clock.
@@ -57,6 +96,7 @@ impl AudioActivity {
     }
 
     fn samples_at(&self, samples: impl IntoIterator<Item = i16>, now: Instant) {
+        self.clear_lost();
         if samples.into_iter().any(|s| s.unsigned_abs() > SILENCE_PEAK) {
             self.heard_at(now);
         }
@@ -119,6 +159,33 @@ mod tests {
         assert_eq!(a.silent_for_at(t0 + 3 * S), Some(S));
         a.samples_at([i16::MIN], t0 + 3 * S);
         assert_eq!(a.silent_for_at(t0 + 3 * S), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn a_lost_device_stays_lost_until_samples_arrive_even_silent_ones() {
+        let a = AudioActivity::default();
+        a.started();
+        assert!(!a.is_lost());
+        a.lost();
+        assert!(a.is_lost());
+        a.samples([0, 0]);
+        assert!(!a.is_lost());
+        assert_eq!((a.losses(), a.recoveries()), (1, 1));
+        a.lost();
+        a.stopped();
+        a.started();
+        assert!(
+            a.is_lost(),
+            "a stop and restart alone do not bring the device back"
+        );
+        assert_eq!((a.losses(), a.recoveries()), (2, 1));
+        a.samples([0]);
+        assert!(!a.is_lost());
+        assert_eq!(
+            (a.losses(), a.recoveries()),
+            (2, 2),
+            "samples after the restart end the loss"
+        );
     }
 
     #[test]

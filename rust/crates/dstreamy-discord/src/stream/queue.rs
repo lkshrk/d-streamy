@@ -13,6 +13,8 @@ pub struct Effects {
     pub dropped_video: u64,
     pub dropped_audio: u64,
     pub request_keyframe: bool,
+    /// The queue was full, so video was dropped to a keyframe.
+    pub video_overflow: bool,
 }
 
 /// Non-blocking capture-to-transport buffer; late video is dropped up to the next keyframe.
@@ -64,6 +66,7 @@ impl FrameQueue {
                 self.lost_keyframe = false;
                 if self.video_len >= self.max_video {
                     effects.dropped_video = self.drop_video_before(self.frames.len());
+                    effects.video_overflow = true;
                 }
                 self.video_len += 1;
                 self.frames.push_back(frame);
@@ -76,6 +79,7 @@ impl FrameQueue {
                         .iter()
                         .any(|f| matches!(f, MediaFrame::Video(v) if v.keyframe));
                     effects.dropped_video = self.drop_video_before(self.frames.len());
+                    effects.video_overflow = true;
                     self.awaiting_keyframe = true;
                 }
                 if self.awaiting_keyframe {
@@ -131,6 +135,7 @@ impl FrameQueue {
             dropped_video,
             dropped_audio: 0,
             request_keyframe: true,
+            video_overflow: false,
         }
     }
 
@@ -240,10 +245,26 @@ mod tests {
         q.push(video(33, false), now);
         let e = q.require_keyframe(now);
         assert_eq!((e.dropped_video, e.request_keyframe), (2, true));
+        assert!(
+            !e.video_overflow,
+            "a keyframe asked for by a new connection is no overflow"
+        );
         let e = q.push(video(66, false), now);
         assert_eq!((e.dropped_video, e.request_keyframe), (1, false));
         q.push(video(100, true), now);
         assert_eq!(drain(&mut q), [(false, 0), (true, 100)]);
+    }
+
+    #[test]
+    fn a_keyframe_into_a_full_queue_is_an_overflow_and_transport_loss_is_not() {
+        let now = Instant::now();
+        let mut q = FrameQueue::new(1, 4);
+        q.push(video(0, true), now);
+        let e = q.push(video(33, true), now);
+        assert!(e.video_overflow);
+        assert_eq!(e.dropped_video, 1);
+        q.push(video(66, false), now);
+        assert!(!q.video_lost(now, false).video_overflow);
     }
 
     #[test]
@@ -265,6 +286,7 @@ mod tests {
         let mut q = FrameQueue::new(4, 4);
         let e = q.push(video(0, false), now);
         assert_eq!((e.dropped_video, e.request_keyframe), (1, true));
+        assert!(!e.video_overflow);
         let e = q.push(video(33, false), now);
         assert_eq!((e.dropped_video, e.request_keyframe), (1, false));
         assert_eq!(q.push(video(66, true), now), Effects::default());
@@ -280,9 +302,14 @@ mod tests {
         q.push(video(33, false), now);
         let e = q.push(video(66, false), now);
         assert_eq!((e.dropped_video, e.request_keyframe), (3, true));
+        assert!(e.video_overflow);
         assert!(q.awaiting_keyframe());
         let e = q.push(video(100, false), now);
         assert_eq!((e.dropped_video, e.request_keyframe), (1, false));
+        assert!(
+            !e.video_overflow,
+            "dropping on to the keyframe is the same overflow"
+        );
         q.push(audio(20), now);
         q.push(video(133, true), now);
         q.push(video(166, false), now);

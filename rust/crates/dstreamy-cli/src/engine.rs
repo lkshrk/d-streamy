@@ -830,11 +830,9 @@ impl Engine {
         let audio_source = p.audio_source.or(config.audio_source);
         if let Some(id) = &audio_source
             && handle.is_none()
+            && let Some(warning) = capture::verify_audio_source(&p.target, id, &*source).await?
         {
-            capture::check_audio_source(
-                id,
-                &source.list_audio_sources().await.unwrap_or_default(),
-            )?;
+            tracing::warn!("{warning}");
         }
         let capture = stream::capture_config(&p.target, &settings, p.crop, audio_source.clone());
         {

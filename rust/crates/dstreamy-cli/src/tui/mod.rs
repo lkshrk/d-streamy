@@ -206,7 +206,7 @@ where
                         remember_token(ctx, &mut live, &mut app);
                         release_if_stopped(&mut live);
                     }
-                    Msg::Session(event)
+                    Msg::session(event)
                 }
                 Err(RecvError::Lagged(n)) => {
                     tracing::warn!(skipped = n, "session events lagged");
@@ -214,7 +214,7 @@ where
                     let state = l.session.state().borrow().clone();
                     remember_token(ctx, &mut live, &mut app);
                     release_if_stopped(&mut live);
-                    Msg::Session(SessionEvent::State { state })
+                    Msg::session(SessionEvent::State { state })
                 }
                 Err(RecvError::Closed) => unreachable!("the session holds the event sender"),
             },

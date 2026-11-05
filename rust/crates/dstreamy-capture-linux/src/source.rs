@@ -129,13 +129,16 @@ impl CaptureSource for LinuxCaptureSource {
         }
         let audio = if config.audio {
             if let Some(id) = config.audio_source.as_deref() {
+                audio::check_not_alias(id)?;
                 audio::check_known(id, &self.list_audio_sources().await.unwrap_or_default())?;
             }
-            Some(
-                AudioInput::select(&pipeline::available_factories()).ok_or_else(|| {
-                    MediaError::Unsupported("neither pulsesrc nor pipewiresrc installed".into())
-                })?,
-            )
+            let input = AudioInput::select(&pipeline::available_factories()).ok_or_else(|| {
+                MediaError::Unsupported("neither pulsesrc nor pipewiresrc installed".into())
+            })?;
+            if let (AudioInput::PulseMonitor, Some(id)) = (input, config.audio_source.as_deref()) {
+                audio::check_pulse_name(id)?;
+            }
+            Some(input)
         } else {
             None
         };
