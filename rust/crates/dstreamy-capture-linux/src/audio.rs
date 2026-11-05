@@ -56,6 +56,19 @@ pub(crate) fn check_known(id: &str, sources: &[AudioSource]) -> Result<(), Media
     )))
 }
 
+/// Errors for an id that pipewire-pulse would read as a device index: it `atoi`s source names.
+pub(crate) fn check_pulse_name(id: &str) -> Result<(), MediaError> {
+    let digits = id.bytes().take_while(u8::is_ascii_digit).count();
+    if id[..digits].bytes().any(|b| b != b'0') {
+        return Err(MediaError::InvalidConfig(format!(
+            "audio source {id:?} starts with a number, which PulseAudio on PipeWire reads as a \
+             device index, so another device could be captured; rename the device or pick \
+             another from `dstreamy audio-sources`"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +92,19 @@ mod tests {
         sort(&mut sources);
         let ids: Vec<&str> = sources.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["a.monitor", "b.monitor", "stream", "mic"]);
+    }
+
+    #[test]
+    fn names_that_pipewire_pulse_reads_as_an_index_are_refused() {
+        assert!(check_pulse_name("pipeweaver_stream").is_ok());
+        assert!(check_pulse_name("0abc").is_ok());
+        assert!(check_pulse_name("alsa_input.usb-2").is_ok());
+        for id in ["12abc", "3", "007x"] {
+            assert!(
+                matches!(check_pulse_name(id), Err(MediaError::InvalidConfig(_))),
+                "{id}"
+            );
+        }
     }
 
     #[test]

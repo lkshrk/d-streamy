@@ -163,12 +163,18 @@ impl SilenceWarning {
             self.lost = lost;
             self.warned = true;
             return Some(if lost {
-                AudioNotice::Warn(format!(
-                    "{} disappeared, so viewers hear silence; video keeps streaming and audio resumes \
-                     from the same device when it is back, never from another one. \
-                     Restart or reconnect it, or stop and pick another from `dstreamy audio-sources`",
-                    device()
-                ))
+                AudioNotice::Warn(match source {
+                    Some(id) => format!(
+                        "audio source {id} disappeared, so viewers hear silence; video keeps \
+                         streaming and audio resumes from the same device when it is back, never \
+                         from another one. Restart or reconnect it, or stop and pick another from \
+                         `dstreamy audio-sources`"
+                    ),
+                    None => "audio capture from the default output was lost, so viewers hear \
+                             silence; video keeps streaming and audio resumes from whatever the \
+                             default output is once capture works again"
+                        .to_owned(),
+                })
             } else {
                 AudioNotice::Note(format!("{} is back; viewers hear it again", device()))
             });
@@ -532,6 +538,17 @@ mod tests {
             panic!("no warning")
         };
         assert!(again.contains("pipeweaver_stream"), "{again}");
+    }
+
+    #[test]
+    fn a_lost_default_output_promises_no_device_and_says_it_follows_the_default() {
+        let mut w = SilenceWarning::default();
+        let Some(AudioNotice::Warn(lost)) = w.check(Some(Duration::ZERO), true, None) else {
+            panic!("no warning")
+        };
+        assert!(lost.contains("default output"), "{lost}");
+        assert!(!lost.contains("never"), "{lost}");
+        assert!(!lost.contains("same device"), "{lost}");
     }
 
     #[test]
