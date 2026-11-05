@@ -1631,7 +1631,7 @@ fn a_folder_in_place_of_the_module_config_is_reported_and_never_replaced() {
          until then Track",
         path.display()
     );
-    for (when, track) in [("open", 1), ("updated", 5), ("reopened", 5)] {
+    for (when, track) in [("open", 6), ("updated", 5), ("reopened", 5)] {
         let status = status_line(&lines, when);
         assert!(status.starts_with(NO_SERVICE), "{when}: {status}");
         assert!(
