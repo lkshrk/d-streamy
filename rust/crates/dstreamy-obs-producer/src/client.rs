@@ -45,7 +45,11 @@ impl fmt::Display for StartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Connect(e @ IpcError::NotRunning(_)) => {
-                write!(f, "The D-Streamy service is not running ({e})")
+                write!(
+                    f,
+                    "The D-Streamy service is not running ({e}; {})",
+                    crate::START_SERVICE_HINT
+                )
             }
             Self::Connect(e) => write!(f, "Cannot connect to the D-Streamy service: {e}"),
             Self::Refused { code, message } => {

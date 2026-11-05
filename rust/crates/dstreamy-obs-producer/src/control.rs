@@ -454,7 +454,11 @@ impl ControlError {
 impl fmt::Display for ControlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotRunning(e) => write!(f, "The D-Streamy service is not running ({e})"),
+            Self::NotRunning(e) => write!(
+                f,
+                "The D-Streamy service is not running ({e}; {})",
+                crate::START_SERVICE_HINT
+            ),
             Self::Connect(e) => write!(f, "Cannot connect to the D-Streamy service: {e}"),
             Self::NotLoggedIn => f.write_str("Log in first: run `dstreamy login`"),
             Self::InvalidToken => {

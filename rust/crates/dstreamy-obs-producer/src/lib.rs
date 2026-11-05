@@ -17,3 +17,10 @@ pub use client::{Connection, StartError, attach, run};
 pub use dstreamy_ipc::Endpoint;
 pub use ring::{Oversized, Packet, Ring, RingStats, Track};
 pub use types::{End, Hello, Level, Log, MAX_SERVICE_TEXT};
+
+/// How to start the service, appended to every "service is not running" message.
+#[cfg(target_os = "linux")]
+pub const START_SERVICE_HINT: &str =
+    "start it with `dstreamy service install`, or run `dstreamy serve`";
+#[cfg(not(target_os = "linux"))]
+pub const START_SERVICE_HINT: &str = "start it by running `dstreamy serve`";

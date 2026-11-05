@@ -43,7 +43,7 @@ if [[ ${OS:-} == Windows_NT ]]; then
 else
   absent="${TMPDIR:-/tmp}/dstreamy-absent-$$/d/s.sock"
   not_running="The D-Streamy service is not running"
-  not_running_line="^HARNESS expected_error code=-2: The D-Streamy service is not running \(no service is listening at $absent\)"
+  not_running_line="^HARNESS expected_error code=-2: The D-Streamy service is not running \(no service is listening at $absent; start it [^)]*serve.\)"
 fi
 
 run not-running --no-encoders --seconds 3 --output-settings "{\"endpoint\": \"$absent\"}" --expect-error "$not_running" "$@"

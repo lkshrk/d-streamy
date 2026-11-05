@@ -1683,11 +1683,12 @@ fn tools_start_without_the_service_says_so_and_stays_idle() {
         json!({"guild_id": MOCK_GUILD_ID, "channel_id": MOCK_VOICE_CHANNEL_ID, "audio_track": 2}),
     );
     let not_running = format!(
-        "The D-Streamy service is not running (no service is listening at {})",
+        "The D-Streamy service is not running (no service is listening at {}; \
+         start it with `dstreamy service install`, or run `dstreamy serve`)",
         runtime_dir(&h)
             .join("dstreamy")
             .join("serve.sock")
-            .display()
+            .display(),
     );
     let (status, lines) = tools_run(
         &h,
