@@ -4,8 +4,8 @@ use serde::Serialize;
 
 use crate::control::{ADD_ACCOUNT, Named};
 use crate::dock::{
-    AUDIO_TRACKS, DockModel, DockState, LIVE_NO_LOGOUT, LIVE_NO_SWITCH, SWITCHING_ACCOUNT,
-    track_name,
+    AUDIO_TRACKS, DockModel, DockState, LIVE_NO_LOGOUT, LIVE_NO_SWITCH, LOGIN_WAITS,
+    SWITCHING_ACCOUNT, track_name,
 };
 use crate::dock_config::ConfigState;
 use crate::dock_view::{Button, Tone, dock_view};
@@ -99,6 +99,12 @@ pub struct Login {
 pub const CANCEL_LOGIN: &str = "Cancel login";
 pub const ACCOUNT_LABEL: &str = "Account";
 pub const LOG_OUT: &str = "Log out";
+pub const NOT_AVAILABLE: &str = "Not available";
+
+/// Log out's confirm question for `name`.
+pub fn logout_question(name: &str) -> String {
+    format!("Log out {name}?")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AccountItem {
@@ -119,6 +125,8 @@ pub struct AccountRow {
     /// Why the picker is disabled, empty while enabled.
     pub tooltip: &'static str,
     pub logout_tooltip: &'static str,
+    /// Log out's confirm row while it waits for an answer.
+    pub confirm: Option<Confirm>,
 }
 
 /// The row, shown once serve lists at least one account; with none the Log in button takes its place.
@@ -130,8 +138,10 @@ pub fn account_row(m: &DockModel) -> Option<AccountRow> {
         _ if enabled => ("", ""),
         _ if live => (LIVE_NO_SWITCH, LIVE_NO_LOGOUT),
         _ if m.account_changing() => (SWITCHING_ACCOUNT, SWITCHING_ACCOUNT),
+        _ if m.logging_in() => (LOGIN_WAITS, LOGIN_WAITS),
         _ => ("", ""),
     };
+    let shown = m.pending_account().or(accounts.active.as_deref());
     Some(AccountRow {
         label: ACCOUNT_LABEL,
         items: accounts
@@ -144,7 +154,7 @@ pub fn account_row(m: &DockModel) -> Option<AccountRow> {
                     .clone()
                     .or_else(|| a.username.clone())
                     .unwrap_or_default(),
-                selected: accounts.active.as_deref() == Some(a.name.as_str()),
+                selected: shown == Some(a.name.as_str()),
             })
             .collect(),
         add: ADD_ACCOUNT,
@@ -152,6 +162,12 @@ pub fn account_row(m: &DockModel) -> Option<AccountRow> {
         enabled,
         tooltip,
         logout_tooltip,
+        confirm: m.confirming_logout().map(|name| Confirm {
+            text: logout_question(name),
+            ok: LOG_OUT.to_owned(),
+            cancel: NOT_NOW.to_owned(),
+            instead: None,
+        }),
     })
 }
 
@@ -184,6 +200,7 @@ fn choices(
     placeholder: &str,
     loading: bool,
     enabled: bool,
+    unavailable: bool,
 ) -> Choices {
     let mut items: Vec<Item> = list
         .iter()
@@ -196,7 +213,11 @@ fn choices(
     if let Some(id) = selected.filter(|id| list.iter().all(|n| n.id != *id)) {
         items.push(Item {
             id: id.to_owned(),
-            name: id.to_owned(),
+            name: if unavailable {
+                NOT_AVAILABLE.to_owned()
+            } else {
+                id.to_owned()
+            },
             selected: true,
         });
     }
@@ -373,6 +394,7 @@ pub fn panel_view(
             "Pick a server",
             loading_guilds,
             idle,
+            m.guild_unavailable(),
         ),
         channels: choices(
             m.channels(),
@@ -380,6 +402,7 @@ pub fn panel_view(
             "Pick a voice channel",
             loading_channels,
             idle && settings.guild_id.is_some(),
+            m.channel_unavailable(),
         ),
         audio: audio(state, controls, sources, confirming),
         button: dock.button,
@@ -1078,27 +1101,185 @@ mod tests {
     }
 
     #[test]
-    fn a_switch_disables_the_row_until_it_ends_and_then_reloads_the_lists() {
+    fn a_switch_shows_the_pending_pick_and_brings_back_each_account_s_server() {
         let mut s = picked(true);
         s.model
             .accounts_loaded(Ok(Some(accounts(Some("a"), &["a", "b"]))));
+        assert_eq!(
+            s.model.settings().account.as_deref(),
+            Some("a"),
+            "the pick made before accounts belongs to the first one seen"
+        );
         assert!(!s.model.begin_select_account("a"), "already active");
         assert!(!s.model.begin_select_account("zz"), "not listed");
         assert!(s.model.begin_select_account("b"));
+        assert_eq!(s.model.pending_account(), Some("b"));
         let row = view(&s).account.unwrap();
         assert!(!row.enabled);
         assert_eq!(row.tooltip, "Switching account…");
         assert!(
+            row.items[1].selected && !row.items[0].selected,
+            "the pick, not the old account"
+        );
+        assert!(
             s.model
                 .account_changed(Ok(accounts(Some("b"), &["a", "b"])))
         );
+        assert_eq!(s.model.pending_account(), None);
         assert!(s.model.guilds().is_empty(), "the old account's lists go");
         let v = view(&s);
         assert!(v.account.unwrap().items[1].selected);
-        assert_eq!(
-            v.guilds.items[0].id, "g",
-            "the saved server stays until picked again"
+        assert_eq!(s.model.settings().guild_id, None, "b never picked a server");
+        assert!(v.guilds.items.is_empty());
+
+        s.model.guilds_loaded(Ok(vec![named("x", "B's server")]));
+        s.model.select_guild("x");
+        s.model
+            .channels_loaded("x", Ok(vec![named("y", "B's room")]));
+        s.model.select_channel("y");
+        assert!(s.model.begin_select_account("a"));
+        assert!(
+            s.model
+                .account_changed(Ok(accounts(Some("a"), &["a", "b"])))
         );
+        let settings = s.model.settings();
+        assert_eq!(
+            (settings.guild_id.as_deref(), settings.channel_id.as_deref()),
+            (Some("g"), Some("c")),
+            "a's pick comes back"
+        );
+        assert_eq!(settings.picks["b"].guild_id.as_deref(), Some("x"));
+        assert_eq!(settings.picks["b"].channel_id.as_deref(), Some("y"));
+
+        s.model
+            .accounts_loaded(Ok(Some(accounts(Some("a"), &["a"]))));
+        assert!(
+            s.model.settings().picks.is_empty(),
+            "a logged out account's pick goes"
+        );
+    }
+
+    #[test]
+    fn a_saved_server_the_account_isn_t_in_is_flagged_and_blocks_start() {
+        let mut s = picked(true);
+        s.model.guilds_loaded(Ok(vec![named("h", "Other")]));
+        let v = view(&s);
+        assert_eq!(
+            v.guilds.items.last().unwrap(),
+            &Item {
+                id: "g".into(),
+                name: "Not available".into(),
+                selected: true
+            }
+        );
+        assert_eq!(v.state_line, "Server not available");
+        assert_eq!(v.state_fix, "Pick the server again");
+        assert!(!v.button.enabled);
+        assert!(s.model.start(canvas()).is_err());
+        s.model.select_guild("h");
+        s.model.channels_loaded("h", Ok(vec![named("e", "Room")]));
+        let v = view(&s);
+        assert_eq!(v.state_line, "Not set up", "{v:?}");
+
+        let mut s = picked(true);
+        s.model
+            .channels_loaded("g", Ok(vec![named("d", "Elsewhere")]));
+        let v = view(&s);
+        assert_eq!(v.channels.items.last().unwrap().name, "Not available");
+        assert_eq!(v.state_line, "Voice channel not available");
+        assert_eq!(v.state_fix, "Pick the voice channel again");
+        assert!(!v.button.enabled);
+    }
+
+    fn canvas() -> Canvas {
+        Canvas {
+            fps_num: 30,
+            fps_den: 1,
+            output_width: 1280,
+            output_height: 720,
+        }
+    }
+
+    #[test]
+    fn log_out_asks_first_and_a_retry_that_works_clears_the_failure() {
+        let mut s = picked(true);
+        s.model
+            .accounts_loaded(Ok(Some(accounts(Some("a"), &["a", "b"]))));
+        assert!(!s.model.request_logout("zz"));
+        assert!(s.model.request_logout("a"));
+        let row = view(&s).account.unwrap();
+        assert_eq!(
+            row.confirm,
+            Some(Confirm {
+                text: "Log out a?".into(),
+                ok: "Log out".into(),
+                cancel: "Not now".into(),
+                instead: None
+            })
+        );
+        assert_eq!(s.model.confirm_logout(false), None);
+        assert_eq!(view(&s).account.unwrap().confirm, None);
+        assert!(s.model.request_logout("a"));
+        assert_eq!(s.model.confirm_logout(true).as_deref(), Some("a"));
+        assert!(s.model.begin_logout_account("a"));
+        assert!(
+            !s.model
+                .account_changed(Err(ControlError::Locked("pid 7".into())))
+        );
+        assert_eq!(view(&s).state_line, "Account in use");
+        assert!(s.model.begin_logout_account("a"));
+        assert!(s.model.account_changed(Ok(accounts(Some("b"), &["b"]))));
+        assert_ne!(view(&s).state_line, "Account in use", "the retry worked");
+        assert_eq!(s.model.problem(), None);
+    }
+
+    #[test]
+    fn the_row_says_why_it_waits_for_a_login() {
+        let mut s = state(DockSettings::default());
+        s.model
+            .accounts_loaded(Ok(Some(accounts(Some("a"), &["a"]))));
+        s.model
+            .guilds_loaded(Err(ControlError::InvalidToken { window: true }));
+        assert!(s.model.begin_login());
+        assert_eq!(
+            s.model.login_account().as_deref(),
+            Some("a"),
+            "Log in again repairs a"
+        );
+        let row = view(&s).account.unwrap();
+        assert!(!row.enabled);
+        assert_eq!(row.tooltip, "Finish or cancel the login first");
+        assert_eq!(row.logout_tooltip, "Finish or cancel the login first");
+        s.model.login_finished(Err(ControlError::LoginFailed(
+            "signed in as x, but account a belongs to y: use Add account… for x".into(),
+        )));
+        assert!(
+            view(&s).state_tooltip.contains("use Add account… for x"),
+            "{}",
+            view(&s).state_tooltip
+        );
+    }
+
+    #[test]
+    fn a_failed_add_account_keeps_the_log_in_again_offer() {
+        let mut s = state(DockSettings::default());
+        s.model
+            .accounts_loaded(Ok(Some(accounts(Some("a"), &["a"]))));
+        s.model
+            .guilds_loaded(Err(ControlError::InvalidToken { window: true }));
+        assert!(s.model.begin_add_account());
+        assert_eq!(s.model.login_account(), None, "a new account");
+        s.model.login_finished(Err(ControlError::LoginCancelled));
+        assert_eq!(view(&s).login, Some(log_in("Log in again")));
+
+        let mut s = state(DockSettings::default());
+        s.model
+            .accounts_loaded(Ok(Some(accounts(Some("a"), &["a"]))));
+        assert!(s.model.begin_add_account());
+        s.model.login_finished(Err(ControlError::LoginCancelled));
+        let v = view(&s);
+        assert_eq!(v.login, None);
+        assert_eq!(v.state_fix, "Use Add account… again");
     }
 
     #[test]

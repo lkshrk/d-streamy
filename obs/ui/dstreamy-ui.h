@@ -48,8 +48,10 @@ struct dstreamy_ui_host {
 	void (*select_account)(void *ctx, const char *name);
 	/* Opens the service's login window for a new account. */
 	void (*add_account)(void *ctx);
-	/* Removes the saved account `name` from the service. */
+	/* Asks to log out of the saved account `name`; the view shows the confirm. */
 	void (*logout_account)(void *ctx, const char *name);
+	/* Answers that confirm; yes removes the account from the service. */
+	void (*confirm_logout)(void *ctx, bool yes);
 };
 
 /* DSTREAMY_UI_ABI_VERSION of this library; the plugin checks it before dstreamy_ui_load. */

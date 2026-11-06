@@ -43,6 +43,14 @@ pub enum VideoMode {
     Share,
 }
 
+/// A server and voice channel picked for one account.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Pick {
+    pub guild_id: Option<String>,
+    pub channel_id: Option<String>,
+}
+
 /// What the module config keeps between OBS runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -59,6 +67,12 @@ pub struct DockSettings {
     /// The OBS mixer track sent to Discord, one-based.
     pub audio_track: u8,
     pub owned: Option<Ownership>,
+    /// The account `guild_id` and `channel_id` belong to; unset until serve names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The last pick of every other account.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub picks: std::collections::BTreeMap<String, Pick>,
     pub config_version: u32,
     /// A track managed under the old global setting, for the first scene collection that loads.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,6 +92,8 @@ impl Default for DockSettings {
             start_with_stream: false,
             audio_track: DEFAULT_AUDIO_TRACK,
             owned: None,
+            account: None,
+            picks: std::collections::BTreeMap::new(),
             config_version: CONFIG_VERSION,
             adopt_managed_track: None,
         }
@@ -129,6 +145,8 @@ impl DockSettings {
                 })
                 .unwrap_or(d.audio_track),
             owned: field(&map, "owned"),
+            account: field(&map, "account"),
+            picks: field(&map, "picks").unwrap_or_default(),
             config_version: CONFIG_VERSION,
             adopt_managed_track: adopt,
         }
@@ -219,6 +237,8 @@ pub struct Problem {
     pub login: Option<Relogin>,
     /// The login button is its whole fix, so the fix text may give way to it.
     pub login_fix: bool,
+    /// An account switch or logout failed with it, so the next one that works clears it.
+    pub account: bool,
 }
 
 impl Problem {
@@ -230,6 +250,7 @@ impl Problem {
             lists: false,
             login: None,
             login_fix: false,
+            account: false,
         }
     }
 
@@ -241,6 +262,7 @@ impl Problem {
             lists: false,
             login: error.relogin(),
             login_fix: error.fixed_by_login(),
+            account: false,
         }
     }
 }
@@ -251,6 +273,12 @@ pub const WAITING_FOR_LOGIN: &str = "Waiting for login in the browser window…"
 pub const SWITCHING_ACCOUNT: &str = "Switching account…";
 pub const LIVE_NO_SWITCH: &str = "Stop the stream to switch accounts";
 pub const LIVE_NO_LOGOUT: &str = "Stop the stream to log out";
+pub const LOGIN_WAITS: &str = "Finish or cancel the login first";
+const ADD_AGAIN: &str = "Use Add account… again";
+const GUILD_GONE: &str = "Server not available";
+const CHANNEL_GONE: &str = "Voice channel not available";
+const PICK_GUILD_AGAIN: &str = "Pick the server again";
+const PICK_CHANNEL_AGAIN: &str = "Pick the voice channel again";
 
 const NO_CHANNEL: &str = "No voice channel picked";
 const CANT_START: &str = "Can't start";
@@ -295,7 +323,22 @@ pub struct DockModel {
     /// Serve's saved accounts; `None` until listed, or from a serve without accounts.
     accounts: Option<Accounts>,
     /// A select or logout sent and not answered yet.
-    account_change: bool,
+    account_change: Option<AccountChange>,
+    /// The account whose Log out waits for its confirm.
+    confirming_logout: Option<String>,
+    /// The login offer an "Add account…" covered, for when that login fails.
+    add_prior: Option<Relogin>,
+    /// The server list came from serve since the last switch.
+    guilds_listed: bool,
+    /// The server whose channels serve listed last.
+    channels_listed: Option<String>,
+}
+
+/// What the account change in flight does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountChange {
+    Select(String),
+    Logout(String),
 }
 
 impl DockModel {
@@ -315,7 +358,11 @@ impl DockModel {
             unrestored_mixers: 0,
             logging_in: None,
             accounts: None,
-            account_change: false,
+            account_change: None,
+            confirming_logout: None,
+            add_prior: None,
+            guilds_listed: false,
+            channels_listed: None,
         }
     }
 
@@ -465,7 +512,7 @@ impl DockModel {
         let live = self.live_track.map(track_name).unwrap_or_default();
         match &self.state {
             DockState::Idle if self.logging_in() => WAITING_FOR_LOGIN.into(),
-            DockState::Idle if self.account_change => SWITCHING_ACCOUNT.into(),
+            DockState::Idle if self.account_change.is_some() => SWITCHING_ACCOUNT.into(),
             DockState::Idle => match (&self.error, controls) {
                 (Some(error), _) => error.message.clone(),
                 (None, true) => "Idle".into(),
@@ -507,12 +554,13 @@ impl DockModel {
     /// Replaces every setting but the ownership, and the guild and channel unless idle; returns a guild to load.
     pub fn set_settings(&mut self, settings: DockSettings) -> Option<String> {
         let settings = settings.clamped();
-        let (guild_id, channel_id) = if self.state == DockState::Idle {
-            (settings.guild_id, settings.channel_id)
+        let (guild_id, channel_id, account) = if self.state == DockState::Idle {
+            (settings.guild_id, settings.channel_id, settings.account)
         } else {
             (
                 self.settings.guild_id.clone(),
                 self.settings.channel_id.clone(),
+                self.settings.account.clone(),
             )
         };
         let guild_changed = guild_id != self.settings.guild_id;
@@ -520,6 +568,7 @@ impl DockModel {
         self.settings = DockSettings {
             guild_id,
             channel_id,
+            account,
             owned: self.settings.owned.take(),
             adopt_managed_track: adopt,
             ..settings
@@ -546,13 +595,16 @@ impl DockModel {
         match result {
             Ok(guilds) => {
                 self.guilds = guilds;
+                self.guilds_listed = true;
                 self.clear_list_problem();
-                // A saved server the list lacks stays selected and shown until the user picks another.
+                // A saved server the list lacks stays selected, flagged, until the user picks another.
                 let selected = self.settings.guild_id.clone()?;
                 if self.guilds.iter().any(|g| g.id == selected) {
                     Some(selected)
                 } else {
                     self.channels.clear();
+                    self.channels_listed = None;
+                    self.flag_unavailable();
                     None
                 }
             }
@@ -574,6 +626,7 @@ impl DockModel {
         self.settings.guild_id = Some(guild_id.to_owned());
         self.settings.channel_id = None;
         self.channels.clear();
+        self.channels_listed = None;
         self.error = None;
         Some(guild_id.to_owned())
     }
@@ -586,15 +639,70 @@ impl DockModel {
         match result {
             Ok(channels) => {
                 self.channels = channels;
+                self.channels_listed = Some(guild_id.to_owned());
                 self.clear_list_problem();
+                self.flag_unavailable();
             }
             Err(e) => {
                 self.channels.clear();
+                self.channels_listed = None;
                 self.error = Some(Problem {
                     lists: true,
                     ..Problem::control(&e)
                 });
             }
+        }
+    }
+
+    /// Whether the saved server is missing from serve's list for this account.
+    pub fn guild_unavailable(&self) -> bool {
+        self.guilds_listed
+            && self
+                .settings
+                .guild_id
+                .as_deref()
+                .is_some_and(|g| !self.lists_guild(g))
+    }
+
+    /// Whether the saved channel is missing from the listed server's channels.
+    pub fn channel_unavailable(&self) -> bool {
+        !self.guild_unavailable()
+            && self.channels_listed.is_some()
+            && self.channels_listed == self.settings.guild_id
+            && self
+                .settings
+                .channel_id
+                .as_deref()
+                .is_some_and(|c| !self.lists_channel(c))
+    }
+
+    fn unavailable_pick(&self) -> Option<Problem> {
+        if self.guild_unavailable() {
+            return Some(Problem {
+                lists: true,
+                ..Problem::new(
+                    GUILD_GONE,
+                    PICK_GUILD_AGAIN,
+                    "This account isn't in the saved server: pick the server again",
+                )
+            });
+        }
+        self.channel_unavailable().then(|| Problem {
+            lists: true,
+            ..Problem::new(
+                CHANNEL_GONE,
+                PICK_CHANNEL_AGAIN,
+                "The saved voice channel isn't in that server: pick the channel again",
+            )
+        })
+    }
+
+    /// A saved pick serve doesn't list becomes the problem shown, unless another one is.
+    fn flag_unavailable(&mut self) {
+        if self.error.is_none()
+            && let Some(problem) = self.unavailable_pick()
+        {
+            self.error = Some(problem);
         }
     }
 
@@ -620,6 +728,14 @@ impl DockModel {
         self.logging_in.is_some()
     }
 
+    /// The account a login repairs: the active one for "Log in again", else none, so serve names a new one.
+    pub fn login_account(&self) -> Option<String> {
+        if self.logging_in != Some(Relogin::Again) {
+            return None;
+        }
+        self.accounts.as_ref().and_then(|a| a.active.clone())
+    }
+
     /// The login button was pressed; false when it isn't offered.
     pub fn begin_login(&mut self) -> bool {
         let Some(offer) = self.login_offer() else {
@@ -636,20 +752,27 @@ impl DockModel {
         };
         match result {
             Ok(_) => {
+                self.add_prior = None;
                 if self.error.as_ref().is_some_and(|p| p.login.is_some()) {
                     self.error = None;
                 }
                 true
             }
             Err(e) => {
-                self.error = Some(Problem {
+                let prior = self.add_prior.take();
+                let mut problem = Problem {
                     lists: true,
-                    login: e
-                        .retries_login()
-                        .then_some(offer)
-                        .filter(|o| *o != Relogin::Add),
+                    login: match offer {
+                        Relogin::Add => prior,
+                        offer => e.retries_login().then_some(offer),
+                    },
                     ..Problem::control(&e)
-                });
+                };
+                if offer == Relogin::Add && prior.is_none() && e.retries_login() {
+                    problem.fix = ADD_AGAIN;
+                    problem.login_fix = false;
+                }
+                self.error = Some(problem);
                 false
             }
         }
@@ -662,7 +785,10 @@ impl DockModel {
     /// Serve's account list; an error keeps the last one, since the list loads report it.
     pub fn accounts_loaded(&mut self, result: Result<Option<Accounts>, ControlError>) {
         match result {
-            Ok(accounts) => self.accounts = accounts,
+            Ok(accounts) => {
+                self.accounts = accounts;
+                self.follow_account();
+            }
             Err(ControlError::NotRunning(_) | ControlError::Outdated { .. }) => {
                 self.accounts = None;
             }
@@ -670,65 +796,136 @@ impl DockModel {
         }
     }
 
+    /// Swaps in the active account's saved pick; the first account seen keeps the pick made before accounts.
+    fn follow_account(&mut self) {
+        let Some(accounts) = &self.accounts else {
+            return;
+        };
+        let names: Vec<String> = accounts.accounts.iter().map(|a| a.name.clone()).collect();
+        let active = accounts.active.clone();
+        self.settings.picks.retain(|name, _| names.contains(name));
+        let Some(active) = active.filter(|_| self.state == DockState::Idle) else {
+            return;
+        };
+        let Some(old) = self.settings.account.replace(active.clone()) else {
+            return;
+        };
+        if old == active {
+            return;
+        }
+        let current = Pick {
+            guild_id: self.settings.guild_id.take(),
+            channel_id: self.settings.channel_id.take(),
+        };
+        if names.contains(&old) && current != Pick::default() {
+            self.settings.picks.insert(old, current);
+        }
+        let next = self.settings.picks.remove(&active).unwrap_or_default();
+        self.settings.guild_id = next.guild_id;
+        self.settings.channel_id = next.channel_id;
+        self.guilds.clear();
+        self.channels.clear();
+        self.guilds_listed = false;
+        self.channels_listed = None;
+        if self.error.as_ref().is_some_and(|p| p.lists) {
+            self.error = None;
+        }
+    }
+
     pub fn account_changing(&self) -> bool {
-        self.account_change
+        self.account_change.is_some()
+    }
+
+    /// The account being switched to, while that switch waits for serve.
+    pub fn pending_account(&self) -> Option<&str> {
+        match &self.account_change {
+            Some(AccountChange::Select(name)) => Some(name),
+            _ => None,
+        }
     }
 
     /// Whether the account can be switched, added or logged out now.
     pub fn accounts_editable(&self) -> bool {
         self.state == DockState::Idle
             && self.logging_in.is_none()
-            && !self.account_change
+            && self.account_change.is_none()
             && self.accounts.is_some()
+    }
+
+    fn lists_account(&self, name: &str) -> bool {
+        self.accounts
+            .as_ref()
+            .is_some_and(|a| a.accounts.iter().any(|x| x.name == name))
     }
 
     /// A pick of another account; false when it is the active one or can't change now.
     pub fn begin_select_account(&mut self, name: &str) -> bool {
-        let known = self.accounts.as_ref().is_some_and(|a| {
-            a.active.as_deref() != Some(name) && a.accounts.iter().any(|x| x.name == name)
-        });
-        if !known || !self.accounts_editable() {
+        let active = self.accounts.as_ref().and_then(|a| a.active.as_deref());
+        if active == Some(name) || !self.lists_account(name) || !self.accounts_editable() {
             return false;
         }
-        self.account_change = true;
+        self.confirming_logout = None;
+        self.account_change = Some(AccountChange::Select(name.to_owned()));
         true
     }
 
     /// Log out of a saved account; false when it can't change now.
     pub fn begin_logout_account(&mut self, name: &str) -> bool {
-        let known = self
-            .accounts
-            .as_ref()
-            .is_some_and(|a| a.accounts.iter().any(|x| x.name == name));
-        if !known || !self.accounts_editable() {
+        if !self.lists_account(name) || !self.accounts_editable() {
             return false;
         }
-        self.account_change = true;
+        self.confirming_logout = None;
+        self.account_change = Some(AccountChange::Logout(name.to_owned()));
         true
+    }
+
+    /// Log out was pressed: it waits for its confirm. False when it can't change now.
+    pub fn request_logout(&mut self, name: &str) -> bool {
+        if !self.lists_account(name) || !self.accounts_editable() {
+            return false;
+        }
+        self.confirming_logout = Some(name.to_owned());
+        true
+    }
+
+    /// The account whose Log out waits for its confirm.
+    pub fn confirming_logout(&self) -> Option<&str> {
+        self.confirming_logout.as_deref()
+    }
+
+    /// The confirm's answer; the account to log out on yes.
+    pub fn confirm_logout(&mut self, yes: bool) -> Option<String> {
+        self.confirming_logout.take().filter(|_| yes)
     }
 
     /// A select or logout's outcome; true when the lists should load again for the account now used.
     pub fn account_changed(&mut self, result: Result<Accounts, ControlError>) -> bool {
-        if !std::mem::take(&mut self.account_change) {
+        if self.account_change.take().is_none() {
             return false;
         }
         match result {
             Ok(accounts) => {
-                self.accounts = Some(accounts);
-                self.guilds.clear();
-                self.channels.clear();
                 if self
                     .error
                     .as_ref()
-                    .is_some_and(|p| p.lists || p.login.is_some())
+                    .is_some_and(|p| p.lists || p.login.is_some() || p.account)
                 {
                     self.error = None;
                 }
+                self.accounts = Some(accounts);
+                self.guilds.clear();
+                self.channels.clear();
+                self.guilds_listed = false;
+                self.channels_listed = None;
+                self.follow_account();
                 true
             }
             Err(e) => {
                 let reload = matches!(e, ControlError::UnknownAccount(_));
-                self.error = Some(Problem::control(&e));
+                self.error = Some(Problem {
+                    account: true,
+                    ..Problem::control(&e)
+                });
                 reload
             }
         }
@@ -739,6 +936,8 @@ impl DockModel {
         if !self.accounts_editable() {
             return false;
         }
+        self.confirming_logout = None;
+        self.add_prior = self.error.as_ref().and_then(|p| p.login);
         self.logging_in = Some(Relogin::Add);
         true
     }
@@ -836,8 +1035,12 @@ impl DockModel {
         if self.logging_in() {
             return Err("D-Streamy is waiting for the login to finish".into());
         }
-        if self.account_change {
+        if self.account_change.is_some() {
             return Err("D-Streamy is switching accounts".into());
+        }
+        if let Some(problem) = self.unavailable_pick() {
+            self.error = Some(problem.clone());
+            return Err(problem.message);
         }
         let request = self.start_request(canvas);
         match &request {
@@ -1047,6 +1250,40 @@ mod tests {
         m.channels_loaded("g", Ok(vec![named("c"), named("d")]));
         m.select_channel("c");
         m
+    }
+
+    #[test]
+    fn per_account_picks_round_trip_and_older_configs_still_load() {
+        let mut d = DockSettings {
+            guild_id: Some("g".into()),
+            channel_id: Some("c".into()),
+            account: Some("a".into()),
+            ..DockSettings::default()
+        };
+        d.picks.insert(
+            "b".into(),
+            Pick {
+                guild_id: Some("x".into()),
+                channel_id: None,
+            },
+        );
+        let json = d.to_json();
+        assert!(
+            json.contains(r#""picks":{"b":{"guild_id":"x","channel_id":null}}"#),
+            "{json}"
+        );
+        assert_eq!(DockSettings::from_json(&json), d);
+        let old =
+            DockSettings::from_json(r#"{"guild_id":"g","channel_id":"c","config_version":2}"#);
+        assert_eq!((old.account, old.picks.len()), (None, 0));
+        assert_eq!(old.guild_id.as_deref(), Some("g"));
+        assert!(!DockSettings::default().to_json().contains("picks"));
+        let bad = DockSettings::from_json(r#"{"guild_id":"g","picks":[1],"account":7}"#);
+        assert_eq!(
+            (bad.guild_id.as_deref(), bad.account, bad.picks.len()),
+            (Some("g"), None, 0),
+            "a broken field falls back alone"
+        );
     }
 
     #[test]
@@ -1700,10 +1937,7 @@ mod tests {
 
         m.begin_login();
         m.login_finished(Err(ControlError::LoginFailed("no display".into())));
-        assert_eq!(
-            m.error(),
-            Some("The login didn't finish (no display); try again")
-        );
+        assert_eq!(m.error(), Some("The login didn't finish: no display"));
         assert_eq!(m.login_offer(), Some(Relogin::Again));
 
         m.begin_login();

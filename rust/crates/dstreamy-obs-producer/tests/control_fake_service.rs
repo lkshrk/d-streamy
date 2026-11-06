@@ -335,6 +335,16 @@ async fn an_unanswered_status_counts_against_the_same_cap() {
 
 /// Answers every connection's `hello` with `features`, and each other command with `answer(cmd)`.
 fn answering(features: &[&str], answer: fn(&str) -> Value) -> (tempfile::TempDir, PathBuf) {
+    answering_lines(features, move |command| {
+        answer(command["cmd"].as_str().unwrap())
+    })
+}
+
+/// As [`answering`], with the whole command line.
+fn answering_lines(
+    features: &[&str],
+    answer: impl Fn(&Value) -> Value + Clone + Send + Sync + 'static,
+) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::Builder::new().prefix("ds").tempdir().unwrap();
     let private = dir.path().join("d");
     std::fs::create_dir(&private).unwrap();
@@ -346,6 +356,7 @@ fn answering(features: &[&str], answer: fn(&str) -> Value) -> (tempfile::TempDir
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let features = features.clone();
+            let answer = answer.clone();
             tokio::spawn(async move {
                 let (read, mut write) = stream.into_split();
                 let mut lines = BufReader::new(read).lines();
@@ -356,7 +367,7 @@ fn answering(features: &[&str], answer: fn(&str) -> Value) -> (tempfile::TempDir
                             json!({"type": "result", "data": {"protocol": 2, "connection": 1,
                             "features": features, "status": {"session": null}}})
                         }
-                        cmd => answer(cmd),
+                        _ => answer(&command),
                     };
                     reply["id"] = command["id"].clone();
                     write
@@ -392,7 +403,7 @@ async fn a_missing_login_offers_the_window_only_where_serve_has_it() {
         Err(ControlError::NotLoggedIn { window: false })
     );
     assert_eq!(
-        control.login().await,
+        control.login(None).await,
         Err(ControlError::Outdated {
             feature: "browser_login"
         }),
@@ -407,26 +418,23 @@ async fn the_login_s_outcome_comes_back_as_its_error() {
         _ => json!({"type": "result", "data": null}),
     });
     let control = ObsControl::new(Endpoint::new(&path));
-    assert_eq!(control.login().await, Err(ControlError::LoginCancelled));
+    assert_eq!(control.login(None).await, Err(ControlError::LoginCancelled));
     let (_dir, path) = answering(
         &LOGIN_FEATURES,
         |_| json!({"type": "error", "code": "login_failed", "message": "no display"}),
     );
     let err = ObsControl::new(Endpoint::new(&path))
-        .login()
+        .login(None)
         .await
         .unwrap_err();
     assert_eq!(err, ControlError::LoginFailed("no display".into()));
-    assert_eq!(
-        err.to_string(),
-        "The login didn't finish (no display); try again"
-    );
+    assert_eq!(err.to_string(), "The login didn't finish: no display");
     let (_dir, path) = answering(
         &LOGIN_FEATURES,
         |_| json!({"type": "result", "data": {"username": "mock", "global_name": null}}),
     );
     assert_eq!(
-        ObsControl::new(Endpoint::new(&path)).login().await,
+        ObsControl::new(Endpoint::new(&path)).login(None).await,
         Ok(Some("mock".into()))
     );
 }
@@ -477,6 +485,21 @@ async fn accounts_are_listed_selected_and_logged_out_where_serve_has_them() {
 }
 
 #[tokio::test]
+async fn a_login_names_the_account_it_repairs_only_where_serve_has_accounts() {
+    let echo = |command: &Value| json!({"type": "result", "data": {"username": command["account"].as_str().unwrap_or("none"), "global_name": null}});
+    let (_dir, path) = answering_lines(&ACCOUNT_FEATURES, echo);
+    let control = ObsControl::new(Endpoint::new(&path));
+    assert_eq!(control.login(Some("a")).await, Ok(Some("a".into())));
+    assert_eq!(control.login(None).await, Ok(Some("none".into())));
+    let (_dir, path) = answering_lines(&LOGIN_FEATURES, echo);
+    assert_eq!(
+        ObsControl::new(Endpoint::new(&path)).login(Some("a")).await,
+        Ok(Some("none".into())),
+        "an older serve is sent the login it knows"
+    );
+}
+
+#[tokio::test]
 async fn account_refusals_map_to_their_errors() {
     let (_dir, path) = answering(&ACCOUNT_FEATURES, |cmd| match cmd {
         "select_account" => {
@@ -496,7 +519,7 @@ async fn account_refusals_map_to_their_errors() {
         err,
         ControlError::UnknownAccount("unknown account \"z\"; saved: a, b".into())
     );
-    assert_eq!(err.fix(), "Pick the account again");
+    assert_eq!(err.fix(), "Pick another account");
 }
 
 #[tokio::test]

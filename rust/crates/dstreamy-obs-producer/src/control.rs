@@ -620,7 +620,7 @@ impl ControlError {
             Self::NotLoggedIn { window: false } | Self::LoginUnavailable => "Run `dstreamy login`",
             Self::InvalidToken { window: false } => "Run `dstreamy login` again",
             Self::LoginRunning => "Finish the login in its window",
-            Self::UnknownAccount(_) => "Pick the account again",
+            Self::UnknownAccount(_) => "Pick another account",
             Self::Streaming(_) => "Stop the stream first",
             Self::UnknownGuild => "Pick the server again",
             Self::UnknownChannel => "Pick the voice channel again",
@@ -660,7 +660,7 @@ impl fmt::Display for ControlError {
             Self::LoginCancelled => {
                 f.write_str("The login window closed before the login finished; try again")
             }
-            Self::LoginFailed(m) => write!(f, "The login didn't finish ({m}); try again"),
+            Self::LoginFailed(m) => write!(f, "The login didn't finish: {m}"),
             Self::LoginRunning => {
                 f.write_str("A login window is already open: finish the login there")
             }

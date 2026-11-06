@@ -105,6 +105,7 @@ fn host() -> Host {
         select_account: Some(select_account),
         add_account: Some(add_account),
         logout_account: Some(logout_account),
+        confirm_logout: Some(confirm_logout),
     }
 }
 
@@ -322,10 +323,20 @@ extern "C" fn add_account(_ctx: Ctx) {
 
 extern "C" fn logout_account(_ctx: Ctx, name: *const c_char) {
     guard("panel logout_account", (), || {
-        if let Some(name) = picked(name) {
-            session::logout_account(&name, Wait::No);
+        if let Some(name) = picked(name)
+            && change(|c, _| c.model.request_logout(&name))
+        {
             settings_source::refresh();
         }
+    });
+}
+
+extern "C" fn confirm_logout(_ctx: Ctx, yes: bool) {
+    guard("panel confirm_logout", (), || {
+        if let Some(name) = change(|c, _| c.model.confirm_logout(yes)) {
+            session::logout_account(&name, Wait::No);
+        }
+        settings_source::refresh();
     });
 }
 
@@ -428,7 +439,10 @@ extern "C" fn panel_closed(_ctx: Ctx) {
         CONFIRMING.store(false, Ordering::Release);
         PANEL_OPEN.store(false, Ordering::Release);
         if !settings_source::dialog_open() {
-            change(|c, _| c.model.forget_released());
+            change(|c, _| {
+                c.model.forget_released();
+                c.model.confirm_logout(false);
+            });
         }
         settings_source::forget_unrestored();
     });
@@ -575,6 +589,7 @@ pub(crate) mod tests {
             host.select_account.is_some(),
             host.add_account.is_some(),
             host.logout_account.is_some(),
+            host.confirm_logout.is_some(),
         ];
         assert!(set.iter().all(|s| *s));
     }
@@ -788,7 +803,34 @@ pub(crate) mod tests {
             !with_controls(|c| c.model.account_changing()),
             "never stuck"
         );
+        logout(c"zz".as_ptr());
+        assert_eq!(
+            view()["account"]["confirm"],
+            Value::Null,
+            "not a saved account"
+        );
         logout(c"a".as_ptr());
+        assert_eq!(view()["account"]["confirm"]["text"], "Log out a?");
+        assert!(
+            !with_controls(|c| c.model.account_changing()),
+            "it asks first"
+        );
+        // SAFETY: the library's call.
+        unsafe { host.confirm_logout.unwrap()(ptr::null_mut(), false) };
+        assert_eq!(view()["account"]["confirm"], Value::Null);
+        logout(c"a".as_ptr());
+        // SAFETY: the library's call.
+        unsafe { host.confirm_logout.unwrap()(ptr::null_mut(), true) };
+        assert_eq!(view()["account"]["confirm"], Value::Null);
+        assert!(
+            with_controls(|c| c
+                .model
+                .problem()
+                .unwrap()
+                .message
+                .contains("the account can't change")),
+            "no control thread, so the logout ends at once"
+        );
         assert!(!with_controls(|c| c.model.account_changing()));
         call(host.add_account);
         assert_eq!(

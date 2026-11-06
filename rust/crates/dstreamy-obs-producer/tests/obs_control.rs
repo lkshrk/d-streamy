@@ -756,7 +756,7 @@ async fn the_login_window_logs_serve_in_without_a_restart() {
     let mut model = DockModel::new(DockSettings::default());
     model.guilds_loaded(Err(err));
     assert!(model.begin_login());
-    let user = control.login().await;
+    let user = control.login(None).await;
     assert_eq!(user, Ok(Some("Mock User".into())));
     assert!(model.login_finished(user));
     let guilds = control.guilds().await.unwrap();

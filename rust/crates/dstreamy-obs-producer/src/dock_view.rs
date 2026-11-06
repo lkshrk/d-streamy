@@ -137,7 +137,12 @@ pub fn dock_view(
             DockState::Idle => {
                 let chosen = chosen_channel(m);
                 let blocked = mic.filter(|g| !g.live);
-                let start = button(START, Action::Start, chosen.is_some() && blocked.is_none());
+                let unavailable = m.guild_unavailable() || m.channel_unavailable();
+                let start = button(
+                    START,
+                    Action::Start,
+                    chosen.is_some() && blocked.is_none() && !unavailable,
+                );
                 // Without a login nothing can stream, so the login problem comes before the mic.
                 if let Some(guard) = blocked.filter(|_| m.login_offer().is_none()) {
                     detail_tooltip = Some(guard.tooltip());

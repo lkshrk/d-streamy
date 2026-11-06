@@ -59,7 +59,7 @@ enum Job {
     #[cfg(unix)]
     Stop(Option<Ownership>, Done),
     #[cfg(unix)]
-    Login(tokio::sync::oneshot::Receiver<()>, Done),
+    Login(Option<String>, tokio::sync::oneshot::Receiver<()>, Done),
     #[cfg(unix)]
     Account(AccountChange, Done),
     OutputStopped(i64),
@@ -352,7 +352,8 @@ pub fn login(wait: Wait) {
 fn open_login(wait: Wait) {
     let (cancel, cancelled) = tokio::sync::oneshot::channel();
     *LOGIN_CANCEL.lock().unwrap_or_else(PoisonError::into_inner) = Some(cancel);
-    if !queue(|done| Job::Login(cancelled, done), wait) {
+    let account = with_controls(|c| c.model.login_account());
+    if !queue(|done| Job::Login(account, cancelled, done), wait) {
         LOGIN_CANCEL
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -790,9 +791,9 @@ async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &m
             let _ = done.try_send(());
         }
         #[cfg(unix)]
-        Job::Login(cancelled, done) => {
+        Job::Login(account, cancelled, done) => {
             // The window stays open for minutes, so the login must not hold up Start, Stop or the lists.
-            tokio::spawn(login_session(closing, cancelled));
+            tokio::spawn(login_session(closing, account, cancelled));
             let _ = done.try_send(());
         }
         #[cfg(unix)]
@@ -844,7 +845,7 @@ async fn lists(guild: Option<String>, closing: &mut Closing) {
     if let Err(e) = &accounts {
         log::warn(&format!("listing the D-Streamy accounts: {e}"));
     }
-    change(|c, _| c.model.accounts_loaded(accounts));
+    change(|c, p| c.edit(p.write(), |m| m.accounts_loaded(accounts)));
     let Some(guilds) = closing.call(control.guilds()).await else {
         return;
     };
@@ -862,14 +863,18 @@ async fn lists(guild: Option<String>, closing: &mut Closing) {
 async fn lists(_guild: Option<String>, _closing: &mut Closing) {}
 
 #[cfg(unix)]
-async fn login_session(mut closing: Closing, cancelled: tokio::sync::oneshot::Receiver<()>) {
+async fn login_session(
+    mut closing: Closing,
+    account: Option<String>,
+    cancelled: tokio::sync::oneshot::Receiver<()>,
+) {
     let login = async {
         let control = match control() {
             Ok(control) => control,
             Err(e) => return Err(ControlError::Connect(e)),
         };
         tokio::select! {
-            result = closing.call(control.login()) => result.unwrap_or(Err(ControlError::Abandoned)),
+            result = closing.call(control.login(account.as_deref())) => result.unwrap_or(Err(ControlError::Abandoned)),
             Ok(()) = cancelled => Err(ControlError::LoginCancelled),
         }
     };
@@ -924,7 +929,9 @@ async fn account_session(account: AccountChange, closing: &mut Closing) {
         }
         (_, Err(e)) => log::warn(&format!("the D-Streamy account didn't change: {e}")),
     }
-    if step(|m| m.account_changed(result)) {
+    let reload = change(|c, p| c.edit(p.write(), |m| m.account_changed(result)));
+    refresh();
+    if reload {
         request_lists(None);
     }
 }

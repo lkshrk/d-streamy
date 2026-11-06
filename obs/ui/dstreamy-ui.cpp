@@ -31,6 +31,7 @@
 
 #include <cstring>
 #include <memory>
+#include <utility>
 
 namespace {
 
@@ -147,6 +148,10 @@ struct Ui {
 	QPointer<QLabel> account_label;
 	QPointer<QComboBox> accounts;
 	QPointer<QPushButton> logout;
+	QPointer<QWidget> logout_row;
+	QPointer<QLabel> logout_text;
+	QPointer<QPushButton> logout_ok;
+	QPointer<QPushButton> logout_cancel;
 	QPointer<QComboBox> guilds;
 	QPointer<QComboBox> channels;
 	QPointer<QLabel> audio_title;
@@ -247,8 +252,10 @@ void fill_accounts(const QJsonObject &row)
 	QJsonArray items = row.value("items").toArray();
 	ui.account_row->setVisible(!items.isEmpty());
 	ui.account.clear();
-	if (items.isEmpty())
+	if (items.isEmpty()) {
+		ui.logout_row->setVisible(false);
 		return;
+	}
 	ui.account_label->setText(row.value("label").toString());
 	QSignalBlocker block(ui.accounts);
 	QString key = row.value("add").toString();
@@ -282,6 +289,16 @@ void fill_accounts(const QJsonObject &row)
 	ui.logout->setText(row.value("logout").toString());
 	ui.logout->setEnabled(enabled && !ui.account.isEmpty());
 	ui.logout->setToolTip(plain_tip(row.value("logout_tooltip").toString()));
+	QJsonValue confirm = row.value("confirm");
+	bool confirming = confirm.isObject();
+	ui.logout->setVisible(!confirming);
+	ui.logout_row->setVisible(confirming);
+	if (confirming) {
+		QJsonObject c = confirm.toObject();
+		ui.logout_text->setText(c.value("text").toString());
+		ui.logout_ok->setText(c.value("ok").toString());
+		ui.logout_cancel->setText(c.value("cancel").toString());
+	}
 }
 
 void fill_tracks(const QJsonObject &audio)
@@ -424,7 +441,8 @@ void fill_notices(const QJsonArray &notices)
 
 void order_tabs()
 {
-	QList<QWidget *> order{ui.login, ui.accounts, ui.logout, ui.guilds, ui.channels, ui.tracks};
+	QList<QWidget *> order{ui.login,     ui.accounts, ui.logout,   ui.logout_cancel,
+			       ui.logout_ok, ui.guilds,   ui.channels, ui.tracks};
 	const QList<QPushButton *> releases =
 		ui.notices->findChildren<QPushButton *>(QString(), Qt::FindDirectChildrenOnly);
 	for (QPushButton *b : releases)
@@ -674,6 +692,28 @@ Panel *build_panel()
 			rerender();
 		});
 	});
+	ui.logout_row = new QWidget(panel);
+	ui.logout_row->setObjectName(QStringLiteral("dstreamy-logout-confirm"));
+	auto *logout_confirm = new QHBoxLayout(ui.logout_row);
+	logout_confirm->setContentsMargins(0, 0, 0, 0);
+	ui.logout_text = label("dstreamy-logout-text", ui.logout_row, "text-warning");
+	ui.logout_cancel = button("dstreamy-logout-cancel", ui.logout_row);
+	ui.logout_ok = button("dstreamy-logout-ok", ui.logout_row);
+	logout_confirm->addWidget(ui.logout_text, 1);
+	logout_confirm->addWidget(ui.logout_cancel);
+	logout_confirm->addWidget(ui.logout_ok);
+	ui.logout_row->setVisible(false);
+	rows->addWidget(ui.logout_row);
+	for (auto [b, yes] : {std::pair{ui.logout_ok.data(), true}, std::pair{ui.logout_cancel.data(), false}}) {
+		QObject::connect(b, &QPushButton::clicked, b, [yes] {
+			guarded("confirm_logout", [yes] {
+				if (!ui.active)
+					return;
+				ui.host.confirm_logout(ui.host.ctx, yes);
+				rerender();
+			});
+		});
+	}
 	QObject::connect(ui.logout, &QPushButton::clicked, ui.logout, [] {
 		guarded("logout_account", [] {
 			if (!ui.active || ui.account.isEmpty())
@@ -831,7 +871,7 @@ bool load(const struct dstreamy_ui_host *host)
 	    !host->free_string || !host->start || !host->stop || !host->load_lists || !host->select_guild ||
 	    !host->select_channel || !host->set_track || !host->request_take_over || !host->confirm_take_over ||
 	    !host->set_source || !host->panel_closed || !host->release_track || !host->login || !host->cancel_login ||
-	    !host->select_account || !host->add_account || !host->logout_account || failing)
+	    !host->select_account || !host->add_account || !host->logout_account || !host->confirm_logout || failing)
 		return false;
 	QMainWindow *window = dstreamy_ui::main_window();
 	if (!window)

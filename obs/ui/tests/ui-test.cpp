@@ -61,6 +61,7 @@ struct Host {
 	int adds = 0;
 	std::vector<std::string> selects;
 	std::vector<std::string> logouts;
+	std::vector<bool> logout_answers;
 	std::vector<bool> confirms;
 	std::vector<int> releases;
 	std::string guild = "-";
@@ -170,6 +171,10 @@ dstreamy_ui_host make_host()
 	h.logout_account = [](void *, const char *name) {
 		called();
 		host.logouts.emplace_back(name);
+	};
+	h.confirm_logout = [](void *, bool yes) {
+		called();
+		host.logout_answers.push_back(yes);
 	};
 	return h;
 }
@@ -523,6 +528,9 @@ int main(int argc, char **argv)
 	partial = good;
 	partial.logout_account = nullptr;
 	CHECK(!dstreamy_ui_load(&partial));
+	partial = good;
+	partial.confirm_logout = nullptr;
+	CHECK(!dstreamy_ui_load(&partial));
 	fake::window = nullptr;
 	CHECK(!dstreamy_ui_load(&good));
 	fake::window = &window;
@@ -731,6 +739,36 @@ int main(int argc, char **argv)
 	CHECK(wait_for([accounts] { return accounts->currentIndex() == 0; }));
 	logout->click();
 	CHECK((host.logouts == std::vector<std::string>{"h_cloud_streamy"}));
+	CHECK(!visible("dstreamy-logout-confirm"));
+
+	QJsonObject asking = account_row(true);
+	asking["confirm"] = QJsonObject{{"text", "Log out h_cloud_streamy?"}, {"ok", "Log out"}, {"cancel", "Not now"}};
+	show(view(idle, audio(true, false), false, nullptr, "login", asking));
+	CHECK(visible("dstreamy-logout-confirm") && !visible("dstreamy-logout"));
+	CHECK(text("dstreamy-logout-text") == QLatin1String("Log out h_cloud_streamy?"));
+	CHECK(find<QPushButton>("dstreamy-logout-ok")->text() == QLatin1String("Log out"));
+	CHECK((tab_chain(accounts).mid(0, 4) ==
+	       QStringList{"dstreamy-accounts", "dstreamy-logout-cancel", "dstreamy-logout-ok", "dstreamy-guilds"}));
+	shoot("logout-confirm");
+	find<QPushButton>("dstreamy-logout-cancel")->click();
+	find<QPushButton>("dstreamy-logout-ok")->click();
+	CHECK((host.logout_answers == std::vector<bool>{false, true}));
+	show(view(idle, audio(true, false), false, nullptr, "login", account_row(true)));
+	CHECK(!visible("dstreamy-logout-confirm") && visible("dstreamy-logout"));
+
+	QJsonObject pending = account_row(false, "Switching account…", "Switching account…");
+	QJsonArray items = pending["items"].toArray();
+	QJsonObject first = items[0].toObject(), second = items[1].toObject();
+	first["selected"] = false;
+	second["selected"] = true;
+	pending["items"] = QJsonArray{first, second};
+	show(view(idle, audio(true, false), false, nullptr, "login", pending));
+	CHECK(accounts->currentText() == QLatin1String("burner") && !accounts->isEnabled());
+
+	show(view(waiting, audio(true, false), false, "Cancel login", "cancel",
+		  account_row(false, "Finish or cancel the login first", "Finish or cancel the login first")));
+	CHECK(plain(accounts->toolTip()) == QLatin1String("Finish or cancel the login first"));
+	CHECK(plain(logout->toolTip()) == QLatin1String("Finish or cancel the login first"));
 
 	show(view(live, audio(true, false), false, nullptr, "login",
 		  account_row(false, "Stop the stream to switch accounts", "Stop the stream to log out")));

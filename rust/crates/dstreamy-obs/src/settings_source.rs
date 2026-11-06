@@ -17,7 +17,9 @@ use dstreamy_obs_producer::mixer::{
     AudioView, CONFIRM, NOT_NOW, audio_view, instead_label, mic_guard, notices, release_label,
     track_bit,
 };
-use dstreamy_obs_producer::panel::{AccountRow, CANCEL_LOGIN, NO_AUDIO_CONTROLS, account_row};
+use dstreamy_obs_producer::panel::{
+    AccountRow, CANCEL_LOGIN, NO_AUDIO_CONTROLS, NOT_AVAILABLE, account_row,
+};
 use dstreamy_obs_sys as sys;
 
 use crate::config;
@@ -1211,6 +1213,9 @@ const ACCOUNT: &CStr = c"account";
 const ACCOUNT_USE_PREFIX: &str = "account_use_";
 const ADD_ACCOUNT: &CStr = c"add_account";
 const LOGOUT_ACCOUNT: &CStr = c"logout_account";
+const LOGOUT_QUESTION: &CStr = c"logout_question";
+const CONFIRM_LOGOUT: &CStr = c"confirm_logout";
+const CANCEL_LOGOUT: &CStr = c"cancel_logout";
 
 /// The account a dialog button names after `prefix`.
 fn button_account(property: *mut sys::obs_property_t, prefix: &str) -> Option<String> {
@@ -1253,8 +1258,32 @@ extern "C" fn logout_account_clicked(
     guard("settings logout_account", true, || {
         let active = with_controls(|c| c.model.accounts().and_then(|a| a.active.clone()));
         if let Some(name) = active {
+            change(|c, _| c.model.request_logout(&name));
+        }
+        true
+    })
+}
+
+extern "C" fn confirm_logout_clicked(
+    _props: *mut sys::obs_properties_t,
+    _property: *mut sys::obs_property_t,
+    _data: *mut c_void,
+) -> bool {
+    guard("settings confirm_logout", true, || {
+        if let Some(name) = change(|c, _| c.model.confirm_logout(true)) {
             session::logout_account(&name, session::Wait::Dialog);
         }
+        true
+    })
+}
+
+extern "C" fn cancel_logout_clicked(
+    _props: *mut sys::obs_properties_t,
+    _property: *mut sys::obs_property_t,
+    _data: *mut c_void,
+) -> bool {
+    guard("settings cancel_logout", true, || {
+        change(|c, _| c.model.confirm_logout(false));
         true
     })
 }
@@ -1292,7 +1321,28 @@ unsafe fn add_account_row(props: *mut sys::obs_properties_t, row: &AccountRow) {
             );
         }
         button(ADD_ACCOUNT, row.add, Some(add_account_clicked), row.tooltip);
-        if active.is_some() {
+        if let Some(confirm) = &row.confirm {
+            let text = c_text(&confirm.text);
+            let note = sys::obs_properties_add_text(
+                props,
+                LOGOUT_QUESTION.as_ptr(),
+                text.as_ptr(),
+                sys::OBS_TEXT_INFO,
+            );
+            sys::obs_property_text_set_info_type(note, sys::OBS_TEXT_INFO_WARNING);
+            button(
+                CONFIRM_LOGOUT,
+                &confirm.ok,
+                Some(confirm_logout_clicked),
+                "",
+            );
+            button(
+                CANCEL_LOGOUT,
+                &confirm.cancel,
+                Some(cancel_logout_clicked),
+                "",
+            );
+        } else if active.is_some() {
             button(
                 LOGOUT_ACCOUNT,
                 row.logout,
@@ -1323,6 +1373,7 @@ unsafe fn add_list(
     none: &CStr,
     items: &[(String, String)],
     selected: Option<&str>,
+    unavailable: bool,
 ) -> *mut sys::obs_property_t {
     // SAFETY: the caller's contract.
     unsafe {
@@ -1343,7 +1394,7 @@ unsafe fn add_list(
         }
         // Keeps a saved choice visible while the service can't list it.
         if let Some(id) = selected.filter(|id| items.iter().all(|(i, _)| i != id)) {
-            add(id, id);
+            add(id, if unavailable { NOT_AVAILABLE } else { id });
         }
         list
     }
@@ -1368,7 +1419,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
             .then(|| selected_track(settings))
             .flatten();
         let title = c_text(AUDIO_TRACK_TITLE);
-        let (guilds, channels, picked, state, login, accounts) = with_controls(|c| {
+        let (guilds, channels, picked, state, login, accounts, gone) = with_controls(|c| {
             let named = |list: &[dstreamy_obs_producer::control::Named]| {
                 list.iter()
                     .map(|n| (n.id.clone(), n.name.clone()))
@@ -1389,6 +1440,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                     })
                     .filter(|_| cfg!(unix)),
                 account_row(&c.model).filter(|_| cfg!(unix)),
+                (c.model.guild_unavailable(), c.model.channel_unavailable()),
             )
         });
         // SAFETY: the caller owns and destroys the returned properties; libobs copies every string.
@@ -1419,6 +1471,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                 c"Pick a server",
                 &guilds,
                 picked.guild_id.as_deref(),
+                gone.0,
             );
             sys::obs_property_set_modified_callback(guild, Some(guild_modified));
             let channel = add_list(
@@ -1428,6 +1481,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                 c"Pick a voice channel",
                 &channels,
                 picked.channel_id.as_deref(),
+                gone.1,
             );
             sys::obs_property_set_modified_callback(channel, Some(track_modified));
             let tracks = sys::obs_properties_add_list(
@@ -1453,7 +1507,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                     c"start",
                     c"Start",
                     Some(start_clicked),
-                    cfg!(unix) && state == DockState::Idle && !blocked,
+                    cfg!(unix) && state == DockState::Idle && !blocked && !gone.0 && !gone.1,
                 ),
                 (
                     c"stop",
@@ -1838,6 +1892,87 @@ mod tests {
         let (label, status, _, _) = shown();
         assert_eq!(label, None, "no control thread, so the login ends at once");
         assert!(status.contains("the login can't start"), "{status}");
+        drop(dialog);
+        reset();
+    }
+
+    #[test]
+    fn the_dialog_asks_before_logging_out_and_flags_a_server_the_account_lacks() {
+        use dstreamy_obs_producer::control::{Account, Accounts, Named};
+
+        let _serial = start();
+        let dialog = Dialog::create();
+        let shown = || {
+            // SAFETY: a live source; the properties are destroyed before returning.
+            unsafe {
+                let props = sys::obs_source_properties(dialog.0);
+                let get = |key: &CStr| sys::obs_properties_get(props, key.as_ptr());
+                let describe = |key: &CStr| {
+                    let p = get(key);
+                    (!p.is_null()).then(|| text(sys::obs_property_description(p)))
+                };
+                let guild = get(GUILD);
+                let names: Vec<String> = (0..sys::obs_property_list_item_count(guild))
+                    .map(|i| text(sys::obs_property_list_item_name(guild, i)))
+                    .collect();
+                let shown = (
+                    describe(LOGOUT_ACCOUNT),
+                    describe(LOGOUT_QUESTION),
+                    describe(CONFIRM_LOGOUT),
+                    describe(CANCEL_LOGOUT),
+                    names,
+                    sys::obs_property_enabled(get(c"start")),
+                );
+                sys::obs_properties_destroy(props);
+                shown
+            }
+        };
+        let account = |name: &str| Account {
+            name: name.into(),
+            username: None,
+            global_name: None,
+            has_token: true,
+            active: name == "a",
+        };
+        change(|c, _| {
+            c.model.accounts_loaded(Ok(Some(Accounts {
+                active: Some("a".into()),
+                accounts: vec![account("a"), account("b")],
+            })));
+            c.model.select_guild("g");
+            c.model.select_channel("c");
+            c.model.guilds_loaded(Ok(vec![Named {
+                id: "h".into(),
+                name: "Other".into(),
+            }]));
+        });
+        let (logout, question, _, _, names, start) = shown();
+        assert_eq!(logout.as_deref(), Some("Log out"));
+        assert_eq!(question, None);
+        assert_eq!(names, ["Pick a server", "Other", "Not available"]);
+        assert!(!start, "a server the account isn't in can't start");
+        logout_account_clicked(ptr::null_mut(), ptr::null_mut(), dialog.0.cast());
+        let (logout, question, ok, cancel, _, _) = shown();
+        assert_eq!(logout, None);
+        assert_eq!(question.as_deref(), Some("Log out a?"));
+        assert_eq!(
+            (ok.as_deref(), cancel.as_deref()),
+            (Some("Log out"), Some("Not now"))
+        );
+        cancel_logout_clicked(ptr::null_mut(), ptr::null_mut(), dialog.0.cast());
+        assert_eq!(shown().1, None);
+        logout_account_clicked(ptr::null_mut(), ptr::null_mut(), dialog.0.cast());
+        confirm_logout_clicked(ptr::null_mut(), ptr::null_mut(), dialog.0.cast());
+        assert_eq!(shown().1, None);
+        assert!(
+            with_controls(|c| c
+                .model
+                .problem()
+                .unwrap()
+                .message
+                .contains("the account can't change")),
+            "no control thread, so the logout ends at once"
+        );
         drop(dialog);
         reset();
     }

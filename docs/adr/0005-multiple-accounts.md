@@ -88,7 +88,7 @@ Older builds read only `<config-dir>/token`, so after a migration they report "n
 
 - The panel and the settings dialog get an always-visible account row: `Account  [name ▾]  [Log out]`. The picker lists the saved accounts and ends with `Add account…`, which opens serve's login window for a new account (`login` without `account`). Picking an account sends `select_account` (it becomes the default), the picker shows the pending pick until serve answers, then the lists load again. Log out asks first (`Log out <name>?  [Log out] [Not now]`), then sends `logout_account`; with no account left the row is replaced by the existing `Log in` button.
 - While live, the picker and Log out are disabled with the tooltip `Stop the stream to switch accounts` / `Stop the stream to log out`; while a login window waits, with `Finish or cancel the login first`.
-- The panel's host table gains `select_account(ctx, name)`, `add_account(ctx)` and `logout_account(ctx, name)`, and the view JSON an `account` object; the panel ABI goes to 6. A library and plugin of different ABIs refuse each other and the settings dialog remains, as at every ABI bump.
+- The panel's host table gains `select_account(ctx, name)`, `add_account(ctx)`, `logout_account(ctx, name)` (which asks for the confirm) and `confirm_logout(ctx, yes)`, and the view JSON an `account` object; the panel ABI goes to 6. A library and plugin of different ABIs refuse each other and the settings dialog remains, as at every ABI bump.
 
 ### CLI
 

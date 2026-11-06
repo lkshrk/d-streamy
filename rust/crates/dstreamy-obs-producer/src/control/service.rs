@@ -190,16 +190,19 @@ impl ObsControl {
     }
 
     /// Asks serve to open its login window with this process's graphical session; the account's name once logged in.
-    pub async fn login(&self) -> Result<Option<String>, ControlError> {
+    /// `account` names the saved account the login repairs; `None` lets serve name it after the Discord user.
+    pub async fn login(&self, account: Option<&str>) -> Result<Option<String>, ControlError> {
         let mut c = self.open().await?;
         c.require(BROWSER_LOGIN)?;
         let env: serde_json::Map<String, Value> = dstreamy_ipc::control::LOGIN_ENV
             .iter()
             .filter_map(|name| Some(((*name).to_owned(), std::env::var(name).ok()?.into())))
             .collect();
-        let user = c
-            .call(json!({"cmd": "login", "env": env}), "login", LOGIN_TIMEOUT)
-            .await?;
+        let mut command = json!({"cmd": "login", "env": env});
+        if let Some(account) = account.filter(|_| c.offers(ACCOUNTS)) {
+            command["account"] = account.into();
+        }
+        let user = c.call(command, "login", LOGIN_TIMEOUT).await?;
         Ok(user["global_name"]
             .as_str()
             .or(user["username"].as_str())
