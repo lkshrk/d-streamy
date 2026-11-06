@@ -522,7 +522,9 @@ fn stream_set_paused(shared: &Shared, state: &mut State, d: &Value) {
         return;
     };
     stream.paused = paused;
-    stream_update(shared, state, key);
+    if !state.quiet_set_paused {
+        stream_update(shared, state, key);
+    }
 }
 
 pub(crate) fn stream_update(shared: &Shared, state: &mut State, key: &str) {

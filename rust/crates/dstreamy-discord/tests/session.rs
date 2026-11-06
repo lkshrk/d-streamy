@@ -185,7 +185,16 @@ impl Fixture {
     }
 
     async fn streaming_source(options: SessionOptions, behaviour: Behaviour) -> Self {
+        Self::streaming_armed(options, behaviour, |_| {}).await
+    }
+
+    async fn streaming_armed(
+        options: SessionOptions,
+        behaviour: Behaviour,
+        arm: impl FnOnce(&MockDiscord),
+    ) -> Self {
         let mock = MockDiscord::start().await.unwrap();
+        arm(&mock);
         let client = client(&mock).await;
         let session = Session::new(client.clone());
         let events = session.subscribe();
@@ -427,8 +436,8 @@ async fn wait_viewers(f: &mut Fixture, want: Option<u32>) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn health_counts_viewers_as_they_join_and_leave() {
-    let mut f = Fixture::streaming().await;
-    // The mock answers the op 22 after STREAM_CREATE with an empty STREAM_UPDATE.
+    let mut f =
+        Fixture::streaming_armed(options(), Behaviour::Normal, MockDiscord::quiet_set_paused).await;
     wait_viewers(&mut f, Some(0)).await;
     assert!(
         f.mock

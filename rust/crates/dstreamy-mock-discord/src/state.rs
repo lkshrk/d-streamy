@@ -199,6 +199,7 @@ pub(crate) struct State {
     pub close_voice_on_stream_create: bool,
     pub reset_voice_on_stream_create: bool,
     pub ignore_stream_creates: usize,
+    pub quiet_set_paused: bool,
 }
 
 pub(crate) struct Shared {

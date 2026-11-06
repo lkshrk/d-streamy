@@ -541,6 +541,14 @@ impl Engine {
         self.viewers.subscribe()
     }
 
+    /// Health stops while not streaming, so the last count would go stale.
+    fn forget_viewers(&self) {
+        if let Some(stats) = lock(&self.last_stats).as_mut() {
+            stats.viewers = None;
+        }
+        self.viewers.send_if_modified(|v| v.take().is_some());
+    }
+
     /// The live external session's source, for attaching producers.
     /// `None` unless the session is live, so a producer never attaches to the source of a stopped run.
     pub fn external(&self) -> Option<(ExternalHandle, watch::Receiver<VideoSize>)> {
@@ -687,7 +695,10 @@ impl Engine {
                                 std::mem::replace(v, h.stats.viewers) != h.stats.viewers
                             });
                         }
-                        SessionEvent::State { .. } => {
+                        SessionEvent::State { state } => {
+                            if *state != SessionState::Streaming {
+                                self.forget_viewers();
+                            }
                             self.remember_portal_token();
                             self.release_if_stopped();
                         }
@@ -1386,6 +1397,66 @@ mod tests {
                     json!("test-pattern")
                 ]
             );
+            f.engine.shutdown().await;
+        }
+
+        async fn wait_viewers(rx: &mut watch::Receiver<Option<u32>>, want: Option<u32>) {
+            let waited = timeout(T, rx.wait_for(|v| *v == want))
+                .await
+                .map(|r| r.is_ok());
+            assert_eq!(waited, Ok(true), "viewers stuck at {:?}", *rx.borrow());
+        }
+
+        fn status_viewers(f: &Fixture) -> Value {
+            serde_json::to_value(f.engine.status()).unwrap()["stats"]["viewers"].clone()
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn viewers_turn_unknown_while_reconnecting_or_moved() {
+            use dstreamy_mock_discord::VoiceKind;
+            use dstreamy_mock_discord::opcodes::voice::CLOSE_SESSION_NO_LONGER_VALID;
+            let triggers: [fn(&MockDiscord) -> bool; 2] = [
+                |m| m.drop_voice(VoiceKind::Stream, Some(CLOSE_SESSION_NO_LONGER_VALID)),
+                |m| m.move_to_channel(MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID),
+            ];
+            for trigger in triggers {
+                let f = Fixture::new().await;
+                f.engine.start(params(), None).await.unwrap();
+                f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+                let mut producer = f.engine.viewers();
+                assert!(
+                    f.mock
+                        .set_viewers(&["400000000000000001", "400000000000000002"])
+                );
+                wait_viewers(&mut producer, Some(2)).await;
+                assert_eq!(status_viewers(&f), json!(2));
+
+                f.mock.ignore_stream_creates(usize::MAX);
+                assert!(trigger(&f.mock));
+                f.wait_state(|s| !matches!(s, SessionState::Streaming))
+                    .await;
+                wait_viewers(&mut producer, None).await;
+                assert_eq!(status_viewers(&f), Value::Null);
+                f.engine.shutdown().await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn start_and_stop_reset_the_viewers_a_producer_sees() {
+            let f = Fixture::new().await;
+            let mut producer = f.engine.viewers();
+            f.engine.viewers.send_replace(Some(5));
+            f.engine.start(params(), None).await.unwrap();
+            assert_ne!(
+                *producer.borrow_and_update(),
+                Some(5),
+                "start kept the old count"
+            );
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            assert!(f.mock.set_viewers(&["400000000000000001"]));
+            wait_viewers(&mut producer, Some(1)).await;
+            f.engine.stop().await.unwrap();
+            assert_eq!(*producer.borrow_and_update(), None, "stop kept the count");
             f.engine.shutdown().await;
         }
 

@@ -670,7 +670,7 @@ fn status_counts_viewers_as_they_join_and_leave() {
     wait_for_viewers(&mut a, json!(0));
 
     let stopped = a.request(&json!({"id": "stop", "cmd": "stop"}));
-    assert_eq!(stopped["data"]["viewers"], 0, "{stopped}");
+    assert_eq!(stopped["data"]["viewers"], Value::Null, "{stopped}");
     let status = a.request(&json!({"id": "st", "cmd": "status"}));
     assert_eq!(status["data"]["stats"], Value::Null, "{status}");
     shutdown_and_exit(&h, s);

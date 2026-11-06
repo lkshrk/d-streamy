@@ -282,6 +282,11 @@ impl MockDiscord {
         self.shared.state().reset_voice_on_stream_create = true;
     }
 
+    /// From now on op 22 changes the stream without a STREAM_UPDATE.
+    pub fn quiet_set_paused(&self) {
+        self.shared.state().quiet_set_paused = true;
+    }
+
     /// Leaves the next `n` STREAM_CREATEs unanswered.
     pub fn ignore_stream_creates(&self, n: usize) {
         self.shared.state().ignore_stream_creates = n;

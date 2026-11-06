@@ -52,8 +52,7 @@ impl Viewers {
             u32::try_from(others).unwrap_or(u32::MAX)
         });
         match name {
-            // A new stream starts with no viewers, which says nothing yet.
-            "STREAM_CREATE" => self.count = count.filter(|&n| n > 0),
+            "STREAM_CREATE" => self.count = count,
             "STREAM_UPDATE" => self.count = count.or(self.count),
             _ => self.count = None,
         }
@@ -98,11 +97,13 @@ mod tests {
     fn unknown_until_discord_reports_viewers() {
         let mut v = Viewers::default();
         assert_eq!(v.count(), None);
-        let created =
-            json!({"stream_key": KEY, "rtc_server_id": "9", "viewer_ids": [], "paused": false});
-        assert_eq!(apply(&mut v, "STREAM_CREATE", created), None);
         let no_ids = json!({"stream_key": KEY, "paused": true});
         assert_eq!(apply(&mut v, "STREAM_UPDATE", no_ids), None);
+        let created_without_ids = json!({"stream_key": KEY, "rtc_server_id": "9"});
+        assert_eq!(apply(&mut v, "STREAM_CREATE", created_without_ids), None);
+        let created =
+            json!({"stream_key": KEY, "rtc_server_id": "9", "viewer_ids": [], "paused": false});
+        assert_eq!(apply(&mut v, "STREAM_CREATE", created), Some(0));
     }
 
     #[test]
@@ -172,7 +173,7 @@ mod tests {
         let ids = json!({"stream_key": KEY, "viewer_ids": ["10", "11"]});
         assert_eq!(apply(&mut v, "STREAM_UPDATE", ids), Some(2));
         let created = json!({"stream_key": KEY, "viewer_ids": []});
-        assert_eq!(apply(&mut v, "STREAM_CREATE", created), None);
+        assert_eq!(apply(&mut v, "STREAM_CREATE", created), Some(0));
         let created_watched = json!({"stream_key": KEY, "viewer_ids": ["10"]});
         assert_eq!(apply(&mut v, "STREAM_CREATE", created_watched), Some(1));
         let deleted = json!({"stream_key": KEY, "unavailable": false});
