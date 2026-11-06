@@ -898,13 +898,10 @@ mod tests {
             ..stats
         };
         let v = panel_view(&s, true, Some(&watched), &sources(), false);
-        assert_eq!(
-            v.state_line,
-            "Live · 6.0 Mbit/s · 60 fps · 12:34 · 3 watching"
-        );
+        assert_eq!(v.state_line, "Live · 6.0 Mbit/s · 60 fps · 12:34 · 👁 3");
         assert_eq!(
             v.status_bar,
-            "● D-Streamy live · 6.0 Mbit/s · 60 fps · 12:34 · 3 watching ▴"
+            "● D-Streamy live · 6.0 Mbit/s · 60 fps · 12:34 · 👁 3 ▴"
         );
         assert_eq!(
             v.status_tooltip,

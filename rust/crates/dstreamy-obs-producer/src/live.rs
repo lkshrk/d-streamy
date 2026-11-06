@@ -89,26 +89,38 @@ fn clock(ms: u64) -> String {
     }
 }
 
-/// "6.0 Mbit/s · 60 fps · 12:34 · 3 watching", "… · 3 dropped" once frames drop, or just the uptime until rates exist.
+/// "6.0 Mbit/s · 60 fps · 12:34 · 👁 3", "… · ⚠ 3" once frames drop, or just the uptime until rates exist.
 pub fn stats_line(stats: &LiveStats) -> String {
-    line(stats, stats.dropped > 0)
+    line(stats, stats.dropped > 0, Words::Symbols)
 }
 
-/// Like [`stats_line`], with the dropped count even when it is zero.
+/// Like [`stats_line`] in words, with the dropped count even when it is zero.
 pub fn stats_tooltip(stats: &LiveStats) -> String {
-    line(stats, true)
+    line(stats, true, Words::Full)
 }
 
-fn line(stats: &LiveStats, dropped: bool) -> String {
+#[derive(Clone, Copy, PartialEq)]
+enum Words {
+    Symbols,
+    Full,
+}
+
+fn line(stats: &LiveStats, dropped: bool, words: Words) -> String {
     let mut text = clock(stats.uptime_ms);
     if let Some(r) = stats.rates {
         text = format!("{} · {:.0} fps · {text}", bitrate(r.bits_per_sec), r.fps);
     }
     if let Some(n) = stats.viewers {
-        text.push_str(&format!(" · {n} watching"));
+        text.push_str(&match words {
+            Words::Symbols => format!(" · 👁 {n}"),
+            Words::Full => format!(" · {n} watching"),
+        });
     }
     if dropped && stats.rates.is_some() {
-        text.push_str(&format!(" · {} dropped", stats.dropped));
+        text.push_str(&match words {
+            Words::Symbols => format!(" · ⚠ {}", stats.dropped),
+            Words::Full => format!(" · {} dropped", stats.dropped),
+        });
     }
     text
 }
@@ -149,8 +161,11 @@ mod tests {
         assert!((r.bits_per_sec - 6_000_000.0).abs() < 1.0, "{r:?}");
         assert!((r.fps - 60.0).abs() < 0.01, "{r:?}");
         assert_eq!(stats.uptime_ms, 4000);
-        assert_eq!(stats_line(&stats), "6.0 Mbit/s · 60 fps · 0:04 · 2 dropped");
-        assert_eq!(stats_tooltip(&stats), stats_line(&stats));
+        assert_eq!(stats_line(&stats), "6.0 Mbit/s · 60 fps · 0:04 · ⚠ 2");
+        assert_eq!(
+            stats_tooltip(&stats),
+            "6.0 Mbit/s · 60 fps · 0:04 · 2 dropped"
+        );
     }
 
     #[test]
@@ -231,21 +246,18 @@ mod tests {
         };
         assert_eq!(
             stats_line(&stats),
-            "6.0 Mbit/s · 60 fps · 12:34 · 3 watching · 2 dropped"
+            "6.0 Mbit/s · 60 fps · 12:34 · 👁 3 · ⚠ 2"
         );
         stats.viewers = Some(0);
         stats.dropped = 0;
-        assert_eq!(
-            stats_line(&stats),
-            "6.0 Mbit/s · 60 fps · 12:34 · 0 watching"
-        );
+        assert_eq!(stats_line(&stats), "6.0 Mbit/s · 60 fps · 12:34 · 👁 0");
         assert_eq!(
             stats_tooltip(&stats),
             "6.0 Mbit/s · 60 fps · 12:34 · 0 watching · 0 dropped"
         );
         stats.rates = None;
         stats.viewers = Some(1);
-        assert_eq!(stats_line(&stats), "12:34 · 1 watching");
+        assert_eq!(stats_line(&stats), "12:34 · 👁 1");
         stats.viewers = None;
         assert_eq!(stats_line(&stats), "12:34");
     }
