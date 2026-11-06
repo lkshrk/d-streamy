@@ -1502,10 +1502,17 @@ mod tests {
 
     impl Drop for Dialog {
         fn drop(&mut self) {
+            extern "C" fn queued_after_the_destroy(_: *mut c_void) {}
             // SAFETY: the reference taken in `create`; libobs destroys the source on its destruction thread.
             unsafe {
                 sys::obs_source_release(self.0);
-                while sys::obs_wait_for_destroy_queue() {}
+                // Without video, obs_wait_for_destroy_queue returns at once; a waited task runs after the destroy.
+                sys::obs_queue_task(
+                    sys::OBS_TASK_DESTROY,
+                    Some(queued_after_the_destroy),
+                    ptr::null_mut(),
+                    true,
+                );
             }
         }
     }
@@ -1813,6 +1820,7 @@ mod tests {
         change(|c, _| c.model.take_over(6));
         let desktop = Source::new(PLAIN, c"Desktop");
         let arm = |dialog: &Dialog| {
+            RELOADING.with(|r| r.set(false));
             let o = OPENED.lock().unwrap_or_else(PoisonError::into_inner);
             let o = o.iter().find(|o| o.source == dialog.0).unwrap();
             *REVERTING.lock().unwrap_or_else(PoisonError::into_inner) = Some(Reverting {
@@ -1827,6 +1835,7 @@ mod tests {
         let edited_back = Dialog::create();
         edited_back.build();
         edited_back.tick(&desktop, false);
+        edited_back.tick(&desktop, true);
         arm(&edited_back);
         edited();
         drop(edited_back);
@@ -1838,6 +1847,7 @@ mod tests {
 
         let cancelled = Dialog::create();
         cancelled.build();
+        cancelled.tick(&desktop, false);
         arm(&cancelled);
         drop(cancelled);
         assert_eq!(with_controls(|c| c.model.unrestored_mixers()), track_bit(6));
