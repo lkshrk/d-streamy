@@ -254,6 +254,7 @@ jobs:
           plugins="$stage/lib/x86_64-linux-gnu/obs-plugins"
           test -f "$plugins/obs-dstreamy.so"
           test -f "$plugins/obs-dstreamy-ui/obs-dstreamy-ui.so"
+          grep -q "Tabler Icons" "$plugins/obs-dstreamy-ui/THIRD_PARTY_NOTICES.txt"
           if find "$plugins" -maxdepth 1 -name '*.so' ! -name obs-dstreamy.so | grep .; then
             echo "libobs would try these as modules: only obs-dstreamy.so may sit in the module folder"
             exit 1
@@ -541,6 +542,7 @@ jobs:
           test -f "$stage/obs-dstreamy.plugin/Contents/MacOS/obs-dstreamy"
           test -f "$stage/obs-dstreamy.plugin/Contents/MacOS/obs-dstreamy-ui.dylib"
           test -f "$stage/obs-dstreamy.plugin/Contents/Info.plist"
+          grep -q "Tabler Icons" "$stage/obs-dstreamy.plugin/Contents/Resources/THIRD_PARTY_NOTICES.txt"
 
       - name: D-Streamy status-bar panel test
         working-directory: obs
@@ -756,9 +758,11 @@ jobs:
           cmake --install obs/build_x64 --config RelWithDebInfo --prefix "$stage"
           find "$stage" -print
           bin="$stage/obs-dstreamy/bin/64bit"
-          for f in obs-dstreamy.dll dstreamy_obs.pdb obs-dstreamy-ui/obs-dstreamy-ui.dll obs-dstreamy-ui/obs-dstreamy-ui.pdb; do
+          for f in obs-dstreamy.dll dstreamy_obs.pdb obs-dstreamy-ui/obs-dstreamy-ui.dll obs-dstreamy-ui/obs-dstreamy-ui.pdb \
+            obs-dstreamy-ui/THIRD_PARTY_NOTICES.txt; do
             test -f "$bin/$f" || { echo "the install lacks obs-dstreamy/bin/64bit/$f"; exit 1; }
           done
+          grep -q "Tabler Icons" "$bin/obs-dstreamy-ui/THIRD_PARTY_NOTICES.txt"
           if find "$bin" -maxdepth 1 -name '*.dll' ! -name obs-dstreamy.dll | grep .; then
             echo "libobs would try these as modules: only obs-dstreamy.dll may sit in the module folder"
             exit 1

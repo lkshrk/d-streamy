@@ -11,6 +11,8 @@ pub struct AudioSource {
     pub mixers: u32,
     /// A microphone or other input device, or a source in a Mic/Aux channel.
     pub mic: bool,
+    /// On air: in a shown scene or an audio channel, so OBS mixes it.
+    pub active: bool,
 }
 
 /// One checkbox: whether `uuid` feeds the managed track.
@@ -399,6 +401,7 @@ mod tests {
             name: name.into(),
             mixers,
             mic: false,
+            active: true,
         }
     }
 

@@ -313,7 +313,7 @@ fn audio(state: &ConfigState, controls: bool, sources: &[AudioSource], confirmin
     audio
 }
 
-/// `stats` with what the session adds: its frame rate, and whether a source feeds the Discord track.
+/// `stats` with what the session adds: its frame rate, and whether a source on air feeds the Discord track.
 fn with_session(
     m: &DockModel,
     controls: bool,
@@ -327,7 +327,7 @@ fn with_session(
     let bit = 1u32 << (m.heard_track() - 1);
     LiveStats {
         target_fps,
-        audio_fed: controls.then(|| sources.iter().any(|s| s.mixers & bit != 0)),
+        audio_fed: controls.then(|| sources.iter().any(|s| s.active && s.mixers & bit != 0)),
         ..*stats
     }
 }
@@ -504,6 +504,7 @@ mod tests {
                 name: (*name).into(),
                 mixers: if *name == "Music" { 0b10_0000 } else { 0b1 },
                 mic: false,
+                active: true,
             })
             .collect()
     }
@@ -868,6 +869,7 @@ mod tests {
             name: "Mic/Aux".into(),
             mixers: 0b11_1111,
             mic: true,
+            active: true,
         });
         list
     }
@@ -1043,6 +1045,16 @@ mod tests {
             "nothing feeds Track 6"
         );
         assert_eq!(unfed.status.state, State::Degraded);
+        let off_air: Vec<AudioSource> = sources()
+            .into_iter()
+            .map(|s| AudioSource { active: false, ..s })
+            .collect();
+        let v = panel_view(&s, true, Some(&watched), &off_air, false);
+        assert_eq!(
+            v.status.counters[1].text, "silent",
+            "sources off air don't count"
+        );
+        assert_eq!(v.audio.sources.len(), 5, "the checklist still lists them");
         let windows = panel_view(&s, false, Some(&watched), &[], false);
         assert_ne!(
             windows.status.counters[1].text, "silent",

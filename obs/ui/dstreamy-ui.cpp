@@ -187,6 +187,7 @@ struct Ui {
 	QPointer<QLabel> status_dot;
 	QPointer<QLabel> status_duration;
 	QStringList status_ids;
+	int style_generation = 0;
 	QPointer<Panel> panel;
 	QPointer<QTimer> timer;
 	QPointer<QLabel> mark;
@@ -266,6 +267,7 @@ QLabel *label(const char *name, QWidget *parent, const char *classes = nullptr)
 
 void restyle_status()
 {
+	ui.style_generation++;
 	ui.shown.clear();
 	rerender();
 }
@@ -296,7 +298,6 @@ Tint state_tint(const QString &state)
 	return {"text-muted", nullptr};
 }
 
-// Applies the theme's class to `l` and returns the colour it draws text in.
 void set_class(QLabel *l, const QString &klass)
 {
 	l->setProperty("class", klass);
@@ -305,6 +306,7 @@ void set_class(QLabel *l, const QString &klass)
 	l->setStyleSheet(QString());
 }
 
+// Applies the theme's class to `l` and returns the colour it draws text in.
 QColor apply_tint(QLabel *l, const Tint &tint)
 {
 	QString klass = QString::fromLatin1(tint.klass);
@@ -374,7 +376,7 @@ void build_counters(const QJsonArray &counters)
 	QStringList ids;
 	for (const QJsonValue v : counters)
 		ids << v.toObject().value("id").toString();
-	if (ids == ui.status_ids)
+	if (ui.status_dot && ids == ui.status_ids)
 		return;
 	ui.status_ids = ids;
 	auto *row = static_cast<QHBoxLayout *>(ui.status->layout());
@@ -394,17 +396,31 @@ void build_counters(const QJsonArray &counters)
 	row->addWidget(ui.status_duration);
 }
 
+// Tinting restyles the label, so it happens only when what it shows or the theme changed.
+bool tint_due(QLabel *l, const QString &look, int size, qreal ratio)
+{
+	QString key = QStringLiteral("%1|%2|%3|%4").arg(look).arg(size).arg(ratio).arg(ui.style_generation);
+	if (l->property("tintKey").toString() == key)
+		return false;
+	l->setProperty("tintKey", key);
+	return true;
+}
+
 void render_status(const QJsonObject &status)
 {
 	QJsonArray counters = status.value("counters").toArray();
 	build_counters(counters);
+	if (!ui.status_dot || !ui.status_duration)
+		return;
 	int size = ui.status->fontMetrics().height();
 	qreal ratio = ui.status->devicePixelRatioF();
 	QString state = status.value("state").toString();
-	QColor dot = apply_tint(ui.status_dot, state_tint(state));
-	ui.status_dot->setPixmap(dot_pixmap(size, ratio, dot));
-	ui.status_dot->setProperty("state", state);
-	ui.status_dot->setProperty("color", dot.name(QColor::HexArgb));
+	if (tint_due(ui.status_dot, state, size, ratio)) {
+		QColor dot = apply_tint(ui.status_dot, state_tint(state));
+		ui.status_dot->setPixmap(dot_pixmap(size, ratio, dot));
+		ui.status_dot->setProperty("state", state);
+		ui.status_dot->setProperty("color", dot.name(QColor::HexArgb));
+	}
 	for (const QJsonValue v : counters) {
 		QJsonObject c = v.toObject();
 		QString id = c.value("id").toString();
@@ -415,9 +431,11 @@ void render_status(const QJsonObject &status)
 			continue;
 		text->setText(c.value("text").toString());
 		text->setAccessibleName(c.value("label").toString());
+		QString name = c.value("icon").toString();
+		if (!tint_due(text, level + QLatin1Char('|') + name, size, ratio))
+			continue;
 		text->setProperty("level", level);
 		QColor color = apply_tint(text, level_tint(level));
-		QString name = c.value("icon").toString();
 		icon->setPixmap(icon_pixmap(name, size, ratio, color));
 		icon->setProperty("icon", name);
 		icon->setProperty("level", level);

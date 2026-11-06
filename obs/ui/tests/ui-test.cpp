@@ -1119,6 +1119,26 @@ int main(int argc, char **argv)
 	dstreamy_ui_unload();
 	CHECK(fake::unwatches == 7);
 
+	// A first view without a status bar, or with no counters, must not leave the bar half built.
+	for (bool keep_status : {false, true}) {
+		QJsonObject first = QJsonDocument::fromJson(QByteArray::fromStdString(view(idle, audio(false, false)))).object();
+		if (keep_status) {
+			QJsonObject bare = first.value("status").toObject();
+			bare["counters"] = QJsonArray();
+			first["status"] = bare;
+		} else {
+			first.remove("status");
+		}
+		host.json = QJsonDocument(first).toJson(QJsonDocument::Compact).toStdString();
+		CHECK(dstreamy_ui_load(&good));
+		CHECK(polled());
+		CHECK(status_parts() == QStringList{keep_status ? QStringLiteral("dot:idle") : QStringLiteral("dot:")});
+		show(view(live, audio(true, false)));
+		CHECK(status_parts().size() == 10 && status_parts().last() == QLatin1String("12:34"));
+		dstreamy_ui_unload();
+	}
+	CHECK(fake::unwatches == 9);
+
 	if (failures) {
 		std::fprintf(stderr, "dstreamy-ui-test: %d failures\n", failures);
 		return 1;

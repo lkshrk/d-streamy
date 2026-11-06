@@ -29,14 +29,31 @@ if(OS_MACOS)
       XCODE_ATTRIBUTE_LD_RUNPATH_SEARCH_PATHS "@executable_path/../Frameworks"
   )
   add_dependencies(${ui_target} ${CMAKE_PROJECT_NAME})
+  add_custom_command(
+    TARGET ${ui_target}
+    POST_BUILD
+    COMMAND
+      "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/icons/LICENSE"
+      "${plugin_rundir}/${CMAKE_PROJECT_NAME}.plugin/Contents/Resources/THIRD_PARTY_NOTICES.txt"
+  )
 elseif(OS_WINDOWS)
   # A subfolder: libobs tries every library in the module's own folder as a module.
   set_target_properties(${ui_target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${plugin_rundir}/${ui_target}>")
   install(TARGETS ${ui_target} RUNTIME DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit/${ui_target}")
   install(FILES "$<TARGET_PDB_FILE:${ui_target}>" DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit/${ui_target}" OPTIONAL)
+  install(
+    FILES icons/LICENSE
+    DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit/${ui_target}"
+    RENAME THIRD_PARTY_NOTICES.txt
+  )
 else()
   set_target_properties(${ui_target} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${plugin_rundir}/${ui_target}")
   install(TARGETS ${ui_target} LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/obs-plugins/${ui_target}")
+  install(
+    FILES icons/LICENSE
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/obs-plugins/${ui_target}"
+    RENAME THIRD_PARTY_NOTICES.txt
+  )
 endif()
 
 add_executable(dstreamy-ui-test tests/ui-test.cpp tests/fake-frontend.cpp tests/fake-frontend.hpp)

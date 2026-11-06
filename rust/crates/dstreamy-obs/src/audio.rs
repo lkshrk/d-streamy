@@ -55,6 +55,7 @@ unsafe fn describe(source: *mut sys::obs_source_t) -> Option<AudioSource> {
             name: text(sys::obs_source_get_name(source)),
             mixers: sys::obs_source_get_audio_mixers(source),
             mic: is_input_device(&text(sys::obs_source_get_unversioned_id(source))),
+            active: sys::obs_source_active(source),
         })
     }
 }
