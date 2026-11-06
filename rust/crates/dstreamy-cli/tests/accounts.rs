@@ -287,3 +287,44 @@ fn a_failed_migration_keeps_the_legacy_token_working() {
     assert_eq!(names(&h.list()), ["mockuser"]);
     assert!(!h.dir().join("token").exists());
 }
+
+#[test]
+fn a_login_into_another_users_account_is_refused() {
+    let h = Harness::new();
+    ok(h.first().arg("login").write_stdin(MOCK_TOKEN));
+    let err = failed(
+        h.second()
+            .args(["--account", "mockuser", "login"])
+            .write_stdin(SECOND_TOKEN),
+    );
+    assert!(
+        err.contains("signed in as second, but account mockuser belongs to mockuser"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.dir().join("accounts/mockuser/token"))
+            .unwrap()
+            .trim(),
+        MOCK_TOKEN
+    );
+}
+
+#[test]
+fn a_migration_held_up_elsewhere_uses_the_legacy_token_meanwhile() {
+    let h = Harness::new();
+    h.write_legacy(MOCK_TOKEN);
+    let held = dstreamy_core::Accounts::new(h.dir())
+        .store_lock(T)
+        .unwrap()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let (_, warnings) = ok(h.first().arg("guilds"));
+    assert!(warnings.contains("the saved token stays in"), "{warnings}");
+    assert!(
+        started.elapsed() < Duration::from_secs(19),
+        "bounded by the limit"
+    );
+    assert!(h.dir().join("token").exists());
+    drop(held);
+    assert_eq!(names(&h.list()), ["mockuser"]);
+}

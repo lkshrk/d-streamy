@@ -3,6 +3,7 @@
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -275,7 +276,14 @@ impl Accounts {
             std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
             match builder.create(&dir) {
                 Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                            .map_err(io_err(&dir))?;
+                    }
+                }
                 Err(e) => return Err(io_err(&dir)(e)),
             }
         }
@@ -352,12 +360,9 @@ impl Accounts {
         )
     }
 
-    /// Starts moving `<config-dir>/token` into an account; `None` when there is nothing to move.
-    /// Blocks while another process migrates.
-    pub fn begin_migration(&self) -> Result<Option<Migration<'_>>, ConfigError> {
-        if !self.legacy_token_file().exists() {
-            return Ok(None);
-        }
+    /// The lock that orders migrations and default changes; `None` if another process holds it past `wait`.
+    pub fn store_lock(&self, wait: Duration) -> Result<Option<StoreLock>, ConfigError> {
+        fs::create_dir_all(&self.dir).map_err(io_err(&self.dir))?;
         let lock_path = self.dir.join(MIGRATION_LOCK);
         let lock = File::options()
             .create(true)
@@ -365,8 +370,35 @@ impl Accounts {
             .write(true)
             .open(&lock_path)
             .map_err(io_err(&lock_path))?;
-        lock.lock().map_err(io_err(&lock_path))?;
-        let lock = Unlock(lock);
+        let deadline = Instant::now() + wait;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => return Ok(Some(StoreLock(lock))),
+                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(fs::TryLockError::Error(e)) => return Err(io_err(&lock_path)(e)),
+            }
+        }
+    }
+
+    /// Makes `name` the default while holding the store lock.
+    pub fn set_default_locked(&self, name: &str, wait: Duration) -> Result<(), ConfigError> {
+        let _lock = self
+            .store_lock(wait)?
+            .ok_or_else(|| ConfigError::StoreBusy(self.dir.join(MIGRATION_LOCK)))?;
+        self.set_default(name)
+    }
+
+    /// Starts moving `<config-dir>/token` into an account, waiting at most `wait` for another process's move.
+    pub fn begin_migration(&self, wait: Duration) -> Result<Option<Migration<'_>>, ConfigError> {
+        if !self.legacy_token_file().exists() {
+            return Ok(None);
+        }
+        let lock = self
+            .store_lock(wait)?
+            .ok_or_else(|| ConfigError::StoreBusy(self.dir.join(MIGRATION_LOCK)))?;
         let Some(token) = read_token_file(&self.legacy_token_file())? else {
             return Ok(None);
         };
@@ -388,9 +420,10 @@ fn free_name(base: &str, names: &[String]) -> String {
         .expect("some suffix is free")
 }
 
-struct Unlock(File);
+/// Held until dropped.
+pub struct StoreLock(File);
 
-impl Drop for Unlock {
+impl Drop for StoreLock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
     }
@@ -400,7 +433,7 @@ impl Drop for Unlock {
 pub struct Migration<'a> {
     accounts: &'a Accounts,
     token: String,
-    _lock: Unlock,
+    _lock: StoreLock,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -417,7 +450,6 @@ impl Migration<'_> {
     }
 
     /// Copies the token into an account named after `user` (or `default`), verifies it, then deletes the legacy file.
-    /// On failure the legacy file is untouched and a half-made account is removed again.
     pub fn finish(self, user: Option<&AccountUser>) -> Result<String, ConfigError> {
         self.finish_with(user, Fault::None)
     }
@@ -446,6 +478,9 @@ impl Migration<'_> {
             }
         };
         let legacy = accounts.legacy_token_file();
+        if read_token_file(&legacy)?.as_deref() != Some(self.token.as_str()) {
+            return Ok(name);
+        }
         match fs::remove_file(&legacy) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -480,6 +515,8 @@ impl Migration<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const WAIT: Duration = Duration::from_secs(5);
 
     fn store() -> (tempfile::TempDir, Accounts) {
         let dir = tempfile::tempdir().unwrap();
@@ -693,9 +730,9 @@ mod tests {
     #[test]
     fn migration_moves_the_legacy_token_into_the_users_account() {
         let (_dir, accounts) = store();
-        assert!(accounts.begin_migration().unwrap().is_none());
+        assert!(accounts.begin_migration(WAIT).unwrap().is_none());
         write_legacy(&accounts, "legacy-tok\n");
-        let migration = accounts.begin_migration().unwrap().unwrap();
+        let migration = accounts.begin_migration(WAIT).unwrap().unwrap();
         assert_eq!(migration.token(), "legacy-tok");
         let name = migration
             .finish(Some(&user("9", "H_Cloud_Streamy")))
@@ -708,7 +745,7 @@ mod tests {
         assert_eq!(accounts.user(&name).unwrap().id, "9");
         assert_eq!(accounts.default_name().unwrap(), Some(name));
         assert!(!accounts.legacy_token_file().exists());
-        assert!(accounts.begin_migration().unwrap().is_none());
+        assert!(accounts.begin_migration(WAIT).unwrap().is_none());
     }
 
     #[test]
@@ -717,7 +754,7 @@ mod tests {
         accounts.save("default", "other", None).unwrap();
         write_legacy(&accounts, "legacy");
         let name = accounts
-            .begin_migration()
+            .begin_migration(WAIT)
             .unwrap()
             .unwrap()
             .finish(None)
@@ -736,7 +773,7 @@ mod tests {
         accounts.save("kept", "same", None).unwrap();
         write_legacy(&accounts, "same");
         let name = accounts
-            .begin_migration()
+            .begin_migration(WAIT)
             .unwrap()
             .unwrap()
             .finish(Some(&user("1", "someone")))
@@ -751,7 +788,7 @@ mod tests {
         let (_dir, accounts) = store();
         write_legacy(&accounts, "precious");
         let err = accounts
-            .begin_migration()
+            .begin_migration(WAIT)
             .unwrap()
             .unwrap()
             .finish_with(Some(&user("1", "u")), Fault::AfterCopy)
@@ -769,7 +806,7 @@ mod tests {
             TokenSource::Legacy
         );
         let name = accounts
-            .begin_migration()
+            .begin_migration(WAIT)
             .unwrap()
             .unwrap()
             .finish(Some(&user("1", "u")))
@@ -786,7 +823,7 @@ mod tests {
         write_legacy(&accounts, "precious");
         fs::write(accounts.root(), "not a directory").unwrap();
         let err = accounts
-            .begin_migration()
+            .begin_migration(WAIT)
             .unwrap()
             .unwrap()
             .finish(None)
@@ -812,9 +849,75 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            accounts.begin_migration(),
+            accounts.begin_migration(WAIT),
             Err(ConfigError::InsecureTokenFile { .. })
         ));
         assert!(accounts.legacy_token_file().exists());
+    }
+
+    #[test]
+    fn a_held_store_lock_skips_the_migration_within_the_wait() {
+        let (_dir, accounts) = store();
+        write_legacy(&accounts, "kept");
+        let other = Accounts::new(accounts.config_dir());
+        let held = other.store_lock(WAIT).unwrap().unwrap();
+        let started = Instant::now();
+        let err = accounts
+            .begin_migration(Duration::from_millis(200))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ConfigError::StoreBusy(_)), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            accounts.set_default_locked("x", Duration::from_millis(50)),
+            Err(ConfigError::StoreBusy(_))
+        ));
+        assert_eq!(
+            accounts.resolve(None, None).unwrap().unwrap().source,
+            TokenSource::Legacy
+        );
+        drop(held);
+        let name = accounts
+            .begin_migration(WAIT)
+            .unwrap()
+            .unwrap()
+            .finish(None)
+            .unwrap();
+        assert_eq!(name, "default");
+    }
+
+    #[test]
+    fn a_legacy_file_that_changed_meanwhile_is_kept() {
+        let (_dir, accounts) = store();
+        write_legacy(&accounts, "first");
+        let migration = accounts.begin_migration(WAIT).unwrap().unwrap();
+        write_private(&accounts.legacy_token_file(), b"second\n").unwrap();
+        migration.finish(None).unwrap();
+        assert_eq!(
+            read_token_file(&accounts.legacy_token_file())
+                .unwrap()
+                .as_deref(),
+            Some("second")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_into_an_existing_directory_makes_it_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, accounts) = store();
+        fs::create_dir_all(accounts.account_dir("loose")).unwrap();
+        fs::set_permissions(
+            accounts.account_dir("loose"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        accounts.save("loose", "t", None).unwrap();
+        let mode = fs::metadata(accounts.account_dir("loose"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 }

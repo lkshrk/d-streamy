@@ -51,6 +51,8 @@ pub enum ConfigError {
     AccountWithEnvToken,
     #[error("moving the token into an account: {0}")]
     Migration(String),
+    #[error("another dstreamy is changing the saved accounts ({}); try again", .0.display())]
+    StoreBusy(PathBuf),
 }
 
 fn available_accounts(names: &[String]) -> String {
@@ -247,6 +249,10 @@ pub(crate) fn write_private(path: &Path, contents: &[u8]) -> Result<(), ConfigEr
         .and_then(|()| tmp.as_file().sync_all())
         .map_err(io_err(path))?;
     tmp.persist(path).map_err(|e| io_err(path)(e.error))?;
+    #[cfg(unix)]
+    fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(io_err(dir))?;
     Ok(())
 }
 

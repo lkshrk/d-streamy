@@ -10,10 +10,11 @@ use crate::discord::{self, Persistence};
 use crate::lock::{LockError, SessionLock};
 use crate::{CliError, Ctx};
 
-/// How long the migration waits to learn the legacy token's user before naming the account `default`.
-pub const MIGRATION_LOOKUP: Duration = Duration::from_secs(15);
-/// Shorter for `daemon`, whose app gives `logged_in` 10 s.
-pub const DAEMON_MIGRATION_LOOKUP: Duration = Duration::from_secs(5);
+/// The longest the migration may take, its lock wait and user lookup together, before the legacy token is used as is.
+pub const MIGRATION_LIMIT: Duration = Duration::from_secs(15);
+/// For `serve`, which shouldn't hold back its socket, and `daemon`, whose app gives `logged_in` 10 s.
+pub const SHORT_MIGRATION_LIMIT: Duration = Duration::from_secs(5);
+const MIN_LOOKUP: Duration = Duration::from_secs(1);
 
 /// The token and account `ctx` stands for: `DSTREAMY_TOKEN`, `--account`, the default account, or the legacy file.
 pub fn resolve(ctx: &Ctx) -> Result<ResolvedToken, CliError> {
@@ -26,9 +27,29 @@ pub fn lock_dir(ctx: &Ctx, source: &TokenSource) -> PathBuf {
     ctx.paths.accounts().lock_dir(source)
 }
 
-/// The session lock of the account a connection made from `source` streams with.
+/// The session lock of the account a connection made from `source` streams with; never recreates a removed account.
 pub fn session_lock(ctx: &Ctx, source: &TokenSource) -> Result<SessionLock, LockError> {
-    SessionLock::acquire(&lock_dir(ctx, source))
+    let accounts = ctx.paths.accounts();
+    let dir = lock_dir(ctx, source);
+    let Some(name) = source.account() else {
+        std::fs::create_dir_all(&dir).map_err(|e| LockError::Io {
+            path: dir.clone(),
+            source: e,
+        })?;
+        return SessionLock::acquire(&dir);
+    };
+    let gone = || LockError::AccountGone(name.to_owned());
+    if !accounts.exists(name) {
+        return Err(gone());
+    }
+    let lock = SessionLock::acquire(&dir).map_err(|e| match e {
+        LockError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => gone(),
+        e => e,
+    })?;
+    if accounts.load_token(name).ok().flatten().is_none() {
+        return Err(gone());
+    }
+    Ok(lock)
 }
 
 pub fn account_user(user: &CurrentUser) -> AccountUser {
@@ -52,16 +73,18 @@ pub fn remember_user(ctx: &Ctx, source: &TokenSource, user: &CurrentUser) {
 }
 
 /// Moves `<config-dir>/token` into an account once; a failure leaves it in place, warns and is retried next time.
-pub async fn migrate(ctx: &Ctx, lookup_limit: Duration) {
+pub async fn migrate(ctx: &Ctx, limit: Duration) {
     let accounts = ctx.paths.accounts();
     if !accounts.legacy_token_file().exists() {
         return;
     }
     let migrated = async {
-        let Some(migration) = accounts.begin_migration()? else {
+        let started = std::time::Instant::now();
+        let Some(migration) = accounts.begin_migration(limit)? else {
             return Ok(None);
         };
-        let user = lookup(ctx, migration.token(), lookup_limit).await;
+        let left = limit.saturating_sub(started.elapsed()).max(MIN_LOOKUP);
+        let user = lookup(ctx, migration.token(), left).await;
         migration.finish(user.as_ref()).map(Some)
     };
     match migrated.await {

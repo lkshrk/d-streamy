@@ -1421,6 +1421,8 @@ fn accounts_are_listed_selected_and_logged_out() {
 
     let picked = c.request(&account_cmd("s", "select_account", "other"));
     assert_eq!(picked["data"]["active"], "other", "{picked}");
+    let marker = std::fs::read_to_string(h.dir.path().join("default-account")).unwrap();
+    assert_eq!(marker.trim(), "other", "the pick is the default");
     let status = c.request(&json!({"id": "st", "cmd": "status"}));
     assert_eq!(status["data"]["account"]["name"], "other", "{status}");
     let rejected = c.request(&guilds);
@@ -1457,6 +1459,44 @@ fn accounts_are_listed_selected_and_logged_out() {
     let status = c.request(&json!({"id": "st2", "cmd": "status"}));
     assert_eq!(status["data"]["account"], Value::Null);
     assert_eq!(c.request(&guilds)["code"], "not_logged_in");
+    drop(c);
+    shutdown_and_exit(&h, s);
+}
+
+#[test]
+fn a_picked_account_stays_active_after_serve_restarts() {
+    let h = Harness::new();
+    two_accounts(&h);
+    let s = h.serve(&[]);
+    let (mut c, _) = h.control();
+    let picked = c.request(&account_cmd("s", "select_account", "other"));
+    assert_eq!(picked["data"]["active"], "other", "{picked}");
+    drop(c);
+    shutdown_and_exit(&h, s);
+    let s = h.serve(&[]);
+    let (mut c, hello) = h.control();
+    assert_eq!(
+        hello["data"]["status"]["account"]["name"], "other",
+        "{hello}"
+    );
+    let out = h
+        .cmd()
+        .args(["--json", "account", "list"])
+        .output()
+        .unwrap();
+    let list: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(list[1]["name"], "other");
+    assert_eq!(list[1]["default"], true, "the CLI uses it too: {list}");
+    let held = ConfigPaths::in_dir(h.dir.path())
+        .accounts()
+        .store_lock(T)
+        .unwrap()
+        .unwrap();
+    let busy = c.request(&account_cmd("s2", "select_account", "mockuser"));
+    assert_eq!(busy["type"], "error", "{busy}");
+    drop(held);
+    let back = c.request(&account_cmd("s3", "select_account", "mockuser"));
+    assert_eq!(back["data"]["active"], "mockuser", "{back}");
     drop(c);
     shutdown_and_exit(&h, s);
 }
@@ -1525,6 +1565,8 @@ fn a_login_into_a_named_account_makes_it_active() {
     assert_eq!(args[at + 1], "alt", "{args:?}");
     let list = c.request(&json!({"id": "a", "cmd": "accounts"}));
     assert_eq!(list["data"]["active"], "alt", "{list}");
+    let marker = std::fs::read_to_string(h.dir.path().join("default-account")).unwrap();
+    assert_eq!(marker.trim(), "alt");
     assert_eq!(account_names(&list), ["alt", "mockuser", "other"]);
     assert_eq!(
         c.request(&json!({"id": "g", "cmd": "guilds"}))["type"],

@@ -33,6 +33,7 @@ pub const PROTOCOL: u32 = 1;
 /// Discord closes the gateway with 4004 when the token is not valid.
 const AUTH_FAILED: u16 = 4004;
 const FORWARDER_DRAIN: Duration = Duration::from_secs(2);
+const STORE_LOCK_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
@@ -202,6 +203,7 @@ impl From<CliError> for Failure {
             CliError::Config(_) | CliError::ServeConfig(_) => "config",
             CliError::InvalidStreamConfig(_)
             | CliError::EmptyToken
+            | CliError::AccountOfAnotherUser { .. }
             | CliError::UnknownAudioSource(_) => "invalid_params",
             CliError::NotLoggedIn => {
                 return Self::new("not_logged_in", "not logged in; send set_token first");
@@ -235,6 +237,7 @@ impl From<CliError> for Failure {
             CliError::AlreadyStreaming
             | CliError::AccountStreaming { .. }
             | CliError::Lock(LockError::Held { .. }) => "already_running",
+            CliError::Lock(LockError::AccountGone(_)) => "unknown_account",
             CliError::ReadToken(_)
             | CliError::Session(_)
             | CliError::Stopped(_)
@@ -629,7 +632,7 @@ impl Engine {
         Ok(json!({ "active": active, "accounts": rows }))
     }
 
-    /// Makes `name` the account of the next connection; refused while a session is live.
+    /// Makes `name` the default account and the next connection's; refused while a session is live.
     pub async fn select_account(&self, name: &str) -> Result<Value, Failure> {
         Self::accounts_available()?;
         let _lifecycle = self.lifecycle.lock().await;
@@ -644,7 +647,7 @@ impl Engine {
                 "stop the stream before switching accounts",
             ));
         }
-        *lock(&self.account) = Some(name.to_owned());
+        self.make_default(name)?;
         if self
             .current()
             .is_some_and(|c| c.source.account() != Some(name))
@@ -653,6 +656,17 @@ impl Engine {
         }
         drop(_lifecycle);
         self.accounts()
+    }
+
+    /// Saves `name` as the default; serve then follows it, unless it was started with `--account`.
+    fn make_default(&self, name: &str) -> Result<(), Failure> {
+        self.ctx
+            .paths
+            .accounts()
+            .set_default_locked(name, STORE_LOCK_WAIT)
+            .map_err(CliError::from)?;
+        *lock(&self.account) = self.ctx.account.is_some().then(|| name.to_owned());
+        Ok(())
     }
 
     /// Deletes a saved account; refused while it streams here or in another process.
@@ -689,9 +703,12 @@ impl Engine {
         self.accounts()
     }
 
-    /// A login saved into `account`: it becomes the active account, and a connection made with an older token is replaced once no session streams on it.
+    /// A login saved into `account` makes it the default; an older connection goes once idle.
     pub async fn logged_in_as(&self, account: Option<String>) {
-        if let Some(name) = account {
+        if let Some(name) = account
+            && let Err(e) = self.make_default(&name)
+        {
+            tracing::warn!("making account {name} the default: {}", e.message);
             *lock(&self.account) = Some(name);
         }
         self.token_changed().await;

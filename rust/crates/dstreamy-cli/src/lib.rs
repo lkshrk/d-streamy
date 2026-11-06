@@ -71,6 +71,14 @@ pub enum CliError {
     Media(#[from] MediaError),
     #[error("a stream is already running")]
     AlreadyStreaming,
+    #[error(
+        "signed in as {signed_in}, but account {account} belongs to {owner}: log in as {owner}, or save {signed_in} as its own account (Add account… or `dstreamy login` without --account)"
+    )]
+    AccountOfAnotherUser {
+        account: String,
+        signed_in: String,
+        owner: String,
+    },
     #[error("account {name} is streaming{}; stop that stream first", pid.map(|p| format!(" (pid {p})")).unwrap_or_default())]
     AccountStreaming { name: String, pid: Option<u32> },
     #[error(transparent)]

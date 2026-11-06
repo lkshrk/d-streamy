@@ -305,8 +305,10 @@ async fn run(
 ) -> Result<ExitCode, CliError> {
     match &command {
         Command::Targets { .. } | Command::AudioSources | Command::Service(_) => {}
-        Command::Daemon { .. } => accounts::migrate(ctx, accounts::DAEMON_MIGRATION_LOOKUP).await,
-        _ => accounts::migrate(ctx, accounts::MIGRATION_LOOKUP).await,
+        Command::Daemon { .. } | Command::Serve { .. } => {
+            accounts::migrate(ctx, accounts::SHORT_MIGRATION_LIMIT).await;
+        }
+        _ => accounts::migrate(ctx, accounts::MIGRATION_LIMIT).await,
     }
     match command {
         Command::Account(command) => account(ctx, out, command),
@@ -505,6 +507,13 @@ async fn login(ctx: &Ctx, out: &Out, credentials: Credentials) -> Result<ExitCod
         Some(name) => name.clone(),
         None => accounts.name_for(&account_user)?,
     };
+    if let Some(owner) = accounts.user(&name).filter(|u| u.id != user.id) {
+        return Err(CliError::AccountOfAnotherUser {
+            account: name,
+            signed_in: user.username,
+            owner: owner.username,
+        });
+    }
     accounts.save(&name, &token, Some(&account_user))?;
     let default = accounts.default_name()?.as_deref() == Some(name.as_str());
     let token_file = accounts.token_file(&name);

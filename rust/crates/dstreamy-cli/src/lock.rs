@@ -10,6 +10,8 @@ pub enum LockError {
     Held { pid: Option<u32> },
     #[error("session lock {}: {source}", path.display())]
     Io { path: PathBuf, source: io::Error },
+    #[error("account {0} was removed meanwhile; see `dstreamy account list`")]
+    AccountGone(String),
 }
 
 /// Released when dropped, or by the OS when the process dies.
@@ -28,9 +30,6 @@ impl SessionLock {
             let path = path.to_owned();
             move |source| LockError::Io { path, source }
         };
-        if let Some(dir) = lock_file.parent() {
-            fs::create_dir_all(dir).map_err(io_err(dir))?;
-        }
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -72,6 +71,7 @@ mod tests {
     fn a_second_acquire_is_refused_with_the_pid_until_the_first_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let paths = dir.path().join("nested");
+        fs::create_dir(&paths).unwrap();
         let first = SessionLock::acquire(&paths).unwrap();
         let pid = read_pid(&dir.path().join("nested/session.pid"));
         assert_eq!(pid, Some(std::process::id()));
@@ -145,5 +145,29 @@ mod tests {
         assert!(dir.path().join("accounts/a/session.lock").exists());
         drop((held_a, held_b, legacy));
         crate::accounts::session_lock(&ctx, &a).unwrap();
+    }
+
+    #[test]
+    fn a_removed_account_is_not_recreated_by_its_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::Ctx {
+            paths: dstreamy_core::ConfigPaths::in_dir(&dir.path().join("cfg")),
+            gateway_url: String::new(),
+            account: None,
+        };
+        let accounts = ctx.paths.accounts();
+        accounts.save("a", "tok", None).unwrap();
+        accounts.remove("a").unwrap();
+        let a = dstreamy_core::TokenSource::Account("a".into());
+        let err = crate::accounts::session_lock(&ctx, &a).unwrap_err();
+        assert!(matches!(err, LockError::AccountGone(_)), "{err:?}");
+        assert!(!accounts.account_dir("a").exists());
+        accounts.save("a", "tok", None).unwrap();
+        fs::remove_file(accounts.token_file("a")).unwrap();
+        assert!(matches!(
+            crate::accounts::session_lock(&ctx, &a),
+            Err(LockError::AccountGone(_))
+        ));
+        crate::accounts::session_lock(&ctx, &dstreamy_core::TokenSource::Env).unwrap();
     }
 }
