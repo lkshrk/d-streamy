@@ -167,7 +167,7 @@ fn runtime_dir(h: &Harness) -> PathBuf {
             .create(&dir)
             .unwrap();
     }
-    dir
+    dir.canonicalize().unwrap()
 }
 
 fn passed(status: ExitStatus, lines: &[String]) {
