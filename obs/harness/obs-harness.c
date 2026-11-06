@@ -1276,19 +1276,18 @@ static bool click_settings_button(obs_source_t *source, const char *name)
 	return enabled;
 }
 
-// Start and Stop ask first: report the question and whether the output runs, then answer it with `answer`.
+// Start and Stop ask first: report the question and whether the output runs, then answer it, if asked, with `answer`.
 static bool click_and_answer(obs_source_t *source, const char *name, const char *answer)
 {
-	if (!click_settings_button(source, name))
-		return false;
+	bool enabled = click_settings_button(source, name);
 	obs_properties_t *props = obs_source_properties(source);
-	obs_property_t *question = obs_properties_get(props, "stream_question");
+	obs_property_t *question = enabled ? obs_properties_get(props, "stream_question") : NULL;
 	obs_output_t *output = obs_get_output_by_name("D-Streamy");
 	printf("HARNESS settings_asked name=%s output_active=%d question=%s\n", name,
 	       output && obs_output_active(output) ? 1 : 0, question ? obs_property_description(question) : "");
 	obs_output_release(output);
 	obs_properties_destroy(props);
-	return click_settings_button(source, answer);
+	return !question || click_settings_button(source, answer);
 }
 
 static bool starts_with(const char *text, const char *prefix)

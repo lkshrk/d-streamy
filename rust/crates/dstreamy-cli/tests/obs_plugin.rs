@@ -1214,7 +1214,7 @@ fn the_settings_dialog_offers_a_server_a_channel_tracks_1_to_6_and_start_while_i
         "HARNESS settings_info when=open name=audio_help kind=0".to_owned(),
         "HARNESS settings_property when=open name=take_over type=8 enabled=1 desc=Manage Track 6"
             .to_owned(),
-        "HARNESS settings_property when=open name=start type=8 enabled=1 desc=Start".to_owned(),
+        "HARNESS settings_property when=open name=start type=8 enabled=0 desc=Start".to_owned(),
         "HARNESS settings_property when=open name=stop type=8 enabled=0 desc=Stop".to_owned(),
         "HARNESS settings_source when=open audio_track=6".to_owned(),
     ]);
@@ -1387,7 +1387,14 @@ fn a_saved_track_3_stays_and_is_taken_over_on_its_own_bit() {
 
 /// Runs a harness mode on the settings dialog with the fake frontend; also returns the module config, if saved.
 fn dialog_session(mode: &str) -> (Vec<String>, Option<Value>) {
+    dialog_session_with(mode, None)
+}
+
+fn dialog_session_with(mode: &str, saved: Option<Value>) -> (Vec<String>, Option<Value>) {
     let config = tempfile::tempdir().unwrap();
+    if let Some(saved) = saved {
+        write_module_config(config.path(), saved);
+    }
     let dir = config.path().to_string_lossy().into_owned();
     let lib = fake_frontend();
     let lines = report_ui(&[
@@ -1414,7 +1421,8 @@ fn start_button(lines: &[String], when: &str) -> Option<bool> {
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn the_managed_track_belongs_to_its_scene_collection_and_loads_never_touch_mixers() {
-    let (lines, saved) = dialog_session("--collection-session");
+    let picks = json!({"guild_id": "g", "channel_id": "c", "audio_track": 6, "config_version": 2});
+    let (lines, saved) = dialog_session_with("--collection-session", Some(picks));
     assert_lines(
         &lines,
         &[
@@ -1488,9 +1496,16 @@ fn the_managed_track_belongs_to_its_scene_collection_and_loads_never_touch_mixer
             "{when} is unmanaged with no confirm open: {lines:#?}"
         );
     }
+    let saved = saved.expect("the picks stay saved");
     assert_eq!(
-        saved, None,
-        "a takeover is kept in the scene collection, not the module config"
+        saved.get("managed_track"),
+        None,
+        "a takeover is kept in the scene collection, not the module config: {saved}"
+    );
+    assert_eq!(
+        (&saved["guild_id"], &saved["channel_id"]),
+        (&json!("g"), &json!("c")),
+        "{saved}"
     );
 }
 
@@ -1643,7 +1658,10 @@ fn a_track_managed_before_the_upgrade_is_adopted_by_the_first_collection_without
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn a_legacy_managed_track_with_a_mic_on_it_stays_unmanaged_so_go_live_waits() {
-    let (lines, saved) = adopt(json!({"audio_track": 3, "managed_track": 3}), 0x1f);
+    let (lines, saved) = adopt(
+        json!({"audio_track": 3, "managed_track": 3, "guild_id": "g", "channel_id": "c"}),
+        0x1f,
+    );
     assert_lines(
         &lines,
         &[
@@ -2671,7 +2689,6 @@ fn a_server_change_in_the_dialog_never_keeps_the_old_servers_channel() {
         json!({"guild_id": MOCK_GUILD_ID, "channel_id": MOCK_VOICE_CHANNEL_ID, "audio_track": 2})
             .to_string();
     let other = json!({"guild_id": OTHER_GUILD_ID}).to_string();
-    let pick_first = "Pick a server and a voice channel first";
     let (status, lines) = tools_run(
         &h,
         config.path(),
@@ -2681,7 +2698,7 @@ fn a_server_change_in_the_dialog_never_keeps_the_old_servers_channel() {
             "--then-update",
             &other,
             "--tools-expect",
-            pick_first,
+            "Idle",
             "--seconds",
             "10",
             "--until-video",
@@ -2711,14 +2728,23 @@ fn a_server_change_in_the_dialog_never_keeps_the_old_servers_channel() {
         ["value=0 text=Pick a voice channel", "value=0 text=Lobby"],
         "only the new server's channels: {lines:#?}"
     );
-    asked_first(&lines, "start", 0, "Go live in ");
+    assert_lines(
+        &lines,
+        &[
+            "HARNESS settings_property when=updated_again name=start type=8 enabled=0 desc=Start",
+            "HARNESS settings_clicked name=start enabled=0 refresh=0 status=Idle",
+            "HARNESS settings_asked name=start output_active=0 question=",
+            "HARNESS settings_status when=live status=Idle",
+            "HARNESS tools output=0 active=0",
+        ]
+        .map(str::to_owned),
+    );
     assert!(
-        lines.contains(&format!(
-            "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status={pick_first}"
-        )),
+        !lines
+            .iter()
+            .any(|l| l.starts_with("HARNESS settings_clicked name=confirm_stream ")),
         "Start never uses the old server's channel: {lines:#?}"
     );
-    assert!(lines.contains(&"HARNESS tools output=0 active=0".to_owned()));
     assert!(
         lines.contains(&format!(
             "HARNESS pick when=reopened guild_id={OTHER_GUILD_ID} channel_id="

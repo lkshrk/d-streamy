@@ -1537,8 +1537,15 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                 shown_track(selected.unwrap_or(picked.audio_track)),
             );
             drop(owned);
-            let can_start =
-                cfg!(unix) && state == DockState::Idle && !blocked && !gone.0 && !gone.1;
+            let picked_both = [&picked.guild_id, &picked.channel_id]
+                .iter()
+                .all(|id| id.as_deref().is_some_and(|id| !id.is_empty()));
+            let can_start = cfg!(unix)
+                && state == DockState::Idle
+                && picked_both
+                && !blocked
+                && !gone.0
+                && !gone.1;
             let can_stop = cfg!(unix) && matches!(state, DockState::Live { .. });
             let confirming = match STREAM_CONFIRM.load(Ordering::Acquire) {
                 CONFIRM_START if can_start => Some(Action::Start),
@@ -2026,6 +2033,37 @@ mod tests {
         );
         assert_eq!(STREAM_CONFIRM.load(Ordering::Acquire), 0);
         assert_eq!(shown().1, None);
+        drop(dialog);
+        reset();
+    }
+
+    #[test]
+    fn the_dialog_keeps_start_disabled_until_a_server_and_a_voice_channel_are_picked() {
+        let _serial = start();
+        let dialog = Dialog::create();
+        let start_enabled = || {
+            // SAFETY: a live source; the properties are destroyed before returning.
+            unsafe {
+                let props = sys::obs_source_properties(dialog.0);
+                let enabled =
+                    sys::obs_property_enabled(sys::obs_properties_get(props, c"start".as_ptr()));
+                sys::obs_properties_destroy(props);
+                enabled
+            }
+        };
+        assert!(!start_enabled(), "nothing picked");
+        change(|c, _| {
+            c.model.select_guild("g");
+        });
+        assert!(!start_enabled(), "a server but no voice channel");
+        change(|c, _| c.model.select_channel(""));
+        assert!(!start_enabled(), "an empty channel is no pick");
+        change(|c, _| c.model.select_channel("c"));
+        assert!(start_enabled(), "both picked");
+        change(|c, _| {
+            c.model.choose_guild(None);
+        });
+        assert!(!start_enabled(), "clearing the server clears the channel");
         drop(dialog);
         reset();
     }
