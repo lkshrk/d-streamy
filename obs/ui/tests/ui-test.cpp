@@ -749,12 +749,10 @@ int main(int argc, char **argv)
 	QList<QCheckBox *> boxes = sources();
 	CHECK(boxes.size() == 5 && visible("dstreamy-sources") && !visible("dstreamy-manage"));
 	CHECK(boxes.size() == 5 && boxes[2]->text() == QLatin1String("Music") && boxes[2]->isChecked());
-	CHECK(wait_for([&] {
-		return boxes.size() == 5 && boxes[0]->y() == boxes[1]->y() && boxes[0]->x() < boxes[1]->x();
-	}));
-	CHECK(wait_for([&] {
-		return boxes.size() == 5 && boxes[2]->y() > boxes[0]->y() && boxes[4]->x() == boxes[0]->x();
-	}));
+	CHECK(wait_for(
+		[&] { return boxes.size() == 5 && boxes[0]->y() == boxes[1]->y() && boxes[0]->x() < boxes[1]->x(); }));
+	CHECK(wait_for(
+		[&] { return boxes.size() == 5 && boxes[2]->y() > boxes[0]->y() && boxes[4]->x() == boxes[0]->x(); }));
 	if (boxes.size() == 5 && !(boxes[0]->x() < boxes[1]->x()))
 		std::fprintf(stderr, "grid: box0 %d,%d box1 %d,%d box2 %d,%d sources %dx%d\n", boxes[0]->x(),
 			     boxes[0]->y(), boxes[1]->x(), boxes[1]->y(), boxes[2]->x(), boxes[2]->y(),
