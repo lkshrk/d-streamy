@@ -1,3 +1,6 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include <ctype.h>
 #include <inttypes.h>
 #include <math.h>
@@ -2774,6 +2777,79 @@ static obs_data_t *video_settings(void)
 	return vs;
 }
 
+#if LIBOBS_API_MAJOR_VER >= 33
+static size_t load_plugins_at(const char *bin, const char *data, enum obs_runtime_module_type type)
+{
+	struct obs_runtime_module_info info = {.path_info = {.binary = bin, .data = data}, .type = type};
+	struct obs_module_failure_info mfi = {0};
+	obs_load_plugins(&info, &mfi);
+	size_t failed = mfi.count;
+	for (size_t i = 0; i < mfi.count; i++)
+		harness_error("module failed to load: %s", mfi.failed_modules[i]);
+	obs_module_failure_info_free(&mfi);
+	return failed;
+}
+
+#ifdef __linux__
+// libobs 33 looks for core modules next to the executable; the harness isn't installed there.
+static bool core_module_paths_beside_libobs(struct dstr *bin, struct dstr *data)
+{
+	Dl_info info;
+	if (!dladdr((void *)obs_startup, &info) || !info.dli_fname)
+		return false;
+	const char *slash = strrchr(info.dli_fname, '/');
+	if (!slash)
+		return false;
+	dstr_ncopy(bin, info.dli_fname, (size_t)(slash - info.dli_fname));
+	dstr_copy_dstr(data, bin);
+	dstr_cat(bin, "/obs-modules/core");
+	dstr_cat(data, "/../share/obs/obs-modules/core/%module%");
+	return true;
+}
+#endif
+
+static size_t load_modules(const char *module_bin, const char *module_data)
+{
+	size_t failed = 0;
+	if (module_bin) {
+		failed += load_plugins_at(module_bin, module_data ? module_data : "", OBS_MODULE_TYPE_CORE);
+	} else {
+#ifdef __linux__
+		struct dstr bin = {0}, data = {0};
+		if (core_module_paths_beside_libobs(&bin, &data))
+			failed += load_plugins_at(bin.array, data.array, OBS_MODULE_TYPE_CORE);
+		else {
+			harness_error("cannot locate libobs; set DSTREAMY_OBS_MODULE_PATH");
+			failed++;
+		}
+		dstr_free(&bin);
+		dstr_free(&data);
+#else
+		if (!obs_load_core_modules())
+			failed++;
+#endif
+	}
+	if (args.plugin_bin)
+		failed += load_plugins_at(args.plugin_bin, args.plugin_data, OBS_MODULE_TYPE_LEGACY_PLUGIN);
+	return failed;
+}
+#else
+static size_t load_modules(const char *module_bin, const char *module_data)
+{
+	if (module_bin)
+		obs_add_module_path(module_bin, module_data ? module_data : "");
+	if (args.plugin_bin)
+		obs_add_module_path(args.plugin_bin, args.plugin_data);
+	struct obs_module_failure_info mfi;
+	obs_load_all_modules2(&mfi);
+	size_t failed = mfi.count;
+	for (size_t i = 0; i < mfi.count; i++)
+		harness_error("module failed to load: %s", mfi.failed_modules[i]);
+	obs_module_failure_info_free(&mfi);
+	return failed;
+}
+#endif
+
 int main(int argc, char **argv)
 {
 	int rc = 0;
@@ -2840,9 +2916,6 @@ int main(int argc, char **argv)
 	if (!obs_reset_audio2(&oai))
 		FAIL("obs_reset_audio2 failed");
 
-	if (args.plugin_bin)
-		obs_add_module_path(args.plugin_bin, args.plugin_data);
-
 	if (args.fake_frontend) {
 #ifdef __linux__
 		if (!load_fake_frontend())
@@ -2857,14 +2930,14 @@ int main(int argc, char **argv)
 		obs_add_safe_module(m);
 	bfree(mods);
 
-	struct obs_module_failure_info mfi;
-	obs_load_all_modules2(&mfi);
-	size_t failed = mfi.count;
-	for (size_t i = 0; i < mfi.count; i++)
-		harness_error("module failed to load: %s", mfi.failed_modules[i]);
-	obs_module_failure_info_free(&mfi);
+	size_t failed = load_modules(getenv("DSTREAMY_OBS_MODULE_PATH"), getenv("DSTREAMY_OBS_MODULE_DATA_PATH"));
 	if (failed)
 		FAIL("%zu module(s) failed to load", failed);
+	mods = bstrdup(args.modules);
+	for (char *m = strtok(mods, ","); m; m = strtok(NULL, ","))
+		if (!obs_get_module(m))
+			printf("HARNESS module not loaded: %s\n", m);
+	bfree(mods);
 	obs_post_load_modules();
 	obs_log_loaded_modules();
 
