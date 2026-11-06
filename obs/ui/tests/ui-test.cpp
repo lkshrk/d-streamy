@@ -678,7 +678,8 @@ void check_status_action(QToolButton *status)
 	int height = status->fontMetrics().height();
 	CHECK(act->property("iconName").toString() == QLatin1String("player-play"));
 	CHECK(!act->icon().isNull() && act->iconSize() == QSize(height, height));
-	CHECK(QColor(act->property("color").toString()) == act->palette().color(QPalette::WindowText));
+	QColor play = QColor(act->property("color").toString());
+	CHECK(play.green() > play.red() && play.green() > play.blue());
 	CHECK(plain(act->toolTip()) == QLatin1String("Start D-Streamy"));
 	auto *row = status->layout();
 	int at = row->indexOf(act);
@@ -741,6 +742,8 @@ void check_status_action(QToolButton *status)
 	CHECK(wait_for([] { return !confirm_box(); }));
 	CHECK(host.starts == starts + 2 && host.stops == stops);
 	CHECK(act->property("iconName").toString() == QLatin1String("player-stop") && act->isEnabled());
+	QColor stop = QColor(act->property("color").toString());
+	CHECK(stop.red() > stop.green() && stop.red() > stop.blue());
 	CHECK(plain(act->toolTip()) == QLatin1String("Stop D-Streamy"));
 	act->click();
 	CHECK(confirm_box() && confirm_box()->text() == QLatin1String("Stop the Discord stream?"));

@@ -489,8 +489,16 @@ void render_control(const QJsonObject &control)
 	int size = ui.status->fontMetrics().height();
 	qreal ratio = ui.status->devicePixelRatioF();
 	if (tint_due(b, icon, size, ratio)) {
-		QColor color = b->palette().color(QPalette::WindowText);
-		QColor faded = color;
+		auto *probe = b->findChild<QLabel *>(QStringLiteral("dstreamy-status-action-tint"));
+		if (!probe) {
+			probe = new QLabel(b);
+			probe->setObjectName(QStringLiteral("dstreamy-status-action-tint"));
+			probe->hide();
+		}
+		bool stop = icon == QLatin1String("player-stop");
+		QColor color = apply_tint(probe, stop ? level_tint(QStringLiteral("error"))
+						      : state_tint(QStringLiteral("live")));
+		QColor faded = b->palette().color(QPalette::WindowText);
 		faded.setAlphaF(0.4f);
 		QIcon pixmaps;
 		pixmaps.addPixmap(icon_pixmap(icon, size, ratio, color), QIcon::Normal);
