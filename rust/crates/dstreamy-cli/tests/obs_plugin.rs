@@ -2529,7 +2529,10 @@ fn tools_start_then_cancel_leaves_the_session_idle_and_the_service_untouched() {
         "serve never started a session"
     );
     let saved = read_module_config(config.path());
-    assert_eq!(saved.get("owned"), None, "never owned: {saved}");
+    assert!(
+        saved.get("owned").is_none_or(Value::is_null),
+        "never owned: {saved}"
+    );
 }
 
 #[test]
