@@ -380,7 +380,7 @@ QToolButton *status_action()
 {
 	auto *b = new QToolButton(ui.status);
 	b->setObjectName(QStringLiteral("dstreamy-status-action"));
-	b->setAutoRaise(true);
+	b->setCursor(Qt::PointingHandCursor);
 	// Clicks on the button, enabled or not, never reach the item, which opens the panel.
 	b->setAttribute(Qt::WA_NoMousePropagation);
 	QObject::connect(b, &QToolButton::clicked, b, [] { guarded("start_stop", ask); });
@@ -410,6 +410,14 @@ void build_counters(const QJsonArray &counters)
 		row->addWidget(status_label(QStringLiteral("dstreamy-status-text-") + id));
 	}
 	row->addSpacing(8);
+	auto *divider = new QFrame(ui.status);
+	divider->setObjectName(QStringLiteral("dstreamy-status-divider"));
+	divider->setFrameShape(QFrame::VLine);
+	divider->setFrameShadow(QFrame::Plain);
+	divider->setFixedHeight(ui.status->fontMetrics().height());
+	divider->show();
+	row->addWidget(divider);
+	row->addSpacing(6);
 	ui.status_action = status_action();
 	row->addWidget(ui.status_action);
 	ui.status_duration = status_label(QStringLiteral("dstreamy-status-duration"));
@@ -483,6 +491,8 @@ void render_control(const QJsonObject &control)
 	if (!b)
 		return;
 	b->setVisible(!control.isEmpty());
+	if (auto *divider = ui.status->findChild<QFrame *>(QStringLiteral("dstreamy-status-divider")))
+		divider->setVisible(!control.isEmpty());
 	if (control.isEmpty())
 		return;
 	QString icon = control.value("icon").toString();
@@ -498,13 +508,32 @@ void render_control(const QJsonObject &control)
 		bool stop = icon == QLatin1String("player-stop");
 		QColor color = apply_tint(probe, stop ? level_tint(QStringLiteral("error"))
 						      : state_tint(QStringLiteral("live")));
-		QColor faded = b->palette().color(QPalette::WindowText);
+		QColor text = b->palette().color(QPalette::WindowText);
+		QColor faded = text;
 		faded.setAlphaF(0.4f);
+		QColor idle = text;
+		idle.setAlphaF(0.12f);
+		auto rgba = [](const QColor &c) {
+			return QStringLiteral("rgba(%1, %2, %3, %4)")
+				.arg(c.red())
+				.arg(c.green())
+				.arg(c.blue())
+				.arg(c.alpha());
+		};
+		b->setStyleSheet(QStringLiteral("QToolButton { background: %1; border: none; border-radius: %4px; "
+						"padding: 1px %5px; }"
+						"QToolButton:hover { background: %2; }"
+						"QToolButton:pressed { background: %3; }"
+						"QToolButton:disabled { background: %6; }")
+					 .arg(rgba(color), rgba(color.lighter(115)), rgba(color.darker(120)))
+					 .arg(size / 2)
+					 .arg(size / 2)
+					 .arg(rgba(idle)));
 		QIcon pixmaps;
-		pixmaps.addPixmap(icon_pixmap(icon, size, ratio, color), QIcon::Normal);
+		pixmaps.addPixmap(icon_pixmap(icon, size, ratio, Qt::white), QIcon::Normal);
 		pixmaps.addPixmap(icon_pixmap(icon, size, ratio, faded), QIcon::Disabled);
 		b->setIcon(pixmaps);
-		b->setIconSize(QSize(size, size));
+		b->setIconSize(QSize(size * 4 / 5, size * 4 / 5));
 		b->setProperty("iconName", icon);
 		b->setProperty("color", color.name(QColor::HexArgb));
 	}

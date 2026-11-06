@@ -6,6 +6,7 @@
 #include <QComboBox>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QFrame>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -677,7 +678,10 @@ void check_status_action(QToolButton *status)
 		return;
 	int height = status->fontMetrics().height();
 	CHECK(act->property("iconName").toString() == QLatin1String("player-play"));
-	CHECK(!act->icon().isNull() && act->iconSize() == QSize(height, height));
+	CHECK(!act->icon().isNull() && act->iconSize() == QSize(height * 4 / 5, height * 4 / 5));
+	CHECK(act->styleSheet().contains(QLatin1String("border-radius")));
+	auto *divider = status->findChild<QFrame *>("dstreamy-status-divider");
+	CHECK(divider && divider->isVisible() && divider->frameShape() == QFrame::VLine);
 	QColor play = QColor(act->property("color").toString());
 	CHECK(play.green() > play.red() && play.green() > play.blue());
 	CHECK(plain(act->toolTip()) == QLatin1String("Start D-Streamy"));
