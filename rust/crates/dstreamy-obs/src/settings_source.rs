@@ -12,13 +12,13 @@ use dstreamy_obs_producer::dock::{
     track_name,
 };
 use dstreamy_obs_producer::dock_config::{ConfigError, ConfigState};
-use dstreamy_obs_producer::dock_view::UNSUPPORTED;
+use dstreamy_obs_producer::dock_view::{Action, UNSUPPORTED};
 use dstreamy_obs_producer::mixer::{
     AudioView, CONFIRM, NOT_NOW, audio_view, instead_label, mic_guard, notices, release_label,
     track_bit,
 };
 use dstreamy_obs_producer::panel::{
-    AccountRow, CANCEL_LOGIN, NO_AUDIO_CONTROLS, NOT_AVAILABLE, account_row,
+    AccountRow, CANCEL_LOGIN, NO_AUDIO_CONTROLS, NOT_AVAILABLE, account_row, stream_confirm,
 };
 use dstreamy_obs_sys as sys;
 
@@ -253,6 +253,7 @@ fn activate(source: *mut sys::obs_source_t) {
     let (choice, managed) = with_controls(|c| (c.model.choice(), c.model.managed_mixers()));
     let mixers = cfg!(unix).then(crate::audio::mixers);
     CONFIRMING.store(0, Ordering::Release);
+    STREAM_CONFIRM.store(0, Ordering::Release);
     OPENED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -1173,13 +1174,47 @@ extern "C" fn guild_modified(
     true
 }
 
+/// The action whose confirm the dialog shows in place of Start and Stop; 0 for none.
+static STREAM_CONFIRM: AtomicU8 = AtomicU8::new(0);
+const CONFIRM_START: u8 = 1;
+const CONFIRM_STOP: u8 = 2;
+const STREAM_QUESTION: &CStr = c"stream_question";
+const CONFIRM_STREAM: &CStr = c"confirm_stream";
+const CANCEL_STREAM: &CStr = c"cancel_stream";
+
 extern "C" fn start_clicked(
     _props: *mut sys::obs_properties_t,
     _property: *mut sys::obs_property_t,
     _data: *mut c_void,
 ) -> bool {
     guard("settings start", true, || {
-        session::start(session::Wait::Dialog);
+        STREAM_CONFIRM.store(CONFIRM_START, Ordering::Release);
+        true
+    })
+}
+
+extern "C" fn confirm_stream_clicked(
+    _props: *mut sys::obs_properties_t,
+    _property: *mut sys::obs_property_t,
+    _data: *mut c_void,
+) -> bool {
+    guard("settings confirm_stream", true, || {
+        match STREAM_CONFIRM.swap(0, Ordering::AcqRel) {
+            CONFIRM_START => session::start(session::Wait::Dialog),
+            CONFIRM_STOP => session::stop(session::Wait::Dialog),
+            _ => {}
+        }
+        true
+    })
+}
+
+extern "C" fn cancel_stream_clicked(
+    _props: *mut sys::obs_properties_t,
+    _property: *mut sys::obs_property_t,
+    _data: *mut c_void,
+) -> bool {
+    guard("settings cancel_stream", true, || {
+        STREAM_CONFIRM.store(0, Ordering::Release);
         true
     })
 }
@@ -1359,7 +1394,7 @@ extern "C" fn stop_clicked(
     _data: *mut c_void,
 ) -> bool {
     guard("settings stop", true, || {
-        session::stop(session::Wait::Dialog);
+        STREAM_CONFIRM.store(CONFIRM_STOP, Ordering::Release);
         true
     })
 }
@@ -1502,24 +1537,49 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                 shown_track(selected.unwrap_or(picked.audio_track)),
             );
             drop(owned);
-            let buttons: [(&CStr, &CStr, sys::obs_property_clicked_t, bool); 2] = [
-                (
-                    c"start",
-                    c"Start",
-                    Some(start_clicked),
-                    cfg!(unix) && state == DockState::Idle && !blocked && !gone.0 && !gone.1,
-                ),
-                (
-                    c"stop",
-                    c"Stop",
-                    Some(stop_clicked),
-                    cfg!(unix) && matches!(state, DockState::Live { .. }),
-                ),
-            ];
-            for (name, label, clicked, enabled) in buttons {
-                let button =
+            let can_start =
+                cfg!(unix) && state == DockState::Idle && !blocked && !gone.0 && !gone.1;
+            let can_stop = cfg!(unix) && matches!(state, DockState::Live { .. });
+            let confirming = match STREAM_CONFIRM.load(Ordering::Acquire) {
+                CONFIRM_START if can_start => Some(Action::Start),
+                CONFIRM_STOP if can_stop => Some(Action::Stop),
+                _ => {
+                    STREAM_CONFIRM.store(0, Ordering::Release);
+                    None
+                }
+            };
+            if let Some(action) = confirming {
+                let confirm = with_controls(|c| stream_confirm(&c.model, action));
+                let text = c_text(&confirm.text);
+                let note = sys::obs_properties_add_text(
+                    props,
+                    STREAM_QUESTION.as_ptr(),
+                    text.as_ptr(),
+                    sys::OBS_TEXT_INFO,
+                );
+                sys::obs_property_text_set_info_type(note, sys::OBS_TEXT_INFO_WARNING);
+                let answers: [(&CStr, &str, sys::obs_property_clicked_t); 2] = [
+                    (CONFIRM_STREAM, confirm.ok, Some(confirm_stream_clicked)),
+                    (CANCEL_STREAM, confirm.cancel, Some(cancel_stream_clicked)),
+                ];
+                for (name, label, clicked) in answers {
+                    let label = c_text(label);
                     sys::obs_properties_add_button(props, name.as_ptr(), label.as_ptr(), clicked);
-                sys::obs_property_set_enabled(button, enabled);
+                }
+            } else {
+                let buttons: [(&CStr, &CStr, sys::obs_property_clicked_t, bool); 2] = [
+                    (c"start", c"Start", Some(start_clicked), can_start),
+                    (c"stop", c"Stop", Some(stop_clicked), can_stop),
+                ];
+                for (name, label, clicked, enabled) in buttons {
+                    let button = sys::obs_properties_add_button(
+                        props,
+                        name.as_ptr(),
+                        label.as_ptr(),
+                        clicked,
+                    );
+                    sys::obs_property_set_enabled(button, enabled);
+                }
             }
             owned_props.into_raw()
         }
@@ -1571,6 +1631,7 @@ mod tests {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         CONFIRMING.store(0, Ordering::Release);
+        STREAM_CONFIRM.store(0, Ordering::Release);
         let old = DIALOG.lock().unwrap_or_else(PoisonError::into_inner).take();
         if let Some(old) = old {
             // SAFETY: the weak reference this module took.
@@ -1892,6 +1953,79 @@ mod tests {
         let (label, status, _, _) = shown();
         assert_eq!(label, None, "no control thread, so the login ends at once");
         assert!(status.contains("the login can't start"), "{status}");
+        drop(dialog);
+        reset();
+    }
+
+    #[test]
+    fn the_dialog_asks_before_going_live_and_cancel_starts_nothing() {
+        use dstreamy_obs_producer::control::Named;
+
+        let _serial = start();
+        let named = |id: &str, name: &str| Named {
+            id: id.into(),
+            name: name.into(),
+        };
+        change(|c, _| {
+            c.model.select_guild("g");
+            c.model.select_channel("c");
+            c.model
+                .guilds_loaded(Ok(vec![named("g", "Beste Chatgruppe")]));
+            c.model
+                .channels_loaded("g", Ok(vec![named("c", "Kids Lounge")]));
+        });
+        let dialog = Dialog::create();
+        let shown = || {
+            // SAFETY: a live source; the properties are destroyed before returning.
+            unsafe {
+                let props = sys::obs_source_properties(dialog.0);
+                let described = |key: &CStr| {
+                    let p = sys::obs_properties_get(props, key.as_ptr());
+                    (!p.is_null()).then(|| text(sys::obs_property_description(p)))
+                };
+                let start = sys::obs_properties_get(props, c"start".as_ptr());
+                let shown = (
+                    (!start.is_null()).then(|| sys::obs_property_enabled(start)),
+                    described(STREAM_QUESTION),
+                    described(CONFIRM_STREAM),
+                    described(CANCEL_STREAM),
+                    described(c"stop").is_some(),
+                );
+                sys::obs_properties_destroy(props);
+                shown
+            }
+        };
+        let problem = || with_controls(|c| c.model.problem().map(|p| p.headline));
+        assert_eq!(shown(), (Some(true), None, None, None, true));
+        start_clicked(ptr::null_mut(), ptr::null_mut(), dialog.0.cast());
+        assert_eq!(
+            shown(),
+            (
+                None,
+                Some("Go live in Kids Lounge on Beste Chatgruppe?".into()),
+                Some("Go live".into()),
+                Some("Cancel".into()),
+                false
+            ),
+            "the question takes Start's and Stop's place"
+        );
+        cancel_stream_clicked(ptr::null_mut(), ptr::null_mut(), dialog.0.cast());
+        assert_eq!(shown(), (Some(true), None, None, None, true));
+        assert_eq!(problem(), None);
+        assert_eq!(with_controls(|c| c.model.state().clone()), DockState::Idle);
+
+        stop_clicked(ptr::null_mut(), ptr::null_mut(), dialog.0.cast());
+        assert_eq!(shown().1, None, "nothing to stop, so no question");
+        assert_eq!(STREAM_CONFIRM.load(Ordering::Acquire), 0);
+
+        start_clicked(ptr::null_mut(), ptr::null_mut(), dialog.0.cast());
+        confirm_stream_clicked(ptr::null_mut(), ptr::null_mut(), dialog.0.cast());
+        assert!(
+            problem().is_some(),
+            "the confirmed start ran and found no video"
+        );
+        assert_eq!(STREAM_CONFIRM.load(Ordering::Acquire), 0);
+        assert_eq!(shown().1, None);
         drop(dialog);
         reset();
     }
