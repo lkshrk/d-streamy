@@ -2,6 +2,8 @@
 {"type":"keyframe_request"}
 {"attachment":1,"state":"producing","type":"source"}
 {"state":"detached","type":"source"}
+{"count":3,"type":"viewers"}
+{"count":null,"type":"viewers"}
 {"message":"no media within the grace period","reason":"stopped","type":"detached"}
 {"message":"the service is shutting down","reason":"shutdown","type":"detached"}
 {"message":"B-frames are enabled: video pts 0 µs does not follow 33333 µs","reason":"incompatible","type":"detached"}

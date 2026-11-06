@@ -432,6 +432,8 @@ mod tests {
             Event::Source {
                 view: SourceView::from(&SourceState::Detached),
             },
+            Event::Viewers { count: Some(3) },
+            Event::Viewers { count: None },
             Detach::Stopped("no media within the grace period".into()).event(),
             Detach::Shutdown.event(),
             Detach::Incompatible(

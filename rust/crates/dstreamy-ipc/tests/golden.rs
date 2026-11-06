@@ -63,7 +63,9 @@ fn producer_reverse_channel_events() {
         json!({"type": "source", "state": "producing", "attachment": 1})
     );
     assert_eq!(lines[3], json!({"type": "source", "state": "detached"}));
-    let reasons: Vec<&str> = lines[4..]
+    assert_eq!(lines[4], json!({"type": "viewers", "count": 3}));
+    assert_eq!(lines[5], json!({"type": "viewers", "count": null}));
+    let reasons: Vec<&str> = lines[6..]
         .iter()
         .map(|l| {
             assert_eq!(l["type"], "detached", "{l}");
