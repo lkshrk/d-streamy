@@ -76,7 +76,12 @@ pub struct LiveHealth {
     pub video_level: Option<HealthLevel>,
     /// Video frames dropped on the way to Discord.
     pub dropped_video: u64,
+    /// Intervals in which fewer than [`AUDIO_DROPOUT_BELOW`] Opus frames reached Discord.
+    pub audio_dropouts: u64,
 }
+
+/// Half of what a 20 ms Opus track sends a second.
+pub const AUDIO_DROPOUT_BELOW: u64 = dstreamy_core::health::AUDIO_FRAMES_PER_SEC as u64 / 2;
 
 impl LiveHealth {
     pub fn reconnects(&self) -> u64 {
@@ -101,13 +106,16 @@ impl LiveHealth {
     }
 
     fn on_health(current: Option<Self>, snapshot: &HealthSnapshot) -> Option<Self> {
+        let current = current.unwrap_or_default();
+        let dropout = snapshot.metrics.a_sent < AUDIO_DROPOUT_BELOW;
         Some(Self {
+            audio_dropouts: current.audio_dropouts + u64::from(dropout),
             resumes: snapshot.stats.resumes,
             metrics: Some(snapshot.metrics),
             audio_level: Some(snapshot.health.audio_level),
             video_level: Some(snapshot.health.video_level),
             dropped_video: snapshot.stats.video_frames_dropped,
-            ..current.unwrap_or_default()
+            ..current
         })
     }
 }
@@ -1445,6 +1453,31 @@ mod tests {
             "a new stream counts from zero"
         );
         assert_eq!(LiveHealth::on_state(None, &reconnecting), None);
+    }
+
+    #[test]
+    fn live_health_counts_intervals_with_too_little_audio_per_stream() {
+        let mut h = LiveHealth::on_state(None, &SessionState::Connecting);
+        h = LiveHealth::on_state(h, &SessionState::Streaming);
+        h = LiveHealth::on_health(h, &snapshot(0, 0, 50));
+        assert_eq!(h.unwrap().audio_dropouts, 0);
+        h = LiveHealth::on_health(h, &snapshot(0, 0, AUDIO_DROPOUT_BELOW));
+        assert_eq!(
+            h.unwrap().audio_dropouts,
+            0,
+            "half the frames still count as flowing"
+        );
+        h = LiveHealth::on_health(h, &snapshot(0, 0, AUDIO_DROPOUT_BELOW - 1));
+        h = LiveHealth::on_health(h, &snapshot(0, 0, 0));
+        assert_eq!(h.unwrap().audio_dropouts, 2);
+        h = LiveHealth::on_state(h, &SessionState::Reconnecting { attempt: 1 });
+        h = LiveHealth::on_state(h, &SessionState::Streaming);
+        assert_eq!(h.unwrap().audio_dropouts, 2, "kept across a reconnect");
+        assert_eq!(
+            LiveHealth::on_state(h, &SessionState::Connecting).map(|h| h.audio_dropouts),
+            Some(0),
+            "a new stream counts from zero"
+        );
     }
 
     #[test]

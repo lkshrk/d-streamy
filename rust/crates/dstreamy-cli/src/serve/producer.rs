@@ -157,6 +157,7 @@ pub(super) struct HealthView {
     /// Lost by this attachment's source queue plus on the way to Discord.
     dropped_video: u64,
     audio_per_sec: Option<u64>,
+    audio_dropouts: Option<u64>,
     audio_level: Option<HealthLevel>,
     video_level: Option<HealthLevel>,
     fps: Option<u64>,
@@ -173,6 +174,7 @@ impl HealthView {
             reconnects: health.reconnects(),
             dropped_video: health.dropped_video + source_dropped_video,
             audio_per_sec: m.map(|m| m.a_sent),
+            audio_dropouts: m.map(|_| health.audio_dropouts),
             audio_level: health.audio_level,
             video_level: health.video_level,
             fps: m.map(|m| m.fps),
@@ -509,6 +511,7 @@ mod tests {
                         audio_level: Some(HealthLevel::Good),
                         video_level: Some(HealthLevel::Warn),
                         dropped_video: 3,
+                        audio_dropouts: 2,
                         ..LiveHealth::default()
                     },
                     1,
@@ -768,7 +771,7 @@ mod tests {
             next_of("health", &mut reader).await,
             json!({
                 "type": "health", "reconnecting": true, "reconnects": 1, "dropped_video": 0,
-                "audio_per_sec": null, "audio_level": null, "video_level": null, "fps": null,
+                "audio_per_sec": null, "audio_dropouts": null, "audio_level": null, "video_level": null, "fps": null,
                 "jitter_p95_ms": null, "jitter_max_ms": null, "bitrate_kbps": null
             })
         );
@@ -787,6 +790,7 @@ mod tests {
             audio_level: Some(HealthLevel::Good),
             video_level: Some(HealthLevel::Warn),
             dropped_video: 3,
+            audio_dropouts: 2,
             ..LiveHealth::default()
         }));
         let line = next_of("health", &mut reader).await;
@@ -801,10 +805,11 @@ mod tests {
         assert_eq!(
             (
                 &line["audio_per_sec"],
+                &line["audio_dropouts"],
                 &line["audio_level"],
                 &line["video_level"]
             ),
-            (&json!(50), &json!("good"), &json!("warn"))
+            (&json!(50), &json!(2), &json!("good"), &json!("warn"))
         );
         assert_eq!(
             (
