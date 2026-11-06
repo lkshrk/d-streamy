@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use dstreamy_core::ConfigPaths;
 use dstreamy_mock_discord::opcodes::gateway as gw;
 use dstreamy_mock_discord::{
-    MOCK_GUILD_ID, MOCK_TOKEN, MOCK_VOICE_CHANNEL_ID, MockDiscord, Recorded, VoiceKind,
+    MOCK_GUILD_ID, MOCK_TOKEN, MOCK_USER_ID, MOCK_VOICE_CHANNEL_ID, MockDiscord, Recorded,
+    VoiceKind,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -633,6 +634,46 @@ fn sigterm_stops_the_session_and_exits_zero() {
         h.voice_left(),
         "no op 4 leaving voice; serve stderr:\n{stderr}"
     );
+}
+
+/// Polls `status` until its stream stats report `want` viewers.
+fn wait_for_viewers(c: &mut Client, want: Value) -> Value {
+    let deadline = Instant::now() + T;
+    loop {
+        let status = c.request(&json!({"id": "v", "cmd": "status"}));
+        if status["data"]["stats"]["viewers"] == want {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "viewers never {want}: {status}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn status_counts_viewers_as_they_join_and_leave() {
+    let h = Harness::new().logged_in();
+    let s = h.serve(&[]);
+    let (mut a, _) = h.control();
+    a.request(&json!({"id": "sub", "cmd": "subscribe"}));
+    let reply = a.request(&start("test-pattern"));
+    assert_eq!(reply["type"], "result", "{reply}");
+    a.state("streaming");
+    wait_for_viewers(&mut a, json!(0));
+    assert!(
+        h.mock
+            .set_viewers(&["400000000000000001", "400000000000000002"])
+    );
+    wait_for_viewers(&mut a, json!(2));
+    assert!(h.mock.set_viewers(&["400000000000000002", MOCK_USER_ID]));
+    wait_for_viewers(&mut a, json!(1));
+    assert!(h.mock.set_viewers(&[]));
+    wait_for_viewers(&mut a, json!(0));
+
+    let stopped = a.request(&json!({"id": "stop", "cmd": "stop"}));
+    assert_eq!(stopped["data"]["viewers"], 0, "{stopped}");
+    let status = a.request(&json!({"id": "st", "cmd": "status"}));
+    assert_eq!(status["data"]["stats"], Value::Null, "{status}");
+    shutdown_and_exit(&h, s);
 }
 
 #[test]

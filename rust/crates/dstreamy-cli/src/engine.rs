@@ -347,6 +347,7 @@ pub struct Engine {
     lifecycle: tokio::sync::Mutex<()>,
     updating: tokio::sync::Mutex<()>,
     last_stats: Mutex<Option<StreamStats>>,
+    viewers: watch::Sender<Option<u32>>,
     running: Mutex<Option<Running>>,
     /// Set before the session starts, so a session that stops at once never leaves it behind.
     place: Mutex<Option<Placed>>,
@@ -424,6 +425,7 @@ impl Engine {
             lifecycle: tokio::sync::Mutex::new(()),
             updating: tokio::sync::Mutex::new(()),
             last_stats: Mutex::new(None),
+            viewers: watch::Sender::new(None),
             running: Mutex::new(None),
             place: Mutex::new(None),
             conn_seq: std::sync::atomic::AtomicU64::new(0),
@@ -532,6 +534,11 @@ impl Engine {
             source,
             stats: lock(&self.last_stats).clone(),
         }
+    }
+
+    /// The live session's viewer count, `None` while unknown.
+    pub fn viewers(&self) -> watch::Receiver<Option<u32>> {
+        self.viewers.subscribe()
     }
 
     /// The live external session's source, for attaching producers.
@@ -674,7 +681,12 @@ impl Engine {
             match received {
                 Ok(event) => {
                     match &event {
-                        SessionEvent::Health(h) => *lock(&self.last_stats) = Some(h.stats.clone()),
+                        SessionEvent::Health(h) => {
+                            *lock(&self.last_stats) = Some(h.stats.clone());
+                            self.viewers.send_if_modified(|v| {
+                                std::mem::replace(v, h.stats.viewers) != h.stats.viewers
+                            });
+                        }
                         SessionEvent::State { .. } => {
                             self.remember_portal_token();
                             self.release_if_stopped();
@@ -886,6 +898,7 @@ impl Engine {
         }
         started?;
         *lock(&self.last_stats) = None;
+        self.viewers.send_replace(None);
         *lock(&self.portal) = Some(PortalBook::new(restore_token, portal_token));
         *lock(&self.started_by) = caller;
         let announced = (
@@ -981,6 +994,7 @@ impl Engine {
         *lock(&self.external) = None;
         self.release_if_stopped();
         let stats = lock(&self.last_stats).take().unwrap_or_default();
+        self.viewers.send_replace(None);
         serde_json::to_value(stats).map_err(|e| Failure::new("internal", e.to_string()))
     }
 

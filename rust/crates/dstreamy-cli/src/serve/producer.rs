@@ -135,6 +135,9 @@ pub(super) enum Event {
         #[serde(flatten)]
         view: SourceView,
     },
+    Viewers {
+        count: Option<u32>,
+    },
     Detached {
         reason: &'static str,
         message: String,
@@ -205,6 +208,7 @@ fn queue<W>(writer: &mut FramedWrite<W, ControlCodec>, event: &Event) {
 pub(super) async fn run<R, W>(
     attachment: Attachment,
     mut states: watch::Receiver<SourceState>,
+    mut viewers: watch::Receiver<Option<u32>>,
     mut reader: FramedRead<R, ProducerCodec>,
     mut writer: FramedWrite<W, ControlCodec>,
     mut phase: watch::Receiver<Phase>,
@@ -216,6 +220,7 @@ pub(super) async fn run<R, W>(
     let mut requests = attachment.keyframe_requests();
     let mut ingest = Ingest::default();
     let (mut keyframe_due, mut source_due, mut states_open) = (false, true, true);
+    let (mut viewers_due, mut viewers_open) = (viewers.borrow_and_update().is_some(), true);
     let current = phase.clone();
     let stopped = |attachment: &Attachment| {
         if *current.borrow() != Phase::Running {
@@ -235,6 +240,9 @@ pub(super) async fn run<R, W>(
             } else if std::mem::take(&mut source_due) {
                 let view = SourceView::from(&*states.borrow_and_update());
                 queue(&mut writer, &Event::Source { view });
+            } else if std::mem::take(&mut viewers_due) {
+                let count = *viewers.borrow_and_update();
+                queue(&mut writer, &Event::Viewers { count });
             }
         }
         let unflushed = !writer.write_buffer().is_empty();
@@ -248,6 +256,10 @@ pub(super) async fn run<R, W>(
             changed = states.changed(), if states_open => match changed {
                 Ok(()) => source_due = true,
                 Err(_) => states_open = false,
+            },
+            changed = viewers.changed(), if viewers_open => match changed {
+                Ok(()) => viewers_due = true,
+                Err(_) => viewers_open = false,
             },
             flushed = SinkExt::<&Event>::flush(&mut writer), if unflushed => {
                 if flushed.is_err() {
@@ -478,10 +490,15 @@ mod tests {
         client: DuplexStream,
         events: tokio::task::JoinHandle<()>,
         phase: watch::Sender<Phase>,
+        viewers: watch::Sender<Option<u32>>,
     }
 
     /// A started source with one attachment served over a duplex whose buffers hold `buffer` bytes.
     async fn rig(buffer: usize) -> Rig {
+        rig_with(buffer, None).await
+    }
+
+    async fn rig_with(buffer: usize, viewers: Option<u32>) -> Rig {
         let mut source = ExternalSource::new(ExternalOptions::default()).unwrap();
         let handle = source.handle();
         let attachment = handle
@@ -504,9 +521,11 @@ mod tests {
         let (client, service) = tokio::io::duplex(buffer);
         let (read, write) = tokio::io::split(service);
         let (phase, phase_rx) = watch::channel(Phase::Running);
+        let (viewers, viewers_rx) = watch::channel(viewers);
         let events = tokio::spawn(run(
             attachment,
             handle.state(),
+            viewers_rx,
             FramedRead::new(read, ProducerCodec::new()),
             FramedWrite::new(write, ControlCodec::new()),
             phase_rx,
@@ -518,6 +537,7 @@ mod tests {
             client,
             events,
             phase,
+            viewers,
         }
     }
 
@@ -575,6 +595,57 @@ mod tests {
             events.contains(&json!({"type": "keyframe_request"})),
             "{events:?}"
         );
+        timeout(T, r.events).await.unwrap().unwrap();
+    }
+
+    async fn next_viewers(reader: &mut FramedRead<&mut DuplexStream, ControlCodec>) -> Value {
+        loop {
+            let line = timeout(T, reader.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if line["type"] == "viewers" {
+                return line;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_known_viewer_count_is_sent_on_attach_and_on_every_change() {
+        let mut r = rig_with(1 << 16, Some(2)).await;
+        let mut reader = FramedRead::new(&mut r.client, ControlCodec::new());
+        assert_eq!(
+            next_viewers(&mut reader).await,
+            json!({"type": "viewers", "count": 2})
+        );
+        r.viewers.send_replace(None);
+        assert_eq!(
+            next_viewers(&mut reader).await,
+            json!({"type": "viewers", "count": null})
+        );
+        r.viewers.send_replace(Some(3));
+        assert_eq!(
+            next_viewers(&mut reader).await,
+            json!({"type": "viewers", "count": 3})
+        );
+        drop(reader);
+        r.phase.send_replace(Phase::Stopping);
+        timeout(T, r.events).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_viewer_count_is_not_sent_on_attach() {
+        let mut r = rig(1 << 16).await;
+        let mut reader = FramedRead::new(&mut r.client, ControlCodec::new());
+        r.viewers.send_replace(Some(1));
+        assert_eq!(
+            next_viewers(&mut reader).await,
+            json!({"type": "viewers", "count": 1})
+        );
+        drop(reader);
+        r.phase.send_replace(Phase::Stopping);
         timeout(T, r.events).await.unwrap().unwrap();
     }
 
