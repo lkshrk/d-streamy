@@ -1502,6 +1502,30 @@ fn a_picked_account_stays_active_after_serve_restarts() {
 }
 
 #[test]
+fn an_account_without_a_token_can_be_logged_out_but_not_picked() {
+    let h = Harness::new();
+    two_accounts(&h);
+    std::fs::remove_file(h.dir.path().join("accounts/other/token")).unwrap();
+    let s = h.serve(&[]);
+    let (mut c, _) = h.control();
+    let refused = c.request(&account_cmd("s", "select_account", "other"));
+    assert_eq!(refused["code"], "not_logged_in", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("log in to other first"),
+        "{refused}"
+    );
+    let marker = std::fs::read_to_string(h.dir.path().join("default-account")).unwrap();
+    assert_eq!(marker.trim(), "mockuser");
+    let out = c.request(&account_cmd("o", "logout_account", "other"));
+    assert_eq!(account_names(&out), ["mockuser"], "{out}");
+    drop(c);
+    shutdown_and_exit(&h, s);
+}
+
+#[test]
 fn switching_or_logging_out_the_live_account_is_refused() {
     let h = Harness::new();
     two_accounts(&h);

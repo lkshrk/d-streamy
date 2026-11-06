@@ -514,7 +514,9 @@ async fn login(ctx: &Ctx, out: &Out, credentials: Credentials) -> Result<ExitCod
             owner: owner.username,
         });
     }
+    let store = accounts::store_lock(ctx)?;
     accounts.save(&name, &token, Some(&account_user))?;
+    drop(store);
     let default = accounts.default_name()?.as_deref() == Some(name.as_str());
     let token_file = accounts.token_file(&name);
     if out.json {
@@ -594,14 +596,15 @@ fn account(ctx: &Ctx, out: &Out, command: AccountCommand) -> Result<ExitCode, Cl
         }
         AccountCommand::Use { name } => {
             account_name(&name).map_err(CliError::Session)?;
+            let _store = accounts::store_lock(ctx)?;
             accounts.set_default(&name)?;
             out.line(format_args!("account {name} is now the default"));
         }
         AccountCommand::Remove { name } => {
             account_name(&name).map_err(CliError::Session)?;
             accounts.require(&name)?;
-            let source = dstreamy_core::TokenSource::Account(name.clone());
-            let held = accounts::session_lock(ctx, &source).map_err(|e| match e {
+            let _store = accounts::store_lock(ctx)?;
+            let held = accounts::removal_lock(ctx, &name).map_err(|e| match e {
                 dstreamy_cli::lock::LockError::Held { pid } => CliError::AccountStreaming {
                     name: name.clone(),
                     pid,

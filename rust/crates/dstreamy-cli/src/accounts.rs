@@ -14,7 +14,8 @@ use crate::{CliError, Ctx};
 pub const MIGRATION_LIMIT: Duration = Duration::from_secs(15);
 /// For `serve`, which shouldn't hold back its socket, and `daemon`, whose app gives `logged_in` 10 s.
 pub const SHORT_MIGRATION_LIMIT: Duration = Duration::from_secs(5);
-const MIN_LOOKUP: Duration = Duration::from_secs(1);
+/// The user lookup gets at least this, apart from the lock wait.
+const MIN_LOOKUP: Duration = Duration::from_secs(3);
 
 /// The token and account `ctx` stands for: `DSTREAMY_TOKEN`, `--account`, the default account, or the legacy file.
 pub fn resolve(ctx: &Ctx) -> Result<ResolvedToken, CliError> {
@@ -52,6 +53,28 @@ pub fn session_lock(ctx: &Ctx, source: &TokenSource) -> Result<SessionLock, Lock
     Ok(lock)
 }
 
+/// The lock that keeps an account from being removed while it streams; works without a token.
+pub fn removal_lock(ctx: &Ctx, name: &str) -> Result<SessionLock, LockError> {
+    let dir = ctx.paths.accounts().account_dir(name);
+    SessionLock::acquire(&dir).map_err(|e| match e {
+        LockError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+            LockError::AccountGone(name.to_owned())
+        }
+        e => e,
+    })
+}
+
+/// How long account changes wait for `accounts.lock`.
+pub const STORE_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Holds `accounts.lock` for a change of the saved accounts or the default.
+pub fn store_lock(ctx: &Ctx) -> Result<dstreamy_core::accounts::StoreLock, CliError> {
+    let accounts = ctx.paths.accounts();
+    accounts.store_lock(STORE_LOCK_WAIT)?.ok_or_else(|| {
+        dstreamy_core::ConfigError::StoreBusy(accounts.config_dir().join("accounts.lock")).into()
+    })
+}
+
 pub fn account_user(user: &CurrentUser) -> AccountUser {
     AccountUser {
         id: user.id.clone(),
@@ -80,7 +103,10 @@ pub async fn migrate(ctx: &Ctx, limit: Duration) {
     }
     let migrated = async {
         let started = std::time::Instant::now();
-        let Some(migration) = accounts.begin_migration(limit)? else {
+        let lock_wait = limit
+            .saturating_sub(MIN_LOOKUP)
+            .max(Duration::from_millis(500));
+        let Some(migration) = accounts.begin_migration(lock_wait)? else {
             return Ok(None);
         };
         let left = limit.saturating_sub(started.elapsed()).max(MIN_LOOKUP);

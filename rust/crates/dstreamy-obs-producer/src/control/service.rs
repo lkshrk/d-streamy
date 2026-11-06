@@ -189,8 +189,7 @@ impl ObsControl {
         }
     }
 
-    /// Asks serve to open its login window with this process's graphical session; the account's name once logged in.
-    /// `account` names the saved account the login repairs; `None` lets serve name it after the Discord user.
+    /// Opens serve's login window for `account` (`None`: named after the user); the saved account's name.
     pub async fn login(&self, account: Option<&str>) -> Result<Option<String>, ControlError> {
         let mut c = self.open().await?;
         c.require(BROWSER_LOGIN)?;

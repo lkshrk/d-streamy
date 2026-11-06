@@ -328,3 +328,14 @@ fn a_migration_held_up_elsewhere_uses_the_legacy_token_meanwhile() {
     drop(held);
     assert_eq!(names(&h.list()), ["mockuser"]);
 }
+
+#[test]
+fn an_account_without_a_token_can_still_be_removed() {
+    let h = Harness::new();
+    ok(h.first().arg("login").write_stdin(MOCK_TOKEN));
+    ok(h.second().arg("login").write_stdin(SECOND_TOKEN));
+    std::fs::remove_file(h.dir().join("accounts/second/token")).unwrap();
+    let (text, _) = ok(h.first().args(["account", "remove", "second"]));
+    assert!(text.contains("removed account second"), "{text}");
+    assert_eq!(names(&h.list()), ["mockuser"]);
+}

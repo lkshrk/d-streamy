@@ -47,7 +47,7 @@ Runs once, at the start of any command that reads a token or the accounts (`logi
 1. Take `accounts.lock`, so a `serve` and a CLI starting together don't both migrate, and check the file still exists. The lock is polled for at most the command's migration limit (15 s; 5 s for `serve` and `daemon`); when another process holds it longer, the migration is skipped and the command uses the legacy token (choice 4).
 2. Read the legacy token with the usual checks. An insecure mode or a read error stops here with that error, as before.
 3. If a saved account already holds the same token (a migration that stopped after the copy), only step 6 is left.
-4. Look the user up with one brief Discord connection, within what is left of the limit (at least 1 s). The account is named after the user as in a login without `--account`; offline, rejected or timed out, it is named `default` (with a suffix if taken), and its `account.toml` is filled in on its first successful connection.
+4. Look the user up with one brief Discord connection, within what is left of the limit; the lock wait leaves the lookup at least 3 s. The account is named after the user as in a login without `--account`; offline, rejected or timed out, it is named `default` (with a suffix if taken), and its `account.toml` is filled in on its first successful connection.
 5. Write the account's token and `account.toml` (fsynced), read the token back and compare it. Make it the default if there is none.
 6. Only then delete `<config-dir>/token`, and only if it still holds the token that was copied (re-read under the lock); a file that changed meanwhile is kept and migrated next time.
 
@@ -60,11 +60,12 @@ Older builds read only `<config-dir>/token`, so after a migration they report "n
 - The lock of ADR 0004 moves into the account: `accounts/<name>/session.lock` and `session.pid`. A session takes the lock of the account its Discord connection was made with. So `serve` streaming A and `dstreamy stream --account B` run at once, while A twice is still refused with `already_running` and the PID.
 - `stream`, `tui`, `daemon` and `serve` all take it at the same point as before. With `DSTREAMY_TOKEN` or the legacy fallback the lock stays `<config-dir>/session.lock`.
 - Not protected, as before with different `--config-dir`s: the same Discord user saved under two names, `DSTREAMY_TOKEN` holding a saved account's token, and an older build streaming next to a newer one.
-- `account remove` and serve's `logout_account` take the account's lock before deleting it, so an account streaming in another process is refused (`already_running`) instead of being deleted under it. Taking a session lock never creates a missing account directory, and after locking it checks that the account still has its token; an account removed meanwhile fails with `account <name> was removed meanwhile` (`unknown_account` in serve) instead of reappearing as an empty directory.
+- `account remove` and serve's `logout_account` take the account's lock before deleting it, so an account streaming in another process is refused (`already_running`) instead of being deleted under it. Removal locks the account directory without needing its token, so an account whose token is gone can still be removed. Taking a session lock never creates a missing account directory, and after locking it checks that the account still has its token; an account removed meanwhile fails with `account <name> was removed meanwhile` (`unknown_account` in serve) instead of reappearing as an empty directory.
 
 ### Per account and global
 
 - Per account: the token, the Discord user, the session lock, and the OBS plugin's saved server and channel.
+- Every change of the saved accounts or the default (`login`, `account use`, `account remove`, serve's `select_account` and `logout_account`, the migration) holds `accounts.lock`, waiting at most 2 s outside the migration.
 - Global, unchanged: `config.toml` (stream settings, capture target and crop, audio source, `[serve]`), and the other OBS plugin settings (the dock's tracks and sources, the managed track).
 - The plugin keeps the server and channel per account in its dock config. On a switch it restores that account's last server and channel, or none if it never picked one. The first time it sees an active account, the old global pick moves to that account. A saved server the account isn't in shows as not available in the picker, with "Pick the server again" and Start disabled.
 
@@ -77,7 +78,7 @@ Older builds read only `<config-dir>/token`, so after a migration they report "n
 | `cmd` | fields | reply `data` |
 |---|---|---|
 | `accounts` | — | `{"active": name\|null, "accounts": [{"name", "username", "global_name", "has_token", "active"}]}`, in name order; `username` and `global_name` are `null` while unknown |
-| `select_account` | `account` | the `accounts` reply. Makes the account the default. `unknown_account` (the message lists the saved names), `streaming` while a session is live, `config` when another process holds `accounts.lock` longer than 2 s |
+| `select_account` | `account` | the `accounts` reply. Makes the account the default. `not_logged_in` for an account without a saved token, so the default never points at one; `unknown_account` (the message lists the saved names), `streaming` while a session is live, `config` when another process holds `accounts.lock` longer than 2 s |
 | `logout_account` | `account` | the `accounts` reply. Deletes the account's token and directory. `unknown_account`; `streaming` while serve's live session uses it; `already_running` (with the PID) while another process streams it. Logging out the active account makes serve follow the default again |
 
 - `login` takes an optional `account`: the window's login is saved there (`dstreamy login --account <name>`), and refused with `login_failed` and the message above if the browser signed in as another user than the account's; without it, the login is named as in `dstreamy login`. The reply adds `account`, the name it was saved under, and serve makes that account the default and active one. An invalid name is `invalid_params`. The plugin's "Log in again" sends the active account, so it repairs that account; `Add account…` sends none. An older client sends no `account`; logging in again as the same Discord user then lands in the same account.
@@ -103,6 +104,8 @@ Older builds read only `<config-dir>/token`, so after a migration they report "n
 - Two accounts stream at once without a multi-session serve.
 - The legacy token moves on first use; going back to an older build needs `DSTREAMY_TOKEN` or a new login (above).
 - The account picked in OBS is the default for the CLI as well; `--account` or `dstreamy account use` overrides it.
+
+- Going back to an older plugin drops the per-account picks: it rewrites the dock config without the `account` and `picks` fields, keeping only the current server and channel. Accepted.
 
 ## Decided by the user (2026-11-06)
 

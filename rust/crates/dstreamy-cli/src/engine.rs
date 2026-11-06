@@ -33,7 +33,6 @@ pub const PROTOCOL: u32 = 1;
 /// Discord closes the gateway with 4004 when the token is not valid.
 const AUTH_FAILED: u16 = 4004;
 const FORWARDER_DRAIN: Duration = Duration::from_secs(2);
-const STORE_LOCK_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
@@ -647,6 +646,22 @@ impl Engine {
                 "stop the stream before switching accounts",
             ));
         }
+        let has_token = self
+            .ctx
+            .paths
+            .accounts()
+            .load_token(name)
+            .ok()
+            .flatten()
+            .is_some();
+        if !has_token {
+            return Err(Failure::new(
+                "not_logged_in",
+                format!(
+                    "account {name} has no saved login: log in to {name} first (`dstreamy login --account {name}`), or log it out"
+                ),
+            ));
+        }
         self.make_default(name)?;
         if self
             .current()
@@ -663,7 +678,7 @@ impl Engine {
         self.ctx
             .paths
             .accounts()
-            .set_default_locked(name, STORE_LOCK_WAIT)
+            .set_default_locked(name, crate::accounts::STORE_LOCK_WAIT)
             .map_err(CliError::from)?;
         *lock(&self.account) = self.ctx.account.is_some().then(|| name.to_owned());
         Ok(())
@@ -686,8 +701,10 @@ impl Engine {
                 "stop the stream before logging this account out",
             ));
         }
-        let held = crate::accounts::session_lock(&self.ctx, &source).map_err(CliError::from)?;
+        let store = crate::accounts::store_lock(&self.ctx)?;
+        let held = crate::accounts::removal_lock(&self.ctx, name).map_err(CliError::from)?;
         accounts.remove(name).map_err(CliError::from)?;
+        drop(store);
         drop(held);
         {
             let mut selected = lock(&self.account);

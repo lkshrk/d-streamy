@@ -564,6 +564,10 @@ impl DockModel {
             )
         };
         let guild_changed = guild_id != self.settings.guild_id;
+        if account != self.settings.account {
+            self.guilds_listed = false;
+            self.channels_listed = None;
+        }
         let adopt = settings.adopt_managed_track.filter(|_| !self.adoption_done);
         self.settings = DockSettings {
             guild_id,
@@ -1512,6 +1516,23 @@ mod tests {
             });
             assert_eq!(m.settings().audio_track, 6, "{bad}");
         }
+    }
+
+    #[test]
+    fn settings_of_another_account_forget_the_listed_servers() {
+        let mut m = DockModel::new(DockSettings {
+            guild_id: Some("g1".into()),
+            account: Some("a".into()),
+            ..DockSettings::default()
+        });
+        m.guilds_loaded(Ok(Vec::new()));
+        assert!(m.guild_unavailable());
+        m.set_settings(DockSettings {
+            guild_id: Some("g2".into()),
+            account: Some("b".into()),
+            ..DockSettings::default()
+        });
+        assert!(!m.guild_unavailable(), "b's servers aren't listed yet");
     }
 
     fn with_track(m: &mut DockModel, track: u8) {
