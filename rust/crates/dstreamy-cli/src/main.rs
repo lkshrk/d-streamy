@@ -36,7 +36,7 @@ struct Cli {
     /// Saved account to use instead of the default, see `dstreamy account list`
     #[arg(long, global = true, value_name = "NAME", value_parser = account_name)]
     account: Option<String>,
-    /// Log more on stderr (-v info, -vv debug)
+    /// Log more on stderr (-v info, -vv debug); RUST_LOG adds per-target levels on top
     #[arg(short, long, global = true, action = ArgAction::Count)]
     verbose: u8,
     #[arg(
@@ -257,10 +257,18 @@ fn init_logging(
         1 => (Level::INFO, Level::WARN),
         _ => (Level::DEBUG, Level::INFO),
     };
-    let filter = Targets::new()
+    let mut filter = Targets::new()
         .with_target("dstreamy", ours)
         .with_target("discord_stream_rs", ours)
         .with_default(others);
+    if let Ok(spec) = std::env::var("RUST_LOG")
+        && !spec.trim().is_empty()
+    {
+        match spec.parse::<Targets>() {
+            Ok(extra) => filter = with_overrides(filter, extra),
+            Err(e) => out.warn(format!("RUST_LOG ignored: {e}")),
+        }
+    }
     let file = file.map(|path| {
         if let Some(dir) = path.parent() {
             // A missing directory only costs the log file; the writer swallows its own errors.
@@ -283,6 +291,16 @@ fn init_logging(
         .with(stderr)
         .with(filter)
         .try_init();
+}
+
+/// `base` with `extra`'s targets and default level, which win where both name one.
+fn with_overrides(base: Targets, extra: Targets) -> Targets {
+    let default = extra.default_level();
+    let mut merged = base.with_targets(extra);
+    if let Some(level) = default {
+        merged = merged.with_default(level);
+    }
+    merged
 }
 
 fn context(cli: &Cli) -> Result<Ctx, CliError> {
@@ -748,4 +766,34 @@ async fn audio_sources(out: &Out) -> Result<ExitCode, CliError> {
         out.raw(&table(&cells));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info_filter() -> Targets {
+        Targets::new()
+            .with_target("dstreamy", Level::INFO)
+            .with_default(Level::WARN)
+    }
+
+    #[test]
+    fn rust_log_raises_one_target_on_top_of_the_verbosity() {
+        let f = with_overrides(
+            info_filter(),
+            "dstreamy_discord::viewers=debug".parse().unwrap(),
+        );
+        assert!(f.would_enable("dstreamy_discord::viewers", &Level::DEBUG));
+        assert!(!f.would_enable("dstreamy_discord::session", &Level::DEBUG));
+        assert!(f.would_enable("dstreamy_discord::session", &Level::INFO));
+        assert!(!f.would_enable("hyper", &Level::INFO));
+    }
+
+    #[test]
+    fn rust_log_replaces_a_target_and_the_default() {
+        let f = with_overrides(info_filter(), "dstreamy=warn,debug".parse().unwrap());
+        assert!(!f.would_enable("dstreamy_cli::serve", &Level::INFO));
+        assert!(f.would_enable("hyper", &Level::DEBUG));
+    }
 }
