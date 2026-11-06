@@ -328,6 +328,7 @@ fn with_session(
     LiveStats {
         target_fps,
         audio_fed: controls.then(|| sources.iter().any(|s| s.active && s.mixers & bit != 0)),
+        heard_track: Some(m.heard_track()),
         ..*stats
     }
 }
@@ -1013,7 +1014,7 @@ mod tests {
         assert_eq!(no_stats.status.duration, "");
         assert_eq!(
             v.status.tooltip,
-            "Live · Kids Lounge 🧃\nMissed frames: 0\nAudio: unknown\nReconnects: unknown\n\
+            "Live · Kids Lounge 🧃\nMissed frames: 0\nAudio dropouts: unknown\nReconnects: unknown\n\
              Viewers: unknown\nDuration: 12:34\nVideo: 6.0 Mbit/s, 60 fps\nTrack 6"
         );
         assert!(!v.guilds.enabled && !v.channels.enabled);
@@ -1023,6 +1024,7 @@ mod tests {
             viewers: Some(3),
             service: Some(ServiceHealth {
                 audio_per_sec: Some(50),
+                audio_dropouts: Some(0),
                 jitter_p95_ms: Some(18),
                 jitter_max_ms: Some(41),
                 ..ServiceHealth::default()
@@ -1033,7 +1035,7 @@ mod tests {
         assert_eq!(v.state_line, "Live · 6.0 Mbit/s · 60 fps · 12:34");
         assert_eq!(v.state_fix, "Frame gaps 18 ms p95, 41 ms max · audio 50/s");
         let texts: Vec<&str> = v.status.counters.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(texts, ["0", "ok", "0", "3"]);
+        assert_eq!(texts, ["0", "0", "0", "3"]);
         assert!(
             v.status.tooltip.contains("\nViewers: 3\n"),
             "{}",
@@ -1041,8 +1043,17 @@ mod tests {
         );
         let unfed = panel_view(&s, true, Some(&watched), &[], false);
         assert_eq!(
-            unfed.status.counters[1].text, "silent",
+            unfed.status.counters[1].icon, "audio-silent",
             "nothing feeds Track 6"
+        );
+        assert_eq!(unfed.status.counters[1].text, "0");
+        assert!(
+            unfed
+                .status
+                .tooltip
+                .contains("Audio dropouts: 0, no source feeds Track 6"),
+            "{}",
+            unfed.status.tooltip
         );
         assert_eq!(unfed.status.state, State::Degraded);
         let off_air: Vec<AudioSource> = sources()
@@ -1051,13 +1062,13 @@ mod tests {
             .collect();
         let v = panel_view(&s, true, Some(&watched), &off_air, false);
         assert_eq!(
-            v.status.counters[1].text, "silent",
+            v.status.counters[1].icon, "audio-silent",
             "sources off air don't count"
         );
         assert_eq!(v.audio.sources.len(), 5, "the checklist still lists them");
         let windows = panel_view(&s, false, Some(&watched), &[], false);
-        assert_ne!(
-            windows.status.counters[1].text, "silent",
+        assert_eq!(
+            windows.status.counters[1].icon, "audio",
             "no mixer data there"
         );
     }

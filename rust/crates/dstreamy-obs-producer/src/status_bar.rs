@@ -11,7 +11,7 @@ pub const MISSED_ERROR: u64 = 30;
 pub const RECONNECTS_ERROR: u64 = 3;
 /// What Discord gets from an Opus track of 20 ms frames.
 pub const AUDIO_PER_SEC: u64 = 50;
-/// Fewer audio frames a second than this reach Discord: audio counts as lost.
+/// Fewer audio frames a second than this reach Discord: audio counts as lost, and serve counts a dropout.
 pub const AUDIO_LOST_BELOW: u64 = AUDIO_PER_SEC / 2;
 /// Shown for a figure nobody reported yet.
 pub const UNKNOWN: &str = "–";
@@ -83,6 +83,41 @@ fn missed_level(stats: &LiveStats) -> Level {
     }
 }
 
+/// Red while audio is lost, amber while silent or after a dropout in the last [`crate::live::AUDIO_DROPOUT_WINDOW_MS`].
+fn audio_level(stats: &LiveStats) -> Level {
+    match audio(stats) {
+        Audio::Lost => Level::Error,
+        Audio::Silent => Level::Warn,
+        _ if stats.audio_dropouts_recent > 0 => Level::Warn,
+        _ => Level::Normal,
+    }
+}
+
+fn audio_icon(stats: &LiveStats) -> &'static str {
+    match audio(stats) {
+        Audio::Lost => "audio-lost",
+        Audio::Silent => "audio-silent",
+        Audio::Ok | Audio::Unknown => "audio",
+    }
+}
+
+/// What Discord hears right now, in words; `None` while unknown.
+fn audio_now(stats: &LiveStats) -> Option<String> {
+    match audio(stats) {
+        Audio::Ok => Some("audio flowing".to_owned()),
+        Audio::Silent => Some(match stats.heard_track {
+            Some(track) => format!("no source feeds {}", crate::dock::track_name(track)),
+            None => "no source feeds the Discord track".to_owned(),
+        }),
+        Audio::Lost => Some("audio lost".to_owned()),
+        Audio::Unknown => None,
+    }
+}
+
+fn audio_dropouts(stats: &LiveStats) -> Option<u64> {
+    stats.service.and_then(|s| s.audio_dropouts)
+}
+
 fn reconnects_level(stats: &LiveStats) -> Level {
     match stats.service {
         None => Level::Normal,
@@ -126,22 +161,20 @@ pub fn counters(live: Option<&LiveStats>) -> Vec<Counter> {
         };
         return vec![
             unknown("missed", "missed", "Missed frames"),
-            unknown("audio", "audio", "Audio"),
+            unknown("audio", "audio", "Audio dropouts"),
             unknown("reconnects", "reconnects", "Reconnects"),
             unknown("viewers", "viewers", "Viewers"),
         ];
     };
     let missed = stats.missed();
-    let (icon, text, level) = match audio(stats) {
-        Audio::Unknown => ("audio", UNKNOWN, Level::Normal),
-        Audio::Ok => ("audio", "ok", Level::Normal),
-        Audio::Silent => ("audio-silent", "silent", Level::Warn),
-        Audio::Lost => ("audio-lost", "lost", Level::Error),
-    };
-    let audio_label = match text {
-        UNKNOWN => "Audio unknown".to_owned(),
-        _ => format!("Audio {text}"),
-    };
+    let dropouts = audio_dropouts(stats);
+    let mut audio_label = dropouts.map_or_else(
+        || "Audio dropouts unknown".to_owned(),
+        |n| plural(n, "audio dropout", "audio dropouts"),
+    );
+    if let Some(now) = audio_now(stats) {
+        audio_label = format!("{audio_label}, {now}");
+    }
     let reconnects = stats.service.map(|s| s.reconnects);
     vec![
         counter(
@@ -151,7 +184,13 @@ pub fn counters(live: Option<&LiveStats>) -> Vec<Counter> {
             missed_level(stats),
             plural(missed, "missed frame", "missed frames"),
         ),
-        counter("audio", icon, text.to_owned(), level, audio_label),
+        counter(
+            "audio",
+            audio_icon(stats),
+            dropouts.map_or_else(|| UNKNOWN.to_owned(), |n| n.to_string()),
+            audio_level(stats),
+            audio_label,
+        ),
         counter(
             "reconnects",
             "reconnects",
@@ -191,18 +230,31 @@ pub fn status_lines(stats: &LiveStats) -> Vec<String> {
         missed.push_str(&format!(", {} in the last 10 seconds", stats.missed_recent));
     }
     lines.push(missed);
+    let mut audio_line = match audio_dropouts(stats) {
+        Some(n) => format!("Audio dropouts: {n}"),
+        None => "Audio dropouts: unknown".to_owned(),
+    };
+    if stats.audio_dropouts_recent > 0 {
+        audio_line.push_str(&format!(
+            ", {} in the last 10 seconds",
+            stats.audio_dropouts_recent
+        ));
+    }
     let per_sec = stats.service.and_then(|s| s.audio_per_sec);
-    lines.push(match (audio(stats), per_sec) {
-        (Audio::Ok, Some(n)) => format!("Audio: ok, {n} of {AUDIO_PER_SEC} frames a second"),
-        (Audio::Lost, Some(n)) => {
-            format!("Audio: lost, only {n} of {AUDIO_PER_SEC} frames a second reach Discord")
+    match (audio(stats), per_sec, audio_now(stats)) {
+        (Audio::Ok, Some(n), Some(now)) => {
+            audio_line.push_str(&format!(", {now} ({n} of {AUDIO_PER_SEC} frames a second)"));
         }
-        (Audio::Silent, _) => "Audio: silent, no audio source feeds the Discord track".to_owned(),
+        (Audio::Lost, Some(n), Some(now)) => audio_line.push_str(&format!(
+            ", {now} (only {n} of {AUDIO_PER_SEC} frames a second reach Discord)"
+        )),
+        (_, _, Some(now)) => audio_line.push_str(&format!(", {now}")),
         _ if stats.service.is_some_and(|s| s.reconnecting) => {
-            "Audio: unknown while reconnecting".to_owned()
+            audio_line.push_str(", audio unknown while reconnecting");
         }
-        _ => "Audio: unknown".to_owned(),
-    });
+        _ => {}
+    }
+    lines.push(audio_line);
     lines.push(match stats.service {
         Some(s) if s.reconnecting => format!("Reconnects: {}, reconnecting now", s.reconnects),
         Some(s) => format!("Reconnects: {}", s.reconnects),
@@ -271,6 +323,7 @@ mod tests {
             service: Some(ServiceHealth {
                 reconnects: 0,
                 audio_per_sec: Some(50),
+                audio_dropouts: Some(0),
                 fps: Some(60),
                 jitter_p95_ms: Some(18),
                 jitter_max_ms: Some(41),
@@ -279,6 +332,7 @@ mod tests {
             }),
             target_fps: Some(60),
             audio_fed: Some(true),
+            heard_track: Some(6),
             ..LiveStats::default()
         }
     }
@@ -299,7 +353,7 @@ mod tests {
             texts(&bar),
             [
                 ("missed", "0", Level::Normal),
-                ("audio", "ok", Level::Normal),
+                ("audio", "0", Level::Normal),
                 ("reconnects", "0", Level::Normal),
                 ("viewers", "3", Level::Normal),
             ]
@@ -310,7 +364,12 @@ mod tests {
         let labels: Vec<&str> = bar.counters.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(
             labels,
-            ["0 missed frames", "Audio ok", "0 reconnects", "3 viewers"]
+            [
+                "0 missed frames",
+                "0 audio dropouts, audio flowing",
+                "0 reconnects",
+                "3 viewers"
+            ]
         );
     }
 
@@ -367,19 +426,25 @@ mod tests {
         let set = |stats: &mut LiveStats, n: Option<u64>| {
             stats.service.as_mut().unwrap().audio_per_sec = n;
         };
+        stats.service.as_mut().unwrap().audio_dropouts = Some(1);
         set(&mut stats, Some(AUDIO_LOST_BELOW));
         assert_eq!(audio(&stats), Audio::Ok);
         set(&mut stats, Some(AUDIO_LOST_BELOW - 1));
         assert_eq!(audio(&stats), Audio::Lost);
         let bar = status_bar(Tone::Live, Some(&stats), String::new());
-        assert_eq!(texts(&bar)[1], ("audio", "lost", Level::Error));
+        assert_eq!(texts(&bar)[1], ("audio", "1", Level::Error));
         assert_eq!(bar.counters[1].icon, "audio-lost");
+        assert_eq!(bar.counters[1].label, "1 audio dropout, audio lost");
         set(&mut stats, Some(50));
         stats.audio_fed = Some(false);
         assert_eq!(audio(&stats), Audio::Silent);
         let bar = status_bar(Tone::Live, Some(&stats), String::new());
-        assert_eq!(texts(&bar)[1], ("audio", "silent", Level::Warn));
+        assert_eq!(texts(&bar)[1], ("audio", "1", Level::Warn));
         assert_eq!(bar.counters[1].icon, "audio-silent");
+        assert_eq!(
+            bar.counters[1].label,
+            "1 audio dropout, no source feeds Track 6"
+        );
         set(&mut stats, Some(0));
         assert_eq!(audio(&stats), Audio::Lost, "lost outranks silent");
         set(&mut stats, None);
@@ -397,6 +462,50 @@ mod tests {
     }
 
     #[test]
+    fn a_recent_audio_dropout_turns_the_counter_amber_for_ten_seconds() {
+        let mut stats = healthy();
+        stats.service.as_mut().unwrap().audio_dropouts = Some(2);
+        stats.audio_dropouts_recent = 1;
+        let bar = status_bar(Tone::Live, Some(&stats), String::new());
+        assert_eq!(texts(&bar)[1], ("audio", "2", Level::Warn));
+        assert_eq!(bar.counters[1].icon, "audio", "audio flows again");
+        assert_eq!(bar.state, State::Degraded);
+        stats.audio_dropouts_recent = 0;
+        let bar = status_bar(Tone::Live, Some(&stats), String::new());
+        assert_eq!(texts(&bar)[1], ("audio", "2", Level::Normal));
+        assert_eq!(bar.state, State::Live);
+        assert_eq!(bar.counters[1].label, "2 audio dropouts, audio flowing");
+    }
+
+    #[test]
+    fn the_audio_count_is_a_dash_until_serve_reports_one() {
+        let mut stats = healthy();
+        {
+            let s = stats.service.as_mut().unwrap();
+            s.audio_dropouts = None;
+            s.audio_per_sec = None;
+        }
+        let bar = status_bar(Tone::Live, Some(&stats), String::new());
+        assert_eq!(texts(&bar)[1], ("audio", "–", Level::Normal));
+        assert_eq!(bar.counters[1].label, "Audio dropouts unknown");
+        stats.service.as_mut().unwrap().audio_per_sec = Some(50);
+        let bar = status_bar(Tone::Live, Some(&stats), String::new());
+        assert_eq!(
+            texts(&bar)[1],
+            ("audio", "–", Level::Normal),
+            "an older serve sends no count"
+        );
+        assert_eq!(
+            bar.counters[1].label,
+            "Audio dropouts unknown, audio flowing"
+        );
+        stats.service.as_mut().unwrap().audio_per_sec = Some(0);
+        let bar = status_bar(Tone::Live, Some(&stats), String::new());
+        assert_eq!(texts(&bar)[1], ("audio", "–", Level::Error));
+        assert_eq!(bar.counters[1].icon, "audio-lost");
+    }
+
+    #[test]
     fn reconnecting_turns_the_dot_and_counter_amber() {
         let mut stats = healthy();
         {
@@ -410,9 +519,10 @@ mod tests {
         assert_eq!(texts(&bar)[2], ("reconnects", "1", Level::Warn));
         assert_eq!(
             texts(&bar)[1],
-            ("audio", "–", Level::Normal),
-            "stale while reconnecting"
+            ("audio", "0", Level::Normal),
+            "the count stays while reconnecting"
         );
+        assert_eq!(bar.counters[1].label, "0 audio dropouts");
         stats.service.as_mut().unwrap().reconnecting = false;
         assert_eq!(reconnects_level(&stats), Level::Warn, "a minute after it");
         stats.reconnects_recent = 0;
@@ -442,7 +552,7 @@ mod tests {
             status_lines(&stats),
             [
                 "Missed frames: 4",
-                "Audio: unknown",
+                "Audio dropouts: unknown",
                 "Reconnects: unknown",
                 "Viewers: unknown",
                 "Duration: 12:34",
@@ -465,7 +575,7 @@ mod tests {
             status_lines(&stats),
             [
                 "Missed frames: 3 (1 in OBS, 2 in the service), 3 in the last 10 seconds",
-                "Audio: ok, 50 of 50 frames a second",
+                "Audio dropouts: 0, audio flowing (50 of 50 frames a second)",
                 "Reconnects: 2",
                 "Viewers: 3",
                 "Duration: 12:34",
@@ -475,18 +585,29 @@ mod tests {
         stats.service.as_mut().unwrap().audio_per_sec = Some(10);
         stats.service.as_mut().unwrap().reconnecting = true;
         let lines = status_lines(&stats);
-        assert_eq!(lines[1], "Audio: unknown while reconnecting");
+        assert_eq!(
+            lines[1],
+            "Audio dropouts: 0, audio unknown while reconnecting"
+        );
         assert_eq!(lines[2], "Reconnects: 2, reconnecting now");
         stats.service.as_mut().unwrap().reconnecting = false;
+        stats.service.as_mut().unwrap().audio_dropouts = Some(2);
+        stats.audio_dropouts_recent = 1;
         assert_eq!(
             status_lines(&stats)[1],
-            "Audio: lost, only 10 of 50 frames a second reach Discord"
+            "Audio dropouts: 2, 1 in the last 10 seconds, audio lost \
+             (only 10 of 50 frames a second reach Discord)"
         );
         stats.audio_fed = Some(false);
         stats.service.as_mut().unwrap().audio_per_sec = Some(50);
         assert_eq!(
             status_lines(&stats)[1],
-            "Audio: silent, no audio source feeds the Discord track"
+            "Audio dropouts: 2, 1 in the last 10 seconds, no source feeds Track 6"
+        );
+        stats.heard_track = None;
+        assert_eq!(
+            status_lines(&stats)[1],
+            "Audio dropouts: 2, 1 in the last 10 seconds, no source feeds the Discord track"
         );
         stats.rates = None;
         stats.service = None;

@@ -166,7 +166,7 @@ async fn viewer_counts_from_the_service_are_reported() {
                     "{\"type\":\"viewers\",\"count\":3}\n",
                     "{\"type\":\"viewers\",\"count\":null}\n",
                     "{\"type\":\"viewers\",\"count\":0}\n",
-                    "{\"type\":\"health\",\"reconnecting\":false,\"reconnects\":2,\"dropped_video\":4,\"audio_per_sec\":49,\"audio_level\":\"good\",\"video_level\":\"warn\",\"fps\":59,\"jitter_p95_ms\":18,\"jitter_max_ms\":41,\"bitrate_kbps\":5800,\"future\":1}\n",
+                    "{\"type\":\"health\",\"reconnecting\":false,\"reconnects\":2,\"dropped_video\":4,\"audio_per_sec\":49,\"audio_dropouts\":1,\"audio_level\":\"good\",\"video_level\":\"warn\",\"fps\":59,\"jitter_p95_ms\":18,\"jitter_max_ms\":41,\"bitrate_kbps\":5800,\"future\":1}\n",
                     "{\"type\":\"health\"}\n",
                     "{\"type\":\"something_new\"}\n",
                     "{\"message\":\"bye\",\"reason\":\"stopped\",\"type\":\"detached\"}\n",
@@ -207,8 +207,13 @@ async fn viewer_counts_from_the_service_are_reported() {
         (false, 2, 4)
     );
     assert_eq!(
-        (first.audio_per_sec, first.fps, first.jitter_p95_ms),
-        (Some(49), Some(59), Some(18))
+        (
+            first.audio_per_sec,
+            first.audio_dropouts,
+            first.fps,
+            first.jitter_p95_ms
+        ),
+        (Some(49), Some(1), Some(59), Some(18))
     );
     assert_eq!(first.audio_level, Some(ServiceLevel::Good));
     assert_eq!(first.video_level, Some(ServiceLevel::Warn));

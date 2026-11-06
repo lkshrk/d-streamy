@@ -12,6 +12,8 @@ pub const MIN_SPAN_MS: u64 = 1000;
 pub const MISSED_WINDOW_MS: u64 = 10_000;
 /// Reconnects this recent tint the status bar's counter.
 pub const RECONNECT_WINDOW_MS: u64 = 60_000;
+/// Audio dropouts this recent tint the status bar's counter.
+pub const AUDIO_DROPOUT_WINDOW_MS: u64 = 10_000;
 
 /// The output's counters at one poll; `at_ms` is any monotonic clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +57,8 @@ pub struct ServiceHealth {
     /// Video frames serve lost after the plugin sent them.
     pub dropped_video: u64,
     pub audio_per_sec: Option<u64>,
+    /// serve's intervals of this stream with too few audio frames; `None` before the first, or from an older serve.
+    pub audio_dropouts: Option<u64>,
     pub audio_level: Option<ServiceLevel>,
     pub video_level: Option<ServiceLevel>,
     pub fps: Option<u64>,
@@ -71,6 +75,7 @@ impl ServiceHealth {
             reconnects: event["reconnects"].as_u64()?,
             dropped_video: event["dropped_video"].as_u64().unwrap_or(0),
             audio_per_sec: event["audio_per_sec"].as_u64(),
+            audio_dropouts: event["audio_dropouts"].as_u64(),
             audio_level: ServiceLevel::parse(&event["audio_level"]),
             video_level: ServiceLevel::parse(&event["video_level"]),
             fps: event["fps"].as_u64(),
@@ -95,10 +100,14 @@ pub struct LiveStats {
     pub missed_recent: u64,
     /// Reconnects in the last [`RECONNECT_WINDOW_MS`].
     pub reconnects_recent: u64,
+    /// Audio dropouts in the last [`AUDIO_DROPOUT_WINDOW_MS`].
+    pub audio_dropouts_recent: u64,
     /// The session's frame rate, filled in by the panel.
     pub target_fps: Option<u32>,
     /// Whether any audio source feeds the Discord track, filled in by the panel; `None` where unknown.
     pub audio_fed: Option<bool>,
+    /// The one-based track Discord hears, filled in by the panel.
+    pub heard_track: Option<u8>,
 }
 
 impl LiveStats {
@@ -138,6 +147,7 @@ pub struct Sampler {
     samples: VecDeque<OutputSample>,
     missed: Recent<MISSED_WINDOW_MS>,
     reconnects: Recent<RECONNECT_WINDOW_MS>,
+    audio_dropouts: Recent<AUDIO_DROPOUT_WINDOW_MS>,
 }
 
 impl Sampler {
@@ -172,7 +182,7 @@ impl Sampler {
         }
     }
 
-    /// [`Sampler::push`] plus what the service reported, with the recent missed frames and reconnects.
+    /// [`Sampler::push`] plus what the service reported, with the recent missed frames, reconnects and audio dropouts.
     pub fn observe(
         &mut self,
         sample: OutputSample,
@@ -187,6 +197,9 @@ impl Sampler {
         stats.missed_recent = self.missed.push(sample.at_ms, stats.missed());
         stats.reconnects_recent =
             service.map_or(0, |s| self.reconnects.push(sample.at_ms, s.reconnects));
+        stats.audio_dropouts_recent = service
+            .and_then(|s| s.audio_dropouts)
+            .map_or(0, |n| self.audio_dropouts.push(sample.at_ms, n));
         stats
     }
 }
@@ -333,7 +346,7 @@ mod tests {
         assert_eq!(stats_line(&targeted), "2.5 Mbit/s · 30/30 fps · 1:02:05");
         assert_eq!(
             stats_tooltip(&targeted),
-            "Missed frames: 0\nAudio: unknown\nReconnects: unknown\nViewers: unknown\n\
+            "Missed frames: 0\nAudio dropouts: unknown\nReconnects: unknown\nViewers: unknown\n\
              Duration: 1:02:05\nVideo: 2.5 Mbit/s, 30 of 30 fps"
         );
     }
@@ -342,14 +355,19 @@ mod tests {
     fn service_health_comes_from_its_event() {
         let event = serde_json::json!({
             "type": "health", "reconnecting": true, "reconnects": 2, "dropped_video": 4,
-            "audio_per_sec": 49, "audio_level": "warn", "video_level": "bad", "fps": 59,
+            "audio_per_sec": 49, "audio_dropouts": 3, "audio_level": "warn", "video_level": "bad", "fps": 59,
             "jitter_p95_ms": 18, "jitter_max_ms": 41, "bitrate_kbps": 5800
         });
         let h = ServiceHealth::from_event(&event).unwrap();
         assert!(h.reconnecting);
         assert_eq!(
-            (h.reconnects, h.dropped_video, h.audio_per_sec),
-            (2, 4, Some(49))
+            (
+                h.reconnects,
+                h.dropped_video,
+                h.audio_per_sec,
+                h.audio_dropouts
+            ),
+            (2, 4, Some(49), Some(3))
         );
         assert_eq!(
             (h.audio_level, h.video_level),
@@ -364,7 +382,10 @@ mod tests {
             "audio_per_sec": null, "audio_level": null, "level": "new"
         });
         let h = ServiceHealth::from_event(&early).unwrap();
-        assert_eq!((h.audio_per_sec, h.audio_level, h.fps), (None, None, None));
+        assert_eq!(
+            (h.audio_per_sec, h.audio_dropouts, h.audio_level, h.fps),
+            (None, None, None, None)
+        );
         assert_eq!(
             ServiceHealth::from_event(&serde_json::json!({"type": "health"})),
             None
@@ -412,6 +433,36 @@ mod tests {
         );
         let back = s.observe(at(63_000, 63_000, 63_000, 1), None, health(0, 0));
         assert_eq!(back.missed_recent, 0, "a lower total starts over");
+    }
+
+    #[test]
+    fn observe_counts_audio_dropouts_within_ten_seconds() {
+        let mut s = Sampler::default();
+        let health = |audio_dropouts| {
+            Some(ServiceHealth {
+                audio_dropouts,
+                ..ServiceHealth::default()
+            })
+        };
+        assert_eq!(
+            s.observe(at(0, 0, 0, 0), None, health(None))
+                .audio_dropouts_recent,
+            0
+        );
+        assert_eq!(
+            s.observe(at(500, 1, 1, 0), None, health(Some(0)))
+                .audio_dropouts_recent,
+            0
+        );
+        let dropped = s.observe(at(1000, 2, 2, 0), None, health(Some(2)));
+        assert_eq!(dropped.audio_dropouts_recent, 2);
+        let mut later = dropped;
+        for t in (1500..=11_500).step_by(500) {
+            later = s.observe(at(t, t, t, 0), None, health(Some(2)));
+        }
+        assert_eq!(later.audio_dropouts_recent, 0, "older than 10 s");
+        let old = s.observe(at(12_000, 12_000, 12_000, 0), None, health(None));
+        assert_eq!(old.audio_dropouts_recent, 0, "an older serve");
     }
 
     #[test]

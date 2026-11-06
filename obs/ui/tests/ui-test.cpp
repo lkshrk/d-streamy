@@ -304,7 +304,7 @@ QJsonObject status_of(const State &s)
 	const char *dash = "–";
 	return QJsonObject{{"state", s.dot},
 			   {"counters", QJsonArray{counter("missed", "missed", live ? "0" : dash),
-						   counter("audio", "audio", live ? "ok" : dash),
+						   counter("audio", "audio", live ? "0" : dash),
 						   counter("reconnects", "reconnects", live ? "0" : dash),
 						   counter("viewers", "viewers", live ? "3" : dash)}},
 			   {"duration", live ? "12:34" : ""},
@@ -514,13 +514,16 @@ void check_problem_status(QApplication &app, QToolButton *status)
 	QColor plain_color = status_part("text", "missed")->palette().color(QPalette::WindowText);
 	status_override = QJsonObject{
 		{"state", "degraded"},
-		{"counters", QJsonArray{counter("missed", "missed", "5", "warn"), counter("audio", "audio-lost", "lost", "error"),
-					counter("reconnects", "reconnects", "1", "warn"), counter("viewers", "viewers", "–")}},
+		{"counters",
+		 QJsonArray{counter("missed", "missed", "5", "warn"), counter("audio", "audio-lost", "2", "error"),
+			    counter("reconnects", "reconnects", "1", "warn"), counter("viewers", "viewers", "–")}},
 		{"duration", "1:02:05"},
-		{"tooltip", "Live · Kids Lounge\nMissed frames: 5, 5 in the last 10 seconds\nAudio: lost, only 10 of 50 frames a "
-			    "second reach Discord\nReconnects: 1, reconnecting now\nViewers: unknown\nDuration: 1:02:05"}};
+		{"tooltip",
+		 "Live · Kids Lounge\nMissed frames: 5, 5 in the last 10 seconds\nAudio dropouts: 2, 1 in the last 10 "
+		 "seconds, audio lost (only 10 of 50 frames a second reach Discord)\nReconnects: 1\nViewers: "
+		 "unknown\nDuration: 1:02:05"}};
 	show(view(live, audio(true, false)));
-	CHECK(status_parts() == (QStringList{"dot:degraded", "missed", "5", "audio-lost", "lost", "reconnects", "1",
+	CHECK(status_parts() == (QStringList{"dot:degraded", "missed", "5", "audio-lost", "2", "reconnects", "1",
 					     "viewers", "–", "1:02:05"}));
 	CHECK(color_of(status_part("text", "missed")) == QLatin1String("#b88a16"));
 	CHECK(color_of(status_part("text", "audio")) == QLatin1String("#c01c37"));
@@ -531,7 +534,7 @@ void check_problem_status(QApplication &app, QToolButton *status)
 	CHECK(QColor(status_button()->findChild<QLabel *>("dstreamy-status-dot")->property("color").toString()).name() ==
 	      QLatin1String("#b88a16"));
 	QString tip = plain(status->toolTip());
-	CHECK(tip.contains(QLatin1String("Audio: lost")) && tip.contains(QLatin1String("Reconnects: 1, reconnecting now")));
+	CHECK(tip.contains(QLatin1String("Audio dropouts: 2")) && tip.contains(QLatin1String("audio lost")));
 	CHECK(status->accessibleDescription().contains(QLatin1String("Missed frames: 5")));
 	check_status_icons(status);
 	shoot_status("problem");
@@ -547,6 +550,26 @@ void check_problem_status(QApplication &app, QToolButton *status)
 	      QLatin1String("#00aa44"));
 	CHECK(status_part("text", "missed")->palette().color(QPalette::WindowText) == plain_color);
 	app.setStyleSheet(sheet);
+	show(view(live, audio(true, false)));
+
+	status_override = QJsonObject{
+		{"state", "degraded"},
+		{"counters", QJsonArray{counter("missed", "missed", "0"), counter("audio", "audio-silent", "0", "warn"),
+					counter("reconnects", "reconnects", "0"), counter("viewers", "viewers", "3")}},
+		{"duration", "12:34"},
+		{"tooltip",
+		 "Live · Kids Lounge\nMissed frames: 0\nAudio dropouts: 0, no source feeds Track 6\nReconnects: "
+		 "0\nViewers: 3\nDuration: 12:34"}};
+	show(view(live, audio(true, false)));
+	CHECK(status_parts() == (QStringList{"dot:degraded", "missed", "0", "audio-silent", "0", "reconnects", "0",
+					     "viewers", "3", "12:34"}));
+	CHECK(color_of(status_part("text", "audio")) == QLatin1String("#b88a16"));
+	CHECK(QColor(status_part("icon", "audio")->property("color").toString()).name() == QLatin1String("#b88a16"));
+	CHECK(status_part("text", "missed")->palette().color(QPalette::WindowText) == plain_color);
+	CHECK(plain(status->toolTip()).contains(QLatin1String("no source feeds Track 6")));
+	check_status_icons(status);
+	shoot_status("audio-silent");
+	status_override = QJsonObject();
 	show(view(live, audio(true, false)));
 }
 
@@ -804,10 +827,10 @@ int main(int argc, char **argv)
 	CHECK(visible("dstreamy-audio-line") && !visible("dstreamy-manage") && !visible("dstreamy-sources"));
 
 	show(view(live, audio(true, false)));
-	CHECK(status_parts() == (QStringList{"dot:live", "missed", "0", "audio", "ok", "reconnects", "0", "viewers", "3",
-					     "12:34"}));
+	CHECK(status_parts() ==
+	      (QStringList{"dot:live", "missed", "0", "audio", "0", "reconnects", "0", "viewers", "3", "12:34"}));
 	CHECK(plain(status->toolTip()) == QString::fromUtf8(live.tooltip));
-	CHECK(status_part("text", "audio") && status_part("text", "audio")->accessibleName() == QLatin1String("audio ok"));
+	CHECK(status_part("text", "audio") && status_part("text", "audio")->accessibleName() == QLatin1String("audio 0"));
 	check_status_icons(status);
 	shoot_status("healthy");
 	check_problem_status(app, status);

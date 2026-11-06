@@ -733,7 +733,7 @@ mod tests {
         assert_eq!(v.detail, "6.0 Mbit/s · 60 fps · 12:34");
         assert_eq!(
             v.detail_tooltip,
-            "Missed frames: 0\nAudio: unknown\nReconnects: unknown\nViewers: unknown\n\
+            "Missed frames: 0\nAudio dropouts: unknown\nReconnects: unknown\nViewers: unknown\n\
              Duration: 12:34\nVideo: 6.0 Mbit/s, 60 fps\n\
              Track 6 · Discord hears Track 3 from the next Go Live"
         );
