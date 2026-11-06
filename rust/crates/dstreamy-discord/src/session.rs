@@ -505,7 +505,7 @@ impl Run {
         channel_id: String,
         options: SessionOptions,
     ) -> Self {
-        Self {
+        let mut run = Self {
             client: actor.client.clone(),
             guild_id,
             channel_id,
@@ -521,7 +521,13 @@ impl Run {
             joined: false,
             unacked: None,
             viewers: Viewers::default(),
-        }
+        };
+        run.viewers.expect(
+            run.guild_id.as_deref(),
+            &run.channel_id,
+            &run.client.user().id,
+        );
+        run
     }
 
     async fn drive(mut self, actor: &mut Actor, source: Box<dyn CaptureSource>) -> Ended {
@@ -726,6 +732,7 @@ impl Run {
             }
             source = stopped.or(source);
         }
+        self.viewers.reset();
         actor.set_state(SessionState::Stopped { reason });
         Ended {
             source,
@@ -901,6 +908,11 @@ impl Run {
                 self.guild_id = guild_id.clone();
                 self.channel_id = channel_id.clone();
                 self.viewers.reset();
+                self.viewers.expect(
+                    self.guild_id.as_deref(),
+                    &self.channel_id,
+                    &self.client.user().id,
+                );
                 actor.emit(SessionEvent::ChannelMoved {
                     guild_id,
                     channel_id,

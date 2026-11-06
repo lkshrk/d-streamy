@@ -1,8 +1,9 @@
 use serde::Deserialize;
 use serde_json::Value;
+use tracing::debug;
 
 use crate::gateway::Dispatch;
-use crate::transport::parse_stream_key;
+use crate::transport::{StreamType, generate_stream_key, parse_stream_key};
 
 #[derive(Deserialize)]
 struct StreamPayload {
@@ -15,6 +16,8 @@ struct StreamPayload {
 #[derive(Debug, Default)]
 pub(crate) struct Viewers {
     count: Option<u32>,
+    /// Only for the debug log; matching parses the dispatch's key.
+    expected_key: Option<String>,
 }
 
 impl Viewers {
@@ -25,6 +28,21 @@ impl Viewers {
 
     pub(crate) fn reset(&mut self) {
         self.count = None;
+        if let Some(key) = self.expected_key.take() {
+            debug!(stream_key = %key, "expected stream key cleared");
+        }
+    }
+
+    pub(crate) fn expect(&mut self, guild_id: Option<&str>, channel_id: &str, user_id: &str) {
+        let kind = match guild_id {
+            Some(_) => StreamType::Guild,
+            None => StreamType::Call,
+        };
+        let key = generate_stream_key(kind, guild_id, channel_id, user_id);
+        if self.expected_key.as_deref() != Some(key.as_str()) {
+            debug!(stream_key = %key, "expected stream key set");
+            self.expected_key = Some(key);
+        }
     }
 
     pub(crate) fn apply(
@@ -38,24 +56,66 @@ impl Viewers {
         if !matches!(name, "STREAM_CREATE" | "STREAM_UPDATE" | "STREAM_DELETE") {
             return;
         }
-        let Ok(payload) = StreamPayload::deserialize(&*dispatch.data) else {
-            return;
+        self.expect(guild_id, channel_id, user_id);
+        let data = &*dispatch.data;
+        let keys: Vec<&str> = data
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let ids = data.get("viewer_ids");
+        let ids_type = ids.map_or("absent", json_type);
+        let ids_len = ids.and_then(Value::as_array).map(Vec::len);
+        let payload = match StreamPayload::deserialize(data) {
+            Ok(payload) => payload,
+            Err(e) => {
+                debug!(
+                    event = name,
+                    stream_key = ?data.get("stream_key"),
+                    expected = ?self.expected_key,
+                    viewer_ids = ids_type,
+                    viewer_ids_len = ?ids_len,
+                    ?keys,
+                    "stream dispatch unreadable: {e}"
+                );
+                return;
+            }
         };
         let ours = parse_stream_key(&payload.stream_key).is_ok_and(|k| {
             k.guild_id.as_deref() == guild_id && k.channel_id == channel_id && k.user_id == user_id
         });
-        if !ours {
-            return;
+        if ours {
+            let count = payload.viewer_ids.map(|ids| {
+                let others = ids.iter().filter(|id| !is_user(id, user_id)).count();
+                u32::try_from(others).unwrap_or(u32::MAX)
+            });
+            match name {
+                "STREAM_CREATE" => self.count = count,
+                "STREAM_UPDATE" => self.count = count.or(self.count),
+                _ => self.count = None,
+            }
         }
-        let count = payload.viewer_ids.map(|ids| {
-            let others = ids.iter().filter(|id| !is_user(id, user_id)).count();
-            u32::try_from(others).unwrap_or(u32::MAX)
-        });
-        match name {
-            "STREAM_CREATE" => self.count = count,
-            "STREAM_UPDATE" => self.count = count.or(self.count),
-            _ => self.count = None,
-        }
+        debug!(
+            event = name,
+            stream_key = %payload.stream_key,
+            expected = ?self.expected_key,
+            ours,
+            viewer_ids = ids_type,
+            viewer_ids_len = ?ids_len,
+            count = ?self.count,
+            ?keys,
+            "stream dispatch"
+        );
+    }
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -165,6 +225,23 @@ mod tests {
         );
         v.apply(&call, None, CHANNEL, ME);
         assert_eq!(v.count(), Some(1));
+    }
+
+    #[test]
+    fn the_expected_key_follows_the_channel_and_clears_on_reset() {
+        let mut v = Viewers::default();
+        v.expect(Some(GUILD), CHANNEL, ME);
+        assert_eq!(v.expected_key.as_deref(), Some(KEY));
+        v.reset();
+        assert_eq!(v.expected_key, None);
+        v.expect(None, CHANNEL, ME);
+        assert_eq!(v.expected_key.as_deref(), Some("call:2:3"));
+        apply(&mut v, "STREAM_UPDATE", json!({"stream_key": KEY}));
+        assert_eq!(v.expected_key.as_deref(), Some(KEY));
+        assert_eq!(
+            apply(&mut v, "STREAM_UPDATE", json!({"stream_key": 5})),
+            None
+        );
     }
 
     #[test]
