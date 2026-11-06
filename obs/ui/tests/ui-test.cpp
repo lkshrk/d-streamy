@@ -317,6 +317,8 @@ QJsonObject status_of(const State &s)
 QJsonObject status_override;
 
 const char *const go_live_question = "Go live in Kids Lounge 🧃 on Beste Chatgruppe?";
+// Replaces Start's question in the next views while set.
+const char *question_override = nullptr;
 
 QJsonObject control_of(const State &s)
 {
@@ -328,11 +330,13 @@ QJsonObject control_of(const State &s)
 			   {"icon", stop ? "player-stop" : "player-play"},
 			   {"enabled", s.enabled},
 			   {"tooltip", s.enabled ? QString::fromUtf8(s.button) : reason},
-			   {"confirm", QJsonObject{{"text", stop ? QStringLiteral("Stop the Discord stream?")
-								 : QString::fromUtf8(go_live_question)},
-						   {"ok", stop ? "Stop" : "Go live"},
-						   {"cancel", "Cancel"},
-						   {"default_ok", !stop}}}};
+			   {"confirm",
+			    QJsonObject{{"text", stop ? QStringLiteral("Stop the Discord stream?")
+						      : QString::fromUtf8(question_override ? question_override
+											    : go_live_question)},
+					{"ok", stop ? "Stop" : "Go live"},
+					{"cancel", "Cancel"},
+					{"default_ok", !stop}}}};
 }
 
 std::string view(const State &s, const QJsonObject &a, bool loading = false, const char *login = nullptr,
@@ -720,6 +724,19 @@ void check_status_action(QToolButton *status)
 
 	act->click();
 	CHECK(confirm_box() != nullptr);
+	question_override = "Go live in Music on Beste Chatgruppe?";
+	show(view(idle, audio(true, false)));
+	CHECK(wait_for([] { return !confirm_box(); }));
+	CHECK(host.starts == starts + 2);
+	act->click();
+	CHECK(confirm_box() && confirm_box()->text() == QLatin1String("Go live in Music on Beste Chatgruppe?"));
+	question_override = nullptr;
+	show(view(idle, audio(true, false)));
+	CHECK(wait_for([] { return !confirm_box(); }));
+	CHECK(host.starts == starts + 2);
+
+	act->click();
+	CHECK(confirm_box() != nullptr);
 	show(view(live, audio(true, false)));
 	CHECK(wait_for([] { return !confirm_box(); }));
 	CHECK(host.starts == starts + 2 && host.stops == stops);
@@ -737,6 +754,25 @@ void check_status_action(QToolButton *status)
 	act->click();
 	answer("ok");
 	CHECK(host.stops == stops + 1);
+
+	act->click();
+	QMessageBox *stop_box = confirm_box();
+	CHECK(stop_box != nullptr);
+	for (int i = 0; i < 3; i++) {
+		status_override = status_of(live);
+		status_override["duration"] = QStringLiteral("12:3%1").arg(5 + i);
+		status_override["tooltip"] = QStringLiteral("Live · Kids Lounge\nDuration: 12:3%1").arg(5 + i);
+		QJsonArray counters = status_override["counters"].toArray();
+		counters[3] = counter("viewers", "viewers", i % 2 ? "4" : "5");
+		status_override["counters"] = counters;
+		show(view(live, audio(true, false)));
+		CHECK(confirm_box() == stop_box);
+	}
+	status_override = QJsonObject();
+	show(view(live, audio(true, false)));
+	CHECK(confirm_box() == stop_box);
+	answer("ok");
+	CHECK(host.stops == stops + 2);
 
 	const State waiting{"busy",
 			    "●",

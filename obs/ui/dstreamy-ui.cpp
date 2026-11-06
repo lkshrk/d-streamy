@@ -470,6 +470,12 @@ void render_status(const QJsonObject &status)
 	ui.status->updateGeometry();
 }
 
+bool still_offered(const QString &action, const QString &question)
+{
+	return ui.control.value("enabled").toBool() && ui.control.value("action").toString() == action &&
+	       ui.control.value("confirm").toObject().value("text").toString() == question;
+}
+
 void render_control(const QJsonObject &control)
 {
 	ui.control = control;
@@ -795,8 +801,8 @@ void render()
 		render_status(view.value("status").toObject());
 		render_control(view.value("control").toObject());
 	}
-	if (ui.confirm_box && (!ui.control.value("enabled").toBool() ||
-			       ui.control.value("action").toString() != ui.confirm_box->property("action").toString()))
+	if (ui.confirm_box && !still_offered(ui.confirm_box->property("action").toString(),
+					     ui.confirm_box->property("question").toString()))
 		ui.confirm_box->reject();
 
 	ui.panel->setProperty("tone", view.value("tone").toString());
@@ -860,14 +866,14 @@ void render()
 }
 
 // Acts only if the view still offers what the user confirmed.
-void answered(bool yes, const QString &action)
+void answered(bool yes, const QString &action, const QString &question)
 {
 	ui.confirm_box = nullptr;
 	if (!yes || !ui.active)
 		return;
 	ui.shown.clear();
 	render();
-	if (!ui.control.value("enabled").toBool() || ui.control.value("action").toString() != action)
+	if (!still_offered(action, question))
 		return;
 	if (action == QLatin1String("start"))
 		ui.host.start(ui.host.ctx);
@@ -902,12 +908,15 @@ void ask()
 	box->setDefaultButton(question.value("default_ok").toBool() ? ok : cancel);
 	box->setEscapeButton(cancel);
 	box->setProperty("action", action);
+	box->setProperty("question", box->text());
 	QObject::connect(box, &QMessageBox::finished, box, [box, ok] {
 		if (ui.confirm_box != box)
 			return;
 		box->deleteLater();
-		guarded("confirm_start_stop",
-			[box, ok] { answered(box->clickedButton() == ok, box->property("action").toString()); });
+		guarded("confirm_start_stop", [box, ok] {
+			answered(box->clickedButton() == ok, box->property("action").toString(),
+				 box->property("question").toString());
+		});
 	});
 	ui.confirm_box = box;
 	box->open();
