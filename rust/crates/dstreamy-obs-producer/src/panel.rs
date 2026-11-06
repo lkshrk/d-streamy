@@ -8,7 +8,7 @@ use crate::dock::{
     SWITCHING_ACCOUNT, track_name,
 };
 use crate::dock_config::ConfigState;
-use crate::dock_view::{Button, Tone, dock_view};
+use crate::dock_view::{Action, Button, DockView, Tone, UNSUPPORTED, dock_view};
 use crate::live::LiveStats;
 use crate::mixer::{
     AudioSource, AudioView, CONFIRM, NOT_NOW, audio_view, instead_label, mic_guard, notices,
@@ -107,6 +107,98 @@ pub fn logout_question(name: &str) -> String {
     format!("Log out {name}?")
 }
 
+pub const GO_LIVE: &str = "Go live";
+pub const STOP: &str = "Stop";
+pub const CANCEL: &str = "Cancel";
+pub const STOP_QUESTION: &str = "Stop the Discord stream?";
+pub const PLAY_ICON: &str = "player-play";
+pub const STOP_ICON: &str = "player-stop";
+
+/// The question Start or Stop asks before it acts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StreamConfirm {
+    pub text: String,
+    pub ok: &'static str,
+    pub cancel: &'static str,
+    /// Enter confirms; otherwise Enter cancels.
+    pub default_ok: bool,
+}
+
+/// "Go live in <channel> on <server>?", naming the account once serve has more than one.
+pub fn go_live_question(m: &DockModel) -> String {
+    let settings = m.settings();
+    let name = |list: &[Named], id: Option<&str>| {
+        let id = id?;
+        list.iter().find(|n| n.id == id).map(|n| n.name.clone())
+    };
+    let channel = name(m.channels(), settings.channel_id.as_deref())
+        .unwrap_or_else(|| "the picked voice channel".to_owned());
+    let place = match name(m.guilds(), settings.guild_id.as_deref()) {
+        Some(guild) => format!("{channel} on {guild}"),
+        None => channel,
+    };
+    let account = m
+        .accounts()
+        .filter(|a| a.accounts.len() > 1)
+        .and_then(|a| a.active.as_deref());
+    match account {
+        Some(account) => format!("Go live in {place} as {account}?"),
+        None => format!("Go live in {place}?"),
+    }
+}
+
+pub fn stream_confirm(m: &DockModel, action: Action) -> StreamConfirm {
+    match action {
+        Action::Start => StreamConfirm {
+            text: go_live_question(m),
+            ok: GO_LIVE,
+            cancel: CANCEL,
+            default_ok: true,
+        },
+        Action::Stop => StreamConfirm {
+            text: STOP_QUESTION.to_owned(),
+            ok: STOP,
+            cancel: CANCEL,
+            default_ok: false,
+        },
+    }
+}
+
+/// The status bar's Start/Stop button: the panel button's action and rules, with why it is disabled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Control {
+    pub action: Action,
+    pub icon: &'static str,
+    pub enabled: bool,
+    pub tooltip: String,
+    pub confirm: StreamConfirm,
+}
+
+fn control(m: &DockModel, dock: &DockView, controls: bool) -> Control {
+    let button = &dock.button;
+    let with_detail = || match dock.detail.as_str() {
+        "" => dock.headline.clone(),
+        detail => format!("{}\n{detail}", dock.headline),
+    };
+    let tooltip = match dock.tone {
+        _ if button.enabled => button.label.to_owned(),
+        _ if !controls => UNSUPPORTED.to_owned(),
+        Tone::Busy if !m.logging_in() => dock.headline.clone(),
+        _ => with_detail(),
+    };
+    Control {
+        action: button.action,
+        icon: if m.state() == &DockState::Idle {
+            PLAY_ICON
+        } else {
+            STOP_ICON
+        },
+        enabled: button.enabled,
+        tooltip,
+        confirm: stream_confirm(m, button.action),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AccountItem {
     pub name: String,
@@ -185,6 +277,8 @@ pub struct PanelView {
     pub channels: Choices,
     pub audio: Audio,
     pub button: Button,
+    /// The status bar's Start/Stop, and the confirm both it and the panel's button ask.
+    pub control: Control,
     pub login: Option<Login>,
     pub account: Option<AccountRow>,
 }
@@ -442,6 +536,7 @@ pub fn panel_view(
             m.channel_unavailable(),
         ),
         audio: audio(state, controls, sources, confirming),
+        control: control(m, &dock, controls),
         button: dock.button,
         login,
         account: controls.then(|| account_row(m)).flatten(),
@@ -1403,5 +1498,142 @@ mod tests {
         assert!(v.account.unwrap().enabled);
         assert!(s.model.begin_add_account());
         assert!(s.model.login_finished(Ok(Some("New".into()))));
+    }
+
+    #[test]
+    fn the_status_bar_button_starts_with_a_go_live_question_naming_the_channel() {
+        let v = view(&picked(true));
+        assert_eq!(v.control.action, Action::Start);
+        assert_eq!(v.control.icon, PLAY_ICON);
+        assert!(v.control.enabled);
+        assert_eq!(v.control.tooltip, "Start D-Streamy");
+        assert_eq!(
+            v.control.confirm,
+            StreamConfirm {
+                text: "Go live in Kids Lounge 🧃 on Beste Chatgruppe?".into(),
+                ok: GO_LIVE,
+                cancel: CANCEL,
+                default_ok: true,
+            }
+        );
+
+        let mut s = picked(true);
+        s.model
+            .accounts_loaded(Ok(Some(accounts(Some("a"), &["a"]))));
+        assert_eq!(
+            view(&s).control.confirm.text,
+            "Go live in Kids Lounge 🧃 on Beste Chatgruppe?",
+            "a single account goes without saying"
+        );
+        s.model
+            .accounts_loaded(Ok(Some(accounts(Some("a"), &["a", "b"]))));
+        assert_eq!(
+            view(&s).control.confirm.text,
+            "Go live in Kids Lounge 🧃 on Beste Chatgruppe as a?"
+        );
+
+        let mut unlisted = picked(true);
+        unlisted.model.guilds_loaded(Ok(Vec::new()));
+        unlisted.model.channels_loaded("g", Ok(Vec::new()));
+        assert_eq!(
+            go_live_question(&unlisted.model),
+            "Go live in the picked voice channel?"
+        );
+    }
+
+    #[test]
+    fn the_status_bar_button_stops_with_cancel_as_the_default() {
+        let v = view(&live(picked(true)));
+        assert_eq!(v.control.action, Action::Stop);
+        assert_eq!(v.control.icon, STOP_ICON);
+        assert!(v.control.enabled);
+        assert_eq!(v.control.tooltip, "Stop D-Streamy");
+        assert_eq!(
+            v.control.confirm,
+            StreamConfirm {
+                text: STOP_QUESTION.into(),
+                ok: STOP,
+                cancel: CANCEL,
+                default_ok: false,
+            }
+        );
+        let leak = panel_view(&live(picked(false)), true, None, &mic_on_track_6(), false);
+        assert!(leak.control.enabled, "Stop stays while the mic leaks");
+        assert_eq!(leak.control.action, Action::Stop);
+    }
+
+    #[test]
+    fn a_disabled_status_bar_button_says_why_like_the_panel() {
+        let reason = |v: PanelView| {
+            assert!(!v.control.enabled);
+            assert_eq!(v.control.enabled, v.button.enabled);
+            assert_eq!(v.control.action, v.button.action);
+            v.control.tooltip
+        };
+        assert_eq!(
+            reason(view(&state(DockSettings::default()))),
+            "Not set up\nPick a server and voice channel"
+        );
+        assert_eq!(
+            reason(panel_view(
+                &picked(false),
+                true,
+                None,
+                &mic_on_track_6(),
+                false
+            )),
+            "Discord would hear Mic/Aux\nManage Track 6"
+        );
+        assert_eq!(
+            reason(panel_view(&picked(true), false, None, &[], false)),
+            UNSUPPORTED
+        );
+
+        let mut login = state(DockSettings::default());
+        login
+            .model
+            .guilds_loaded(Err(ControlError::NotLoggedIn { window: true }));
+        assert!(login.model.begin_login());
+        assert_eq!(
+            reason(view(&login)),
+            "Logging in…\nWaiting for login in the browser window…"
+        );
+
+        let mut switching = picked(true);
+        switching
+            .model
+            .accounts_loaded(Ok(Some(accounts(Some("a"), &["a", "b"]))));
+        assert!(switching.model.begin_select_account("b"));
+        assert_eq!(reason(view(&switching)), SWITCHING_ACCOUNT);
+
+        let mut starting = picked(true);
+        starting
+            .model
+            .start(Canvas {
+                fps_num: 30,
+                fps_den: 1,
+                output_width: 1280,
+                output_height: 720,
+            })
+            .unwrap();
+        let v = view(&starting);
+        assert_eq!(v.control.icon, STOP_ICON, "connecting shows Stop");
+        assert_eq!(reason(v), "Starting…");
+    }
+
+    #[test]
+    fn the_json_carries_the_control_for_the_status_bar() {
+        let v: Value = serde_json::from_str(&view(&live(picked(true))).to_json()).unwrap();
+        assert_eq!(
+            v["control"],
+            serde_json::json!({
+                "action": "stop", "icon": "player-stop", "enabled": true,
+                "tooltip": "Stop D-Streamy",
+                "confirm": {
+                    "text": "Stop the Discord stream?", "ok": "Stop", "cancel": "Cancel",
+                    "default_ok": false
+                }
+            })
+        );
     }
 }
