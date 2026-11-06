@@ -3,7 +3,8 @@
 use serde::Serialize;
 
 use crate::dock::{
-    DockModel, DockState, LOGGING_IN, TrackStatus, WAITING_FOR_LOGIN, next_go_live, track_name,
+    DockModel, DockState, LOGGING_IN, SWITCHING_ACCOUNT, TrackStatus, WAITING_FOR_LOGIN,
+    next_go_live, track_name,
 };
 use crate::dock_config::ConfigState;
 use crate::live::{LiveStats, stats_line, stats_tooltip};
@@ -127,6 +128,12 @@ pub fn dock_view(
                 WAITING_FOR_LOGIN.to_owned(),
                 button(START, Action::Start, false),
             ),
+            DockState::Idle if m.account_changing() => (
+                Tone::Busy,
+                SWITCHING_ACCOUNT.to_owned(),
+                track_line(m, true),
+                button(START, Action::Start, false),
+            ),
             DockState::Idle => {
                 let chosen = chosen_channel(m);
                 let blocked = mic.filter(|g| !g.live);
@@ -213,6 +220,9 @@ pub fn dock_view(
         (Tone::Live, _) => ("●", "● D-Streamy live".to_owned()),
         (_, DockState::Starting) => ("●", "D-Streamy starting…".to_owned()),
         (_, DockState::Stopping) => ("●", "D-Streamy stopping…".to_owned()),
+        (Tone::Busy, DockState::Idle) if m.account_changing() => {
+            ("●", "D-Streamy switching account…".to_owned())
+        }
         (Tone::Busy, DockState::Idle) => ("●", "D-Streamy logging in…".to_owned()),
         _ => ("●", "D-Streamy idle".to_owned()),
     };
@@ -454,6 +464,8 @@ mod tests {
             ControlError::LoginFailed("x".into()),
             ControlError::LoginRunning,
             ControlError::LoginUnavailable,
+            ControlError::UnknownAccount("saved: a, b".into()),
+            ControlError::Streaming("stop first".into()),
             ControlError::UnknownGuild,
             ControlError::UnknownChannel,
             ControlError::GuildUnavailable,

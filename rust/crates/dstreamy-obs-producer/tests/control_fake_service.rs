@@ -431,6 +431,74 @@ async fn the_login_s_outcome_comes_back_as_its_error() {
     );
 }
 
+const ACCOUNT_FEATURES: [&str; 4] = [
+    "start_grace_secs",
+    "status_place",
+    "browser_login",
+    "accounts",
+];
+
+fn account_list() -> Value {
+    json!({"type": "result", "data": {"active": "b", "accounts": [
+        {"name": "a", "username": "alpha", "global_name": "Alpha", "has_token": true, "active": false},
+        {"name": "b", "username": null, "global_name": null, "has_token": true, "active": true},
+    ]}})
+}
+
+#[tokio::test]
+async fn accounts_are_listed_selected_and_logged_out_where_serve_has_them() {
+    let (_dir, path) = answering(&ACCOUNT_FEATURES, |cmd| match cmd {
+        "accounts" | "select_account" | "logout_account" => account_list(),
+        _ => json!({"type": "result", "data": null}),
+    });
+    let control = ObsControl::new(Endpoint::new(&path));
+    let accounts = control.accounts().await.unwrap().unwrap();
+    assert_eq!(accounts.active.as_deref(), Some("b"));
+    assert_eq!(accounts.accounts.len(), 2);
+    assert_eq!(accounts.accounts[0].global_name.as_deref(), Some("Alpha"));
+    assert_eq!(accounts.active().unwrap().name, "b");
+    assert_eq!(control.select_account("b").await, Ok(accounts.clone()));
+    assert_eq!(control.logout_account("a").await, Ok(accounts));
+
+    let (_dir, path) = answering(&LOGIN_FEATURES, |_| account_list());
+    let control = ObsControl::new(Endpoint::new(&path));
+    assert_eq!(
+        control.accounts().await,
+        Ok(None),
+        "an older serve has no accounts"
+    );
+    assert_eq!(
+        control.select_account("a").await,
+        Err(ControlError::Outdated {
+            feature: "accounts"
+        }),
+        "an older serve is never sent a select"
+    );
+}
+
+#[tokio::test]
+async fn account_refusals_map_to_their_errors() {
+    let (_dir, path) = answering(&ACCOUNT_FEATURES, |cmd| match cmd {
+        "select_account" => {
+            json!({"type": "error", "code": "streaming", "message": "stop the stream first"})
+        }
+        _ => {
+            json!({"type": "error", "code": "unknown_account", "message": "unknown account \"z\"; saved: a, b"})
+        }
+    });
+    let control = ObsControl::new(Endpoint::new(&path));
+    assert_eq!(
+        control.select_account("a").await,
+        Err(ControlError::Streaming("stop the stream first".into()))
+    );
+    let err = control.logout_account("z").await.unwrap_err();
+    assert_eq!(
+        err,
+        ControlError::UnknownAccount("unknown account \"z\"; saved: a, b".into())
+    );
+    assert_eq!(err.fix(), "Pick the account again");
+}
+
 #[tokio::test]
 async fn a_hello_left_unanswered_keeps_the_ownership_for_a_later_stop() {
     let dir = tempfile::Builder::new().prefix("ds").tempdir().unwrap();

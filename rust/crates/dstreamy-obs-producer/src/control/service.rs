@@ -9,9 +9,9 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use super::{
-    BROWSER_LOGIN, Candidate, ControlError, Instance, Live, Named, Ownership, Resolution,
-    START_GRACE_SECS, STATUS_PLACE, StartFailed, StartRequest, Started, Stopped, owns, resolve,
-    start_in_flight,
+    ACCOUNTS, Accounts, BROWSER_LOGIN, Candidate, ControlError, Instance, Live, Named, Ownership,
+    Resolution, START_GRACE_SECS, STATUS_PLACE, StartFailed, StartRequest, Started, Stopped, owns,
+    resolve, start_in_flight,
 };
 use crate::client::REPLY_TIMEOUT;
 use crate::types::service_text;
@@ -204,6 +204,37 @@ impl ObsControl {
             .as_str()
             .or(user["username"].as_str())
             .map(service_text))
+    }
+
+    /// Serve's saved accounts; `None` from a serve without account support.
+    pub async fn accounts(&self) -> Result<Option<Accounts>, ControlError> {
+        let mut c = self.open().await?;
+        if !c.offers(ACCOUNTS) {
+            return Ok(None);
+        }
+        let data = c
+            .call(json!({"cmd": "accounts"}), "accounts", REPLY_TIMEOUT)
+            .await?;
+        Accounts::from_reply(&data).map(Some)
+    }
+
+    /// Makes serve use `name`; refused while a session streams.
+    pub async fn select_account(&self, name: &str) -> Result<Accounts, ControlError> {
+        self.account_call("select_account", name).await
+    }
+
+    /// Removes `name`'s saved login from serve.
+    pub async fn logout_account(&self, name: &str) -> Result<Accounts, ControlError> {
+        self.account_call("logout_account", name).await
+    }
+
+    async fn account_call(&self, cmd: &'static str, name: &str) -> Result<Accounts, ControlError> {
+        let mut c = self.open().await?;
+        c.require(ACCOUNTS)?;
+        let data = c
+            .call(json!({"cmd": cmd, "account": name}), cmd, REPLY_TIMEOUT)
+            .await?;
+        Accounts::from_reply(&data)
     }
 
     /// Sends `stop` only while the live session is still the one `ownership` names.

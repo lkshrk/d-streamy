@@ -17,7 +17,7 @@ use dstreamy_obs_producer::mixer::{
     AudioView, CONFIRM, NOT_NOW, audio_view, instead_label, mic_guard, notices, release_label,
     track_bit,
 };
-use dstreamy_obs_producer::panel::{CANCEL_LOGIN, NO_AUDIO_CONTROLS};
+use dstreamy_obs_producer::panel::{AccountRow, CANCEL_LOGIN, NO_AUDIO_CONTROLS, account_row};
 use dstreamy_obs_sys as sys;
 
 use crate::config;
@@ -318,7 +318,7 @@ fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type, bool) {
         let mic = (cfg!(unix) && (idle || live))
             .then(|| mic_guard(&preview, &sources))
             .flatten();
-        let held = idle && (mic.is_some() || preview.logging_in());
+        let held = idle && (mic.is_some() || preview.logging_in() || preview.account_changing());
         let login = preview.logging_in() || preview.login_offer().is_some();
         let quiet = idle && preview.error().is_none() && mic.is_none();
         let session = match &mic {
@@ -1207,6 +1207,102 @@ extern "C" fn cancel_login_clicked(
     })
 }
 
+const ACCOUNT: &CStr = c"account";
+const ACCOUNT_USE_PREFIX: &str = "account_use_";
+const ADD_ACCOUNT: &CStr = c"add_account";
+const LOGOUT_ACCOUNT: &CStr = c"logout_account";
+
+/// The account a dialog button names after `prefix`.
+fn button_account(property: *mut sys::obs_property_t, prefix: &str) -> Option<String> {
+    // SAFETY: the view passes a live property; libobs owns the name.
+    let name = unsafe { text(sys::obs_property_name(property)) };
+    name.strip_prefix(prefix)
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+}
+
+extern "C" fn use_account_clicked(
+    _props: *mut sys::obs_properties_t,
+    property: *mut sys::obs_property_t,
+    _data: *mut c_void,
+) -> bool {
+    guard("settings use_account", true, || {
+        if let Some(name) = button_account(property, ACCOUNT_USE_PREFIX) {
+            session::select_account(&name, session::Wait::Dialog);
+        }
+        true
+    })
+}
+
+extern "C" fn add_account_clicked(
+    _props: *mut sys::obs_properties_t,
+    _property: *mut sys::obs_property_t,
+    _data: *mut c_void,
+) -> bool {
+    guard("settings add_account", true, || {
+        session::add_account(session::Wait::Dialog);
+        true
+    })
+}
+
+extern "C" fn logout_account_clicked(
+    _props: *mut sys::obs_properties_t,
+    _property: *mut sys::obs_property_t,
+    _data: *mut c_void,
+) -> bool {
+    guard("settings logout_account", true, || {
+        let active = with_controls(|c| c.model.accounts().and_then(|a| a.active.clone()));
+        if let Some(name) = active {
+            session::logout_account(&name, session::Wait::Dialog);
+        }
+        true
+    })
+}
+
+/// The dialog's account row: the account in use, a button per other account, Add account… and Log out.
+/// # Safety
+/// `props` is live; libobs copies every string.
+unsafe fn add_account_row(props: *mut sys::obs_properties_t, row: &AccountRow) {
+    let active = row.items.iter().find(|i| i.selected);
+    let line = match active {
+        Some(a) if !a.user.is_empty() => format!("{}: {} ({})", row.label, a.name, a.user),
+        Some(a) => format!("{}: {}", row.label, a.name),
+        None => format!("{}: none picked", row.label),
+    };
+    // SAFETY: the caller's contract.
+    unsafe {
+        let line = c_text(&line);
+        sys::obs_properties_add_text(props, ACCOUNT.as_ptr(), line.as_ptr(), sys::OBS_TEXT_INFO);
+        let button = |key: &CStr, label: &str, clicked: sys::obs_property_clicked_t, tip: &str| {
+            let label = c_text(label);
+            let b = sys::obs_properties_add_button(props, key.as_ptr(), label.as_ptr(), clicked);
+            sys::obs_property_set_enabled(b, row.enabled);
+            if !tip.is_empty() {
+                let tip = c_text(tip);
+                sys::obs_property_set_long_description(b, tip.as_ptr());
+            }
+        };
+        for item in row.items.iter().filter(|i| !i.selected) {
+            let key = c_text(&format!("{ACCOUNT_USE_PREFIX}{}", item.name));
+            button(
+                &key,
+                &format!("Use {}", item.name),
+                Some(use_account_clicked),
+                row.tooltip,
+            );
+        }
+        button(ADD_ACCOUNT, row.add, Some(add_account_clicked), row.tooltip);
+        if active.is_some() {
+            button(
+                LOGOUT_ACCOUNT,
+                row.logout,
+                Some(logout_account_clicked),
+                row.logout_tooltip,
+            );
+        }
+    }
+}
+
 extern "C" fn stop_clicked(
     _props: *mut sys::obs_properties_t,
     _property: *mut sys::obs_property_t,
@@ -1272,7 +1368,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
             .then(|| selected_track(settings))
             .flatten();
         let title = c_text(AUDIO_TRACK_TITLE);
-        let (guilds, channels, picked, state, login) = with_controls(|c| {
+        let (guilds, channels, picked, state, login, accounts) = with_controls(|c| {
             let named = |list: &[dstreamy_obs_producer::control::Named]| {
                 list.iter()
                     .map(|n| (n.id.clone(), n.name.clone()))
@@ -1292,6 +1388,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                             .then_some((CANCEL_LOGIN, Some(cancel_login_clicked as LoginClicked)))
                     })
                     .filter(|_| cfg!(unix)),
+                account_row(&c.model).filter(|_| cfg!(unix)),
             )
         });
         // SAFETY: the caller owns and destroys the returned properties; libobs copies every string.
@@ -1311,6 +1408,9 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
             if let Some((label, clicked)) = login {
                 let label = c_text(label);
                 sys::obs_properties_add_button(props, LOGIN.as_ptr(), label.as_ptr(), clicked);
+            }
+            if let Some(row) = &accounts {
+                add_account_row(props, row);
             }
             let guild = add_list(
                 props,
@@ -1738,6 +1838,112 @@ mod tests {
         let (label, status, _, _) = shown();
         assert_eq!(label, None, "no control thread, so the login ends at once");
         assert!(status.contains("the login can't start"), "{status}");
+        drop(dialog);
+        reset();
+    }
+
+    #[test]
+    fn the_dialog_shows_the_account_row_and_disables_it_while_live() {
+        use dstreamy_obs_producer::control::{Account, Accounts, Started};
+        use dstreamy_obs_producer::dock::Canvas;
+
+        let _serial = start();
+        let dialog = Dialog::create();
+        let shown = || {
+            // SAFETY: a live source; the properties are destroyed before returning.
+            unsafe {
+                let props = sys::obs_source_properties(dialog.0);
+                let get = |key: &CStr| sys::obs_properties_get(props, key.as_ptr());
+                let line = get(ACCOUNT);
+                let line = (!line.is_null()).then(|| text(sys::obs_property_description(line)));
+                let button = |key: &CStr| {
+                    let b = get(key);
+                    (!b.is_null()).then(|| {
+                        (
+                            text(sys::obs_property_description(b)),
+                            sys::obs_property_enabled(b),
+                            text(sys::obs_property_long_description(b)),
+                        )
+                    })
+                };
+                let shown = (
+                    line,
+                    button(c"account_use_b"),
+                    button(ADD_ACCOUNT),
+                    button(LOGOUT_ACCOUNT),
+                    get(c"account_use_a").is_null(),
+                );
+                sys::obs_properties_destroy(props);
+                shown
+            }
+        };
+        assert_eq!(shown().0, None, "an older serve has no account row");
+        let account = |name: &str, user: Option<&str>| Account {
+            name: name.into(),
+            username: user.map(Into::into),
+            global_name: None,
+            has_token: true,
+            active: name == "a",
+        };
+        change(|c, _| {
+            c.model.accounts_loaded(Ok(Some(Accounts {
+                active: Some("a".into()),
+                accounts: vec![account("a", Some("alpha")), account("b", None)],
+            })));
+        });
+        let (line, use_b, add, logout, no_use_a) = shown();
+        assert_eq!(line.as_deref(), Some("Account: a (alpha)"));
+        assert_eq!(use_b, Some(("Use b".into(), true, String::new())));
+        assert_eq!(add, Some(("Add account…".into(), true, String::new())));
+        assert_eq!(logout, Some(("Log out".into(), true, String::new())));
+        assert!(no_use_a, "the account in use has no Use button");
+
+        change(|c, _| {
+            c.model.select_guild("g");
+            c.model.select_channel("c");
+            c.model
+                .start(Canvas {
+                    fps_num: 30,
+                    fps_den: 1,
+                    output_width: 1280,
+                    output_height: 720,
+                })
+                .unwrap();
+            c.model.claim(None);
+            c.model.started(Ok(Started {
+                ownership: None,
+                channel: "c".into(),
+            }));
+        });
+        let (_, use_b, add, logout, _) = shown();
+        let tip = "Stop the stream to switch accounts".to_owned();
+        assert_eq!(use_b, Some(("Use b".into(), false, tip.clone())));
+        assert_eq!(add, Some(("Add account…".into(), false, tip)));
+        assert_eq!(
+            logout,
+            Some(("Log out".into(), false, "Stop the stream to log out".into()))
+        );
+        reset();
+
+        change(|c, _| {
+            c.model.accounts_loaded(Ok(Some(Accounts {
+                active: Some("a".into()),
+                accounts: vec![account("a", None), account("b", None)],
+            })));
+        });
+        // SAFETY: a live property list the call frees at once.
+        let props = unsafe { sys::obs_source_properties(dialog.0) };
+        // SAFETY: as above.
+        let button = unsafe { sys::obs_properties_get(props, c"account_use_b".as_ptr()) };
+        use_account_clicked(ptr::null_mut(), button, dialog.0.cast());
+        // SAFETY: as above.
+        unsafe { sys::obs_properties_destroy(props) };
+        let status = with_controls(|c| c.model.status_text(true));
+        assert!(status.contains("the account can't change"), "{status}");
+        assert!(
+            !with_controls(|c| c.model.account_changing()),
+            "never stuck"
+        );
         drop(dialog);
         reset();
     }

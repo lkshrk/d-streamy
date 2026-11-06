@@ -2,8 +2,11 @@
 
 use serde::Serialize;
 
-use crate::control::Named;
-use crate::dock::{AUDIO_TRACKS, DockState, track_name};
+use crate::control::{ADD_ACCOUNT, Named};
+use crate::dock::{
+    AUDIO_TRACKS, DockModel, DockState, LIVE_NO_LOGOUT, LIVE_NO_SWITCH, SWITCHING_ACCOUNT,
+    track_name,
+};
 use crate::dock_config::ConfigState;
 use crate::dock_view::{Button, Tone, dock_view};
 use crate::live::LiveStats;
@@ -94,6 +97,63 @@ pub struct Login {
 }
 
 pub const CANCEL_LOGIN: &str = "Cancel login";
+pub const ACCOUNT_LABEL: &str = "Account";
+pub const LOG_OUT: &str = "Log out";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AccountItem {
+    pub name: String,
+    /// The Discord user's display name, empty while unknown.
+    pub user: String,
+    pub selected: bool,
+}
+
+/// The account row: a picker of serve's saved accounts ending with "Add account…", and Log out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AccountRow {
+    pub label: &'static str,
+    pub items: Vec<AccountItem>,
+    pub add: &'static str,
+    pub logout: &'static str,
+    pub enabled: bool,
+    /// Why the picker is disabled, empty while enabled.
+    pub tooltip: &'static str,
+    pub logout_tooltip: &'static str,
+}
+
+/// The row, shown once serve lists at least one account; with none the Log in button takes its place.
+pub fn account_row(m: &DockModel) -> Option<AccountRow> {
+    let accounts = m.accounts().filter(|a| !a.accounts.is_empty())?;
+    let enabled = m.accounts_editable();
+    let live = m.state() != &DockState::Idle;
+    let (tooltip, logout_tooltip) = match () {
+        _ if enabled => ("", ""),
+        _ if live => (LIVE_NO_SWITCH, LIVE_NO_LOGOUT),
+        _ if m.account_changing() => (SWITCHING_ACCOUNT, SWITCHING_ACCOUNT),
+        _ => ("", ""),
+    };
+    Some(AccountRow {
+        label: ACCOUNT_LABEL,
+        items: accounts
+            .accounts
+            .iter()
+            .map(|a| AccountItem {
+                name: a.name.clone(),
+                user: a
+                    .global_name
+                    .clone()
+                    .or_else(|| a.username.clone())
+                    .unwrap_or_default(),
+                selected: accounts.active.as_deref() == Some(a.name.as_str()),
+            })
+            .collect(),
+        add: ADD_ACCOUNT,
+        logout: LOG_OUT,
+        enabled,
+        tooltip,
+        logout_tooltip,
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PanelView {
@@ -110,6 +170,7 @@ pub struct PanelView {
     pub audio: Audio,
     pub button: Button,
     pub login: Option<Login>,
+    pub account: Option<AccountRow>,
 }
 
 pub const LOADING: &str = "Loading…";
@@ -323,6 +384,7 @@ pub fn panel_view(
         audio: audio(state, controls, sources, confirming),
         button: dock.button,
         login,
+        account: controls.then(|| account_row(m)).flatten(),
     }
 }
 
@@ -337,7 +399,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::control::{ControlError, Started};
+    use crate::control::{Account, Accounts, ControlError, Started};
     use crate::dock::{Canvas, DockModel, DockSettings};
     use crate::live::Rates;
 
@@ -936,6 +998,7 @@ mod tests {
             "audio",
             "button",
             "login",
+            "account",
         ] {
             assert!(v.get(key).is_some(), "{key}: {v}");
         }
@@ -944,5 +1007,142 @@ mod tests {
         assert_eq!(v["audio"]["confirm"], Value::Null);
         assert_eq!(v["button"]["action"], "start");
         assert_eq!(v["login"], Value::Null);
+        assert_eq!(v["account"], Value::Null);
+    }
+
+    fn accounts(active: Option<&str>, names: &[&str]) -> Accounts {
+        Accounts {
+            active: active.map(Into::into),
+            accounts: names
+                .iter()
+                .map(|n| Account {
+                    name: (*n).into(),
+                    username: Some(format!("{n}_user")),
+                    global_name: (*n == "a").then(|| "Alpha".into()),
+                    has_token: true,
+                    active: Some(*n) == active,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_account_row_lists_accounts_and_hides_without_serve_support() {
+        let mut s = picked(true);
+        assert_eq!(view(&s).account, None, "an older serve has no accounts");
+        s.model.accounts_loaded(Ok(Some(accounts(None, &[]))));
+        assert_eq!(
+            view(&s).account,
+            None,
+            "no account: the Log in button instead"
+        );
+        s.model
+            .accounts_loaded(Ok(Some(accounts(Some("a"), &["a", "b"]))));
+        let row = view(&s).account.unwrap();
+        assert_eq!(row.label, "Account");
+        assert_eq!(row.add, "Add account…");
+        assert_eq!(row.logout, "Log out");
+        assert!(row.enabled);
+        assert_eq!(row.tooltip, "");
+        assert_eq!(
+            row.items,
+            [
+                AccountItem {
+                    name: "a".into(),
+                    user: "Alpha".into(),
+                    selected: true
+                },
+                AccountItem {
+                    name: "b".into(),
+                    user: "b_user".into(),
+                    selected: false
+                },
+            ]
+        );
+        assert_eq!(panel_view(&s, false, None, &[], false).account, None);
+        let json: Value = serde_json::from_str(&view(&s).to_json()).unwrap();
+        assert_eq!(json["account"]["items"][1]["name"], "b");
+        assert_eq!(json["account"]["enabled"], true);
+    }
+
+    #[test]
+    fn live_disables_the_account_row_and_says_why() {
+        let mut s = picked(true);
+        s.model
+            .accounts_loaded(Ok(Some(accounts(Some("a"), &["a", "b"]))));
+        let s = live(s);
+        let row = view(&s).account.unwrap();
+        assert!(!row.enabled);
+        assert_eq!(row.tooltip, "Stop the stream to switch accounts");
+        assert_eq!(row.logout_tooltip, "Stop the stream to log out");
+    }
+
+    #[test]
+    fn a_switch_disables_the_row_until_it_ends_and_then_reloads_the_lists() {
+        let mut s = picked(true);
+        s.model
+            .accounts_loaded(Ok(Some(accounts(Some("a"), &["a", "b"]))));
+        assert!(!s.model.begin_select_account("a"), "already active");
+        assert!(!s.model.begin_select_account("zz"), "not listed");
+        assert!(s.model.begin_select_account("b"));
+        let row = view(&s).account.unwrap();
+        assert!(!row.enabled);
+        assert_eq!(row.tooltip, "Switching account…");
+        assert!(
+            s.model
+                .account_changed(Ok(accounts(Some("b"), &["a", "b"])))
+        );
+        assert!(s.model.guilds().is_empty(), "the old account's lists go");
+        let v = view(&s);
+        assert!(v.account.unwrap().items[1].selected);
+        assert_eq!(
+            v.guilds.items[0].id, "g",
+            "the saved server stays until picked again"
+        );
+    }
+
+    #[test]
+    fn a_refused_switch_shows_why_and_keeps_the_account() {
+        let mut s = picked(true);
+        s.model
+            .accounts_loaded(Ok(Some(accounts(Some("a"), &["a", "b"]))));
+        assert!(s.model.begin_logout_account("a"));
+        assert!(
+            !s.model
+                .account_changed(Err(ControlError::Streaming("stop the stream first".into())))
+        );
+        let v = view(&s);
+        assert_eq!(v.state_line, "Stream running");
+        assert!(v.account.unwrap().enabled);
+        assert!(s.model.begin_select_account("b"));
+        assert!(
+            s.model
+                .account_changed(Err(ControlError::UnknownAccount("saved: a".into()))),
+            "an unknown account reloads the list"
+        );
+    }
+
+    #[test]
+    fn add_account_waits_for_the_login_and_a_failure_offers_no_stale_button() {
+        let mut s = picked(true);
+        s.model
+            .accounts_loaded(Ok(Some(accounts(Some("a"), &["a"]))));
+        assert!(s.model.begin_add_account());
+        let v = view(&s);
+        assert!(!v.account.unwrap().enabled);
+        assert_eq!(
+            v.login,
+            Some(Login {
+                label: CANCEL_LOGIN,
+                action: LoginAction::Cancel
+            })
+        );
+        s.model.login_finished(Err(ControlError::LoginCancelled));
+        let v = view(&s);
+        assert_eq!(v.state_line, "Login cancelled");
+        assert_eq!(v.login, None, "Add account… stays in the picker");
+        assert!(v.account.unwrap().enabled);
+        assert!(s.model.begin_add_account());
+        assert!(s.model.login_finished(Ok(Some("New".into()))));
     }
 }

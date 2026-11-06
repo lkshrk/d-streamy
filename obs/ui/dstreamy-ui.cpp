@@ -143,6 +143,10 @@ struct Ui {
 	QPointer<ElidedLabel> state_line;
 	QPointer<ElidedLabel> state_fix;
 	QPointer<QPushButton> login;
+	QPointer<QWidget> account_row;
+	QPointer<QLabel> account_label;
+	QPointer<QComboBox> accounts;
+	QPointer<QPushButton> logout;
 	QPointer<QComboBox> guilds;
 	QPointer<QComboBox> channels;
 	QPointer<QLabel> audio_title;
@@ -162,6 +166,7 @@ struct Ui {
 	QByteArray shown;
 	QString pressed;
 	QString login_action;
+	QString account;
 	QString source_list;
 	QString notice_list;
 };
@@ -234,6 +239,49 @@ void fill(QComboBox *box, const QJsonObject &choices)
 			current = i + 1;
 	box->setCurrentIndex(current);
 	box->setEnabled(choices.value("enabled").toBool());
+}
+
+// The last entry is "Add account…", told apart by its "add" role.
+void fill_accounts(const QJsonObject &row)
+{
+	QJsonArray items = row.value("items").toArray();
+	ui.account_row->setVisible(!items.isEmpty());
+	ui.account.clear();
+	if (items.isEmpty())
+		return;
+	ui.account_label->setText(row.value("label").toString());
+	QSignalBlocker block(ui.accounts);
+	QString key = row.value("add").toString();
+	for (const QJsonValue v : items)
+		key += QLatin1Char('\n') + v.toObject().value("name").toString() + QLatin1Char('\t') +
+		       v.toObject().value("user").toString();
+	if (ui.accounts->property("filled").toString() != key) {
+		ui.accounts->clear();
+		for (const QJsonValue v : items) {
+			QJsonObject a = v.toObject();
+			QString name = a.value("name").toString();
+			QString user = a.value("user").toString();
+			ui.accounts->addItem(name, name);
+			if (!user.isEmpty())
+				ui.accounts->setItemData(ui.accounts->count() - 1, user, Qt::ToolTipRole);
+		}
+		ui.accounts->addItem(row.value("add").toString(), QString());
+		ui.accounts->setItemData(ui.accounts->count() - 1, QStringLiteral("add"), Qt::UserRole + 1);
+		ui.accounts->setProperty("filled", key);
+	}
+	int current = -1;
+	for (int i = 0; i < items.size(); i++)
+		if (items[i].toObject().value("selected").toBool()) {
+			current = i;
+			ui.account = items[i].toObject().value("name").toString();
+		}
+	ui.accounts->setCurrentIndex(current);
+	bool enabled = row.value("enabled").toBool();
+	ui.accounts->setEnabled(enabled);
+	ui.accounts->setToolTip(plain_tip(row.value("tooltip").toString()));
+	ui.logout->setText(row.value("logout").toString());
+	ui.logout->setEnabled(enabled && !ui.account.isEmpty());
+	ui.logout->setToolTip(plain_tip(row.value("logout_tooltip").toString()));
 }
 
 void fill_tracks(const QJsonObject &audio)
@@ -376,7 +424,7 @@ void fill_notices(const QJsonArray &notices)
 
 void order_tabs()
 {
-	QList<QWidget *> order{ui.login, ui.guilds, ui.channels, ui.tracks};
+	QList<QWidget *> order{ui.login, ui.accounts, ui.logout, ui.guilds, ui.channels, ui.tracks};
 	const QList<QPushButton *> releases =
 		ui.notices->findChildren<QPushButton *>(QString(), Qt::FindDirectChildrenOnly);
 	for (QPushButton *b : releases)
@@ -459,6 +507,7 @@ void render()
 	ui.login->setText(login.value("label").toString());
 	ui.login->setVisible(!login.isEmpty());
 	ui.login_action = login.value("action").toString();
+	fill_accounts(view.value("account").toObject());
 
 	fill(ui.guilds, view.value("guilds").toObject());
 	fill(ui.channels, view.value("channels").toObject());
@@ -596,6 +645,44 @@ Panel *build_panel()
 		});
 	});
 	rows->addWidget(ui.login, 0, Qt::AlignLeft);
+
+	ui.account_row = new QWidget(panel);
+	ui.account_row->setObjectName(QStringLiteral("dstreamy-account"));
+	auto *account = new QHBoxLayout(ui.account_row);
+	account->setContentsMargins(0, 0, 0, 0);
+	ui.account_label = label("dstreamy-account-label", ui.account_row);
+	ui.accounts = new QComboBox(ui.account_row);
+	ui.accounts->setObjectName(QStringLiteral("dstreamy-accounts"));
+	ui.account_label->setBuddy(ui.accounts);
+	ui.logout = button("dstreamy-logout", ui.account_row);
+	account->addWidget(ui.account_label);
+	account->addWidget(ui.accounts, 1);
+	account->addWidget(ui.logout);
+	ui.account_row->setVisible(false);
+	rows->addWidget(ui.account_row);
+	QObject::connect(ui.accounts, &QComboBox::activated, ui.accounts, [](int index) {
+		guarded("select_account", [index] {
+			if (!ui.active)
+				return;
+			if (ui.accounts->itemData(index, Qt::UserRole + 1).toString() == QLatin1String("add")) {
+				ui.host.add_account(ui.host.ctx);
+			} else {
+				QByteArray name = ui.accounts->itemData(index).toString().toUtf8();
+				if (!name.isEmpty() && QString::fromUtf8(name) != ui.account)
+					ui.host.select_account(ui.host.ctx, name.constData());
+			}
+			rerender();
+		});
+	});
+	QObject::connect(ui.logout, &QPushButton::clicked, ui.logout, [] {
+		guarded("logout_account", [] {
+			if (!ui.active || ui.account.isEmpty())
+				return;
+			QByteArray name = ui.account.toUtf8();
+			ui.host.logout_account(ui.host.ctx, name.constData());
+			rerender();
+		});
+	});
 
 	auto *form = new QFormLayout();
 	ui.guilds = new QComboBox(panel);
@@ -743,8 +830,8 @@ bool load(const struct dstreamy_ui_host *host)
 	if (ui.active || !host || host->abi_version != DSTREAMY_UI_ABI_VERSION || !host->view_json ||
 	    !host->free_string || !host->start || !host->stop || !host->load_lists || !host->select_guild ||
 	    !host->select_channel || !host->set_track || !host->request_take_over || !host->confirm_take_over ||
-	    !host->set_source || !host->panel_closed || !host->release_track || !host->login ||
-	    !host->cancel_login || failing)
+	    !host->set_source || !host->panel_closed || !host->release_track || !host->login || !host->cancel_login ||
+	    !host->select_account || !host->add_account || !host->logout_account || failing)
 		return false;
 	QMainWindow *window = dstreamy_ui::main_window();
 	if (!window)

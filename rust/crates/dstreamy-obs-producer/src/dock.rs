@@ -3,7 +3,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::control::{ControlError, Named, Ownership, Relogin, StartFailed, StartRequest, Started};
+use crate::control::{
+    Accounts, ControlError, Named, Ownership, Relogin, StartFailed, StartRequest, Started,
+};
 use crate::settings::{fit_1080p, target_fps};
 
 pub const DEFAULT_VIDEO_ENCODER: &str = "obs_x264";
@@ -246,6 +248,9 @@ impl Problem {
 pub const LOGGING_IN: &str = "Logging in…";
 const LOGIN_FAILED: &str = "Login failed";
 pub const WAITING_FOR_LOGIN: &str = "Waiting for login in the browser window…";
+pub const SWITCHING_ACCOUNT: &str = "Switching account…";
+pub const LIVE_NO_SWITCH: &str = "Stop the stream to switch accounts";
+pub const LIVE_NO_LOGOUT: &str = "Stop the stream to log out";
 
 const NO_CHANNEL: &str = "No voice channel picked";
 const CANT_START: &str = "Can't start";
@@ -287,6 +292,10 @@ pub struct DockModel {
     unrestored_mixers: u32,
     /// The login window serve opened for this button, until its login ends.
     logging_in: Option<Relogin>,
+    /// Serve's saved accounts; `None` until listed, or from a serve without accounts.
+    accounts: Option<Accounts>,
+    /// A select or logout sent and not answered yet.
+    account_change: bool,
 }
 
 impl DockModel {
@@ -305,6 +314,8 @@ impl DockModel {
             released_mixers: 0,
             unrestored_mixers: 0,
             logging_in: None,
+            accounts: None,
+            account_change: false,
         }
     }
 
@@ -454,6 +465,7 @@ impl DockModel {
         let live = self.live_track.map(track_name).unwrap_or_default();
         match &self.state {
             DockState::Idle if self.logging_in() => WAITING_FOR_LOGIN.into(),
+            DockState::Idle if self.account_change => SWITCHING_ACCOUNT.into(),
             DockState::Idle => match (&self.error, controls) {
                 (Some(error), _) => error.message.clone(),
                 (None, true) => "Idle".into(),
@@ -632,12 +644,103 @@ impl DockModel {
             Err(e) => {
                 self.error = Some(Problem {
                     lists: true,
-                    login: e.retries_login().then_some(offer),
+                    login: e
+                        .retries_login()
+                        .then_some(offer)
+                        .filter(|o| *o != Relogin::Add),
                     ..Problem::control(&e)
                 });
                 false
             }
         }
+    }
+
+    pub fn accounts(&self) -> Option<&Accounts> {
+        self.accounts.as_ref()
+    }
+
+    /// Serve's account list; an error keeps the last one, since the list loads report it.
+    pub fn accounts_loaded(&mut self, result: Result<Option<Accounts>, ControlError>) {
+        match result {
+            Ok(accounts) => self.accounts = accounts,
+            Err(ControlError::NotRunning(_) | ControlError::Outdated { .. }) => {
+                self.accounts = None;
+            }
+            Err(_) => {}
+        }
+    }
+
+    pub fn account_changing(&self) -> bool {
+        self.account_change
+    }
+
+    /// Whether the account can be switched, added or logged out now.
+    pub fn accounts_editable(&self) -> bool {
+        self.state == DockState::Idle
+            && self.logging_in.is_none()
+            && !self.account_change
+            && self.accounts.is_some()
+    }
+
+    /// A pick of another account; false when it is the active one or can't change now.
+    pub fn begin_select_account(&mut self, name: &str) -> bool {
+        let known = self.accounts.as_ref().is_some_and(|a| {
+            a.active.as_deref() != Some(name) && a.accounts.iter().any(|x| x.name == name)
+        });
+        if !known || !self.accounts_editable() {
+            return false;
+        }
+        self.account_change = true;
+        true
+    }
+
+    /// Log out of a saved account; false when it can't change now.
+    pub fn begin_logout_account(&mut self, name: &str) -> bool {
+        let known = self
+            .accounts
+            .as_ref()
+            .is_some_and(|a| a.accounts.iter().any(|x| x.name == name));
+        if !known || !self.accounts_editable() {
+            return false;
+        }
+        self.account_change = true;
+        true
+    }
+
+    /// A select or logout's outcome; true when the lists should load again for the account now used.
+    pub fn account_changed(&mut self, result: Result<Accounts, ControlError>) -> bool {
+        if !std::mem::take(&mut self.account_change) {
+            return false;
+        }
+        match result {
+            Ok(accounts) => {
+                self.accounts = Some(accounts);
+                self.guilds.clear();
+                self.channels.clear();
+                if self
+                    .error
+                    .as_ref()
+                    .is_some_and(|p| p.lists || p.login.is_some())
+                {
+                    self.error = None;
+                }
+                true
+            }
+            Err(e) => {
+                let reload = matches!(e, ControlError::UnknownAccount(_));
+                self.error = Some(Problem::control(&e));
+                reload
+            }
+        }
+    }
+
+    /// "Add account…": serve's login window, saved as a new account; false when it can't open now.
+    pub fn begin_add_account(&mut self) -> bool {
+        if !self.accounts_editable() {
+            return false;
+        }
+        self.logging_in = Some(Relogin::Add);
+        true
     }
 
     /// A login that couldn't reach serve's window at all, with `message`.
@@ -732,6 +835,9 @@ impl DockModel {
         }
         if self.logging_in() {
             return Err("D-Streamy is waiting for the login to finish".into());
+        }
+        if self.account_change {
+            return Err("D-Streamy is switching accounts".into());
         }
         let request = self.start_request(canvas);
         match &request {

@@ -17,6 +17,50 @@ pub use service::{LOGIN_TIMEOUT, ObsControl, STOP_TIMEOUT};
 pub const STATUS_PLACE: &str = "status_place";
 pub const START_GRACE_SECS: &str = "start_grace_secs";
 pub const BROWSER_LOGIN: &str = "browser_login";
+pub const ACCOUNTS: &str = "accounts";
+pub const ADD_ACCOUNT: &str = "Add account…";
+
+/// A saved Discord account as serve's `accounts` reply lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    pub name: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub global_name: Option<String>,
+    #[serde(default)]
+    pub has_token: bool,
+    #[serde(default)]
+    pub active: bool,
+}
+
+/// Serve's saved accounts and the one it uses.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Accounts {
+    #[serde(default)]
+    pub active: Option<String>,
+    #[serde(default)]
+    pub accounts: Vec<Account>,
+}
+
+impl Accounts {
+    pub fn from_reply(data: &Value) -> Result<Self, ControlError> {
+        let mut accounts: Self = serde_json::from_value(data.clone())
+            .map_err(|e| ControlError::Protocol(service_text(&format!("{e}: {data}"))))?;
+        accounts.active = accounts.active.map(|a| service_text(&a));
+        for a in &mut accounts.accounts {
+            a.name = service_text(&a.name);
+            a.username = a.username.as_deref().map(service_text);
+            a.global_name = a.global_name.as_deref().map(service_text);
+        }
+        Ok(accounts)
+    }
+
+    pub fn active(&self) -> Option<&Account> {
+        let name = self.active.as_deref()?;
+        self.accounts.iter().find(|a| a.name == name)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Named {
@@ -405,6 +449,10 @@ pub enum ControlError {
     LoginFailed(String),
     LoginRunning,
     LoginUnavailable,
+    /// Serve has no saved account of that name; the message lists the saved ones.
+    UnknownAccount(String),
+    /// Refused while a session streams.
+    Streaming(String),
     UnknownGuild,
     UnknownChannel,
     GuildUnavailable,
@@ -445,6 +493,8 @@ pub enum Relogin {
     First,
     /// Discord rejected the saved one.
     Again,
+    /// A login saved as another account.
+    Add,
 }
 
 impl Relogin {
@@ -452,6 +502,7 @@ impl Relogin {
         match self {
             Self::First => "Log in",
             Self::Again => "Log in again",
+            Self::Add => ADD_ACCOUNT,
         }
     }
 }
@@ -472,6 +523,7 @@ impl ControlError {
             Self::LoginCancelled
                 | Self::LoginFailed(_)
                 | Self::LoginRunning
+                | Self::Streaming(_)
                 | Self::Timeout { .. }
                 | Self::Restarted
                 | Self::Abandoned
@@ -511,6 +563,8 @@ impl ControlError {
             "login_failed" => Self::LoginFailed(message),
             "login_running" => Self::LoginRunning,
             "login_unavailable" => Self::LoginUnavailable,
+            "unknown_account" => Self::UnknownAccount(message),
+            "streaming" => Self::Streaming(message),
             "unknown_guild" => Self::UnknownGuild,
             "unknown_channel" => Self::UnknownChannel,
             "guild_unavailable" => Self::GuildUnavailable,
@@ -535,6 +589,8 @@ impl ControlError {
             Self::LoginCancelled => "Login cancelled",
             Self::LoginFailed(_) => "Login failed",
             Self::LoginRunning => "Login window open",
+            Self::UnknownAccount(_) => "Account not found",
+            Self::Streaming(_) => "Stream running",
             Self::UnknownGuild => "Server not found",
             Self::UnknownChannel => "Voice channel not found",
             Self::GuildUnavailable => "Server unavailable",
@@ -564,6 +620,8 @@ impl ControlError {
             Self::NotLoggedIn { window: false } | Self::LoginUnavailable => "Run `dstreamy login`",
             Self::InvalidToken { window: false } => "Run `dstreamy login` again",
             Self::LoginRunning => "Finish the login in its window",
+            Self::UnknownAccount(_) => "Pick the account again",
+            Self::Streaming(_) => "Stop the stream first",
             Self::UnknownGuild => "Pick the server again",
             Self::UnknownChannel => "Pick the voice channel again",
             Self::GuildUnavailable => "Try again later",
@@ -609,6 +667,8 @@ impl fmt::Display for ControlError {
             Self::LoginUnavailable => f.write_str(
                 "This D-Streamy service can't open a login window: run `dstreamy login`",
             ),
+            Self::UnknownAccount(_) => f.write_str("That account isn't saved anymore: pick another"),
+            Self::Streaming(_) => f.write_str("Stop the stream first"),
             Self::UnknownGuild => f.write_str("Discord doesn't list that server: pick it again"),
             Self::UnknownChannel => {
                 f.write_str("That server has no such voice channel: pick the channel again")

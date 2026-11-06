@@ -58,6 +58,9 @@ struct Host {
 	int closed = 0;
 	int logins = 0;
 	int cancels = 0;
+	int adds = 0;
+	std::vector<std::string> selects;
+	std::vector<std::string> logouts;
 	std::vector<bool> confirms;
 	std::vector<int> releases;
 	std::string guild = "-";
@@ -155,6 +158,18 @@ dstreamy_ui_host make_host()
 	h.cancel_login = [](void *) {
 		called();
 		host.cancels++;
+	};
+	h.select_account = [](void *, const char *name) {
+		called();
+		host.selects.emplace_back(name);
+	};
+	h.add_account = [](void *) {
+		called();
+		host.adds++;
+	};
+	h.logout_account = [](void *, const char *name) {
+		called();
+		host.logouts.emplace_back(name);
 	};
 	return h;
 }
@@ -254,8 +269,21 @@ const State attention{
 	"start",
 	true};
 
+QJsonObject account_row(bool enabled, const char *tooltip = "", const char *logout_tooltip = "")
+{
+	return QJsonObject{
+		{"label", "Account"},
+		{"items", QJsonArray{QJsonObject{{"name", "h_cloud_streamy"}, {"user", "Streamy"}, {"selected", true}},
+				     QJsonObject{{"name", "burner"}, {"user", ""}, {"selected", false}}}},
+		{"add", QString::fromUtf8("Add account…")},
+		{"logout", "Log out"},
+		{"enabled", enabled},
+		{"tooltip", tooltip},
+		{"logout_tooltip", logout_tooltip}};
+}
+
 std::string view(const State &s, const QJsonObject &a, bool loading = false, const char *login = nullptr,
-		 const char *login_action = "login")
+		 const char *login_action = "login", const QJsonValue &account = QJsonValue())
 {
 	bool lists = std::strcmp(s.tone, "live") != 0;
 	QJsonObject v{
@@ -275,7 +303,8 @@ std::string view(const State &s, const QJsonObject &a, bool loading = false, con
 		{"button",
 		 QJsonObject{{"label", QString::fromUtf8(s.button)}, {"action", s.action}, {"enabled", s.enabled}}},
 		{"login", login ? QJsonValue(QJsonObject{{"label", QString::fromUtf8(login)}, {"action", login_action}})
-				: QJsonValue()}};
+				: QJsonValue()},
+		{"account", account}};
 	return QJsonDocument(v).toJson(QJsonDocument::Compact).toStdString();
 }
 
@@ -465,10 +494,12 @@ int main(int argc, char **argv)
 	window.show();
 	fake::window = &window;
 
-	CHECK(dstreamy_ui_abi_version() == 5);
+	CHECK(dstreamy_ui_abi_version() == 6);
 	dstreamy_ui_host good = make_host();
 	CHECK(!dstreamy_ui_load(nullptr));
 	dstreamy_ui_host old = good;
+	old.abi_version = 5;
+	CHECK(!dstreamy_ui_load(&old));
 	old.abi_version = 4;
 	CHECK(!dstreamy_ui_load(&old));
 	dstreamy_ui_host partial = good;
@@ -482,6 +513,15 @@ int main(int argc, char **argv)
 	CHECK(!dstreamy_ui_load(&partial));
 	partial = good;
 	partial.cancel_login = nullptr;
+	CHECK(!dstreamy_ui_load(&partial));
+	partial = good;
+	partial.select_account = nullptr;
+	CHECK(!dstreamy_ui_load(&partial));
+	partial = good;
+	partial.add_account = nullptr;
+	CHECK(!dstreamy_ui_load(&partial));
+	partial = good;
+	partial.logout_account = nullptr;
 	CHECK(!dstreamy_ui_load(&partial));
 	fake::window = nullptr;
 	CHECK(!dstreamy_ui_load(&good));
@@ -666,6 +706,43 @@ int main(int argc, char **argv)
 	CHECK(host.cancels == 1 && host.logins == 1);
 	show(view(waiting, audio(true, false)));
 	CHECK(!visible("dstreamy-login"));
+
+	CHECK(!visible("dstreamy-account"));
+	show(view(idle, audio(true, false), false, nullptr, "login", account_row(true)));
+	auto *accounts = find<QComboBox>("dstreamy-accounts");
+	auto *logout = find<QPushButton>("dstreamy-logout");
+	CHECK(visible("dstreamy-account") && accounts && logout);
+	CHECK(text("dstreamy-account-label") == QLatin1String("Account"));
+	CHECK(accounts && accounts->count() == 3 && accounts->currentText() == QLatin1String("h_cloud_streamy"));
+	CHECK(accounts && accounts->itemText(2) == QString::fromUtf8("Add account…"));
+	CHECK(accounts && accounts->itemData(0, Qt::ToolTipRole).toString() == QLatin1String("Streamy"));
+	CHECK(accounts && accounts->isEnabled() && logout && logout->isEnabled());
+	CHECK(logout && logout->text() == QLatin1String("Log out"));
+	CHECK((tab_chain(accounts).mid(0, 3) ==
+	       QStringList{"dstreamy-accounts", "dstreamy-logout", "dstreamy-guilds"}));
+	shoot("accounts");
+	emit accounts->activated(0);
+	CHECK(host.selects.empty());
+	emit accounts->activated(1);
+	CHECK((host.selects == std::vector<std::string>{"burner"}));
+	CHECK(wait_for([accounts] { return accounts->currentIndex() == 0; }));
+	emit accounts->activated(2);
+	CHECK(host.adds == 1 && host.selects.size() == 1);
+	CHECK(wait_for([accounts] { return accounts->currentIndex() == 0; }));
+	logout->click();
+	CHECK((host.logouts == std::vector<std::string>{"h_cloud_streamy"}));
+
+	show(view(live, audio(true, false), false, nullptr, "login",
+		  account_row(false, "Stop the stream to switch accounts", "Stop the stream to log out")));
+	CHECK(visible("dstreamy-account") && !accounts->isEnabled() && !logout->isEnabled());
+	CHECK(plain(accounts->toolTip()) == QLatin1String("Stop the stream to switch accounts"));
+	CHECK(plain(logout->toolTip()) == QLatin1String("Stop the stream to log out"));
+	shoot("accounts-live");
+	logout->click();
+	CHECK(host.logouts.size() == 1);
+
+	show(view(expired, audio(true, false), false, "Log in"));
+	CHECK(!visible("dstreamy-account") && visible("dstreamy-login"));
 
 	State long_state = live;
 	long_state.line = "Live · 12.3 Mbit/s · 60 fps · 1:02:05 · 1234 dropped and more text that cannot fit";

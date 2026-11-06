@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#define DSTREAMY_UI_ABI_VERSION 5u
+#define DSTREAMY_UI_ABI_VERSION 6u
 
 /* Callbacks run on the Qt UI thread; strings are UTF-8, valid only for the call. */
 struct dstreamy_ui_host {
@@ -44,6 +44,12 @@ struct dstreamy_ui_host {
 	void (*login)(void *ctx);
 	/* Stops waiting for that window, which the service then closes. */
 	void (*cancel_login)(void *ctx);
+	/* Makes the service use the saved account `name`; the lists load again. */
+	void (*select_account)(void *ctx, const char *name);
+	/* Opens the service's login window for a new account. */
+	void (*add_account)(void *ctx);
+	/* Removes the saved account `name` from the service. */
+	void (*logout_account)(void *ctx, const char *name);
 };
 
 /* DSTREAMY_UI_ABI_VERSION of this library; the plugin checks it before dstreamy_ui_load. */

@@ -60,6 +60,8 @@ enum Job {
     Stop(Option<Ownership>, Done),
     #[cfg(unix)]
     Login(tokio::sync::oneshot::Receiver<()>, Done),
+    #[cfg(unix)]
+    Account(AccountChange, Done),
     OutputStopped(i64),
     Shutdown,
 }
@@ -295,12 +297,59 @@ pub fn stop(wait: Wait) {
     }
 }
 
+#[cfg(unix)]
+enum AccountChange {
+    Select(String),
+    Logout(String),
+}
+
+const ACCOUNT_GONE: &str = "D-Streamy's control thread is not running, so the account can't change. \
+     See the OBS log and restart OBS";
+
+/// The account picker of the dialog or the status-bar panel, on the UI thread.
+#[cfg(unix)]
+pub fn select_account(name: &str, wait: Wait) {
+    if change(|c, _| c.model.begin_select_account(name)) {
+        queue_account(AccountChange::Select(name.to_owned()), wait);
+    }
+}
+
+/// Log out of `name`, on the UI thread.
+#[cfg(unix)]
+pub fn logout_account(name: &str, wait: Wait) {
+    if change(|c, _| c.model.begin_logout_account(name)) {
+        queue_account(AccountChange::Logout(name.to_owned()), wait);
+    }
+}
+
+#[cfg(unix)]
+fn queue_account(account: AccountChange, wait: Wait) {
+    if !queue(|done| Job::Account(account, done), wait) {
+        change(|c, _| {
+            c.model
+                .account_changed(Err(ControlError::Connect(ACCOUNT_GONE.into())))
+        });
+    }
+}
+
+/// "Add account…": serve's login window, saved as a new account.
+#[cfg(unix)]
+pub fn add_account(wait: Wait) {
+    if change(|c, _| c.model.begin_add_account()) {
+        open_login(wait);
+    }
+}
+
 /// The login button of the dialog or the status-bar panel, on the UI thread: serve opens its login window.
 #[cfg(unix)]
 pub fn login(wait: Wait) {
-    if !change(|c, _| c.model.begin_login()) {
-        return;
+    if change(|c, _| c.model.begin_login()) {
+        open_login(wait);
     }
+}
+
+#[cfg(unix)]
+fn open_login(wait: Wait) {
     let (cancel, cancelled) = tokio::sync::oneshot::channel();
     *LOGIN_CANCEL.lock().unwrap_or_else(PoisonError::into_inner) = Some(cancel);
     if !queue(|done| Job::Login(cancelled, done), wait) {
@@ -329,6 +378,15 @@ static LOGIN_CANCEL: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::ne
 
 #[cfg(not(unix))]
 pub fn login(_wait: Wait) {}
+
+#[cfg(not(unix))]
+pub fn add_account(_wait: Wait) {}
+
+#[cfg(not(unix))]
+pub fn select_account(_name: &str, _wait: Wait) {}
+
+#[cfg(not(unix))]
+pub fn logout_account(_name: &str, _wait: Wait) {}
 
 #[cfg(not(unix))]
 pub fn cancel_login() {}
@@ -737,6 +795,11 @@ async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &m
             tokio::spawn(login_session(closing, cancelled));
             let _ = done.try_send(());
         }
+        #[cfg(unix)]
+        Job::Account(account, done) => {
+            account_session(account, &mut closing).await;
+            let _ = done.try_send(());
+        }
         Job::OutputStopped(code) => {
             let message = (code != i64::from(sys::OBS_OUTPUT_SUCCESS)).then(|| {
                 let reason = output
@@ -775,6 +838,13 @@ async fn lists(guild: Option<String>, closing: &mut Closing) {
             return;
         }
     }
+    let Some(accounts) = closing.call(control.accounts()).await else {
+        return;
+    };
+    if let Err(e) = &accounts {
+        log::warn(&format!("listing the D-Streamy accounts: {e}"));
+    }
+    change(|c, _| c.model.accounts_loaded(accounts));
     let Some(guilds) = closing.call(control.guilds()).await else {
         return;
     };
@@ -821,6 +891,40 @@ async fn login_session(mut closing: Closing, cancelled: tokio::sync::oneshot::Re
         Err(e) => log::warn(&format!("the D-Streamy login didn't finish: {e}")),
     }
     if step(|m| m.login_finished(result)) {
+        request_lists(None);
+    }
+}
+
+#[cfg(unix)]
+async fn account_session(account: AccountChange, closing: &mut Closing) {
+    let result = match control() {
+        Err(e) => Err(ControlError::Connect(e)),
+        Ok(control) => {
+            let call = async {
+                match &account {
+                    AccountChange::Select(name) => control.select_account(name).await,
+                    AccountChange::Logout(name) => control.logout_account(name).await,
+                }
+            };
+            match AssertUnwindSafe(closing.call(call)).catch_unwind().await {
+                Ok(result) => result.unwrap_or(Err(ControlError::Abandoned)),
+                Err(payload) => {
+                    let message = crate::guard::record_panic("account", payload.as_ref());
+                    Err(ControlError::Protocol(message))
+                }
+            }
+        }
+    };
+    match (&account, &result) {
+        (AccountChange::Select(name), Ok(_)) => {
+            log::info(&format!("D-Streamy now uses the account {name}"));
+        }
+        (AccountChange::Logout(name), Ok(_)) => {
+            log::info(&format!("logged out of the D-Streamy account {name}"));
+        }
+        (_, Err(e)) => log::warn(&format!("the D-Streamy account didn't change: {e}")),
+    }
+    if step(|m| m.account_changed(result)) {
         request_lists(None);
     }
 }

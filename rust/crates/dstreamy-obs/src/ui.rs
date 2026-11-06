@@ -102,6 +102,9 @@ fn host() -> Host {
         release_track: Some(release_track),
         login: Some(login),
         cancel_login: Some(cancel_login),
+        select_account: Some(select_account),
+        add_account: Some(add_account),
+        logout_account: Some(logout_account),
     }
 }
 
@@ -298,6 +301,31 @@ extern "C" fn cancel_login(_ctx: Ctx) {
     guard("panel cancel_login", (), || {
         session::cancel_login();
         settings_source::refresh();
+    });
+}
+
+extern "C" fn select_account(_ctx: Ctx, name: *const c_char) {
+    guard("panel select_account", (), || {
+        if let Some(name) = picked(name) {
+            session::select_account(&name, Wait::No);
+            settings_source::refresh();
+        }
+    });
+}
+
+extern "C" fn add_account(_ctx: Ctx) {
+    guard("panel add_account", (), || {
+        session::add_account(Wait::No);
+        settings_source::refresh();
+    });
+}
+
+extern "C" fn logout_account(_ctx: Ctx, name: *const c_char) {
+    guard("panel logout_account", (), || {
+        if let Some(name) = picked(name) {
+            session::logout_account(&name, Wait::No);
+            settings_source::refresh();
+        }
     });
 }
 
@@ -526,7 +554,7 @@ pub(crate) mod tests {
     #[test]
     fn the_host_table_is_the_header_s_and_complete() {
         let host = host();
-        assert_eq!(host.abi_version, 5);
+        assert_eq!(host.abi_version, 6);
         assert!(host.ctx.is_null());
         let set = [
             host.view_json.is_some(),
@@ -544,6 +572,9 @@ pub(crate) mod tests {
             host.release_track.is_some(),
             host.login.is_some(),
             host.cancel_login.is_some(),
+            host.select_account.is_some(),
+            host.add_account.is_some(),
+            host.logout_account.is_some(),
         ];
         assert!(set.iter().all(|s| *s));
     }
@@ -704,6 +735,67 @@ pub(crate) mod tests {
         assert!(!with_controls(|c| c.model.logging_in()));
         assert_eq!(view()["state_line"], "Login cancelled");
         assert_eq!(view()["login"]["action"], "login");
+        reset();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_account_callbacks_change_only_a_listed_idle_account() {
+        use dstreamy_obs_producer::control::{Account, Accounts};
+
+        let _serial = crate::serial();
+        libobs();
+        reset();
+        let host = host();
+        let raw_select = host.select_account.unwrap();
+        let raw_logout = host.logout_account.unwrap();
+        // SAFETY: the library's calls: NULL or a NUL-terminated string valid for the call.
+        let select = |name: *const c_char| unsafe { raw_select(ptr::null_mut(), name) };
+        // SAFETY: as above.
+        let logout = |name: *const c_char| unsafe { raw_logout(ptr::null_mut(), name) };
+        assert_eq!(view()["account"], Value::Null, "no account support listed");
+        select(c"b".as_ptr());
+        call(host.add_account);
+        assert!(!with_controls(
+            |c| c.model.account_changing() || c.model.logging_in()
+        ));
+
+        let account = |name: &str| Account {
+            name: name.into(),
+            username: None,
+            global_name: None,
+            has_token: true,
+            active: name == "a",
+        };
+        change(|c, _| {
+            c.model.accounts_loaded(Ok(Some(Accounts {
+                active: Some("a".into()),
+                accounts: vec![account("a"), account("b")],
+            })));
+        });
+        assert_eq!(view()["account"]["items"][0]["selected"], true);
+        assert_eq!(view()["account"]["enabled"], true);
+        select(ptr::null());
+        assert!(!with_controls(|c| c.model.account_changing()));
+        select(c"b".as_ptr());
+        let (headline, message) = with_controls(|c| {
+            let p = c.model.problem().unwrap();
+            (p.headline, p.message.clone())
+        });
+        assert_eq!(headline, "Can't reach the service");
+        assert!(message.contains("the account can't change"), "{message}");
+        assert!(
+            !with_controls(|c| c.model.account_changing()),
+            "never stuck"
+        );
+        logout(c"a".as_ptr());
+        assert!(!with_controls(|c| c.model.account_changing()));
+        call(host.add_account);
+        assert_eq!(
+            with_controls(|c| c.model.problem().map(|p| p.headline)),
+            Some("Login failed"),
+            "without a control thread the login can't start"
+        );
         reset();
     }
 
