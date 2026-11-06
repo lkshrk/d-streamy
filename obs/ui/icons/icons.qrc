@@ -1,0 +1,11 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/dstreamy/icons">
+    <file>missed.svg</file>
+    <file>audio.svg</file>
+    <file>audio-silent.svg</file>
+    <file>audio-lost.svg</file>
+    <file>reconnects.svg</file>
+    <file>viewers.svg</file>
+  </qresource>
+</RCC>

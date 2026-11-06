@@ -13,7 +13,7 @@ use dstreamy_mock_discord::{
     MOCK_GUILD_ID, MOCK_TOKEN, MOCK_VOICE_CHANNEL_ID, MockDiscord, VoiceKind,
 };
 use dstreamy_obs_producer::{
-    End, Endpoint, Hello, Level, Log, Packet, Ring, StartError, Track, attach, run,
+    End, Endpoint, Hello, Level, Log, Packet, Reports, Ring, StartError, Track, attach, run,
 };
 use dstreamy_test_producer::sync::H264LumaDecoder;
 use dstreamy_test_producer::trace::Trace;
@@ -329,7 +329,7 @@ fn packets_stream_to_discord_and_a_stop_ends_with_end_of_stream() {
                     extra_reads += 1;
                     Some(video_extra.clone())
                 },
-                &|_| {},
+                Reports::ignored(),
                 async { stop_rx.await.unwrap() },
                 &Stderr,
             ),
@@ -401,7 +401,7 @@ fn a_service_shutdown_detaches_the_producer() {
                 connection,
                 &ring,
                 || Some(video_extra.clone()),
-                &|_| {},
+                Reports::ignored(),
                 std::future::pending::<()>(),
                 &Stderr,
             ),
@@ -449,7 +449,7 @@ fn an_ingest_refusal_surfaces_as_detached() {
             connection,
             &ring,
             || None,
-            &|_| {},
+            Reports::ignored(),
             std::future::pending::<()>(),
             &Stderr,
         ),

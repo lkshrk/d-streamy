@@ -240,16 +240,16 @@ fn live_stats() -> Option<LiveStats> {
         return None;
     };
     let at_ms = CLOCK.get_or_init(Instant::now).elapsed().as_millis();
-    let stats = sampler.push(OutputSample {
-        at_ms: u64::try_from(at_ms).unwrap_or(u64::MAX),
-        bytes,
-        frames,
-        dropped,
-    });
-    Some(LiveStats {
-        viewers: session::viewers(),
-        ..stats
-    })
+    Some(sampler.observe(
+        OutputSample {
+            at_ms: u64::try_from(at_ms).unwrap_or(u64::MAX),
+            bytes,
+            frames,
+            dropped,
+        },
+        session::viewers(),
+        session::health(),
+    ))
 }
 
 extern "C" fn view_json(_ctx: Ctx) -> *mut c_char {

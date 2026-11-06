@@ -7,7 +7,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use dstreamy_obs_producer::client::STOP_DEADLINE;
-use dstreamy_obs_producer::{End, Endpoint, Hello, Level, Log, Packet, Ring, Track, attach, run};
+use dstreamy_obs_producer::live::ServiceLevel;
+use dstreamy_obs_producer::{
+    End, Endpoint, Hello, Level, Log, Packet, Reports, Ring, Track, attach, run,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
@@ -86,7 +89,7 @@ async fn a_service_that_stops_reading_cannot_hold_up_a_stop() {
     let started = Instant::now();
     let end = tokio::time::timeout(
         STOP_DEADLINE + Duration::from_secs(5),
-        run(connection, &ring, || None, &|_| {}, stop, &Quiet),
+        run(connection, &ring, || None, Reports::ignored(), stop, &Quiet),
     )
     .await
     .expect("run did not return after the stop");
@@ -125,7 +128,7 @@ async fn a_detached_already_sent_is_read_after_the_write_fails() {
             connection,
             &ring,
             || None,
-            &|_| {},
+            Reports::ignored(),
             std::future::pending::<()>(),
             &log,
         ),
@@ -163,6 +166,9 @@ async fn viewer_counts_from_the_service_are_reported() {
                     "{\"type\":\"viewers\",\"count\":3}\n",
                     "{\"type\":\"viewers\",\"count\":null}\n",
                     "{\"type\":\"viewers\",\"count\":0}\n",
+                    "{\"type\":\"health\",\"reconnecting\":false,\"reconnects\":2,\"dropped_video\":4,\"audio_per_sec\":49,\"audio_level\":\"good\",\"video_level\":\"warn\",\"fps\":59,\"jitter_p95_ms\":18,\"jitter_max_ms\":41,\"bitrate_kbps\":5800,\"future\":1}\n",
+                    "{\"type\":\"health\"}\n",
+                    "{\"type\":\"something_new\"}\n",
                     "{\"message\":\"bye\",\"reason\":\"stopped\",\"type\":\"detached\"}\n",
                 )
                 .as_bytes(),
@@ -174,13 +180,17 @@ async fn viewer_counts_from_the_service_are_reported() {
     let connection = attach(&Endpoint::new(&path), &hello()).await.unwrap();
     let ring = Ring::default();
     let seen = Mutex::new(Vec::new());
+    let health = Mutex::new(Vec::new());
     let end = tokio::time::timeout(
         Duration::from_secs(10),
         run(
             connection,
             &ring,
             || None,
-            &|n| seen.lock().unwrap().push(n),
+            Reports {
+                viewers: &|n| seen.lock().unwrap().push(n),
+                health: &|h| health.lock().unwrap().push(h),
+            },
             std::future::pending::<()>(),
             &Quiet,
         ),
@@ -189,5 +199,19 @@ async fn viewer_counts_from_the_service_are_reported() {
     .unwrap();
     assert!(matches!(end, End::Detached { .. }), "{end:?}");
     assert_eq!(*seen.lock().unwrap(), [Some(3), None, Some(0)]);
+    let health = health.lock().unwrap();
+    assert_eq!(health.len(), 2, "{health:?}");
+    let first = health[0].expect("the first event has counters");
+    assert_eq!(
+        (first.reconnecting, first.reconnects, first.dropped_video),
+        (false, 2, 4)
+    );
+    assert_eq!(
+        (first.audio_per_sec, first.fps, first.jitter_p95_ms),
+        (Some(49), Some(59), Some(18))
+    );
+    assert_eq!(first.audio_level, Some(ServiceLevel::Good));
+    assert_eq!(first.video_level, Some(ServiceLevel::Warn));
+    assert_eq!(health[1], None, "no stream runs");
     service.abort();
 }

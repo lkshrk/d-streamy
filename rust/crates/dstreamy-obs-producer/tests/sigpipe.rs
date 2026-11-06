@@ -5,7 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use dstreamy_obs_producer::{End, Endpoint, Hello, Level, Log, Packet, Ring, Track, attach, run};
+use dstreamy_obs_producer::{
+    End, Endpoint, Hello, Level, Log, Packet, Reports, Ring, Track, attach, run,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
@@ -72,7 +74,7 @@ async fn the_client_write_path_never_raises_sigpipe() {
             connection,
             &ring,
             || None,
-            &|_| {},
+            Reports::ignored(),
             std::future::pending::<()>(),
             &log,
         ),

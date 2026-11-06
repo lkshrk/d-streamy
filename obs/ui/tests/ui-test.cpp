@@ -14,6 +14,7 @@
 #include <QScreen>
 #include <QScrollArea>
 #include <QLabel>
+#include <QLayout>
 #include <QMainWindow>
 #include <QPalette>
 #include <QPushButton>
@@ -235,7 +236,7 @@ QJsonObject audio(bool managed, bool confirming, int track = 6, const std::vecto
 struct State {
 	const char *tone;
 	const char *mark;
-	const char *status_bar;
+	const char *dot;
 	const char *line;
 	const char *fix;
 	const char *tooltip;
@@ -246,7 +247,7 @@ struct State {
 
 const State idle{"idle",
 		 "●",
-		 "D-Streamy idle ▴",
+		 "idle",
 		 "Idle · Kids Lounge 🧃",
 		 "",
 		 "Idle · Kids Lounge 🧃\nTrack 6",
@@ -255,7 +256,7 @@ const State idle{"idle",
 		 true};
 const State live{"live",
 		 "●",
-		 "● D-Streamy live ▴",
+		 "live",
 		 "Live · 6.0 Mbit/s · 60 fps · 12:34",
 		 "",
 		 "Live · Kids Lounge 🧃\n6.0 Mbit/s · 60 fps · 12:34 · 0 dropped\nTrack 6",
@@ -265,7 +266,7 @@ const State live{"live",
 const State attention{
 	"attention",
 	"⚠",
-	"⚠ D-Streamy ▴",
+	"error",
 	"Service not running",
 	"Run `dstreamy service install`",
 	"The D-Streamy service is not running (no service is listening at /run/user/1000/dstreamy/serve.sock; "
@@ -287,6 +288,32 @@ QJsonObject account_row(bool enabled, const char *tooltip = "", const char *logo
 		{"logout_tooltip", logout_tooltip}};
 }
 
+QJsonObject counter(const char *id, const char *icon, const char *text, const char *level = "normal")
+{
+	return QJsonObject{{"id", id},
+			   {"icon", icon},
+			   {"text", QString::fromUtf8(text)},
+			   {"level", level},
+			   {"label", QStringLiteral("%1 %2").arg(QLatin1String(id), QString::fromUtf8(text))}};
+}
+
+// The status bar of a healthy stream, or dashes while not live.
+QJsonObject status_of(const State &s)
+{
+	bool live = std::strcmp(s.dot, "live") == 0;
+	const char *dash = "–";
+	return QJsonObject{{"state", s.dot},
+			   {"counters", QJsonArray{counter("missed", "missed", live ? "0" : dash),
+						   counter("audio", "audio", live ? "ok" : dash),
+						   counter("reconnects", "reconnects", live ? "0" : dash),
+						   counter("viewers", "viewers", live ? "3" : dash)}},
+			   {"duration", live ? "12:34" : ""},
+			   {"tooltip", QString::fromUtf8(s.tooltip)}};
+}
+
+// Replaces the next views' status bar while set.
+QJsonObject status_override;
+
 std::string view(const State &s, const QJsonObject &a, bool loading = false, const char *login = nullptr,
 		 const char *login_action = "login", const QJsonValue &account = QJsonValue())
 {
@@ -294,8 +321,7 @@ std::string view(const State &s, const QJsonObject &a, bool loading = false, con
 	QJsonObject v{
 		{"tone", s.tone},
 		{"mark", QString::fromUtf8(s.mark)},
-		{"status_bar", QString::fromUtf8(s.status_bar)},
-		{"status_tooltip", QString::fromUtf8(s.tooltip)},
+		{"status", status_override.isEmpty() ? status_of(s) : status_override},
 		{"state_line", QString::fromUtf8(s.line)},
 		{"state_fix", QString::fromUtf8(s.fix)},
 		{"state_tooltip", QString::fromUtf8(s.tooltip)},
@@ -406,6 +432,122 @@ void shoot(const char *name)
 	QString path = QString::fromLocal8Bit(dir) + QStringLiteral("/panel-%1.png").arg(QLatin1String(name));
 	if (!p->grab().save(path))
 		std::fprintf(stderr, "could not save %s\n", qPrintable(path));
+}
+
+// With DSTREAMY_UI_SHOTS=DIR, saves the status bar as DIR/status-NAME.png.
+void shoot_status(const char *name)
+{
+	QByteArray dir = qgetenv("DSTREAMY_UI_SHOTS");
+	auto *bar = fake::window ? fake::window->statusBar() : nullptr;
+	if (dir.isEmpty() || !bar)
+		return;
+	QString path = QString::fromLocal8Bit(dir) + QStringLiteral("/status-%1.png").arg(QLatin1String(name));
+	if (!bar->grab().save(path))
+		std::fprintf(stderr, "could not save %s\n", qPrintable(path));
+}
+
+QToolButton *status_button()
+{
+	return find<QToolButton>("dstreamy-status");
+}
+
+// The status button's shown parts in layout order: "dot:STATE", then each icon's name and text, then the duration.
+QStringList status_parts()
+{
+	QStringList parts;
+	QToolButton *b = status_button();
+	if (!b || !b->layout())
+		return parts;
+	for (int i = 0; i < b->layout()->count(); i++) {
+		auto *l = qobject_cast<QLabel *>(b->layout()->itemAt(i)->widget());
+		if (!l || !l->isVisibleTo(b))
+			continue;
+		QString name = l->objectName();
+		if (name == QLatin1String("dstreamy-status-dot"))
+			parts << QStringLiteral("dot:") + l->property("state").toString();
+		else if (name.startsWith(QLatin1String("dstreamy-status-icon-")))
+			parts << l->property("icon").toString();
+		else
+			parts << l->text();
+	}
+	return parts;
+}
+
+QLabel *status_part(const char *kind, const char *id)
+{
+	QToolButton *b = status_button();
+	return b ? b->findChild<QLabel *>(QStringLiteral("dstreamy-status-%1-%2").arg(QLatin1String(kind), QLatin1String(id)))
+		 : nullptr;
+}
+
+QString color_of(QLabel *l)
+{
+	return l ? l->palette().color(l->foregroundRole()).name() : QString();
+}
+
+void check_status_icons(QToolButton *status)
+{
+	int height = status->fontMetrics().height();
+	for (const char *id : {"missed", "audio", "reconnects", "viewers"}) {
+		QLabel *icon = status_part("icon", id);
+		CHECK(icon && !icon->pixmap().isNull());
+		CHECK(icon && icon->pixmap().deviceIndependentSize().toSize() == QSize(height, height));
+		CHECK(icon && icon->pixmap().devicePixelRatio() == status->devicePixelRatioF());
+		CHECK(icon && icon->testAttribute(Qt::WA_TransparentForMouseEvents));
+		QLabel *text = status_part("text", id);
+		CHECK(icon && text && QColor(icon->property("color").toString()) == text->palette().color(text->foregroundRole()));
+	}
+	auto *dot = status->findChild<QLabel *>("dstreamy-status-dot");
+	CHECK(dot && !dot->pixmap().isNull());
+	QImage image = status_part("icon", "missed")->pixmap().toImage();
+	bool inked = false;
+	for (int y = 0; y < image.height(); y++)
+		for (int x = 0; x < image.width(); x++)
+			if (qAlpha(image.pixel(x, y)) > 128)
+				inked = true;
+	CHECK(inked);
+}
+
+// Amber and red counters take the theme's text-warning and text-danger colours, or D-Streamy's own without them.
+void check_problem_status(QApplication &app, QToolButton *status)
+{
+	QColor plain_color = status_part("text", "missed")->palette().color(QPalette::WindowText);
+	status_override = QJsonObject{
+		{"state", "degraded"},
+		{"counters", QJsonArray{counter("missed", "missed", "5", "warn"), counter("audio", "audio-lost", "lost", "error"),
+					counter("reconnects", "reconnects", "1", "warn"), counter("viewers", "viewers", "–")}},
+		{"duration", "1:02:05"},
+		{"tooltip", "Live · Kids Lounge\nMissed frames: 5, 5 in the last 10 seconds\nAudio: lost, only 10 of 50 frames a "
+			    "second reach Discord\nReconnects: 1, reconnecting now\nViewers: unknown\nDuration: 1:02:05"}};
+	show(view(live, audio(true, false)));
+	CHECK(status_parts() == (QStringList{"dot:degraded", "missed", "5", "audio-lost", "lost", "reconnects", "1",
+					     "viewers", "–", "1:02:05"}));
+	CHECK(color_of(status_part("text", "missed")) == QLatin1String("#b88a16"));
+	CHECK(color_of(status_part("text", "audio")) == QLatin1String("#c01c37"));
+	CHECK(color_of(status_part("text", "reconnects")) == QLatin1String("#b88a16"));
+	CHECK(status_part("text", "viewers")->palette().color(QPalette::WindowText) == plain_color);
+	CHECK(status_part("icon", "audio")->property("level").toString() == QLatin1String("error"));
+	CHECK(QColor(status_part("icon", "audio")->property("color").toString()).name() == QLatin1String("#c01c37"));
+	CHECK(QColor(status_button()->findChild<QLabel *>("dstreamy-status-dot")->property("color").toString()).name() ==
+	      QLatin1String("#b88a16"));
+	QString tip = plain(status->toolTip());
+	CHECK(tip.contains(QLatin1String("Audio: lost")) && tip.contains(QLatin1String("Reconnects: 1, reconnecting now")));
+	CHECK(status->accessibleDescription().contains(QLatin1String("Missed frames: 5")));
+	check_status_icons(status);
+	shoot_status("problem");
+
+	QString sheet = app.styleSheet();
+	app.setStyleSheet(sheet + QStringLiteral(" .text-warning { color: #0a7cff; } .text-success { color: #00aa44; }"));
+	CHECK(wait_for([] { return color_of(status_part("text", "missed")) == QLatin1String("#0a7cff"); }));
+	CHECK(QColor(status_part("icon", "missed")->property("color").toString()).name() == QLatin1String("#0a7cff"));
+	CHECK(color_of(status_part("text", "audio")) == QLatin1String("#c01c37"));
+	status_override = QJsonObject();
+	show(view(live, audio(true, false)));
+	CHECK(QColor(status_button()->findChild<QLabel *>("dstreamy-status-dot")->property("color").toString()).name() ==
+	      QLatin1String("#00aa44"));
+	CHECK(status_part("text", "missed")->palette().color(QPalette::WindowText) == plain_color);
+	app.setStyleSheet(sheet);
+	show(view(live, audio(true, false)));
 }
 
 // The panel's size when it is shown, before anything can move or resize it again.
@@ -541,7 +683,10 @@ int main(int argc, char **argv)
 	CHECK(!dstreamy_ui_load(&good));
 	CHECK(fake::watches == 1);
 	auto *status = window.statusBar()->findChild<QToolButton *>("dstreamy-status");
-	CHECK(status && status->text() == QString::fromUtf8("D-Streamy idle ▴"));
+	CHECK(status && status->text().isEmpty());
+	CHECK(status && status->accessibleName() == QLatin1String("D-Streamy"));
+	CHECK(status_parts() == (QStringList{"dot:idle", "missed", "–", "audio", "–", "reconnects", "–", "viewers", "–"}));
+	shoot_status("idle");
 	CHECK(status && plain(status->toolTip()) == QString::fromUtf8("Idle · Kids Lounge 🧃\nTrack 6"));
 	CHECK(panel() && !panel()->isVisible());
 	CHECK(host.loads == 0);
@@ -653,8 +798,13 @@ int main(int argc, char **argv)
 	CHECK(visible("dstreamy-audio-line") && !visible("dstreamy-manage") && !visible("dstreamy-sources"));
 
 	show(view(live, audio(true, false)));
-	CHECK(status->text() == QString::fromUtf8("● D-Streamy live ▴"));
-	CHECK(plain(status->toolTip()).contains(QString::fromUtf8("6.0 Mbit/s · 60 fps · 12:34 · 0 dropped")));
+	CHECK(status_parts() == (QStringList{"dot:live", "missed", "0", "audio", "ok", "reconnects", "0", "viewers", "3",
+					     "12:34"}));
+	CHECK(plain(status->toolTip()) == QString::fromUtf8(live.tooltip));
+	CHECK(status_part("text", "audio") && status_part("text", "audio")->accessibleName() == QLatin1String("audio ok"));
+	check_status_icons(status);
+	shoot_status("healthy");
+	check_problem_status(app, status);
 	CHECK(text("dstreamy-state") == QString::fromUtf8("Live · 6.0 Mbit/s · 60 fps · 12:34"));
 	CHECK(!guilds->isEnabled() && !channels->isEnabled());
 	CHECK(sources().size() == 5 && sources()[2]->isChecked());
@@ -667,14 +817,14 @@ int main(int argc, char **argv)
 	CHECK(visible("dstreamy-fix") && text("dstreamy-fix") == QLatin1String("Run `dstreamy service install`"));
 	CHECK(plain(find<QLabel>("dstreamy-fix")->toolTip())
 		      .startsWith(QLatin1String("The D-Streamy service is not running")));
-	CHECK(status->text() == QString::fromUtf8("⚠ D-Streamy ▴"));
+	CHECK(status_parts().first() == QLatin1String("dot:error"));
 	CHECK(find<QLabel>("dstreamy-mark")->text() == QString::fromUtf8("⚠"));
 	CHECK(!visible("dstreamy-login"));
 	shoot("attention");
 
 	const State expired{"attention",
 			    "⚠",
-			    "⚠ D-Streamy ▴",
+			    "error",
 			    "Discord login expired",
 			    "",
 			    "Discord rejected the saved login: press Log in again",

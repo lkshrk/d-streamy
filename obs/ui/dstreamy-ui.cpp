@@ -24,6 +24,7 @@
 #include <QSignalBlocker>
 #include <QStatusBar>
 #include <QStyle>
+#include <QSvgRenderer>
 #include <QTextDocument>
 #include <QTimer>
 #include <QToolButton>
@@ -32,6 +33,11 @@
 #include <cstring>
 #include <memory>
 #include <utility>
+
+static void init_icons()
+{
+	Q_INIT_RESOURCE(icons);
+}
 
 namespace {
 
@@ -96,6 +102,46 @@ private:
 
 void panel_hidden();
 void fail_later(const char *call);
+void restyle_status();
+
+// The dot, icons and counters are child labels, so the button's size comes from their layout.
+class StatusButton : public QToolButton {
+public:
+	StatusButton()
+	{
+		setObjectName(QStringLiteral("dstreamy-status"));
+		setAutoRaise(true);
+		setAccessibleName(QStringLiteral("D-Streamy"));
+		auto *row = new QHBoxLayout(this);
+		row->setContentsMargins(6, 0, 6, 0);
+		row->setSpacing(4);
+	}
+
+	QSize sizeHint() const override
+	{
+		QSize inner = layout()->sizeHint();
+		return QSize(inner.width(), qMax(inner.height(), QToolButton::sizeHint().height()));
+	}
+	QSize minimumSizeHint() const override { return sizeHint(); }
+
+protected:
+	void changeEvent(QEvent *event) override
+	{
+		QToolButton::changeEvent(event);
+		if (event->type() == QEvent::StyleChange || event->type() == QEvent::PaletteChange ||
+		    event->type() == QEvent::FontChange)
+			restyle_status();
+	}
+
+	bool event(QEvent *event) override
+	{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
+		if (event->type() == QEvent::DevicePixelRatioChange)
+			restyle_status();
+#endif
+		return QToolButton::event(event);
+	}
+};
 
 // A slot runs from Qt's event loop, where an exception would end OBS; drop the panel instead.
 template<typename F> void guarded(const char *call, F &&body)
@@ -137,7 +183,10 @@ struct Ui {
 	dstreamy_ui_host host{};
 	bool active = false;
 	QPointer<QMainWindow> window;
-	QPointer<QToolButton> status;
+	QPointer<StatusButton> status;
+	QPointer<QLabel> status_dot;
+	QPointer<QLabel> status_duration;
+	QStringList status_ids;
 	QPointer<Panel> panel;
 	QPointer<QTimer> timer;
 	QPointer<QLabel> mark;
@@ -213,6 +262,174 @@ QLabel *label(const char *name, QWidget *parent, const char *classes = nullptr)
 	if (classes)
 		l->setProperty("class", QString::fromLatin1(classes));
 	return l;
+}
+
+void restyle_status()
+{
+	ui.shown.clear();
+	rerender();
+}
+
+// The OBS theme class for a level or dot state, and its colour where the theme has no such class.
+struct Tint {
+	const char *klass;
+	const char *fallback;
+};
+
+Tint level_tint(const QString &level)
+{
+	if (level == QLatin1String("error"))
+		return {"text-danger", "#c01c37"};
+	if (level == QLatin1String("warn"))
+		return {"text-warning", "#b88a16"};
+	return {"", nullptr};
+}
+
+Tint state_tint(const QString &state)
+{
+	if (state == QLatin1String("live"))
+		return {"text-success", "#25a231"};
+	if (state == QLatin1String("error"))
+		return level_tint(QStringLiteral("error"));
+	if (state == QLatin1String("busy") || state == QLatin1String("degraded"))
+		return level_tint(QStringLiteral("warn"));
+	return {"text-muted", nullptr};
+}
+
+// Applies the theme's class to `l` and returns the colour it draws text in.
+void set_class(QLabel *l, const QString &klass)
+{
+	l->setProperty("class", klass);
+	// A style sheet change makes Qt match the class rules again, as OBS's setClasses does.
+	l->setStyleSheet(QStringLiteral("/* */"));
+	l->setStyleSheet(QString());
+}
+
+QColor apply_tint(QLabel *l, const Tint &tint)
+{
+	QString klass = QString::fromLatin1(tint.klass);
+	set_class(l, QString());
+	QColor plain = l->palette().color(l->foregroundRole());
+	if (klass.isEmpty())
+		return plain;
+	set_class(l, klass);
+	QColor color = l->palette().color(l->foregroundRole());
+	if (color == plain) {
+		if (tint.fallback) {
+			color = QColor(QString::fromLatin1(tint.fallback));
+		} else {
+			color = plain;
+			color.setAlphaF(0.55);
+		}
+		l->setStyleSheet(QStringLiteral("color: rgba(%1, %2, %3, %4);")
+					 .arg(color.red())
+					 .arg(color.green())
+					 .arg(color.blue())
+					 .arg(color.alpha()));
+	}
+	return color;
+}
+
+QPixmap icon_pixmap(const QString &name, int size, qreal ratio, const QColor &color)
+{
+	QPixmap pixmap(QSize(size, size) * ratio);
+	pixmap.setDevicePixelRatio(ratio);
+	pixmap.fill(Qt::transparent);
+	QSvgRenderer svg(QStringLiteral(":/dstreamy/icons/%1.svg").arg(name));
+	QPainter painter(&pixmap);
+	painter.setRenderHint(QPainter::Antialiasing);
+	svg.render(&painter, QRectF(0, 0, size, size));
+	painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+	painter.fillRect(QRectF(0, 0, size, size), color);
+	return pixmap;
+}
+
+QPixmap dot_pixmap(int size, qreal ratio, const QColor &color)
+{
+	QPixmap pixmap(QSize(size, size) * ratio);
+	pixmap.setDevicePixelRatio(ratio);
+	pixmap.fill(Qt::transparent);
+	QPainter painter(&pixmap);
+	painter.setRenderHint(QPainter::Antialiasing);
+	painter.setPen(Qt::NoPen);
+	painter.setBrush(color);
+	qreal d = size * 0.6;
+	painter.drawEllipse(QRectF((size - d) / 2, (size - d) / 2, d, d));
+	return pixmap;
+}
+
+QLabel *status_label(const QString &name)
+{
+	auto *l = new QLabel(ui.status);
+	l->setObjectName(name);
+	l->setTextFormat(Qt::PlainText);
+	l->setAttribute(Qt::WA_TransparentForMouseEvents);
+	l->show();
+	return l;
+}
+
+// One icon and one text label per counter, rebuilt only when the counters themselves change.
+void build_counters(const QJsonArray &counters)
+{
+	QStringList ids;
+	for (const QJsonValue v : counters)
+		ids << v.toObject().value("id").toString();
+	if (ids == ui.status_ids)
+		return;
+	ui.status_ids = ids;
+	auto *row = static_cast<QHBoxLayout *>(ui.status->layout());
+	while (QLayoutItem *item = row->takeAt(0)) {
+		delete item->widget();
+		delete item;
+	}
+	ui.status_dot = status_label(QStringLiteral("dstreamy-status-dot"));
+	row->addWidget(ui.status_dot);
+	for (const QString &id : ids) {
+		row->addSpacing(6);
+		row->addWidget(status_label(QStringLiteral("dstreamy-status-icon-") + id));
+		row->addWidget(status_label(QStringLiteral("dstreamy-status-text-") + id));
+	}
+	row->addSpacing(8);
+	ui.status_duration = status_label(QStringLiteral("dstreamy-status-duration"));
+	row->addWidget(ui.status_duration);
+}
+
+void render_status(const QJsonObject &status)
+{
+	QJsonArray counters = status.value("counters").toArray();
+	build_counters(counters);
+	int size = ui.status->fontMetrics().height();
+	qreal ratio = ui.status->devicePixelRatioF();
+	QString state = status.value("state").toString();
+	QColor dot = apply_tint(ui.status_dot, state_tint(state));
+	ui.status_dot->setPixmap(dot_pixmap(size, ratio, dot));
+	ui.status_dot->setProperty("state", state);
+	ui.status_dot->setProperty("color", dot.name(QColor::HexArgb));
+	for (const QJsonValue v : counters) {
+		QJsonObject c = v.toObject();
+		QString id = c.value("id").toString();
+		QString level = c.value("level").toString();
+		auto *icon = ui.status->findChild<QLabel *>(QStringLiteral("dstreamy-status-icon-") + id);
+		auto *text = ui.status->findChild<QLabel *>(QStringLiteral("dstreamy-status-text-") + id);
+		if (!icon || !text)
+			continue;
+		text->setText(c.value("text").toString());
+		text->setAccessibleName(c.value("label").toString());
+		text->setProperty("level", level);
+		QColor color = apply_tint(text, level_tint(level));
+		QString name = c.value("icon").toString();
+		icon->setPixmap(icon_pixmap(name, size, ratio, color));
+		icon->setProperty("icon", name);
+		icon->setProperty("level", level);
+		icon->setProperty("color", color.name(QColor::HexArgb));
+	}
+	QString duration = status.value("duration").toString();
+	ui.status_duration->setText(duration);
+	ui.status_duration->setVisible(!duration.isEmpty());
+	QString tip = status.value("tooltip").toString();
+	ui.status->setToolTip(plain_tip(tip));
+	ui.status->setAccessibleDescription(tip);
+	ui.status->updateGeometry();
 }
 
 QPushButton *button(const char *name, QWidget *parent)
@@ -505,13 +722,8 @@ void render()
 
 	QJsonObject view = doc.object();
 	QString color = QStringLiteral("color: %1;").arg(tone_color(view.value("tone").toString()));
-	if (ui.status) {
-		ui.status->setText(view.value("status_bar").toString().replace(QLatin1Char('&'), QLatin1String("&&")));
-		ui.status->setStyleSheet(color);
-		QString tip = view.value("status_tooltip").toString();
-		ui.status->setToolTip(plain_tip(tip));
-		ui.status->setAccessibleDescription(tip);
-	}
+	if (ui.status)
+		render_status(view.value("status").toObject());
 
 	ui.panel->setProperty("tone", view.value("tone").toString());
 	ui.mark->setText(view.value("mark").toString());
@@ -884,9 +1096,8 @@ bool load(const struct dstreamy_ui_host *host)
 	ui.panel = build_panel();
 	ui.panel->ensurePolished();
 
-	ui.status = new QToolButton();
-	ui.status->setObjectName(QStringLiteral("dstreamy-status"));
-	ui.status->setAutoRaise(true);
+	init_icons();
+	ui.status = new StatusButton();
 	QObject::connect(ui.status, &QToolButton::clicked, ui.status, [] { guarded("open_panel", toggle_panel); });
 	window->statusBar()->addPermanentWidget(ui.status);
 

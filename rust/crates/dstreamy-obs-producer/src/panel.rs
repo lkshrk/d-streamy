@@ -14,6 +14,7 @@ use crate::mixer::{
     AudioSource, AudioView, CONFIRM, NOT_NOW, audio_view, instead_label, mic_guard, notices,
     release_label,
 };
+use crate::status_bar::{StatusBar, status_bar};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Item {
@@ -175,8 +176,7 @@ pub fn account_row(m: &DockModel) -> Option<AccountRow> {
 pub struct PanelView {
     pub tone: Tone,
     pub mark: &'static str,
-    pub status_bar: String,
-    pub status_tooltip: String,
+    pub status: StatusBar,
     pub state_line: String,
     /// The fix for a problem, empty otherwise.
     pub state_fix: String,
@@ -313,6 +313,40 @@ fn audio(state: &ConfigState, controls: bool, sources: &[AudioSource], confirmin
     audio
 }
 
+/// `stats` with what the session adds: its frame rate, and whether a source feeds the Discord track.
+fn with_session(
+    m: &DockModel,
+    controls: bool,
+    sources: &[AudioSource],
+    stats: &LiveStats,
+) -> LiveStats {
+    let target_fps = match m.state() {
+        DockState::Live { session_fps, .. } => *session_fps,
+        _ => None,
+    };
+    let bit = 1u32 << (m.heard_track() - 1);
+    LiveStats {
+        target_fps,
+        audio_fed: controls.then(|| sources.iter().any(|s| s.mixers & bit != 0)),
+        ..*stats
+    }
+}
+
+/// The service's frame gaps and audio rate under the live line, empty without a service report.
+fn gaps_line(stats: &LiveStats) -> String {
+    let Some(s) = stats.service else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    if let (Some(p95), Some(max)) = (s.jitter_p95_ms, s.jitter_max_ms) {
+        parts.push(format!("Frame gaps {p95} ms p95, {max} ms max"));
+    }
+    if let Some(n) = s.audio_per_sec {
+        parts.push(format!("audio {n}/s"));
+    }
+    parts.join(" · ")
+}
+
 /// The status-bar item and panel; `confirming` says the takeover's confirm row is open.
 pub fn panel_view(
     state: &ConfigState,
@@ -325,6 +359,8 @@ pub fn panel_view(
     let settings = m.settings();
     let idle = m.state() == &DockState::Idle;
     let mic = controls.then(|| mic_guard(m, sources)).flatten();
+    let live = live.map(|stats| with_session(m, controls, sources, stats));
+    let live = live.as_ref();
     let dock = dock_view(state, controls, live, mic.as_ref());
     let not_set_up =
         dock.tone == Tone::Idle && (settings.guild_id.is_none() || settings.channel_id.is_none());
@@ -346,7 +382,7 @@ pub fn panel_view(
         ),
         Tone::Live => (
             format!("Live · {}", dock.detail),
-            String::new(),
+            live.map(gaps_line).unwrap_or_default(),
             format!("{}\n{}", dock.headline, dock.detail_tooltip),
         ),
         Tone::Idle | Tone::Busy => (
@@ -376,15 +412,15 @@ pub fn panel_view(
     PanelView {
         tone: dock.tone,
         mark: dock.mark,
-        status_bar: match (dock.tone, live) {
-            (Tone::Live, Some(_)) => format!("{} · {} ▴", dock.status_bar, dock.detail),
-            _ => format!("{} ▴", dock.status_bar),
-        },
-        status_tooltip: if not_set_up {
-            state_tooltip.clone()
-        } else {
-            format!("{}\n{}", dock.headline, dock.detail_tooltip)
-        },
+        status: status_bar(
+            dock.tone,
+            live,
+            if not_set_up {
+                state_tooltip.clone()
+            } else {
+                format!("{}\n{}", dock.headline, dock.detail_tooltip)
+            },
+        ),
         state_line,
         state_fix,
         state_tooltip,
@@ -424,7 +460,8 @@ mod tests {
     use super::*;
     use crate::control::{Account, Accounts, ControlError, Started};
     use crate::dock::{Canvas, DockModel, DockSettings};
-    use crate::live::Rates;
+    use crate::live::{Rates, ServiceHealth};
+    use crate::status_bar::State;
 
     fn named(id: &str, name: &str) -> Named {
         Named {
@@ -583,10 +620,11 @@ mod tests {
             assert_eq!(v.state_line, "Not set up");
             assert_eq!(v.state_fix, "Pick a server and voice channel below");
             assert_eq!(
-                v.status_tooltip,
+                v.status.tooltip,
                 "Not set up\nPick a server and voice channel below"
             );
-            assert_eq!(v.state_tooltip, v.status_tooltip);
+            assert_eq!(v.state_tooltip, v.status.tooltip);
+            assert_eq!(v.status.state, State::Idle);
             assert!(!v.state_fix.contains('⚙'), "the panel has no gear");
             assert!(!v.button.enabled);
         }
@@ -606,7 +644,7 @@ mod tests {
         assert_eq!(v.state_line, "Not logged in");
         assert_eq!(v.state_fix, "Run `dstreamy login`");
         assert_eq!(v.state_tooltip, "Log in first: run `dstreamy login`");
-        assert_eq!(v.status_bar, "⚠ D-Streamy ▴");
+        assert_eq!(v.status.state, State::Error);
         assert_eq!(v.login, None, "this serve can't open a login window");
     }
 
@@ -640,7 +678,7 @@ mod tests {
             }),
             "the wait can be ended from OBS"
         );
-        assert_eq!(v.status_bar, "D-Streamy logging in… ▴");
+        assert_eq!(v.status.state, State::Busy);
         assert!(!v.button.enabled);
         assert_eq!(v.state_fix, "Waiting for login in the browser window…");
 
@@ -879,7 +917,7 @@ mod tests {
         assert_eq!(leak.tone, Tone::Attention, "Discord hears the mic now");
         assert_eq!(leak.state_line, "Discord hears Mic/Aux");
         assert_eq!(leak.state_fix, "Manage Track 6");
-        assert_eq!(leak.status_bar, "⚠ D-Streamy live ▴");
+        assert_eq!(leak.status.state, State::Error);
         assert!(leak.button.enabled, "Stop stays");
         assert_eq!(
             leak.audio.manage, "Manage Track 6",
@@ -960,37 +998,55 @@ mod tests {
                 bits_per_sec: 6_000_000.0,
                 fps: 60.0,
             }),
-            dropped: 0,
-            viewers: None,
+            ..LiveStats::default()
         };
         let v = panel_view(&s, true, Some(&stats), &sources(), false);
         assert_eq!(v.state_line, "Live · 6.0 Mbit/s · 60 fps · 12:34");
-        assert_eq!(
-            v.status_bar,
-            "● D-Streamy live · 6.0 Mbit/s · 60 fps · 12:34 ▴"
-        );
+        assert_eq!(v.state_fix, "", "no service report");
+        assert_eq!(v.status.state, State::Live);
+        let texts: Vec<&str> = v.status.counters.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["0", "–", "–", "–"]);
+        assert_eq!(v.status.duration, "12:34");
         let no_stats = panel_view(&s, true, None, &sources(), false);
-        assert_eq!(no_stats.status_bar, "● D-Streamy live ▴");
+        assert_eq!(no_stats.status.duration, "");
         assert_eq!(
-            v.status_tooltip,
-            "Live · Kids Lounge 🧃\n6.0 Mbit/s · 60 fps · 12:34 · 0 dropped\nTrack 6"
+            v.status.tooltip,
+            "Live · Kids Lounge 🧃\nMissed frames: 0\nAudio: unknown\nReconnects: unknown\n\
+             Viewers: unknown\nDuration: 12:34\nVideo: 6.0 Mbit/s, 60 fps\nTrack 6"
         );
         assert!(!v.guilds.enabled && !v.channels.enabled);
         assert_eq!(v.button.label, "Stop D-Streamy");
         assert!(v.audio.managed, "ticks still work while live");
         let watched = LiveStats {
             viewers: Some(3),
+            service: Some(ServiceHealth {
+                audio_per_sec: Some(50),
+                jitter_p95_ms: Some(18),
+                jitter_max_ms: Some(41),
+                ..ServiceHealth::default()
+            }),
             ..stats
         };
         let v = panel_view(&s, true, Some(&watched), &sources(), false);
-        assert_eq!(v.state_line, "Live · 6.0 Mbit/s · 60 fps · 12:34 · 👁 3");
-        assert_eq!(
-            v.status_bar,
-            "● D-Streamy live · 6.0 Mbit/s · 60 fps · 12:34 · 👁 3 ▴"
+        assert_eq!(v.state_line, "Live · 6.0 Mbit/s · 60 fps · 12:34");
+        assert_eq!(v.state_fix, "Frame gaps 18 ms p95, 41 ms max · audio 50/s");
+        let texts: Vec<&str> = v.status.counters.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["0", "ok", "0", "3"]);
+        assert!(
+            v.status.tooltip.contains("\nViewers: 3\n"),
+            "{}",
+            v.status.tooltip
         );
+        let unfed = panel_view(&s, true, Some(&watched), &[], false);
         assert_eq!(
-            v.status_tooltip,
-            "Live · Kids Lounge 🧃\n6.0 Mbit/s · 60 fps · 12:34 · 3 watching · 0 dropped\nTrack 6"
+            unfed.status.counters[1].text, "silent",
+            "nothing feeds Track 6"
+        );
+        assert_eq!(unfed.status.state, State::Degraded);
+        let windows = panel_view(&s, false, Some(&watched), &[], false);
+        assert_ne!(
+            windows.status.counters[1].text, "silent",
+            "no mixer data there"
         );
     }
 
@@ -1000,8 +1056,8 @@ mod tests {
         assert_eq!(v.tone, Tone::Idle);
         assert_eq!(v.state_line, "Idle · Kids Lounge 🧃");
         assert_eq!(v.state_fix, "");
-        assert_eq!(v.status_bar, "D-Streamy idle ▴");
-        assert_eq!(v.status_tooltip, "Idle · Kids Lounge 🧃\nTrack 6");
+        assert_eq!(v.status.state, State::Idle);
+        assert_eq!(v.status.tooltip, "Idle · Kids Lounge 🧃\nTrack 6");
         assert_eq!(v.button.label, "Start D-Streamy");
     }
 
@@ -1011,8 +1067,7 @@ mod tests {
         for key in [
             "tone",
             "mark",
-            "status_bar",
-            "status_tooltip",
+            "status",
             "state_line",
             "state_fix",
             "state_tooltip",

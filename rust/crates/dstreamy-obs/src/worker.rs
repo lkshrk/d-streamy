@@ -184,16 +184,21 @@ async fn session(
     }
     let output = shared.output;
     crate::session::set_viewers(None);
+    crate::session::set_health(None);
     let end = producer::run(
         connection,
         &shared.ring,
         || video_extra_data(output),
-        &crate::session::set_viewers,
+        producer::Reports {
+            viewers: &crate::session::set_viewers,
+            health: &crate::session::set_health,
+        },
         next_reason(commands),
         &log::Obs,
     )
     .await;
     crate::session::set_viewers(None);
+    crate::session::set_health(None);
     Outcome::Ended(end)
 }
 

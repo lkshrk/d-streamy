@@ -14,6 +14,7 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio_util::bytes::Bytes;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
+use crate::live::ServiceHealth;
 use crate::ring::{MAX_PACKET, Oversized, Packet, Ring, Track};
 use crate::types::{End, Hello, Level, Log, service_text};
 
@@ -131,17 +132,32 @@ enum WriterEnd<T> {
     Refused(String),
 }
 
-/// Sends the ring's packets until `stop` fires or the service ends the attachment; `viewers` gets each viewer count the service reports.
+/// What the service reports while attached: each viewer count, and its health (`None` without a stream).
+pub struct Reports<'a> {
+    pub viewers: &'a dyn Fn(Option<u32>),
+    pub health: &'a dyn Fn(Option<ServiceHealth>),
+}
+
+impl Reports<'static> {
+    pub fn ignored() -> Self {
+        Self {
+            viewers: &|_| {},
+            health: &|_| {},
+        }
+    }
+}
+
+/// Sends the ring's packets until `stop` fires or the service ends the attachment, passing its reports on.
 pub async fn run<T>(
     connection: Connection,
     ring: &Ring,
     video_extra_data: impl FnMut() -> Option<Vec<u8>>,
-    viewers: &dyn Fn(Option<u32>),
+    reports: Reports<'_>,
     stop: impl Future<Output = T>,
     log: &dyn Log,
 ) -> End<T> {
     let Connection { lines, sink, .. } = connection;
-    let reader = read_events(lines, viewers, log);
+    let reader = read_events(lines, reports, log);
     let writer = write_packets(sink, ring, video_extra_data, stop, log);
     tokio::pin!(reader, writer);
     tokio::select! {
@@ -160,7 +176,7 @@ pub async fn run<T>(
     }
 }
 
-async fn read_events<T>(mut lines: Lines, viewers: &dyn Fn(Option<u32>), log: &dyn Log) -> End<T> {
+async fn read_events<T>(mut lines: Lines, reports: Reports<'_>, log: &dyn Log) -> End<T> {
     let mut malformed = 0u64;
     let end = loop {
         let event = match lines.next().await {
@@ -184,8 +200,9 @@ async fn read_events<T>(mut lines: Lines, viewers: &dyn Fn(Option<u32>), log: &d
                 "keyframe requested; the encoder's keyframe interval answers it",
             ),
             Some("viewers") => {
-                viewers(event["count"].as_u64().and_then(|n| u32::try_from(n).ok()));
+                (reports.viewers)(event["count"].as_u64().and_then(|n| u32::try_from(n).ok()));
             }
+            Some("health") => (reports.health)(ServiceHealth::from_event(&event)),
             Some("detached") => {
                 break End::Detached {
                     reason: service_text(event["reason"].as_str().unwrap_or("unknown")),

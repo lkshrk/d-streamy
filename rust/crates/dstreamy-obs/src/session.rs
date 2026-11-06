@@ -17,6 +17,7 @@ use dstreamy_obs_producer::dock::{
     Canvas, DockModel, DockState, FIX_AFTER_CLOSING, FIX_LOG, FIX_OUTPUT_SETTING, FIX_PRESS_START,
     FIX_RESTART_OBS, FIX_START_THEN_STOP, FIX_VIDEO,
 };
+use dstreamy_obs_producer::live::ServiceHealth;
 #[cfg(unix)]
 use dstreamy_obs_producer::{
     Endpoint,
@@ -589,6 +590,19 @@ pub fn set_viewers(count: Option<u32>) {
 /// `None` until the service reports viewers for the running output.
 pub fn viewers() -> Option<u32> {
     u32::try_from(VIEWERS.load(Ordering::Acquire)).ok()
+}
+
+/// The service's latest health for the running output.
+static HEALTH: Mutex<Option<ServiceHealth>> = Mutex::new(None);
+
+#[cfg(unix)]
+pub fn set_health(health: Option<ServiceHealth>) {
+    *HEALTH.lock().unwrap_or_else(PoisonError::into_inner) = health;
+}
+
+/// `None` until the service reports health for the running output; an older service never does.
+pub fn health() -> Option<ServiceHealth> {
+    *HEALTH.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The output's counters while it is active: bytes, frames and dropped frames. Cheap; callable on the UI thread.

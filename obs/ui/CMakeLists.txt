@@ -1,21 +1,22 @@
-find_package(Qt6 COMPONENTS Widgets)
-if(NOT TARGET Qt6::Widgets OR NOT TARGET OBS::obs-frontend-api)
+find_package(Qt6 COMPONENTS Widgets Svg)
+if(NOT TARGET Qt6::Widgets OR NOT TARGET Qt6::Svg OR NOT TARGET OBS::obs-frontend-api)
   message(
     FATAL_ERROR
-    "The D-Streamy status-bar panel needs Qt6 Widgets and obs-frontend-api. Install Qt6's development files and point "
+    "The D-Streamy status-bar panel needs Qt6 Widgets, Qt6 Svg and obs-frontend-api. Install Qt6's development files and point "
     "CMAKE_PREFIX_PATH at an OBS build with its frontend, or pass -DDSTREAMY_UI=OFF"
   )
 endif()
 
 set(ui_target ${CMAKE_PROJECT_NAME}-ui)
 
-add_library(dstreamy-ui-core OBJECT dstreamy-ui.cpp dstreamy-ui.h frontend.hpp)
-target_link_libraries(dstreamy-ui-core PUBLIC Qt6::Widgets)
+qt_add_resources(dstreamy_ui_icons icons/icons.qrc)
+add_library(dstreamy-ui-core OBJECT dstreamy-ui.cpp dstreamy-ui.h frontend.hpp ${dstreamy_ui_icons})
+target_link_libraries(dstreamy-ui-core PUBLIC Qt6::Widgets Qt6::Svg)
 target_compile_definitions(dstreamy-ui-core PUBLIC DSTREAMY_UI_BUILDING)
 set_target_properties(dstreamy-ui-core PROPERTIES POSITION_INDEPENDENT_CODE ON AUTOMOC OFF)
 
 add_library(${ui_target} SHARED frontend.cpp $<TARGET_OBJECTS:dstreamy-ui-core>)
-target_link_libraries(${ui_target} PRIVATE Qt6::Widgets OBS::obs-frontend-api OBS::libobs)
+target_link_libraries(${ui_target} PRIVATE Qt6::Widgets Qt6::Svg OBS::obs-frontend-api OBS::libobs)
 set_target_properties(${ui_target} PROPERTIES PREFIX "" AUTOMOC OFF)
 
 if(OS_MACOS)
@@ -39,7 +40,7 @@ else()
 endif()
 
 add_executable(dstreamy-ui-test tests/ui-test.cpp tests/fake-frontend.cpp tests/fake-frontend.hpp)
-target_link_libraries(dstreamy-ui-test PRIVATE dstreamy-ui-core Qt6::Widgets)
+target_link_libraries(dstreamy-ui-test PRIVATE dstreamy-ui-core Qt6::Widgets Qt6::Svg)
 set_target_properties(dstreamy-ui-test PROPERTIES AUTOMOC OFF)
 if(OS_MACOS)
   set_target_properties(

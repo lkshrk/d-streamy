@@ -11,12 +11,13 @@ pub mod mixer;
 pub mod panel;
 pub mod ring;
 pub mod settings;
+pub mod status_bar;
 mod types;
 
 #[cfg(target_os = "linux")]
 pub use client::block_sigpipe_on_this_thread;
 #[cfg(unix)]
-pub use client::{Connection, StartError, attach, run};
+pub use client::{Connection, Reports, StartError, attach, run};
 #[cfg(unix)]
 pub use dstreamy_ipc::Endpoint;
 pub use ring::{Oversized, Packet, Ring, RingStats, Track};

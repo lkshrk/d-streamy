@@ -720,8 +720,7 @@ mod tests {
                 bits_per_sec: 6_000_000.0,
                 fps: 60.0,
             }),
-            dropped: 0,
-            viewers: None,
+            ..LiveStats::default()
         }
     }
 
@@ -734,7 +733,9 @@ mod tests {
         assert_eq!(v.detail, "6.0 Mbit/s · 60 fps · 12:34");
         assert_eq!(
             v.detail_tooltip,
-            "6.0 Mbit/s · 60 fps · 12:34 · 0 dropped\nTrack 6 · Discord hears Track 3 from the next Go Live"
+            "Missed frames: 0\nAudio: unknown\nReconnects: unknown\nViewers: unknown\n\
+             Duration: 12:34\nVideo: 6.0 Mbit/s, 60 fps\n\
+             Track 6 · Discord hears Track 3 from the next Go Live"
         );
         let early = dock_view(&s, true, Some(&stats(false)), None);
         assert_eq!(
