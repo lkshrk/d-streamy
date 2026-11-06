@@ -329,6 +329,7 @@ fn packets_stream_to_discord_and_a_stop_ends_with_end_of_stream() {
                     extra_reads += 1;
                     Some(video_extra.clone())
                 },
+                &|_| {},
                 async { stop_rx.await.unwrap() },
                 &Stderr,
             ),
@@ -400,6 +401,7 @@ fn a_service_shutdown_detaches_the_producer() {
                 connection,
                 &ring,
                 || Some(video_extra.clone()),
+                &|_| {},
                 std::future::pending::<()>(),
                 &Stderr,
             ),
@@ -447,6 +449,7 @@ fn an_ingest_refusal_surfaces_as_detached() {
             connection,
             &ring,
             || None,
+            &|_| {},
             std::future::pending::<()>(),
             &Stderr,
         ),

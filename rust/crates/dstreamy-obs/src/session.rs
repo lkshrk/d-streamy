@@ -518,6 +518,20 @@ unsafe impl Send for Watched {}
 
 static WATCHED: Mutex<Option<Watched>> = Mutex::new(None);
 
+const VIEWERS_UNKNOWN: u64 = u64::MAX;
+/// The service's latest viewer count for the running output.
+static VIEWERS: AtomicU64 = AtomicU64::new(VIEWERS_UNKNOWN);
+
+#[cfg(unix)]
+pub fn set_viewers(count: Option<u32>) {
+    VIEWERS.store(count.map_or(VIEWERS_UNKNOWN, u64::from), Ordering::Release);
+}
+
+/// `None` until the service reports viewers for the running output.
+pub fn viewers() -> Option<u32> {
+    u32::try_from(VIEWERS.load(Ordering::Acquire)).ok()
+}
+
 /// The output's counters while it is active: bytes, frames and dropped frames. Cheap; callable on the UI thread.
 pub fn output_counters() -> Option<(u64, u64, u64)> {
     let strong = WATCHED

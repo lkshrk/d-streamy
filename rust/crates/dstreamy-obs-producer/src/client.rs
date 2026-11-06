@@ -131,16 +131,17 @@ enum WriterEnd<T> {
     Refused(String),
 }
 
-/// Sends the ring's packets until `stop` fires or the service ends the attachment.
+/// Sends the ring's packets until `stop` fires or the service ends the attachment; `viewers` gets each viewer count the service reports.
 pub async fn run<T>(
     connection: Connection,
     ring: &Ring,
     video_extra_data: impl FnMut() -> Option<Vec<u8>>,
+    viewers: &dyn Fn(Option<u32>),
     stop: impl Future<Output = T>,
     log: &dyn Log,
 ) -> End<T> {
     let Connection { lines, sink, .. } = connection;
-    let reader = read_events(lines, log);
+    let reader = read_events(lines, viewers, log);
     let writer = write_packets(sink, ring, video_extra_data, stop, log);
     tokio::pin!(reader, writer);
     tokio::select! {
@@ -159,7 +160,7 @@ pub async fn run<T>(
     }
 }
 
-async fn read_events<T>(mut lines: Lines, log: &dyn Log) -> End<T> {
+async fn read_events<T>(mut lines: Lines, viewers: &dyn Fn(Option<u32>), log: &dyn Log) -> End<T> {
     let mut malformed = 0u64;
     let end = loop {
         let event = match lines.next().await {
@@ -182,6 +183,9 @@ async fn read_events<T>(mut lines: Lines, log: &dyn Log) -> End<T> {
                 Level::Debug,
                 "keyframe requested; the encoder's keyframe interval answers it",
             ),
+            Some("viewers") => {
+                viewers(event["count"].as_u64().and_then(|n| u32::try_from(n).ok()));
+            }
             Some("detached") => {
                 break End::Detached {
                     reason: service_text(event["reason"].as_str().unwrap_or("unknown")),

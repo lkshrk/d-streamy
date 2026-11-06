@@ -27,6 +27,8 @@ pub struct LiveStats {
     pub uptime_ms: u64,
     pub rates: Option<Rates>,
     pub dropped: u64,
+    /// From the service; `None` until Discord reports the viewers.
+    pub viewers: Option<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +65,7 @@ impl Sampler {
             uptime_ms: sample.at_ms - started,
             rates,
             dropped: sample.dropped,
+            viewers: None,
         }
     }
 }
@@ -86,7 +89,7 @@ fn clock(ms: u64) -> String {
     }
 }
 
-/// "6.0 Mbit/s · 60 fps · 12:34", "… · 12:34 · 3 dropped" once frames drop, or just the uptime until rates exist.
+/// "6.0 Mbit/s · 60 fps · 12:34 · 3 watching", "… · 3 dropped" once frames drop, or just the uptime until rates exist.
 pub fn stats_line(stats: &LiveStats) -> String {
     line(stats, stats.dropped > 0)
 }
@@ -97,12 +100,14 @@ pub fn stats_tooltip(stats: &LiveStats) -> String {
 }
 
 fn line(stats: &LiveStats, dropped: bool) -> String {
-    let uptime = clock(stats.uptime_ms);
-    let Some(r) = stats.rates else {
-        return uptime;
-    };
-    let mut text = format!("{} · {:.0} fps · {uptime}", bitrate(r.bits_per_sec), r.fps);
-    if dropped {
+    let mut text = clock(stats.uptime_ms);
+    if let Some(r) = stats.rates {
+        text = format!("{} · {:.0} fps · {text}", bitrate(r.bits_per_sec), r.fps);
+    }
+    if let Some(n) = stats.viewers {
+        text.push_str(&format!(" · {n} watching"));
+    }
+    if dropped && stats.rates.is_some() {
         text.push_str(&format!(" · {} dropped", stats.dropped));
     }
     text
@@ -204,11 +209,44 @@ mod tests {
                 fps: 29.97,
             }),
             dropped: 0,
+            viewers: None,
         };
         assert_eq!(stats_line(&stats), "2.5 Mbit/s · 30 fps · 1:02:05");
         assert_eq!(
             stats_tooltip(&stats),
             "2.5 Mbit/s · 30 fps · 1:02:05 · 0 dropped"
         );
+    }
+
+    #[test]
+    fn viewers_show_once_known() {
+        let mut stats = LiveStats {
+            uptime_ms: 754_000,
+            rates: Some(Rates {
+                bits_per_sec: 6_000_000.0,
+                fps: 60.0,
+            }),
+            dropped: 2,
+            viewers: Some(3),
+        };
+        assert_eq!(
+            stats_line(&stats),
+            "6.0 Mbit/s · 60 fps · 12:34 · 3 watching · 2 dropped"
+        );
+        stats.viewers = Some(0);
+        stats.dropped = 0;
+        assert_eq!(
+            stats_line(&stats),
+            "6.0 Mbit/s · 60 fps · 12:34 · 0 watching"
+        );
+        assert_eq!(
+            stats_tooltip(&stats),
+            "6.0 Mbit/s · 60 fps · 12:34 · 0 watching · 0 dropped"
+        );
+        stats.rates = None;
+        stats.viewers = Some(1);
+        assert_eq!(stats_line(&stats), "12:34 · 1 watching");
+        stats.viewers = None;
+        assert_eq!(stats_line(&stats), "12:34");
     }
 }

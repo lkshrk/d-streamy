@@ -704,6 +704,7 @@ mod tests {
                 fps: 60.0,
             }),
             dropped: 0,
+            viewers: None,
         }
     }
 

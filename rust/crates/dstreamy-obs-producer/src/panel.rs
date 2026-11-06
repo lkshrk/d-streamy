@@ -876,6 +876,7 @@ mod tests {
                 fps: 60.0,
             }),
             dropped: 0,
+            viewers: None,
         };
         let v = panel_view(&s, true, Some(&stats), &sources(), false);
         assert_eq!(v.state_line, "Live · 6.0 Mbit/s · 60 fps · 12:34");
@@ -892,6 +893,23 @@ mod tests {
         assert!(!v.guilds.enabled && !v.channels.enabled);
         assert_eq!(v.button.label, "Stop D-Streamy");
         assert!(v.audio.managed, "ticks still work while live");
+        let watched = LiveStats {
+            viewers: Some(3),
+            ..stats
+        };
+        let v = panel_view(&s, true, Some(&watched), &sources(), false);
+        assert_eq!(
+            v.state_line,
+            "Live · 6.0 Mbit/s · 60 fps · 12:34 · 3 watching"
+        );
+        assert_eq!(
+            v.status_bar,
+            "● D-Streamy live · 6.0 Mbit/s · 60 fps · 12:34 · 3 watching ▴"
+        );
+        assert_eq!(
+            v.status_tooltip,
+            "Live · Kids Lounge 🧃\n6.0 Mbit/s · 60 fps · 12:34 · 3 watching · 0 dropped\nTrack 6"
+        );
     }
 
     #[test]

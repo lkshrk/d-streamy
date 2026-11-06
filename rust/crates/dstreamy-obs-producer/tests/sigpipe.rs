@@ -72,6 +72,7 @@ async fn the_client_write_path_never_raises_sigpipe() {
             connection,
             &ring,
             || None,
+            &|_| {},
             std::future::pending::<()>(),
             &log,
         ),

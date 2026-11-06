@@ -86,7 +86,7 @@ async fn a_service_that_stops_reading_cannot_hold_up_a_stop() {
     let started = Instant::now();
     let end = tokio::time::timeout(
         STOP_DEADLINE + Duration::from_secs(5),
-        run(connection, &ring, || None, stop, &Quiet),
+        run(connection, &ring, || None, &|_| {}, stop, &Quiet),
     )
     .await
     .expect("run did not return after the stop");
@@ -125,6 +125,7 @@ async fn a_detached_already_sent_is_read_after_the_write_fails() {
             connection,
             &ring,
             || None,
+            &|_| {},
             std::future::pending::<()>(),
             &log,
         ),
@@ -145,4 +146,48 @@ async fn a_detached_already_sent_is_read_after_the_write_fails() {
                 && m.ends_with("reading pending events")),
         "the write did not fail first: {log:?}"
     );
+}
+
+#[tokio::test]
+async fn viewer_counts_from_the_service_are_reported() {
+    let (_dir, path, listener) = socket();
+    let service = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut hello = String::new();
+        BufReader::new(read).read_line(&mut hello).await.unwrap();
+        write
+            .write_all(
+                concat!(
+                    "{\"attached\":1}\n",
+                    "{\"type\":\"viewers\",\"count\":3}\n",
+                    "{\"type\":\"viewers\",\"count\":null}\n",
+                    "{\"type\":\"viewers\",\"count\":0}\n",
+                    "{\"message\":\"bye\",\"reason\":\"stopped\",\"type\":\"detached\"}\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    let connection = attach(&Endpoint::new(&path), &hello()).await.unwrap();
+    let ring = Ring::default();
+    let seen = Mutex::new(Vec::new());
+    let end = tokio::time::timeout(
+        Duration::from_secs(10),
+        run(
+            connection,
+            &ring,
+            || None,
+            &|n| seen.lock().unwrap().push(n),
+            std::future::pending::<()>(),
+            &Quiet,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(end, End::Detached { .. }), "{end:?}");
+    assert_eq!(*seen.lock().unwrap(), [Some(3), None, Some(0)]);
+    service.abort();
 }
