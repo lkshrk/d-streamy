@@ -434,7 +434,10 @@ impl Connection {
         producer::run(
             attachment,
             states,
-            self.engine.viewers(),
+            producer::Reports {
+                viewers: self.engine.viewers(),
+                health: self.engine.health(),
+            },
             reader,
             writer,
             self.phase.clone(),

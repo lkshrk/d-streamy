@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use dstreamy_core::{Fps, Resolution};
+use dstreamy_core::{Fps, HealthLevel, Resolution};
 use dstreamy_ipc::{ControlCodec, Frame, Kind, ProducerCodec, ProducerError};
 use dstreamy_media::{
     AttachError, Attachment, CloseReason, Ingest, ProducerFrame, ProducerInfo, SourceState,
@@ -17,7 +17,7 @@ use tokio::time::timeout;
 use tokio_util::codec::{Encoder, FramedRead, FramedWrite};
 
 use super::Phase;
-use crate::engine::{Failure, SourceView};
+use crate::engine::{Failure, LiveHealth, SourceView};
 
 const OPUS_SAMPLE_RATE: u64 = 48_000;
 const OPUS_CHANNELS: u64 = 2;
@@ -138,10 +138,49 @@ pub(super) enum Event {
     Viewers {
         count: Option<u32>,
     },
+    /// Only `type` while no stream runs.
+    Health {
+        #[serde(flatten)]
+        view: Option<HealthView>,
+    },
     Detached {
         reason: &'static str,
         message: String,
     },
+}
+
+/// The `health` event's fields; the last interval's figures are `null` until the first one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct HealthView {
+    reconnecting: bool,
+    reconnects: u64,
+    /// Lost by this attachment's source queue plus on the way to Discord.
+    dropped_video: u64,
+    audio_per_sec: Option<u64>,
+    audio_level: Option<HealthLevel>,
+    video_level: Option<HealthLevel>,
+    fps: Option<u64>,
+    jitter_p95_ms: Option<u64>,
+    jitter_max_ms: Option<u64>,
+    bitrate_kbps: Option<u64>,
+}
+
+impl HealthView {
+    fn new(health: &LiveHealth, source_dropped_video: u64) -> Self {
+        let m = health.metrics;
+        Self {
+            reconnecting: health.reconnecting,
+            reconnects: health.reconnects(),
+            dropped_video: health.dropped_video + source_dropped_video,
+            audio_per_sec: m.map(|m| m.a_sent),
+            audio_level: health.audio_level,
+            video_level: health.video_level,
+            fps: m.map(|m| m.fps),
+            jitter_p95_ms: m.map(|m| m.gap_p95_ms),
+            jitter_max_ms: m.map(|m| m.gap_max_ms),
+            bitrate_kbps: m.map(|m| m.bitrate_kbps),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,11 +243,17 @@ fn queue<W>(writer: &mut FramedWrite<W, ControlCodec>, event: &Event) {
     }
 }
 
+/// What the live session reports to its producer.
+pub(super) struct Reports {
+    pub viewers: watch::Receiver<Option<u32>>,
+    pub health: watch::Receiver<Option<LiveHealth>>,
+}
+
 /// Feeds an attachment from `reader` and reports to `writer` until either side ends it.
 pub(super) async fn run<R, W>(
     attachment: Attachment,
     mut states: watch::Receiver<SourceState>,
-    mut viewers: watch::Receiver<Option<u32>>,
+    reports: Reports,
     mut reader: FramedRead<R, ProducerCodec>,
     mut writer: FramedWrite<W, ControlCodec>,
     mut phase: watch::Receiver<Phase>,
@@ -217,10 +262,15 @@ pub(super) async fn run<R, W>(
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let Reports {
+        mut viewers,
+        mut health,
+    } = reports;
     let mut requests = attachment.keyframe_requests();
     let mut ingest = Ingest::default();
     let (mut keyframe_due, mut source_due, mut states_open) = (false, true, true);
     let (mut viewers_due, mut viewers_open) = (viewers.borrow_and_update().is_some(), true);
+    let (mut health_due, mut health_open) = (health.borrow_and_update().is_some(), true);
     let current = phase.clone();
     let stopped = |attachment: &Attachment| {
         if *current.borrow() != Phase::Running {
@@ -243,6 +293,11 @@ pub(super) async fn run<R, W>(
             } else if std::mem::take(&mut viewers_due) {
                 let count = *viewers.borrow_and_update();
                 queue(&mut writer, &Event::Viewers { count });
+            } else if std::mem::take(&mut health_due) {
+                let view = health
+                    .borrow_and_update()
+                    .map(|h| HealthView::new(&h, attachment.stats().dropped_video));
+                queue(&mut writer, &Event::Health { view });
             }
         }
         let unflushed = !writer.write_buffer().is_empty();
@@ -260,6 +315,10 @@ pub(super) async fn run<R, W>(
             changed = viewers.changed(), if viewers_open => match changed {
                 Ok(()) => viewers_due = true,
                 Err(_) => viewers_open = false,
+            },
+            changed = health.changed(), if health_open => match changed {
+                Ok(()) => health_due = true,
+                Err(_) => health_open = false,
             },
             flushed = SinkExt::<&Event>::flush(&mut writer), if unflushed => {
                 if flushed.is_err() {
@@ -434,6 +493,38 @@ mod tests {
             },
             Event::Viewers { count: Some(3) },
             Event::Viewers { count: None },
+            Event::Health {
+                view: Some(HealthView::new(
+                    &LiveHealth {
+                        reconnect_episodes: 1,
+                        resumes: 1,
+                        metrics: Some(dstreamy_core::StreamMetrics {
+                            fps: 59,
+                            gap_p95_ms: 18,
+                            gap_max_ms: 41,
+                            bitrate_kbps: 5800,
+                            a_sent: 50,
+                            ..dstreamy_core::StreamMetrics::default()
+                        }),
+                        audio_level: Some(HealthLevel::Good),
+                        video_level: Some(HealthLevel::Warn),
+                        dropped_video: 3,
+                        ..LiveHealth::default()
+                    },
+                    1,
+                )),
+            },
+            Event::Health {
+                view: Some(HealthView::new(
+                    &LiveHealth {
+                        reconnecting: true,
+                        reconnect_episodes: 1,
+                        ..LiveHealth::default()
+                    },
+                    0,
+                )),
+            },
+            Event::Health { view: None },
             Detach::Stopped("no media within the grace period".into()).event(),
             Detach::Shutdown.event(),
             Detach::Incompatible(
@@ -493,6 +584,7 @@ mod tests {
         events: tokio::task::JoinHandle<()>,
         phase: watch::Sender<Phase>,
         viewers: watch::Sender<Option<u32>>,
+        health: watch::Sender<Option<LiveHealth>>,
     }
 
     /// A started source with one attachment served over a duplex whose buffers hold `buffer` bytes.
@@ -524,10 +616,14 @@ mod tests {
         let (read, write) = tokio::io::split(service);
         let (phase, phase_rx) = watch::channel(Phase::Running);
         let (viewers, viewers_rx) = watch::channel(viewers);
+        let (health, health_rx) = watch::channel(None);
         let events = tokio::spawn(run(
             attachment,
             handle.state(),
-            viewers_rx,
+            Reports {
+                viewers: viewers_rx,
+                health: health_rx,
+            },
             FramedRead::new(read, ProducerCodec::new()),
             FramedWrite::new(write, ControlCodec::new()),
             phase_rx,
@@ -540,6 +636,7 @@ mod tests {
             events,
             phase,
             viewers,
+            health,
         }
     }
 
@@ -601,6 +698,13 @@ mod tests {
     }
 
     async fn next_viewers(reader: &mut FramedRead<&mut DuplexStream, ControlCodec>) -> Value {
+        next_of("viewers", reader).await
+    }
+
+    async fn next_of(
+        kind: &str,
+        reader: &mut FramedRead<&mut DuplexStream, ControlCodec>,
+    ) -> Value {
         loop {
             let line = timeout(T, reader.next())
                 .await
@@ -608,7 +712,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap();
-            if line["type"] == "viewers" {
+            if line["type"] == kind {
                 return line;
             }
         }
@@ -649,6 +753,86 @@ mod tests {
         drop(reader);
         r.phase.send_replace(Phase::Stopping);
         timeout(T, r.events).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_is_sent_on_every_change_and_empty_once_the_stream_stops() {
+        let mut r = rig(1 << 16).await;
+        let mut reader = FramedRead::new(&mut r.client, ControlCodec::new());
+        r.health.send_replace(Some(LiveHealth {
+            reconnecting: true,
+            reconnect_episodes: 1,
+            ..LiveHealth::default()
+        }));
+        assert_eq!(
+            next_of("health", &mut reader).await,
+            json!({
+                "type": "health", "reconnecting": true, "reconnects": 1, "dropped_video": 0,
+                "audio_per_sec": null, "audio_level": null, "video_level": null, "fps": null,
+                "jitter_p95_ms": null, "jitter_max_ms": null, "bitrate_kbps": null
+            })
+        );
+        let metrics = dstreamy_core::StreamMetrics {
+            fps: 59,
+            gap_p95_ms: 18,
+            gap_max_ms: 41,
+            bitrate_kbps: 5800,
+            a_sent: 50,
+            ..dstreamy_core::StreamMetrics::default()
+        };
+        r.health.send_replace(Some(LiveHealth {
+            reconnect_episodes: 1,
+            resumes: 1,
+            metrics: Some(metrics),
+            audio_level: Some(HealthLevel::Good),
+            video_level: Some(HealthLevel::Warn),
+            dropped_video: 3,
+            ..LiveHealth::default()
+        }));
+        let line = next_of("health", &mut reader).await;
+        assert_eq!(
+            (
+                &line["reconnecting"],
+                &line["reconnects"],
+                &line["dropped_video"]
+            ),
+            (&json!(false), &json!(2), &json!(3))
+        );
+        assert_eq!(
+            (
+                &line["audio_per_sec"],
+                &line["audio_level"],
+                &line["video_level"]
+            ),
+            (&json!(50), &json!("good"), &json!("warn"))
+        );
+        assert_eq!(
+            (
+                &line["fps"],
+                &line["jitter_p95_ms"],
+                &line["jitter_max_ms"],
+                &line["bitrate_kbps"]
+            ),
+            (&json!(59), &json!(18), &json!(41), &json!(5800))
+        );
+        r.health.send_replace(None);
+        assert_eq!(
+            next_of("health", &mut reader).await,
+            json!({"type": "health"})
+        );
+        drop(reader);
+        r.phase.send_replace(Phase::Stopping);
+        timeout(T, r.events).await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn health_counts_the_attachments_own_drops_too() {
+        let h = LiveHealth {
+            dropped_video: 3,
+            ..LiveHealth::default()
+        };
+        let view = serde_json::to_value(HealthView::new(&h, 2)).unwrap();
+        assert_eq!(view["dropped_video"], 5);
     }
 
     async fn detached_after(sent: &[BytesMut]) -> (Value, SourceState) {

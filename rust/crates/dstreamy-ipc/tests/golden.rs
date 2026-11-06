@@ -65,7 +65,15 @@ fn producer_reverse_channel_events() {
     assert_eq!(lines[3], json!({"type": "source", "state": "detached"}));
     assert_eq!(lines[4], json!({"type": "viewers", "count": 3}));
     assert_eq!(lines[5], json!({"type": "viewers", "count": null}));
-    let reasons: Vec<&str> = lines[6..]
+    assert_eq!(lines[6]["type"], "health");
+    assert_eq!(
+        (&lines[6]["reconnects"], &lines[6]["audio_per_sec"]),
+        (&json!(2), &json!(50))
+    );
+    assert_eq!(lines[7]["reconnecting"], true);
+    assert_eq!(lines[7]["fps"], Value::Null);
+    assert_eq!(lines[8], json!({"type": "health"}));
+    let reasons: Vec<&str> = lines[9..]
         .iter()
         .map(|l| {
             assert_eq!(l["type"], "detached", "{l}");

@@ -5,11 +5,12 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use dstreamy_core::{
-    Codec, ConfigError, CropRect, Fps, IdleSetting, Resolution, ServeConfig, StreamConfig,
-    TOKEN_ENV, TokenSource,
+    Codec, ConfigError, CropRect, Fps, HealthLevel, IdleSetting, Resolution, ServeConfig,
+    StreamConfig, StreamMetrics, TOKEN_ENV, TokenSource,
 };
 use dstreamy_discord::{
-    DiscordClient, GatewayError, Session, SessionError, SessionEvent, SessionState, StreamStats,
+    DiscordClient, GatewayError, HealthSnapshot, Session, SessionError, SessionEvent, SessionState,
+    StreamStats,
 };
 use dstreamy_media::{
     CaptureConfig, CaptureSource, EXTERNAL_TARGET_ID, ExternalHandle, ExternalOptions,
@@ -59,6 +60,56 @@ impl Default for Options {
 pub enum EngineEvent {
     Session(SessionEvent),
     Source(SourceState),
+}
+
+/// The live stream's health for producers, from its start until it stops.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LiveHealth {
+    pub reconnecting: bool,
+    /// Times the session went reconnecting.
+    pub reconnect_episodes: u64,
+    /// Voice or stream connection resumes, which need no reconnect.
+    pub resumes: u64,
+    /// The last interval's metrics; `None` until the first one.
+    pub metrics: Option<StreamMetrics>,
+    pub audio_level: Option<HealthLevel>,
+    pub video_level: Option<HealthLevel>,
+    /// Video frames dropped on the way to Discord.
+    pub dropped_video: u64,
+}
+
+impl LiveHealth {
+    pub fn reconnects(&self) -> u64 {
+        self.reconnect_episodes + self.resumes
+    }
+
+    /// `current` is `None` before the stream starts or after it stops.
+    fn on_state(current: Option<Self>, state: &SessionState) -> Option<Self> {
+        match state {
+            SessionState::Connecting => Some(Self::default()),
+            SessionState::Streaming => Some(Self {
+                reconnecting: false,
+                ..current.unwrap_or_default()
+            }),
+            SessionState::Reconnecting { .. } => current.map(|h| Self {
+                reconnecting: true,
+                reconnect_episodes: h.reconnect_episodes + u64::from(!h.reconnecting),
+                ..h
+            }),
+            SessionState::Idle | SessionState::Stopped { .. } => None,
+        }
+    }
+
+    fn on_health(current: Option<Self>, snapshot: &HealthSnapshot) -> Option<Self> {
+        Some(Self {
+            resumes: snapshot.stats.resumes,
+            metrics: Some(snapshot.metrics),
+            audio_level: Some(snapshot.health.audio_level),
+            video_level: Some(snapshot.health.video_level),
+            dropped_video: snapshot.stats.video_frames_dropped,
+            ..current.unwrap_or_default()
+        })
+    }
 }
 
 /// The `[serve]` settings as options for an external source; `stall_ms` below the first-frames wait is refused.
@@ -368,6 +419,7 @@ pub struct Engine {
     updating: tokio::sync::Mutex<()>,
     last_stats: Mutex<Option<StreamStats>>,
     viewers: watch::Sender<Option<u32>>,
+    health: watch::Sender<Option<LiveHealth>>,
     running: Mutex<Option<Running>>,
     /// Set before the session starts, so a session that stops at once never leaves it behind.
     place: Mutex<Option<Placed>>,
@@ -448,6 +500,7 @@ impl Engine {
             updating: tokio::sync::Mutex::new(()),
             last_stats: Mutex::new(None),
             viewers: watch::Sender::new(None),
+            health: watch::Sender::new(None),
             running: Mutex::new(None),
             place: Mutex::new(None),
             conn_seq: std::sync::atomic::AtomicU64::new(0),
@@ -736,6 +789,11 @@ impl Engine {
         self.viewers.subscribe()
     }
 
+    /// The live stream's health, `None` while no stream runs.
+    pub fn health(&self) -> watch::Receiver<Option<LiveHealth>> {
+        self.health.subscribe()
+    }
+
     /// Health stops while not streaming, so the last count would go stale.
     fn forget_viewers(&self) {
         if let Some(stats) = lock(&self.last_stats).as_mut() {
@@ -899,8 +957,16 @@ impl Engine {
                             self.viewers.send_if_modified(|v| {
                                 std::mem::replace(v, h.stats.viewers) != h.stats.viewers
                             });
+                            self.health.send_if_modified(|v| {
+                                let next = LiveHealth::on_health(*v, h);
+                                std::mem::replace(v, next) != next
+                            });
                         }
                         SessionEvent::State { state } => {
+                            self.health.send_if_modified(|v| {
+                                let next = LiveHealth::on_state(*v, state);
+                                std::mem::replace(v, next) != next
+                            });
                             if *state != SessionState::Streaming {
                                 self.forget_viewers();
                             }
@@ -1226,6 +1292,7 @@ impl Engine {
         self.release_if_stopped();
         let stats = lock(&self.last_stats).take().unwrap_or_default();
         self.viewers.send_replace(None);
+        self.health.send_replace(None);
         serde_json::to_value(stats).map_err(|e| Failure::new("internal", e.to_string()))
     }
 
@@ -1324,6 +1391,61 @@ fn session_failure(e: SessionError) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(resumes: u64, dropped: u64, a_sent: u64) -> HealthSnapshot {
+        let metrics = StreamMetrics {
+            fps: 60,
+            a_sent,
+            ..StreamMetrics::default()
+        };
+        HealthSnapshot {
+            metrics,
+            health: dstreamy_core::StreamHealth::compute(&[metrics], 60),
+            stats: StreamStats {
+                resumes,
+                video_frames_dropped: dropped,
+                ..StreamStats::default()
+            },
+        }
+    }
+
+    #[test]
+    fn live_health_counts_reconnects_and_resumes_per_stream() {
+        let reconnecting = SessionState::Reconnecting { attempt: 1 };
+        let mut h = LiveHealth::on_state(None, &SessionState::Connecting);
+        assert_eq!(h, Some(LiveHealth::default()));
+        h = LiveHealth::on_state(h, &SessionState::Streaming);
+        h = LiveHealth::on_health(h, &snapshot(1, 4, 50));
+        let got = h.unwrap();
+        assert_eq!((got.reconnects(), got.dropped_video), (1, 4));
+        assert_eq!(got.metrics.map(|m| m.a_sent), Some(50));
+        assert_eq!(got.audio_level, Some(HealthLevel::Good));
+        h = LiveHealth::on_state(h, &reconnecting);
+        h = LiveHealth::on_state(h, &SessionState::Reconnecting { attempt: 2 });
+        let got = h.unwrap();
+        assert!(got.reconnecting);
+        assert_eq!(got.reconnects(), 2, "one episode, however many attempts");
+        assert_eq!(
+            got.metrics.map(|m| m.a_sent),
+            Some(50),
+            "the last figures stay"
+        );
+        h = LiveHealth::on_state(h, &SessionState::Streaming);
+        h = LiveHealth::on_state(h, &reconnecting);
+        assert_eq!(h.unwrap().reconnects(), 3);
+        h = LiveHealth::on_state(h, &SessionState::Streaming);
+        assert!(!h.unwrap().reconnecting);
+        let stopped = SessionState::Stopped {
+            reason: dstreamy_discord::StopReason::Requested,
+        };
+        assert_eq!(LiveHealth::on_state(h, &stopped), None);
+        assert_eq!(
+            LiveHealth::on_state(h, &SessionState::Connecting),
+            Some(LiveHealth::default()),
+            "a new stream counts from zero"
+        );
+        assert_eq!(LiveHealth::on_state(None, &reconnecting), None);
+    }
 
     #[test]
     fn service_errors_keep_their_own_codes() {
