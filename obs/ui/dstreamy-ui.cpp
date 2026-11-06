@@ -321,7 +321,7 @@ QColor apply_tint(QLabel *l, const Tint &tint)
 			color = QColor(QString::fromLatin1(tint.fallback));
 		} else {
 			color = plain;
-			color.setAlphaF(0.55);
+			color.setAlphaF(0.55f);
 		}
 		l->setStyleSheet(QStringLiteral("color: rgba(%1, %2, %3, %4);")
 					 .arg(color.red())
