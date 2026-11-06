@@ -441,6 +441,7 @@ fn announce_stream(shared: &Shared, state: &mut State, key: &str) {
             stream_key: key.to_owned(),
             rtc_server_id: rtc_server_id.clone(),
             paused: false,
+            viewer_ids: Vec::new(),
         },
     );
     shared.dispatch(
@@ -521,11 +522,20 @@ fn stream_set_paused(shared: &Shared, state: &mut State, d: &Value) {
         return;
     };
     stream.paused = paused;
-    shared.dispatch(
-        state,
-        "STREAM_UPDATE",
-        json!({ "stream_key": key, "region": "mock", "viewer_ids": [], "paused": paused }),
-    );
+    stream_update(shared, state, key);
+}
+
+pub(crate) fn stream_update(shared: &Shared, state: &mut State, key: &str) {
+    let Some(stream) = state.streams.get(key) else {
+        return;
+    };
+    let payload = json!({
+        "stream_key": key,
+        "region": "mock",
+        "viewer_ids": stream.viewer_ids,
+        "paused": stream.paused,
+    });
+    shared.dispatch(state, "STREAM_UPDATE", payload);
 }
 
 /// Send op 9; a non-resumable invalidation forgets the session so only IDENTIFY works.

@@ -144,6 +144,7 @@ pub struct StreamSnapshot {
     pub stream_key: String,
     pub rtc_server_id: String,
     pub paused: bool,
+    pub viewer_ids: Vec<String>,
 }
 
 #[derive(Debug)]

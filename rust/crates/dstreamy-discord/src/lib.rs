@@ -5,6 +5,7 @@ pub mod gateway;
 pub mod remote_auth;
 pub mod session;
 pub mod stream;
+mod viewers;
 
 pub use client::DiscordClient;
 pub use gateway::{

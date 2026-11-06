@@ -20,6 +20,7 @@ use crate::stream::{
     Events, StreamError, StreamOptions, StreamStats, initial_attributes, join_voice, open_stream,
 };
 use crate::transport::{MediaConnection, VideoAttributes, VoiceEvent};
+use crate::viewers::Viewers;
 
 const EVENT_CAPACITY: usize = 256;
 
@@ -494,6 +495,7 @@ struct Run {
     joined: bool,
     /// The latest voice state held back while not `joined`.
     unacked: Option<VoiceState>,
+    viewers: Viewers,
 }
 
 impl Run {
@@ -518,6 +520,7 @@ impl Run {
             history: Vec::new(),
             joined: false,
             unacked: None,
+            viewers: Viewers::default(),
         }
     }
 
@@ -869,6 +872,12 @@ impl Run {
                 }
                 Gateway::Handled
             }
+            Some(GatewayEvent::Dispatch(d)) => {
+                let user = &self.client.user().id;
+                self.viewers
+                    .apply(&d, self.guild_id.as_deref(), &self.channel_id, user);
+                Gateway::Handled
+            }
             Some(_) => Gateway::Handled,
             None => {
                 actor.error("gateway closed", true);
@@ -891,6 +900,7 @@ impl Run {
                     .set_voice_channel(guild_id.clone(), channel_id.clone());
                 self.guild_id = guild_id.clone();
                 self.channel_id = channel_id.clone();
+                self.viewers.reset();
                 actor.emit(SessionEvent::ChannelMoved {
                     guild_id,
                     channel_id,
@@ -993,7 +1003,10 @@ impl Run {
 
     fn sample(&mut self) -> Option<HealthSnapshot> {
         let pump = self.pump.as_ref()?;
-        let stats = pump.stats();
+        let stats = StreamStats {
+            viewers: self.viewers.count(),
+            ..pump.stats()
+        };
         let jitter = pump.take_frame_intervals();
         let cumulative = PipelineStats {
             frame_count: stats.video_frames_sent + stats.video_frames_dropped,

@@ -15,8 +15,8 @@ use dstreamy_media::{
 use dstreamy_mock_discord::opcodes::gateway as gw;
 use dstreamy_mock_discord::opcodes::voice as vo;
 use dstreamy_mock_discord::{
-    MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID, MOCK_TOKEN, MOCK_VOICE_CHANNEL_ID, MockDiscord,
-    VoiceKind, rtc,
+    MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID, MOCK_TOKEN, MOCK_USER_ID, MOCK_VOICE_CHANNEL_ID,
+    MockDiscord, VoiceKind, rtc,
 };
 use secrecy::SecretString;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -417,6 +417,41 @@ async fn a_lost_voice_connection_leaves_before_rejoining() {
         channels[1..rejoin].contains(&None),
         "no leave before the rejoin: {channels:?}"
     );
+    f.finish().await;
+}
+
+async fn wait_viewers(f: &mut Fixture, want: Option<u32>) {
+    f.wait_event(|e| matches!(e, SessionEvent::Health(h) if h.stats.viewers == want))
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn health_counts_viewers_as_they_join_and_leave() {
+    let mut f = Fixture::streaming().await;
+    // The mock answers the op 22 after STREAM_CREATE with an empty STREAM_UPDATE.
+    wait_viewers(&mut f, Some(0)).await;
+    assert!(
+        f.mock
+            .set_viewers(&["400000000000000001", "400000000000000002"])
+    );
+    wait_viewers(&mut f, Some(2)).await;
+    assert!(f.mock.set_viewers(&["400000000000000002", MOCK_USER_ID]));
+    wait_viewers(&mut f, Some(1)).await;
+    assert!(f.mock.set_viewers(&[]));
+    wait_viewers(&mut f, Some(0)).await;
+    assert!(f.mock.set_viewers(&["400000000000000003"]));
+    wait_viewers(&mut f, Some(1)).await;
+
+    assert!(
+        f.mock
+            .drop_voice(VoiceKind::Stream, Some(vo::CLOSE_SESSION_NO_LONGER_VALID))
+    );
+    f.mock
+        .wait_for_op(None, gw::OP_STREAM_CREATE, 1, T)
+        .await
+        .expect("second STREAM_CREATE");
+    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    wait_viewers(&mut f, Some(0)).await;
     f.finish().await;
 }
 

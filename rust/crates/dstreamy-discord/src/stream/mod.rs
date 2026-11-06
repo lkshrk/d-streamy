@@ -82,6 +82,8 @@ pub struct StreamStats {
     pub capture_ended: bool,
     /// The voice or stream connection gave up; the stream needs restarting.
     pub connection_closed: bool,
+    /// Viewers other than this account; `None` until Discord reports them.
+    pub viewers: Option<u32>,
 }
 
 pub struct StreamHandle {

@@ -287,6 +287,22 @@ impl MockDiscord {
         self.shared.state().ignore_stream_creates = n;
     }
 
+    /// Sets who watches the user's Go Live and sends STREAM_UPDATE; false when the user isn't streaming.
+    pub fn set_viewers(&self, viewer_ids: &[&str]) -> bool {
+        let mut state = self.shared.state();
+        let suffix = format!(":{}", self.shared.config.user.id);
+        let Some(key) = state.streams.keys().find(|k| k.ends_with(&suffix)).cloned() else {
+            return false;
+        };
+        if let Some(stream) = state.streams.get_mut(&key) {
+            stream.viewer_ids = viewer_ids.iter().map(|&id| id.to_owned()).collect();
+        }
+        gateway::stream_update(&self.shared, &mut state, &key);
+        drop(state);
+        self.shared.notify();
+        true
+    }
+
     /// Close the voice WebSocket of `kind`; `None` drops TCP without a close frame. The connection stays resumable.
     pub fn drop_voice(&self, kind: VoiceKind, close_code: Option<u16>) -> bool {
         let state = self.shared.state();
