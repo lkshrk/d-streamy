@@ -88,6 +88,7 @@ const char *restart_output_settings;
 	const char *tools_stop_after;
 	bool tools_wait_end;
 	bool tools_exit_while_starting;
+	bool tools_cancel_start;
 	bool tools_exit_while_live;
 	bool settings_cancel;
 	int audio_mixers;
@@ -635,6 +636,7 @@ static void usage(void)
 		"  [--tools-stop-after PATH (with --tools-session: wait until PATH exists before clicking Stop)]\n"
 		"  [--tools-wait-end (with --tools-session: instead of Stop, wait for the session to end on its own)]\n"
 		"  [--tools-exit-while-starting (with --tools-session: close OBS right after the Start click)]\n"
+		"  [--tools-cancel-start (with --tools-session: answer Start's question with Cancel, then reopen)]\n"
 		"  [--tools-exit-while-live (with --tools-session: close OBS while Live, after --tools-stop-after, instead of Stop)]\n"
 		"  [--settings-cancel (with --settings-update: then Cancel, as OBS's properties dialog does, before reopening)]\n"
 		"  [--mixer-session (with --fake-frontend: create audio sources Music and Voice on all tracks, take the\n"
@@ -755,6 +757,10 @@ static int parse_args(int argc, char **argv)
 		}
 		if (strcmp(a, "--tools-exit-while-starting") == 0) {
 			args.tools_exit_while_starting = true;
+			continue;
+		}
+		if (strcmp(a, "--tools-cancel-start") == 0) {
+			args.tools_cancel_start = true;
 			continue;
 		}
 		if (strcmp(a, "--tools-exit-while-live") == 0) {
@@ -1268,6 +1274,21 @@ static bool click_settings_button(obs_source_t *source, const char *name)
 	       os_atomic_load_long(&click_thread_refreshes) - before);
 	bfree(status);
 	return enabled;
+}
+
+// Start and Stop ask first: report the question and whether the output runs, then answer it with `answer`.
+static bool click_and_answer(obs_source_t *source, const char *name, const char *answer)
+{
+	if (!click_settings_button(source, name))
+		return false;
+	obs_properties_t *props = obs_source_properties(source);
+	obs_property_t *question = obs_properties_get(props, "stream_question");
+	obs_output_t *output = obs_get_output_by_name("D-Streamy");
+	printf("HARNESS settings_asked name=%s output_active=%d question=%s\n", name,
+	       output && obs_output_active(output) ? 1 : 0, question ? obs_property_description(question) : "");
+	obs_output_release(output);
+	obs_properties_destroy(props);
+	return click_settings_button(source, answer);
 }
 
 static bool starts_with(const char *text, const char *prefix)
@@ -2382,7 +2403,25 @@ static bool tools_session(void)
 		ok = apply_settings_update(source, args.then_update);
 		report_settings_properties(source, "updated_again");
 	}
-	ok = ok && click_settings_button(source, "start");
+	if (ok && args.tools_cancel_start) {
+		ok = click_and_answer(source, "start", "cancel_stream");
+		obs_output_t *output = obs_get_output_by_name("D-Streamy");
+		printf("HARNESS tools output=%d active=%d\n", output != NULL,
+		       output && obs_output_active(output) ? 1 : 0);
+		obs_output_release(output);
+		report_settings_properties(source, "cancelled");
+		signal_handler_disconnect(signals, "update_properties", on_update_properties, NULL);
+		close_settings_dialog(source);
+		source = open_settings_dialog();
+		if (!source) {
+			harness_error("the settings source did not reopen");
+			return false;
+		}
+		report_settings_properties(source, "reopened");
+		close_settings_dialog(source);
+		return ok;
+	}
+	ok = ok && click_and_answer(source, "start", "confirm_stream");
 	if (ok && args.tools_exit_while_starting) {
 		char *status = settings_status(source);
 		printf("HARNESS tools exiting status=%s\n", status);
@@ -2440,7 +2479,7 @@ static bool tools_session(void)
 		} else {
 			if (args.tools_stop_after)
 				ok = wait_for_file(args.tools_stop_after) && ok;
-			ok = click_settings_button(source, "stop") && ok;
+			ok = click_and_answer(source, "stop", "confirm_stream") && ok;
 			status = wait_for_refresh(source, "Stopping", "stopped");
 		}
 		ok = tools_outcome(status, "Idle") && ok;

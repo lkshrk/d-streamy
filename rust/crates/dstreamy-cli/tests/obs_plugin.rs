@@ -177,6 +177,25 @@ fn passed(status: ExitStatus, lines: &[String]) {
     );
 }
 
+/// The dialog's `name` (start or stop) asked a question starting with `question` and changed nothing itself.
+fn asked_first(lines: &[String], name: &str, output_active: u8, question: &str) {
+    let prefix = format!(
+        "HARNESS settings_asked name={name} output_active={output_active} question={question}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with(&prefix)),
+        "{prefix}: {lines:#?}"
+    );
+    let clicked = lines
+        .iter()
+        .find(|l| l.starts_with(&format!("HARNESS settings_clicked name={name} enabled=1 ")))
+        .unwrap_or_else(|| panic!("no {name} click: {lines:#?}"));
+    assert!(
+        !clicked.contains(" status=Starting") && !clicked.contains(" status=Stopping"),
+        "{name} alone acts on nothing: {clicked}"
+    );
+}
+
 fn has_line(lines: &[String], prefix: &str) -> bool {
     lines.iter().any(|l| l.starts_with(prefix))
 }
@@ -2293,13 +2312,22 @@ fn tools_start_binds_the_chosen_track_and_stop_ends_the_session() {
         lines.iter().any(|l| l == "HARNESS settings_item when=updated name=channel_id value=0 text=General"),
         "{lines:#?}"
     );
+    asked_first(&lines, "start", 0, "Go live in General on Mock Guild");
     assert!(
         lines.iter().any(|l| l
-            == "HARNESS settings_clicked name=start enabled=1 refresh=1 status=Live on Track 3"
+            == "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status=Live on Track 3"
             || l.starts_with(
-                "HARNESS settings_clicked name=start enabled=1 refresh=1 status=Starting on Track 3"
+                "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status=Starting on Track 3"
             )),
-        "{lines:#?}"
+        "the confirm starts: {lines:#?}"
+    );
+    asked_first(&lines, "stop", 1, "Stop the Discord stream?");
+    assert!(
+        lines.iter().any(|l| l.starts_with(
+            "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status=Stopping"
+        ) || l
+            == "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status=Idle"),
+        "the second confirm stops: {lines:#?}"
     );
     assert!(
         lines
@@ -2403,9 +2431,10 @@ fn tools_start_without_the_service_says_so_and_stays_idle() {
     )
     .finish();
     passed(status, &lines);
+    asked_first(&lines, "start", 0, "Go live in ");
     assert!(
         lines.contains(&format!(
-            "HARNESS settings_clicked name=start enabled=1 refresh=1 status={not_running}"
+            "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status={not_running}"
         )),
         "{lines:#?}"
     );
@@ -2439,6 +2468,72 @@ fn tools_start_without_the_service_says_so_and_stays_idle() {
 
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn tools_start_then_cancel_leaves_the_session_idle_and_the_service_untouched() {
+    let h = Harness::new("");
+    let _serve = default_serve(&h);
+    let config = picked_config(3);
+    let (status, lines) = tools_run(
+        &h,
+        config.path(),
+        &[
+            "--tools-cancel-start",
+            "--seconds",
+            "10",
+            "--until-video",
+            "1",
+        ],
+    )
+    .finish();
+    passed(status, &lines);
+    asked_first(&lines, "start", 0, "Go live in ");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l
+                .starts_with("HARNESS settings_clicked name=cancel_stream enabled=1 refresh=1 ")),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("HARNESS settings_clicked name=confirm_stream ")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines.contains(&"HARNESS tools output=0 active=0".to_owned()),
+        "{lines:#?}"
+    );
+    for when in ["cancelled", "reopened"] {
+        for want in [
+            format!("HARNESS settings_property when={when} name=start type=8 enabled=1 desc=Start"),
+            format!("HARNESS settings_property when={when} name=stop type=8 enabled=0 desc=Stop"),
+        ] {
+            assert!(lines.contains(&want), "{want}: {lines:#?}");
+        }
+        assert!(
+            !lines.iter().any(|l| l.starts_with(&format!(
+                "HARNESS settings_property when={when} name=stream_question "
+            ))),
+            "the question is gone: {lines:#?}"
+        );
+    }
+    assert!(!has_plugin_line(&lines, "started from Tools"), "{lines:#?}");
+    assert!(h.mock.voice_state().is_none(), "nothing joined: {lines:#?}");
+    assert!(
+        stream_video(&h.mock.recorded()).is_empty(),
+        "nothing reached Discord"
+    );
+    assert_eq!(
+        serve_session(&h),
+        json!({"state": "idle"}),
+        "serve never started a session"
+    );
+    let saved = read_module_config(config.path());
+    assert_eq!(saved.get("owned"), None, "never owned: {saved}");
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn a_start_without_the_control_thread_says_so_without_rebuilding_inside_the_click() {
     let h = Harness::new("");
     let _serve = default_serve(&h);
@@ -2460,14 +2555,17 @@ fn a_start_without_the_control_thread_says_so_without_rebuilding_inside_the_clic
     )
     .finish();
     passed(status, &lines);
+    asked_first(&lines, "start", 0, "Go live in ");
     assert!(
         lines.contains(&format!(
-            "HARNESS settings_clicked name=start enabled=1 refresh=1 status={gone}"
+            "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status={gone}"
         )),
         "the click's own rebuild shows the error: {lines:#?}"
     );
     assert!(
-        lines.contains(&"HARNESS settings_click_sync_refreshes name=start count=0".to_owned()),
+        lines.contains(
+            &"HARNESS settings_click_sync_refreshes name=confirm_stream count=0".to_owned()
+        ),
         "the click never asked OBS to rebuild the dialog it is running in: {lines:#?}"
     );
     assert!(lines.contains(&"HARNESS tools output=0 active=0".to_owned()));
@@ -2610,9 +2708,10 @@ fn a_server_change_in_the_dialog_never_keeps_the_old_servers_channel() {
         ["value=0 text=Pick a voice channel", "value=0 text=Lobby"],
         "only the new server's channels: {lines:#?}"
     );
+    asked_first(&lines, "start", 0, "Go live in ");
     assert!(
         lines.contains(&format!(
-            "HARNESS settings_clicked name=start enabled=1 refresh=1 status={pick_first}"
+            "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status={pick_first}"
         )),
         "Start never uses the old server's channel: {lines:#?}"
     );
@@ -2695,14 +2794,15 @@ fn a_start_slower_than_the_click_shows_live_or_its_error_without_reopening() {
             extra.extend(["--tools-expect", late_error]);
         }
         let run = tools_run_gated(&h, config.path(), &extra, &gate);
-        let clicked = wait_for_line(&run, "start click", |l| {
-            l.starts_with("HARNESS settings_clicked name=start ")
+        let clicked = wait_for_line(&run, "start confirm", |l| {
+            l.starts_with("HARNESS settings_clicked name=confirm_stream ")
         });
         assert_eq!(
             clicked,
-            "HARNESS settings_clicked name=start enabled=1 refresh=1 status=Starting on Track 4\u{2026}",
+            "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status=Starting on Track 4\u{2026}",
             "the click's wait ran out first"
         );
+        asked_first(&run.lines(), "start", 0, "Go live in ");
         if !answered {
             serve.kill();
         }
@@ -2710,7 +2810,7 @@ fn a_start_slower_than_the_click_shows_live_or_its_error_without_reopening() {
         std::fs::write(&gate, "").unwrap();
         let (status, lines) = run.finish();
         passed(status, &lines);
-        for name in ["start", "stop"] {
+        for name in ["start", "stop", "confirm_stream"] {
             assert!(
                 !lines.iter().any(|l| l.starts_with(&format!(
                     "HARNESS settings_click_sync_refreshes name={name} count="
@@ -2994,6 +3094,7 @@ fn closing_obs_during_a_start_never_streams_and_unloads_promptly() {
         }
         let (status, lines) = run.finish();
         passed(status, &lines);
+        asked_first(&lines, "start", 0, "Go live in ");
         assert!(
             lines.contains(&"HARNESS tools exiting status=Starting on Track 1\u{2026}".to_owned()),
             "{lines:#?}"
