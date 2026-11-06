@@ -704,7 +704,8 @@ Panel *build_panel()
 	logout_confirm->addWidget(ui.logout_ok);
 	ui.logout_row->setVisible(false);
 	rows->addWidget(ui.logout_row);
-	for (auto [b, yes] : {std::pair{ui.logout_ok.data(), true}, std::pair{ui.logout_cancel.data(), false}}) {
+	for (auto [b, choice] : {std::pair{ui.logout_ok.data(), true}, std::pair{ui.logout_cancel.data(), false}}) {
+		const bool yes = choice;
 		QObject::connect(b, &QPushButton::clicked, b, [yes] {
 			guarded("confirm_logout", [yes] {
 				if (!ui.active)
