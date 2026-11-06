@@ -185,13 +185,14 @@ fn live_panel(frame: &mut Frame, area: Rect, live: &Live) {
         Constraint::Length(8),
     ])
     .areas(area);
+    let mut place = format!("  ·  {} › {}  ·  {}", live.guild, live.channel, live.target);
+    if let Some(watching) = live.watching() {
+        place.push_str(&format!("  ·  {watching}"));
+    }
     frame.render_widget(
         Line::from(vec![
             toned(live.state.to_string(), state_tone(&live.state)),
-            Span::raw(format!(
-                "  ·  {} › {}  ·  {}",
-                live.guild, live.channel, live.target
-            )),
+            Span::raw(place),
         ]),
         info,
     );
@@ -409,6 +410,20 @@ mod tests {
     #[test]
     fn live_screen_with_health() {
         insta::assert_snapshot!(render(&streaming()));
+    }
+
+    #[test]
+    fn live_screen_with_viewers() {
+        let mut app = streaming();
+        app.update(Msg::session(SessionEvent::Health(HealthSnapshot {
+            metrics: StreamMetrics::default(),
+            health: StreamHealth::compute(&[StreamMetrics::default()], 30),
+            stats: StreamStats {
+                viewers: Some(3),
+                ..StreamStats::default()
+            },
+        })));
+        insta::assert_snapshot!(render(&app));
     }
 
     #[test]

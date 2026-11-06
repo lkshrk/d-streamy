@@ -289,6 +289,15 @@ impl Live {
         !matches!(self.state, SessionState::Stopped { .. })
     }
 
+    /// "3 watching" while streaming, once Discord has reported the viewers.
+    pub fn watching(&self) -> Option<String> {
+        if self.state != SessionState::Streaming {
+            return None;
+        }
+        let n = self.health.as_ref()?.stats.viewers?;
+        Some(format!("{n} watching"))
+    }
+
     fn log(&mut self, tone: Tone, text: impl Into<String>) {
         if self.log.len() == LOG_LINES {
             self.log.pop_front();
@@ -961,6 +970,37 @@ mod tests {
         assert_eq!(live.channel, "General");
         assert_eq!(live.log.len(), LOG_LINES);
         assert_eq!(live.state, SessionState::Reconnecting { attempt: 1 });
+    }
+
+    #[test]
+    fn watching_shows_a_reported_count_while_streaming() {
+        let mut live = Live {
+            guild: "Mock Guild".into(),
+            channel: "General".into(),
+            target: "Test pattern".into(),
+            target_fps: 30,
+            state: SessionState::Streaming,
+            health: None,
+            log: VecDeque::new(),
+            stopping: false,
+        };
+        assert_eq!(live.watching(), None);
+        let health = |viewers| HealthSnapshot {
+            metrics: StreamMetrics::default(),
+            health: StreamHealth::compute(&[StreamMetrics::default()], 30),
+            stats: StreamStats {
+                viewers,
+                ..StreamStats::default()
+            },
+        };
+        live.health = Some(health(None));
+        assert_eq!(live.watching(), None);
+        live.health = Some(health(Some(0)));
+        assert_eq!(live.watching().as_deref(), Some("0 watching"));
+        live.health = Some(health(Some(3)));
+        assert_eq!(live.watching().as_deref(), Some("3 watching"));
+        live.state = SessionState::Reconnecting { attempt: 1 };
+        assert_eq!(live.watching(), None);
     }
 
     #[test]

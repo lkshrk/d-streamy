@@ -5,8 +5,8 @@ use std::time::Duration;
 use clap::Args;
 use dstreamy_core::{Codec, Config, CropRect, Fps, Resolution, StreamConfig};
 use dstreamy_discord::{
-    DiscordClient, Session, SessionError, SessionEvent, SessionOptions, SessionState, StopReason,
-    StreamOptions,
+    DiscordClient, HealthSnapshot, Session, SessionError, SessionEvent, SessionOptions,
+    SessionState, StopReason, StreamOptions,
 };
 use dstreamy_media::{CaptureConfig, CaptureSource, VideoCodec};
 use tokio::sync::broadcast::error::RecvError;
@@ -389,6 +389,24 @@ pub fn stopped_cleanly(reason: &StopReason) -> bool {
     matches!(reason, StopReason::Requested | StopReason::CaptureEnded)
 }
 
+fn health_line(h: &HealthSnapshot) -> String {
+    let mut line = format!(
+        "{} fps  {} kbps  video {} ({})  audio {} ({})  dropped {}  viewer keyframe requests {}",
+        h.metrics.fps,
+        h.metrics.bitrate_kbps,
+        h.health.video_level.label(),
+        h.health.video_score,
+        h.health.audio_level.label(),
+        h.health.audio_score,
+        h.stats.video_frames_dropped,
+        h.stats.viewer_keyframe_requests,
+    );
+    if let Some(n) = h.stats.viewers {
+        line.push_str(&format!("  {n} watching"));
+    }
+    line
+}
+
 fn print_event(out: &Out, event: &SessionEvent) {
     if out.json {
         out.json_line(event);
@@ -396,17 +414,7 @@ fn print_event(out: &Out, event: &SessionEvent) {
     }
     match event {
         SessionEvent::State { state } => out.line(format_args!("state: {state}")),
-        SessionEvent::Health(h) => out.line(format_args!(
-            "{} fps  {} kbps  video {} ({})  audio {} ({})  dropped {}  viewer keyframe requests {}",
-            h.metrics.fps,
-            h.metrics.bitrate_kbps,
-            h.health.video_level.label(),
-            h.health.video_score,
-            h.health.audio_level.label(),
-            h.health.audio_score,
-            h.stats.video_frames_dropped,
-            h.stats.viewer_keyframe_requests,
-        )),
+        SessionEvent::Health(h) => out.line(health_line(h)),
         SessionEvent::ChannelMoved { channel_id, .. } => {
             out.line(format_args!("moved to channel {channel_id}"));
         }
@@ -422,6 +430,26 @@ fn print_event(out: &Out, event: &SessionEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_line_says_how_many_watch_once_known() {
+        use dstreamy_core::{StreamHealth, StreamMetrics};
+        let health = |viewers| HealthSnapshot {
+            metrics: StreamMetrics::default(),
+            health: StreamHealth::compute(&[StreamMetrics::default()], 30),
+            stats: dstreamy_discord::StreamStats {
+                viewers,
+                ..Default::default()
+            },
+        };
+        let unknown = health_line(&health(None));
+        assert!(!unknown.contains("watching"), "{unknown}");
+        let known = health_line(&health(Some(3)));
+        assert!(
+            known.ends_with("viewer keyframe requests 0  3 watching"),
+            "{known}"
+        );
+    }
 
     #[test]
     fn crop_parses_four_numbers() {

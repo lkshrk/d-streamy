@@ -1,0 +1,28 @@
+---
+source: crates/dstreamy-cli/src/tui/view.rs
+expression: render(&app)
+---
+"dstreamy  ·  logged in as mockuser                                              "
+"streaming  ·  Mock Guild › General  ·  Test pattern  ·  3 watching              "
+"┌ Health ──────────────────────────────────────────────────────────────────────┐"
+"│Video   0% bad     Audio   0% bad                                             │"
+"│FPS, last 1s                           Audio frames/s                         │"
+"│                                                                              │"
+"│                                                                              │"
+"│FPS       0 / 30                                                              │"
+"│Jitter    p95 0 ms, max 0 ms                                                  │"
+"│Drops     0 this second, 0 total                                              │"
+"│Audio     0 / 50 frames/s, 0 not ready, 0 errors                              │"
+"│Bitrate   0 kbps                                                              │"
+"│Keyframes 0 viewer requests, 0 resumes                                        │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌ Events ──────────────────────────────────────────────────────────────────────┐"
+"│streaming                                                                     │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                                                "
+"s stop · q stop and quit                                                        "
