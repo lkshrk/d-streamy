@@ -126,12 +126,11 @@ struct Recent<const WINDOW: u64> {
 impl<const WINDOW: u64> Recent<WINDOW> {
     fn push(&mut self, at_ms: u64, total: u64) -> u64 {
         match self.points.back() {
-            None => self.points.push_back((at_ms, 0)),
-            Some(&(_, last)) if total < last => {
+            Some(&(_, last)) if total >= last => {}
+            _ => {
                 self.points.clear();
                 self.points.push_back((at_ms, total));
             }
-            Some(_) => {}
         }
         self.points.push_back((at_ms, total));
         while self.points.len() > 2 && at_ms.saturating_sub(self.points[1].0) >= WINDOW {
@@ -463,6 +462,35 @@ mod tests {
         assert_eq!(later.audio_dropouts_recent, 0, "older than 10 s");
         let old = s.observe(at(12_000, 12_000, 12_000, 0), None, health(None));
         assert_eq!(old.audio_dropouts_recent, 0, "an older serve");
+    }
+
+    #[test]
+    fn totals_from_before_a_restart_are_not_recent() {
+        let mut s = Sampler::default();
+        let health = |reconnects, audio_dropouts| {
+            Some(ServiceHealth {
+                reconnects,
+                audio_dropouts: Some(audio_dropouts),
+                ..ServiceHealth::default()
+            })
+        };
+        s.observe(at(0, 0, 0, 0), None, health(1, 1));
+        s.observe(at(60_000, 9_000_000, 3600, 0), None, health(3, 4));
+        let restarted = s.observe(at(61_000, 1000, 1, 0), None, health(3, 4));
+        assert_eq!(
+            (restarted.reconnects_recent, restarted.audio_dropouts_recent),
+            (0, 0)
+        );
+        let fresh = Sampler::default().observe(at(5, 0, 0, 0), None, health(3, 4));
+        assert_eq!(
+            (fresh.reconnects_recent, fresh.audio_dropouts_recent),
+            (0, 0)
+        );
+        let later = s.observe(at(62_000, 2000, 2, 0), None, health(4, 6));
+        assert_eq!(
+            (later.reconnects_recent, later.audio_dropouts_recent),
+            (1, 2)
+        );
     }
 
     #[test]

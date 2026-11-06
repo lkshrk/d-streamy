@@ -15,7 +15,7 @@ use dstreamy_media::AUDIO_DEVICE_TARGET;
 use serde::Serialize;
 use tracing::Level;
 use tracing_subscriber::Layer;
-use tracing_subscriber::filter::{Targets, filter_fn};
+use tracing_subscriber::filter::{LevelFilter, Targets, filter_fn};
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -36,7 +36,7 @@ struct Cli {
     /// Saved account to use instead of the default, see `dstreamy account list`
     #[arg(long, global = true, value_name = "NAME", value_parser = account_name)]
     account: Option<String>,
-    /// Log more on stderr (-v info, -vv debug); RUST_LOG adds per-target levels on top
+    /// Log more on stderr (-v info, -vv debug); RUST_LOG adds target=level directives, and its bare level never quiets D-Streamy's own logs
     #[arg(short, long, global = true, action = ArgAction::Count)]
     verbose: u8,
     #[arg(
@@ -257,15 +257,15 @@ fn init_logging(
         1 => (Level::INFO, Level::WARN),
         _ => (Level::DEBUG, Level::INFO),
     };
-    let mut filter = Targets::new()
-        .with_target("dstreamy", ours)
-        .with_target("discord_stream_rs", ours)
+    let mut filter = OWN_TARGETS
+        .iter()
+        .fold(Targets::new(), |t, target| t.with_target(*target, ours))
         .with_default(others);
     if let Ok(spec) = std::env::var("RUST_LOG")
         && !spec.trim().is_empty()
     {
         match spec.parse::<Targets>() {
-            Ok(extra) => filter = with_overrides(filter, extra),
+            Ok(extra) => filter = with_overrides(filter, ours.into(), extra),
             Err(e) => out.warn(format!("RUST_LOG ignored: {e}")),
         }
     }
@@ -293,12 +293,20 @@ fn init_logging(
         .try_init();
 }
 
-/// `base` with `extra`'s targets and default level, which win where both name one.
-fn with_overrides(base: Targets, extra: Targets) -> Targets {
+const OWN_TARGETS: [&str; 2] = ["dstreamy", "discord_stream_rs"];
+
+/// `base` with `extra`'s targets and default level; a bare level also raises [`OWN_TARGETS`] above `ours`, never lowers them.
+fn with_overrides(base: Targets, ours: LevelFilter, extra: Targets) -> Targets {
     let default = extra.default_level();
+    let named: Vec<String> = extra.iter().map(|(t, _)| t.to_owned()).collect();
     let mut merged = base.with_targets(extra);
     if let Some(level) = default {
         merged = merged.with_default(level);
+        for target in OWN_TARGETS {
+            if !named.iter().any(|n| n == target) {
+                merged = merged.with_target(target, ours.max(level));
+            }
+        }
     }
     merged
 }
@@ -782,6 +790,7 @@ mod tests {
     fn rust_log_raises_one_target_on_top_of_the_verbosity() {
         let f = with_overrides(
             info_filter(),
+            LevelFilter::INFO,
             "dstreamy_discord::viewers=debug".parse().unwrap(),
         );
         assert!(f.would_enable("dstreamy_discord::viewers", &Level::DEBUG));
@@ -792,8 +801,24 @@ mod tests {
 
     #[test]
     fn rust_log_replaces_a_target_and_the_default() {
-        let f = with_overrides(info_filter(), "dstreamy=warn,debug".parse().unwrap());
+        let f = with_overrides(
+            info_filter(),
+            LevelFilter::INFO,
+            "dstreamy=warn,debug".parse().unwrap(),
+        );
         assert!(!f.would_enable("dstreamy_cli::serve", &Level::INFO));
         assert!(f.would_enable("hyper", &Level::DEBUG));
+    }
+
+    #[test]
+    fn a_bare_rust_log_level_raises_our_crates_but_never_lowers_them() {
+        let f = with_overrides(info_filter(), LevelFilter::INFO, "debug".parse().unwrap());
+        assert!(f.would_enable("dstreamy_discord::viewers", &Level::DEBUG));
+        assert!(f.would_enable("discord_stream_rs::voice", &Level::DEBUG));
+        assert!(f.would_enable("hyper", &Level::DEBUG));
+        let f = with_overrides(info_filter(), LevelFilter::INFO, "off".parse().unwrap());
+        assert!(f.would_enable("dstreamy_cli::serve", &Level::INFO));
+        assert!(f.would_enable("discord_stream_rs", &Level::WARN));
+        assert!(!f.would_enable("hyper", &Level::ERROR));
     }
 }
