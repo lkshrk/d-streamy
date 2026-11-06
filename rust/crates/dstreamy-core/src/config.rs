@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::accounts::{Accounts, ResolvedToken};
 use crate::crop::CropRect;
 use crate::stream_config::{InvalidStreamConfig, StreamConfig};
 use crate::target::CaptureTarget;
@@ -33,9 +34,37 @@ pub enum ConfigError {
         path.display()
     )]
     InsecureTokenFile { path: PathBuf, mode: u32 },
+    #[error(
+        "invalid account name {0:?}: use up to 32 lower-case letters, digits, _, . or -, starting with a letter, digit or _"
+    )]
+    InvalidAccountName(String),
+    #[error("unknown account {name:?}; {}", available_accounts(available))]
+    UnknownAccount {
+        name: String,
+        available: Vec<String>,
+    },
+    #[error("account {0:?} has no saved token: run `dstreamy login --account {0}`")]
+    AccountWithoutToken(String),
+    #[error(
+        "an account can't be chosen while {TOKEN_ENV} is set, because that token wins: unset it to use the saved accounts"
+    )]
+    AccountWithEnvToken,
+    #[error("moving the token into an account: {0}")]
+    Migration(String),
 }
 
-fn io_err(path: &Path) -> impl FnOnce(io::Error) -> ConfigError + '_ {
+fn available_accounts(names: &[String]) -> String {
+    if names.is_empty() {
+        "no account is saved: run `dstreamy login`".to_owned()
+    } else {
+        format!(
+            "saved accounts: {} (see `dstreamy account list`)",
+            names.join(", ")
+        )
+    }
+}
+
+pub(crate) fn io_err(path: &Path) -> impl FnOnce(io::Error) -> ConfigError + '_ {
     move |source| ConfigError::Io {
         path: path.to_owned(),
         source,
@@ -130,10 +159,12 @@ impl Config {
     }
 }
 
-/// Locations of the config and token files.
+/// Locations of the config file and the saved accounts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigPaths {
+    pub dir: PathBuf,
     pub config_file: PathBuf,
+    /// The single token of builds before saved accounts; moved into an account on first use.
     pub token_file: PathBuf,
 }
 
@@ -146,26 +177,37 @@ impl ConfigPaths {
 
     pub fn in_dir(dir: &Path) -> Self {
         Self {
+            dir: dir.to_owned(),
             config_file: dir.join("config.toml"),
             token_file: dir.join("token"),
         }
     }
 
-    /// The token from `DSTREAMY_TOKEN`, else from the token file; `None` if neither is set.
-    pub fn load_token(&self) -> Result<Option<String>, ConfigError> {
-        resolve_token(std::env::var(TOKEN_ENV).ok().as_deref(), &self.token_file)
+    pub fn accounts(&self) -> Accounts {
+        Accounts::new(&self.dir)
     }
 
-    /// Writes the token file readable by the owner only.
+    /// The token and its account: `DSTREAMY_TOKEN`, else `account`, else the default account; `None` if none is saved.
+    pub fn resolve_token(
+        &self,
+        account: Option<&str>,
+    ) -> Result<Option<ResolvedToken>, ConfigError> {
+        self.accounts()
+            .resolve(account, std::env::var(TOKEN_ENV).ok().as_deref())
+    }
+
+    /// Saves the token into the default account, or into a new account named `default` when none is saved.
     pub fn save_token(&self, token: &str) -> Result<(), ConfigError> {
-        write_private(&self.token_file, format!("{}\n", token.trim()).as_bytes())
+        let accounts = self.accounts();
+        let name = accounts
+            .default_name()?
+            .unwrap_or_else(|| crate::accounts::FALLBACK_NAME.to_owned());
+        accounts.save(&name, token, None)
     }
 }
 
-fn resolve_token(env: Option<&str>, token_file: &Path) -> Result<Option<String>, ConfigError> {
-    if let Some(token) = env.map(str::trim).filter(|t| !t.is_empty()) {
-        return Ok(Some(token.to_owned()));
-    }
+/// A token file's trimmed contents; `None` when it is missing or blank, an error when others may read it.
+pub(crate) fn read_token_file(token_file: &Path) -> Result<Option<String>, ConfigError> {
     let mut file = match fs::File::open(token_file) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -194,7 +236,7 @@ fn resolve_token(env: Option<&str>, token_file: &Path) -> Result<Option<String>,
 }
 
 /// Atomically replaces `path` with an owner-only (0600 on unix) file.
-fn write_private(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
+pub(crate) fn write_private(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
     create_parent(path)?;
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
@@ -316,27 +358,29 @@ mod tests {
     }
 
     #[test]
-    fn env_token_takes_precedence_over_file() {
+    fn save_token_fills_the_default_account() {
         let (_dir, paths) = paths();
-        paths.save_token("from-file").unwrap();
+        paths.save_token("first").unwrap();
+        let accounts = paths.accounts();
+        assert_eq!(accounts.names().unwrap(), ["default"]);
+        accounts.save("other", "second", None).unwrap();
+        accounts.set_default("other").unwrap();
+        paths.save_token("third").unwrap();
         assert_eq!(
-            resolve_token(Some(" from-env \n"), &paths.token_file).unwrap(),
-            Some("from-env".into())
+            accounts.load_token("other").unwrap().as_deref(),
+            Some("third")
         );
         assert_eq!(
-            resolve_token(Some(""), &paths.token_file).unwrap(),
-            Some("from-file".into())
+            accounts.load_token("default").unwrap().as_deref(),
+            Some("first")
         );
-        assert_eq!(
-            resolve_token(None, &paths.token_file).unwrap(),
-            Some("from-file".into())
-        );
+        assert!(!paths.token_file.exists());
     }
 
     #[test]
-    fn no_token_anywhere_is_none() {
+    fn no_token_file_is_none() {
         let (_dir, paths) = paths();
-        assert_eq!(resolve_token(None, &paths.token_file).unwrap(), None);
+        assert_eq!(read_token_file(&paths.token_file).unwrap(), None);
     }
 
     #[test]
@@ -384,7 +428,7 @@ mod tests {
         fs::write(&paths.token_file, "old").unwrap();
         fs::set_permissions(&paths.token_file, fs::Permissions::from_mode(0o644)).unwrap();
 
-        paths.save_token("secret").unwrap();
+        write_private(&paths.token_file, b"secret\n").unwrap();
 
         let mode = fs::metadata(&paths.token_file)
             .unwrap()
@@ -393,7 +437,7 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(
-            resolve_token(None, &paths.token_file).unwrap(),
+            read_token_file(&paths.token_file).unwrap(),
             Some("secret".into())
         );
     }
@@ -403,14 +447,14 @@ mod tests {
     fn token_file_readable_by_others_is_rejected() {
         use std::os::unix::fs::PermissionsExt;
         let (_dir, paths) = paths();
-        paths.save_token("secret").unwrap();
+        write_private(&paths.token_file, b"secret").unwrap();
         for mode in [0o644, 0o640, 0o604] {
             fs::set_permissions(&paths.token_file, fs::Permissions::from_mode(mode)).unwrap();
-            match resolve_token(None, &paths.token_file) {
+            match read_token_file(&paths.token_file) {
                 Err(ConfigError::InsecureTokenFile { mode: m, .. }) => assert_eq!(m, mode),
                 other => panic!("mode {mode:o}: {other:?}"),
             }
         }
-        assert!(resolve_token(Some("env"), &paths.token_file).is_ok());
+        assert!(paths.accounts().resolve(None, Some("env")).is_ok());
     }
 }

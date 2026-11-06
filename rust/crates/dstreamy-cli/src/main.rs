@@ -8,7 +8,7 @@ use clap::{ArgAction, Parser, Subcommand};
 use dstreamy_cli::discord::{self, Persistence};
 use dstreamy_cli::login_capture::{LoginMode, login_mode};
 use dstreamy_cli::output::{Out, table};
-use dstreamy_cli::{CliError, Ctx, capture, daemon, serve, service, stream, tui};
+use dstreamy_cli::{CliError, Ctx, accounts, capture, daemon, serve, service, stream, tui};
 use dstreamy_core::{ConfigPaths, RotatingFileWriter};
 use dstreamy_discord::{CurrentUser, DEFAULT_GATEWAY_URL, VoiceChannelKind, remote_auth};
 use dstreamy_media::AUDIO_DEVICE_TARGET;
@@ -30,9 +30,12 @@ struct Cli {
     /// Print JSON instead of text (one object per line while streaming)
     #[arg(long, global = true)]
     json: bool,
-    /// Directory holding config.toml and the token file
+    /// Directory holding config.toml and the saved accounts
     #[arg(long, global = true, value_name = "DIR", env = "DSTREAMY_CONFIG_DIR")]
     config_dir: Option<PathBuf>,
+    /// Saved account to use instead of the default, see `dstreamy account list`
+    #[arg(long, global = true, value_name = "NAME", value_parser = account_name)]
+    account: Option<String>,
     /// Log more on stderr (-v info, -vv debug)
     #[arg(short, long, global = true, action = ArgAction::Count)]
     verbose: u8,
@@ -50,9 +53,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Log in by scanning a QR code with the Discord mobile app and store the token
+    /// Log in by scanning a QR code with the Discord mobile app and save the account
     ///
-    /// A token piped on stdin is used instead of the QR code.
+    /// A token piped on stdin is used instead of the QR code. The login is saved into
+    /// --account NAME, else into the saved account of the same Discord user, else into a new
+    /// account named after the Discord username (with -2, -3, ... when that name is taken).
     Login {
         /// Type or paste a token instead of scanning a QR code
         #[arg(long, conflicts_with = "browser")]
@@ -64,6 +69,9 @@ enum Command {
         #[arg(long, hide = true, requires = "browser")]
         window_only: bool,
     },
+    /// List, choose or remove the saved accounts
+    #[command(subcommand)]
+    Account(AccountCommand),
     /// List the account's guilds
     Guilds,
     /// List the voice channels of a guild
@@ -122,6 +130,22 @@ enum Command {
     /// Linux: a systemd user unit in ~/.config/systemd/user. A restart of the service ends
     /// the Discord session; nothing is carried over.
     Service(service::ServiceArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AccountCommand {
+    /// List the saved accounts; the default one is marked with *
+    List,
+    /// Make an account the default for commands without --account
+    Use { name: String },
+    /// Delete an account's saved token
+    Remove { name: String },
+}
+
+fn account_name(name: &str) -> Result<String, String> {
+    dstreamy_core::accounts::validate_name(name)
+        .map(|()| name.to_owned())
+        .map_err(|e| e.to_string())
 }
 
 fn main() -> ExitCode {
@@ -269,6 +293,7 @@ fn context(cli: &Cli) -> Result<Ctx, CliError> {
     Ok(Ctx {
         paths,
         gateway_url: cli.gateway_url.clone(),
+        account: cli.account.clone(),
     })
 }
 
@@ -278,7 +303,13 @@ async fn run(
     ctx: &Ctx,
     out: &Out,
 ) -> Result<ExitCode, CliError> {
+    match &command {
+        Command::Targets { .. } | Command::AudioSources | Command::Service(_) => {}
+        Command::Daemon { .. } => accounts::migrate(ctx, accounts::DAEMON_MIGRATION_LOOKUP).await,
+        _ => accounts::migrate(ctx, accounts::MIGRATION_LOOKUP).await,
+    }
     match command {
+        Command::Account(command) => account(ctx, out, command),
         Command::Login { .. } => {
             let credentials = match credentials {
                 Some(credentials) => credentials,
@@ -441,6 +472,8 @@ struct LoginRow<'a> {
     username: &'a str,
     global_name: Option<&'a str>,
     token_file: &'a std::path::Path,
+    account: &'a str,
+    default: bool,
 }
 
 /// A login token; `user` is set once the gateway has accepted it.
@@ -466,21 +499,114 @@ async fn login(ctx: &Ctx, out: &Out, credentials: Credentials) -> Result<ExitCod
             user
         }
     };
-    ctx.paths.save_token(&token)?;
+    let accounts = ctx.paths.accounts();
+    let account_user = accounts::account_user(&user);
+    let name = match &ctx.account {
+        Some(name) => name.clone(),
+        None => accounts.name_for(&account_user)?,
+    };
+    accounts.save(&name, &token, Some(&account_user))?;
+    let default = accounts.default_name()?.as_deref() == Some(name.as_str());
+    let token_file = accounts.token_file(&name);
     if out.json {
         out.json_line(&LoginRow {
             id: &user.id,
             username: &user.username,
             global_name: user.global_name.as_deref(),
-            token_file: &ctx.paths.token_file,
+            token_file: &token_file,
+            account: &name,
+            default,
         });
     } else {
         out.line(format_args!(
-            "logged in as {} ({}); token saved to {}",
-            user.username,
-            user.id,
-            ctx.paths.token_file.display()
+            "logged in as {} ({}); saved as account {name}",
+            user.username, user.id,
         ));
+        if !default {
+            out.note(format_args!(
+                "use it with --account {name}, or make it the default with `dstreamy account use {name}`"
+            ));
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Serialize)]
+struct AccountRow {
+    name: String,
+    username: Option<String>,
+    global_name: Option<String>,
+    default: bool,
+    has_token: bool,
+}
+
+fn account(ctx: &Ctx, out: &Out, command: AccountCommand) -> Result<ExitCode, CliError> {
+    let accounts = ctx.paths.accounts();
+    match command {
+        AccountCommand::List => {
+            let default = accounts.default_name()?;
+            let rows: Vec<AccountRow> = accounts
+                .list()?
+                .into_iter()
+                .map(|a| AccountRow {
+                    default: default.as_deref() == Some(a.name.as_str()),
+                    username: a.user.as_ref().map(|u| u.username.clone()),
+                    global_name: a.user.and_then(|u| u.global_name),
+                    has_token: a.has_token,
+                    name: a.name,
+                })
+                .collect();
+            if out.json {
+                out.json_line(&rows);
+            } else if rows.is_empty() {
+                out.note("no account is saved; run `dstreamy login`");
+            } else {
+                let cells: Vec<Vec<String>> = rows
+                    .iter()
+                    .map(|a| {
+                        let mark = if a.default { "*" } else { " " };
+                        let user = match (&a.username, &a.global_name) {
+                            (Some(u), Some(g)) => format!("{u} ({g})"),
+                            (Some(u), None) => u.clone(),
+                            (None, _) => "-".to_owned(),
+                        };
+                        let token = if a.has_token { "" } else { "no token" };
+                        vec![mark.to_owned(), a.name.clone(), user, token.to_owned()]
+                    })
+                    .collect();
+                out.raw(&table(&cells));
+            }
+            if dstreamy_cli::engine::Engine::env_token() {
+                out.note(format_args!(
+                    "{} is set, so commands use that token instead of these accounts",
+                    dstreamy_core::TOKEN_ENV
+                ));
+            }
+        }
+        AccountCommand::Use { name } => {
+            account_name(&name).map_err(CliError::Session)?;
+            accounts.set_default(&name)?;
+            out.line(format_args!("account {name} is now the default"));
+        }
+        AccountCommand::Remove { name } => {
+            account_name(&name).map_err(CliError::Session)?;
+            accounts.require(&name)?;
+            let source = dstreamy_core::TokenSource::Account(name.clone());
+            let held = accounts::session_lock(ctx, &source).map_err(|e| match e {
+                dstreamy_cli::lock::LockError::Held { pid } => CliError::AccountStreaming {
+                    name: name.clone(),
+                    pid,
+                },
+                e => e.into(),
+            })?;
+            accounts.remove(&name)?;
+            drop(held);
+            out.line(format_args!("removed account {name}"));
+            match accounts.default_name()? {
+                Some(next) => out.note(format_args!("the default account is {next}")),
+                None => out.note("no account is left; run `dstreamy login`"),
+            }
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

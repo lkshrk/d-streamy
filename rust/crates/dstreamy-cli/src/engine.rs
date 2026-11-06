@@ -4,7 +4,10 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use dstreamy_core::{Codec, CropRect, Fps, IdleSetting, Resolution, ServeConfig, StreamConfig};
+use dstreamy_core::{
+    Codec, ConfigError, CropRect, Fps, IdleSetting, Resolution, ServeConfig, StreamConfig,
+    TOKEN_ENV, TokenSource,
+};
 use dstreamy_discord::{
     DiscordClient, GatewayError, Session, SessionError, SessionEvent, SessionState, StreamStats,
 };
@@ -163,6 +166,15 @@ pub struct Status {
     pub source: Option<SourceView>,
     pub stats: Option<StreamStats>,
     pub started_by: Option<u64>,
+    /// The live session's account, else the active one; `None` without accounts.
+    pub account: Option<AccountView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AccountView {
+    pub name: String,
+    pub username: Option<String>,
+    pub global_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -183,6 +195,10 @@ impl Failure {
 impl From<CliError> for Failure {
     fn from(e: CliError) -> Self {
         let code = match &e {
+            CliError::Config(ConfigError::UnknownAccount { .. }) => "unknown_account",
+            CliError::Config(ConfigError::InvalidAccountName(_)) => "invalid_params",
+            CliError::Config(ConfigError::AccountWithoutToken(_)) => "not_logged_in",
+            CliError::Config(ConfigError::AccountWithEnvToken) => "accounts_unavailable",
             CliError::Config(_) | CliError::ServeConfig(_) => "config",
             CliError::InvalidStreamConfig(_)
             | CliError::EmptyToken
@@ -216,9 +232,9 @@ impl From<CliError> for Failure {
             }
             CliError::Media(_) => "capture",
             CliError::Service(e) => e.code(),
-            CliError::AlreadyStreaming | CliError::Lock(LockError::Held { .. }) => {
-                "already_running"
-            }
+            CliError::AlreadyStreaming
+            | CliError::AccountStreaming { .. }
+            | CliError::Lock(LockError::Held { .. }) => "already_running",
             CliError::ReadToken(_)
             | CliError::Session(_)
             | CliError::Stopped(_)
@@ -279,6 +295,8 @@ pub struct UpdateParams {
 }
 
 struct Conn {
+    /// The token this connection was made with.
+    source: TokenSource,
     client: Arc<DiscordClient>,
     session: Session,
     forwarder: JoinHandle<()>,
@@ -354,6 +372,8 @@ pub struct Engine {
     conn_seq: std::sync::atomic::AtomicU64,
     /// The token changed while a session streamed; its connection is replaced once the session is over.
     stale_token: std::sync::atomic::AtomicBool,
+    /// The account chosen for the next connection; `None` follows the default account.
+    account: Mutex<Option<String>>,
     started_by: Mutex<Option<u64>>,
     external: Mutex<Option<External>>,
     portal: Mutex<Option<PortalBook>>,
@@ -430,6 +450,7 @@ impl Engine {
             place: Mutex::new(None),
             conn_seq: std::sync::atomic::AtomicU64::new(0),
             stale_token: std::sync::atomic::AtomicBool::new(false),
+            account: Mutex::new(ctx.account.clone()),
             started_by: Mutex::new(None),
             external: Mutex::new(None),
             portal: Mutex::new(None),
@@ -477,12 +498,14 @@ impl Engine {
             })),
             Command::SetToken { token } => self.set_token(token).await,
             Command::LoggedIn => {
-                let logged_in = self
-                    .ctx
-                    .paths
-                    .load_token()
-                    .map_err(CliError::from)?
-                    .is_some();
+                let logged_in = match crate::accounts::resolve(&self.selected_ctx()) {
+                    Ok(_) => true,
+                    Err(
+                        CliError::NotLoggedIn
+                        | CliError::Config(ConfigError::AccountWithoutToken(_)),
+                    ) => false,
+                    Err(e) => return Err(e.into()),
+                };
                 Ok(json!({ "logged_in": logged_in }))
             }
             Command::Guilds => {
@@ -533,7 +556,145 @@ impl Engine {
             session,
             source,
             stats: lock(&self.last_stats).clone(),
+            account: self.active_account().map(|name| self.account_view(name)),
         }
+    }
+
+    /// The context with the account the next connection uses.
+    fn selected_ctx(&self) -> Ctx {
+        Ctx {
+            account: lock(&self.account).clone(),
+            ..self.ctx.clone()
+        }
+    }
+
+    fn selected_source(&self) -> Option<TokenSource> {
+        crate::accounts::resolve(&self.selected_ctx())
+            .ok()
+            .map(|r| r.source)
+    }
+
+    /// The live session's account, else the account the next connection uses.
+    pub fn active_account(&self) -> Option<String> {
+        let source = match self.current().filter(|c| c.live()) {
+            Some(conn) => Some(conn.source.clone()),
+            None => self.selected_source(),
+        };
+        source.and_then(|s| s.account().map(str::to_owned))
+    }
+
+    fn account_view(&self, name: String) -> AccountView {
+        let user = self.ctx.paths.accounts().user(&name);
+        AccountView {
+            name,
+            username: user.as_ref().map(|u| u.username.clone()),
+            global_name: user.and_then(|u| u.global_name),
+        }
+    }
+
+    /// Whether the token comes from `DSTREAMY_TOKEN`, which leaves no accounts to manage.
+    pub fn env_token() -> bool {
+        std::env::var(TOKEN_ENV).is_ok_and(|t| !t.trim().is_empty())
+    }
+
+    fn accounts_available() -> Result<(), Failure> {
+        if Self::env_token() {
+            return Err(Failure::new(
+                "accounts_unavailable",
+                format!(
+                    "the service takes its token from {TOKEN_ENV}, so it has no accounts: unset it for the service and restart it"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The saved accounts and the active one.
+    pub fn accounts(&self) -> Result<Value, Failure> {
+        Self::accounts_available()?;
+        let active = self.active_account();
+        let list = self.ctx.paths.accounts().list().map_err(CliError::from)?;
+        let rows: Vec<Value> = list
+            .into_iter()
+            .map(|a| {
+                json!({
+                    "active": active.as_deref() == Some(a.name.as_str()),
+                    "username": a.user.as_ref().map(|u| &u.username),
+                    "global_name": a.user.as_ref().and_then(|u| u.global_name.as_ref()),
+                    "has_token": a.has_token,
+                    "name": a.name,
+                })
+            })
+            .collect();
+        Ok(json!({ "active": active, "accounts": rows }))
+    }
+
+    /// Makes `name` the account of the next connection; refused while a session is live.
+    pub async fn select_account(&self, name: &str) -> Result<Value, Failure> {
+        Self::accounts_available()?;
+        let _lifecycle = self.lifecycle.lock().await;
+        self.ctx
+            .paths
+            .accounts()
+            .require(name)
+            .map_err(CliError::from)?;
+        if self.is_live() {
+            return Err(Failure::new(
+                "streaming",
+                "stop the stream before switching accounts",
+            ));
+        }
+        *lock(&self.account) = Some(name.to_owned());
+        if self
+            .current()
+            .is_some_and(|c| c.source.account() != Some(name))
+        {
+            self.disconnect_locked().await;
+        }
+        drop(_lifecycle);
+        self.accounts()
+    }
+
+    /// Deletes a saved account; refused while it streams here or in another process.
+    pub async fn logout_account(&self, name: &str) -> Result<Value, Failure> {
+        Self::accounts_available()?;
+        let _lifecycle = self.lifecycle.lock().await;
+        let accounts = self.ctx.paths.accounts();
+        accounts.require(name).map_err(CliError::from)?;
+        let source = TokenSource::Account(name.to_owned());
+        let conn = self.current();
+        if conn
+            .as_ref()
+            .is_some_and(|c| c.live() && c.source == source)
+        {
+            return Err(Failure::new(
+                "streaming",
+                "stop the stream before logging this account out",
+            ));
+        }
+        let held = crate::accounts::session_lock(&self.ctx, &source).map_err(CliError::from)?;
+        accounts.remove(name).map_err(CliError::from)?;
+        drop(held);
+        {
+            let mut selected = lock(&self.account);
+            if selected.as_deref() == Some(name) {
+                *selected = None;
+            }
+        }
+        if conn.is_some_and(|c| c.source == source) {
+            self.disconnect_locked().await;
+        }
+        drop(_lifecycle);
+        tracing::info!("logged out account {name}");
+        self.accounts()
+    }
+
+    /// A login saved into `account`: it becomes the active account, and a connection made with an older token is replaced once no session streams on it.
+    pub async fn logged_in_as(&self, account: Option<String>) {
+        if let Some(name) = account {
+            *lock(&self.account) = Some(name);
+        }
+        self.token_changed().await;
     }
 
     /// The live session's viewer count, `None` while unknown.
@@ -619,9 +780,15 @@ impl Engine {
         }
     }
 
+    fn reusable(&self, conn: &Conn) -> bool {
+        conn.live()
+            || (!self.stale_token.load(Ordering::Acquire)
+                && self.selected_source().as_ref() == Some(&conn.source))
+    }
+
     async fn conn(&self) -> Result<Arc<Conn>, CliError> {
         if let Some(conn) = self.current()
-            && !self.stale_token.load(Ordering::Acquire)
+            && self.reusable(&conn)
         {
             return Ok(conn);
         }
@@ -632,7 +799,7 @@ impl Engine {
     /// Needs `lifecycle` held.
     async fn ensure_conn(&self) -> Result<Arc<Conn>, CliError> {
         if let Some(conn) = self.current() {
-            if conn.live() || !self.stale_token.load(Ordering::Acquire) {
+            if self.reusable(&conn) {
                 return Ok(conn);
             }
             drop(conn);
@@ -642,7 +809,10 @@ impl Engine {
             .me
             .upgrade()
             .expect("an engine is only reachable through its Arc");
-        let client = Arc::new(discord::connect(&self.ctx, Persistence::Long).await?);
+        let ctx = self.selected_ctx();
+        let resolved = crate::accounts::resolve(&ctx)?;
+        let source = resolved.source.clone();
+        let client = Arc::new(discord::connect_resolved(&ctx, resolved, Persistence::Long).await?);
         let session = Session::new(client.clone());
         let seq = self
             .conn_seq
@@ -651,6 +821,7 @@ impl Engine {
         let (catch_up, catch_ups) = mpsc::unbounded_channel();
         let forwarder = tokio::spawn(engine.forward(session.subscribe(), catch_ups, seq));
         let conn = Arc::new(Conn {
+            source,
             client,
             session,
             forwarder,
@@ -790,8 +961,20 @@ impl Engine {
             ));
         }
         let client = discord::connect_with(&self.ctx, token.clone(), Persistence::Brief).await?;
+        let user = crate::accounts::account_user(client.user());
         client.close().await;
-        self.ctx.paths.save_token(&token).map_err(CliError::from)?;
+        let accounts = self.ctx.paths.accounts();
+        let selected = lock(&self.account).clone();
+        let name = match selected {
+            Some(name) => name,
+            None => match accounts.default_name().map_err(CliError::from)? {
+                Some(name) => name,
+                None => accounts.name_for(&user).map_err(CliError::from)?,
+            },
+        };
+        accounts
+            .save(&name, &token, Some(&user))
+            .map_err(CliError::from)?;
         self.disconnect_locked().await;
         Ok(Value::Null)
     }
@@ -888,7 +1071,10 @@ impl Engine {
         {
             let mut hold = lock(&self.session_lock);
             if hold.lock.is_none() {
-                hold.lock = Some(SessionLock::acquire(&self.ctx.paths).map_err(CliError::from)?);
+                hold.lock = Some(
+                    crate::accounts::session_lock(&self.ctx, &conn.source)
+                        .map_err(CliError::from)?,
+                );
             }
             hold.starting = true;
         }
@@ -1166,9 +1352,8 @@ mod tests {
     #[test]
     fn a_stopped_state_keeps_the_lock_while_a_start_is_in_flight() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = dstreamy_core::ConfigPaths::in_dir(dir.path());
         let mut hold = Hold {
-            lock: Some(SessionLock::acquire(&paths).unwrap()),
+            lock: Some(SessionLock::acquire(dir.path()).unwrap()),
             starting: true,
         };
         hold.release_if(true);
@@ -1214,6 +1399,7 @@ mod tests {
                 let ctx = Ctx {
                     paths,
                     gateway_url: mock.gateway_url(),
+                    account: None,
                 };
                 let opts = Options {
                     include_platform: false,
@@ -1225,7 +1411,7 @@ mod tests {
             }
 
             fn lock_is_free(&self) -> bool {
-                SessionLock::acquire(&ConfigPaths::in_dir(self.dir.path())).is_ok()
+                SessionLock::acquire(&self.dir.path().join("accounts/default")).is_ok()
             }
 
             /// Spawns a start and returns once it is parked on `start_gate` with `starting` set.
@@ -1968,6 +2154,7 @@ mod tests {
         let ctx = Ctx {
             paths: dstreamy_core::ConfigPaths::in_dir(dir.path()),
             gateway_url: String::new(),
+            account: None,
         };
         let opts = Options {
             event_capacity: 4,

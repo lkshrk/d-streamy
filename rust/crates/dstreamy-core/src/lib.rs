@@ -1,5 +1,6 @@
 //! Domain types, configuration, health scoring, stream metrics and logging for D-Streamy.
 
+pub mod accounts;
 pub mod codec;
 pub mod config;
 pub mod crop;
@@ -9,6 +10,7 @@ pub mod metrics;
 pub mod stream_config;
 pub mod target;
 
+pub use accounts::{AccountInfo, AccountUser, Accounts, ResolvedToken, TokenSource};
 pub use codec::{Codec, UnknownCodec};
 pub use config::{Config, ConfigError, ConfigPaths, IdleSetting, ServeConfig, TOKEN_ENV};
 pub use crop::CropRect;

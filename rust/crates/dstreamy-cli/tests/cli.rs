@@ -156,7 +156,12 @@ fn login_verifies_and_stores_the_token() {
     let row: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(row["id"], MOCK_USER_ID);
     assert_eq!(row["username"], "mockuser");
-    let token_file = h.config_dir().join("token");
+    assert_eq!(
+        (&row["account"], &row["default"]),
+        (&Value::from("mockuser"), &Value::Bool(true))
+    );
+    let token_file = h.config_dir().join("accounts/mockuser/token");
+    assert_eq!(row["token_file"], token_file.to_str().unwrap());
     assert_eq!(
         std::fs::read_to_string(&token_file).unwrap().trim(),
         MOCK_TOKEN
@@ -169,7 +174,10 @@ fn login_verifies_and_stores_the_token() {
     }
 
     let text = stdout(h.cmd().arg("login").write_stdin(MOCK_TOKEN));
-    assert!(text.contains("logged in as mockuser"), "{text}");
+    assert!(
+        text.contains("logged in as mockuser") && text.contains("saved as account mockuser"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -179,7 +187,7 @@ fn login_rejects_a_bad_or_missing_token() {
     assert!(err.contains("4004"), "{err}");
     let err = stderr_of_failure(h.cmd().arg("login").write_stdin("\n"));
     assert!(err.contains("no token"), "{err}");
-    assert!(!h.config_dir().join("token").exists());
+    assert!(!h.config_dir().join("accounts").exists());
 }
 
 #[test]
@@ -189,7 +197,7 @@ fn login_never_falls_through_to_qr_on_empty_piped_stdin() {
     assert_eq!(output.status.code(), Some(1));
     let err = String::from_utf8(output.stderr).unwrap();
     assert!(err.contains("no token"), "{err}");
-    assert!(!h.config_dir().join("token").exists());
+    assert!(!h.config_dir().join("accounts").exists());
 }
 
 #[test]
@@ -226,7 +234,7 @@ fn login_browser_without_browser_support_points_to_qr_and_token_login() {
     );
     assert!(err.contains("`dstreamy login`"), "{err}");
     assert!(err.contains("`dstreamy login --token`"), "{err}");
-    assert!(!h.config_dir().join("token").exists());
+    assert!(!h.config_dir().join("accounts").exists());
 }
 
 #[test]
@@ -553,6 +561,7 @@ fn a_second_interrupt_cuts_the_shutdown_short() {
     let ctx = Ctx {
         paths: ConfigPaths::in_dir(h.config_dir()),
         gateway_url: h.mock.gateway_url(),
+        account: None,
     };
     let args = Cmd::parse_from(stream_args(MOCK_VOICE_CHANNEL_ID)).args;
     let (interrupts, rx) = tokio::sync::mpsc::unbounded_channel();

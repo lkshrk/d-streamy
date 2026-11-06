@@ -390,7 +390,13 @@ fn hello_negotiates_the_protocol_and_rejects_bad_roles() {
     assert!(data["connection"].is_u64(), "{reply}");
     assert_eq!(
         data["status"],
-        json!({"session": null, "source": null, "stats": null, "started_by": null})
+        json!({
+            "session": null,
+            "source": null,
+            "stats": null,
+            "started_by": null,
+            "account": null,
+        })
     );
     assert!(data.get("session").is_none(), "{reply}");
 
@@ -1019,7 +1025,7 @@ fn the_endpoint_stays_bound_until_the_session_is_torn_down_and_is_removed_after(
     a.state("streaming");
     a.send(&json!({"id": "bye", "cmd": "shutdown"}));
     let lock_free =
-        || dstreamy_cli::lock::SessionLock::acquire(&ConfigPaths::in_dir(h.dir.path())).is_ok();
+        || dstreamy_cli::lock::SessionLock::acquire(&h.dir.path().join("accounts/default")).is_ok();
     let deadline = Instant::now() + T;
     while h.endpoint().exists() {
         assert!(
@@ -1048,8 +1054,14 @@ fn fake_login(h: &Harness) -> PathBuf {
     let text = format!(
         r#"#!/bin/sh
 dir=
+account=
 prev=
-for a in "$@"; do [ "$prev" = --config-dir ] && dir=$a; prev=$a; done
+for a in "$@"; do
+  [ "$prev" = --config-dir ] && dir=$a
+  [ "$prev" = --account ] && account=$a
+  prev=$a
+done
+name=${{account:-mock}}
 printf '%s\n' "$@" > "$dir/fake-login-args"
 printf 'WAYLAND_DISPLAY=%s\nXAUTHORITY=%s\n' "${{WAYLAND_DISPLAY-unset}}" "${{XAUTHORITY-unset}}" > "$dir/fake-login-env"
 mode=$(cat "$dir/fake-login-mode")
@@ -1059,7 +1071,9 @@ if [ "$mode" = wait ]; then
   mode=ok
 fi
 case "$mode" in
-ok) umask 077; printf '%s\n' '{MOCK_TOKEN}' > "$dir/token"; echo '{{"id":"1","username":"mock","global_name":null}}'; exit 0;;
+ok) umask 077; mkdir -p "$dir/accounts/$name"; printf '%s\n' '{MOCK_TOKEN}' > "$dir/accounts/$name/token"
+  [ -e "$dir/default-account" ] || printf '%s\n' "$name" > "$dir/default-account"
+  echo "{{\"id\":\"1\",\"username\":\"mock\",\"global_name\":null,\"account\":\"$name\"}}"; exit 0;;
 cancel) echo 'error: browser login failed: cancelled' >&2; exit 3;;
 hold) echo $$ > "$dir/fake-login-pid"; exec sleep 30;;
 *) echo 'some webview noise' >&2; echo 'error: browser login failed: no display' >&2; exit 1;;
@@ -1275,6 +1289,7 @@ fn a_login_in_the_window_takes_effect_without_restarting_serve() {
     let ok = c.request(&login(json!({"WAYLAND_DISPLAY": "wayland-test"})));
     assert_eq!(ok["type"], "result", "{ok}");
     assert_eq!(ok["data"]["username"], "mock");
+    assert_eq!(ok["data"]["account"], "mock");
     let env = std::fs::read_to_string(h.dir.path().join("fake-login-env")).unwrap();
     assert_eq!(env, "WAYLAND_DISPLAY=wayland-test\nXAUTHORITY=unset\n");
     let args = std::fs::read_to_string(h.dir.path().join("fake-login-args")).unwrap();
@@ -1348,6 +1363,276 @@ fn malformed_login_parameters_are_invalid() {
     assert_eq!(bad["code"], "invalid_params", "{bad}");
     let foreign = c.request(&json!({"id": "f", "cmd": "login", "env": {"LD_PRELOAD": "/x.so"}}));
     assert_eq!(foreign["code"], "invalid_params", "{foreign}");
+    drop(c);
+    shutdown_and_exit(&h, s);
+}
+
+const OTHER_TOKEN: &str = "other.account.token";
+
+/// Saves `mockuser` (the mock's account, the default) and `other`, whose token the mock rejects.
+fn two_accounts(h: &Harness) {
+    let accounts = ConfigPaths::in_dir(h.dir.path()).accounts();
+    let mock_user = dstreamy_core::AccountUser {
+        id: MOCK_USER_ID.into(),
+        username: "mockuser".into(),
+        global_name: Some("Mock User".into()),
+    };
+    accounts
+        .save("mockuser", MOCK_TOKEN, Some(&mock_user))
+        .unwrap();
+    accounts.save("other", OTHER_TOKEN, None).unwrap();
+}
+
+fn account_cmd(id: &str, cmd: &str, account: &str) -> Value {
+    json!({"id": id, "cmd": cmd, "account": account})
+}
+
+fn account_names(reply: &Value) -> Vec<String> {
+    reply["data"]["accounts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{reply}"))
+        .iter()
+        .map(|a| a["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn accounts_are_listed_selected_and_logged_out() {
+    let h = Harness::new();
+    two_accounts(&h);
+    let s = h.serve(&[]);
+    let (mut c, hello) = h.control();
+    let features = hello["data"]["features"].as_array().unwrap();
+    assert!(features.contains(&json!("accounts")), "{hello}");
+    assert_eq!(
+        hello["data"]["status"]["account"],
+        json!({"name": "mockuser", "username": "mockuser", "global_name": "Mock User"})
+    );
+    let list = c.request(&json!({"id": "l", "cmd": "accounts"}));
+    assert_eq!(
+        list["data"],
+        json!({"active": "mockuser", "accounts": [
+            {"name": "mockuser", "username": "mockuser", "global_name": "Mock User", "has_token": true, "active": true},
+            {"name": "other", "username": null, "global_name": null, "has_token": true, "active": false},
+        ]})
+    );
+    let guilds = json!({"id": "g", "cmd": "guilds"});
+    assert_eq!(c.request(&guilds)["type"], "result");
+
+    let picked = c.request(&account_cmd("s", "select_account", "other"));
+    assert_eq!(picked["data"]["active"], "other", "{picked}");
+    let status = c.request(&json!({"id": "st", "cmd": "status"}));
+    assert_eq!(status["data"]["account"]["name"], "other", "{status}");
+    let rejected = c.request(&guilds);
+    assert_eq!(
+        rejected["code"], "invalid_token",
+        "the other token is used: {rejected}"
+    );
+
+    let unknown = c.request(&account_cmd("u", "select_account", "nope"));
+    assert_eq!(unknown["code"], "unknown_account", "{unknown}");
+    assert!(
+        unknown["message"]
+            .as_str()
+            .unwrap()
+            .contains("saved accounts: mockuser, other"),
+        "{unknown}"
+    );
+    let invalid = c.request(&account_cmd("i", "select_account", "Bad/Name"));
+    assert_eq!(invalid["code"], "invalid_params", "{invalid}");
+    let missing = c.request(&json!({"id": "m", "cmd": "logout_account"}));
+    assert_eq!(missing["code"], "invalid_params", "{missing}");
+
+    let out = c.request(&account_cmd("o", "logout_account", "other"));
+    assert_eq!(account_names(&out), ["mockuser"]);
+    assert_eq!(
+        out["data"]["active"], "mockuser",
+        "back on the default: {out}"
+    );
+    assert!(!h.dir.path().join("accounts/other").exists());
+    assert_eq!(c.request(&guilds)["type"], "result");
+
+    let out = c.request(&account_cmd("o2", "logout_account", "mockuser"));
+    assert_eq!(out["data"], json!({"active": null, "accounts": []}));
+    let status = c.request(&json!({"id": "st2", "cmd": "status"}));
+    assert_eq!(status["data"]["account"], Value::Null);
+    assert_eq!(c.request(&guilds)["code"], "not_logged_in");
+    drop(c);
+    shutdown_and_exit(&h, s);
+}
+
+#[test]
+fn switching_or_logging_out_the_live_account_is_refused() {
+    let h = Harness::new();
+    two_accounts(&h);
+    let s = h.serve(&[]);
+    let (mut c, _) = h.control();
+    c.request(&json!({"id": "sub", "cmd": "subscribe"}));
+    assert_eq!(c.request(&start("test-pattern"))["type"], "result");
+    c.state("streaming");
+    let switch = c.request(&account_cmd("s", "select_account", "other"));
+    assert_eq!(switch["code"], "streaming", "{switch}");
+    let out = c.request(&account_cmd("o", "logout_account", "mockuser"));
+    assert_eq!(out["code"], "streaming", "{out}");
+    let status = c.request(&json!({"id": "st", "cmd": "status"}));
+    assert_eq!(status["data"]["account"]["name"], "mockuser");
+    let other = c.request(&account_cmd("o2", "logout_account", "other"));
+    assert_eq!(
+        account_names(&other),
+        ["mockuser"],
+        "an idle account may go"
+    );
+    assert_eq!(
+        c.request(&json!({"id": "stop", "cmd": "stop"}))["type"],
+        "result"
+    );
+    drop(c);
+    shutdown_and_exit(&h, s);
+}
+
+#[test]
+fn logging_out_an_account_that_streams_elsewhere_is_refused() {
+    let h = Harness::new();
+    two_accounts(&h);
+    let s = h.serve(&[]);
+    let held =
+        dstreamy_cli::lock::SessionLock::acquire(&h.dir.path().join("accounts/other")).unwrap();
+    let (mut c, _) = h.control();
+    let refused = c.request(&account_cmd("o", "logout_account", "other"));
+    assert_eq!(refused["code"], "already_running", "{refused}");
+    assert!(h.dir.path().join("accounts/other/token").exists());
+    drop(held);
+    let out = c.request(&account_cmd("o2", "logout_account", "other"));
+    assert_eq!(account_names(&out), ["mockuser"]);
+    drop(c);
+    shutdown_and_exit(&h, s);
+}
+
+#[test]
+fn a_login_into_a_named_account_makes_it_active() {
+    let h = Harness::new();
+    two_accounts(&h);
+    let s = serve_with_login(&h);
+    login_mode(&h, "ok");
+    let (mut c, _) = h.control();
+    let bad = c.request(&json!({"id": "b", "cmd": "login", "account": "Bad Name"}));
+    assert_eq!(bad["code"], "invalid_params", "{bad}");
+    let ok = c.request(&json!({"id": "l", "cmd": "login", "env": {}, "account": "alt"}));
+    assert_eq!(ok["data"]["account"], "alt", "{ok}");
+    let args = std::fs::read_to_string(h.dir.path().join("fake-login-args")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    let at = args.iter().position(|a| *a == "--account").unwrap();
+    assert_eq!(args[at + 1], "alt", "{args:?}");
+    let list = c.request(&json!({"id": "a", "cmd": "accounts"}));
+    assert_eq!(list["data"]["active"], "alt", "{list}");
+    assert_eq!(account_names(&list), ["alt", "mockuser", "other"]);
+    assert_eq!(
+        c.request(&json!({"id": "g", "cmd": "guilds"}))["type"],
+        "result"
+    );
+
+    let plain = c.request(&login(json!({})));
+    assert_eq!(plain["data"]["account"], "mock", "{plain}");
+    let args = std::fs::read_to_string(h.dir.path().join("fake-login-args")).unwrap();
+    assert!(!args.lines().any(|a| a == "--account"), "{args}");
+    let status = c.request(&json!({"id": "st", "cmd": "status"}));
+    assert_eq!(status["data"]["account"]["name"], "mock");
+    drop(c);
+    shutdown_and_exit(&h, s);
+}
+
+#[test]
+fn a_token_from_the_environment_leaves_no_accounts_to_manage() {
+    let h = Harness::new();
+    two_accounts(&h);
+    let s = serve_with_login_env(&h, &[("DSTREAMY_TOKEN", MOCK_TOKEN)]);
+    let (mut c, hello) = h.control();
+    let features = hello["data"]["features"].as_array().unwrap();
+    assert!(!features.contains(&json!("accounts")), "{hello}");
+    assert_eq!(hello["data"]["status"]["account"], Value::Null);
+    let refused = c.request(&json!({"id": "a", "cmd": "accounts"}));
+    assert_eq!(refused["code"], "accounts_unavailable", "{refused}");
+    let refused = c.request(&account_cmd("s", "select_account", "other"));
+    assert_eq!(refused["code"], "accounts_unavailable", "{refused}");
+    assert_eq!(
+        c.request(&json!({"id": "g", "cmd": "guilds"}))["type"],
+        "result"
+    );
+    drop(c);
+    shutdown_and_exit(&h, s);
+}
+
+#[test]
+fn serve_streams_one_account_while_stream_streams_another() {
+    let h = Harness::new();
+    two_accounts(&h);
+    let second =
+        h.rt.block_on(MockDiscord::start_with(dstreamy_mock_discord::MockConfig {
+            token: OTHER_TOKEN.to_owned(),
+            user: dstreamy_mock_discord::MockUser {
+                id: "100000000000000222".to_owned(),
+                username: "other".to_owned(),
+                global_name: None,
+            },
+            ..dstreamy_mock_discord::MockConfig::default()
+        }))
+        .unwrap();
+    let s = h.serve(&[]);
+    let (mut c, _) = h.control();
+    c.request(&json!({"id": "sub", "cmd": "subscribe"}));
+    assert_eq!(c.request(&start("test-pattern"))["type"], "result");
+    c.state("streaming");
+
+    let same = Service::spawn(h.cmd().args(stream_args()).stdout(Stdio::null()));
+    let (status, stderr) = same.finish();
+    assert!(!status.success(), "the same account twice: {status}");
+    assert!(
+        stderr.contains("another dstreamy session is live"),
+        "{stderr}"
+    );
+
+    let mut other = std::process::Command::new(assert_cmd::cargo::cargo_bin("dstreamy"));
+    other
+        .env_remove("DSTREAMY_TOKEN")
+        .env_remove("DSTREAMY_CONFIG_DIR")
+        .arg("--config-dir")
+        .arg(h.dir.path())
+        .arg("--gateway-url")
+        .arg(second.gateway_url())
+        .args(["--account", "other"])
+        .args(stream_args())
+        .stdout(Stdio::piped());
+    let mut stream = Service::spawn(&mut other);
+    let (tx, streaming) = mpsc::channel();
+    let stdout = stream.child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let seen = BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .any(|l| l == "state: streaming");
+        let _ = tx.send(seen);
+    });
+    assert_eq!(
+        streaming.recv_timeout(T),
+        Ok(true),
+        "account other never streamed"
+    );
+    assert!(
+        h.rt.block_on(second.wait_for(T, |r| (stream_video(r) > 0).then_some(())))
+            .is_some(),
+        "no video reached the second account's Discord"
+    );
+    assert!(h.stream_video(1), "serve's stream stopped");
+    let status = c.request(&json!({"id": "st", "cmd": "status"}));
+    assert_eq!(status["data"]["session"]["state"], "streaming", "{status}");
+    assert_eq!(status["data"]["account"]["name"], "mockuser");
+    stream.signal("INT");
+    let (code, stderr) = stream.finish();
+    assert!(code.success(), "{code}: {stderr}");
+    assert_eq!(
+        c.request(&json!({"id": "stop", "cmd": "stop"}))["type"],
+        "result"
+    );
     drop(c);
     shutdown_and_exit(&h, s);
 }

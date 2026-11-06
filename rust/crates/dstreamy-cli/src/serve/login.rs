@@ -21,6 +21,9 @@ pub struct LoginParams {
     /// The client's graphical session; each name of [`LOGIN_ENV`] it lacks is unset for the window.
     #[serde(default)]
     env: Option<HashMap<String, String>>,
+    /// The account the login is saved into; without it, the one named as `dstreamy login` names it.
+    #[serde(default)]
+    account: Option<String>,
 }
 
 impl LoginParams {
@@ -36,6 +39,9 @@ impl LoginParams {
                 "env may only set {}, not {name}",
                 LOGIN_ENV.join(", ")
             )));
+        }
+        if let Some(account) = &params.account {
+            dstreamy_core::accounts::validate_name(account).map_err(invalid_params)?;
         }
         Ok(params)
     }
@@ -105,13 +111,15 @@ impl Login {
             .arg("--json")
             .arg("--gateway-url")
             .arg(&self.ctx.gateway_url)
+            .arg("--config-dir")
+            .arg(&self.ctx.paths.dir)
             .args(["login", "--browser", "--window-only"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if let Some(dir) = self.ctx.paths.token_file.parent() {
-            command.arg("--config-dir").arg(dir);
+        if let Some(account) = &params.account {
+            command.arg("--account").arg(account);
         }
         if let Some(env) = &params.env {
             for name in LOGIN_ENV {
@@ -156,9 +164,10 @@ impl Login {
             .map_err(|e| Failure::new("login_failed", format!("waiting for the login: {e}")))?;
         window.0 = None;
         let user = outcome(&output)?;
+        let account = user["account"].as_str().map(str::to_owned);
         // Detached, so a client leaving now can't cancel it and leave the old token's connection open.
         let engine = engine.clone();
-        let _ = tokio::spawn(async move { engine.token_changed().await }).await;
+        let _ = tokio::spawn(async move { engine.logged_in_as(account).await }).await;
         tracing::info!("logged in from the login window");
         Ok(user)
     }
@@ -217,6 +226,7 @@ fn outcome(output: &Output) -> Result<Value, Failure> {
         return Ok(json!({
             "username": row["username"],
             "global_name": row["global_name"],
+            "account": row["account"],
         }));
     }
     if output.status.code() == Some(i32::from(CANCELLED_EXIT)) {
@@ -254,10 +264,10 @@ mod tests {
 
     #[test]
     fn a_finished_login_names_the_user() {
-        let row = r#"{"id":"1","username":"mock","global_name":"Mock","token_file":"/t"}"#;
+        let row = r#"{"id":"1","username":"mock","global_name":"Mock","token_file":"/t","account":"mock","default":true}"#;
         assert_eq!(
             outcome(&output(0, &format!("{row}\n"), "")).unwrap(),
-            json!({"username": "mock", "global_name": "Mock"})
+            json!({"username": "mock", "global_name": "Mock", "account": "mock"})
         );
     }
 
@@ -296,6 +306,10 @@ mod tests {
             foreign.message
         );
         let bad = LoginParams::parse(json!({"cmd": "login", "env": {"DISPLAY": 0}})).unwrap_err();
+        assert_eq!(bad.code, "invalid_params");
+        let named = LoginParams::parse(json!({"cmd": "login", "account": "alt"})).unwrap();
+        assert_eq!(named.account.as_deref(), Some("alt"));
+        let bad = LoginParams::parse(json!({"cmd": "login", "account": "../x"})).unwrap_err();
         assert_eq!(bad.code, "invalid_params");
     }
 }

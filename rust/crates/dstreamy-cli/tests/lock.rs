@@ -82,7 +82,7 @@ impl Harness {
     }
 
     fn lock_is_free(&self) -> bool {
-        SessionLock::acquire(&ConfigPaths::in_dir(self.dir.path())).is_ok()
+        SessionLock::acquire(&self.dir.path().join("accounts/default")).is_ok()
     }
 }
 

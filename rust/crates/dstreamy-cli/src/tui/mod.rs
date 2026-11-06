@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use dstreamy_core::Config;
+use dstreamy_core::{Config, TokenSource};
 use dstreamy_discord::{DiscordClient, Session, SessionEvent};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
@@ -46,7 +46,7 @@ pub async fn run(ctx: &Ctx, opts: Options) -> Result<ExitCode, CliError> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(CliError::NoTerminal);
     }
-    ctx.paths.load_token()?.ok_or(CliError::NotLoggedIn)?;
+    crate::accounts::resolve(ctx)?;
     let signals = Signals::new();
     let restore = RestoreOnDrop;
     let mut terminal = ratatui::try_init().map_err(|e| CliError::Terminal(e.to_string()))?;
@@ -160,9 +160,13 @@ where
             let _ = tx.send(Msg::Targets { targets, error });
         }
     });
+    let resolved = crate::accounts::resolve(ctx);
+    let source = resolved
+        .as_ref()
+        .map_or(TokenSource::Legacy, |r| r.source.clone());
     let mut connecting: Option<JoinHandle<Result<DiscordClient, CliError>>> = Some(tokio::spawn({
         let ctx = ctx.clone();
-        async move { discord::connect(&ctx, Persistence::Long).await }
+        async move { discord::connect_resolved(&ctx, resolved?, Persistence::Long).await }
     }));
     let mut live: Option<Live> = None;
     let mut tasks = vec![targets];
@@ -237,7 +241,7 @@ where
                 }
             }
             Effect::Start(request) => {
-                if let Err(e) = start(ctx, &mut live, &mut app, request).await {
+                if let Err(e) = start(ctx, &source, &mut live, &mut app, request).await {
                     app.update(Msg::StartFailed(e));
                 }
             }
@@ -370,6 +374,7 @@ fn remember_token(ctx: &Ctx, live: &mut Option<Live>, app: &mut App) {
 
 async fn start(
     ctx: &Ctx,
+    source: &TokenSource,
     live: &mut Option<Live>,
     app: &mut App,
     request: StartRequest,
@@ -379,7 +384,7 @@ async fn start(
     };
     let lock = match l.lock.take() {
         Some(lock) => lock,
-        None => SessionLock::acquire(&ctx.paths).map_err(|e| e.to_string())?,
+        None => crate::accounts::session_lock(ctx, source).map_err(|e| e.to_string())?,
     };
     let mut config = Config::load(&ctx.paths.config_file).map_err(|e| e.to_string())?;
     let restore_token = capture::restore_token(&config);

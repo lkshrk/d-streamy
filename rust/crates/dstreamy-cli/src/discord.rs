@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
+use dstreamy_core::ResolvedToken;
 use dstreamy_discord::{
     DEFAULT_GATEWAY_URL, DiscordClient, GatewayEvent, GatewayOptions, Guild, VoiceChannel,
 };
@@ -37,8 +38,19 @@ pub enum Persistence {
 }
 
 pub async fn connect(ctx: &Ctx, persistence: Persistence) -> Result<DiscordClient, CliError> {
-    let token = ctx.paths.load_token()?.ok_or(CliError::NotLoggedIn)?;
-    connect_with(ctx, token, persistence).await
+    connect_resolved(ctx, crate::accounts::resolve(ctx)?, persistence).await
+}
+
+/// Connects with an already chosen token, and records the account's user if it lacks one.
+pub async fn connect_resolved(
+    ctx: &Ctx,
+    resolved: ResolvedToken,
+    persistence: Persistence,
+) -> Result<DiscordClient, CliError> {
+    let ResolvedToken { source, token } = resolved;
+    let client = connect_with(ctx, token, persistence).await?;
+    crate::accounts::remember_user(ctx, &source, client.user());
+    Ok(client)
 }
 
 pub async fn connect_with(

@@ -1,10 +1,8 @@
-//! One live session per config directory, held with an OS file lock that dies with the process.
+//! One live session per account, held with an OS file lock that dies with the process.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
-
-use dstreamy_core::ConfigPaths;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
@@ -22,9 +20,10 @@ pub struct SessionLock {
 }
 
 impl SessionLock {
-    pub fn acquire(paths: &ConfigPaths) -> Result<Self, LockError> {
-        let lock_file = paths.config_file.with_file_name("session.lock");
-        let pid_file = paths.config_file.with_file_name("session.pid");
+    /// `dir` is the account's directory, or the config directory for a token without an account.
+    pub fn acquire(dir: &Path) -> Result<Self, LockError> {
+        let lock_file = dir.join("session.lock");
+        let pid_file = dir.join("session.pid");
         let io_err = |path: &Path| {
             let path = path.to_owned();
             move |source| LockError::Io { path, source }
@@ -72,7 +71,7 @@ mod tests {
     #[test]
     fn a_second_acquire_is_refused_with_the_pid_until_the_first_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = ConfigPaths::in_dir(&dir.path().join("nested"));
+        let paths = dir.path().join("nested");
         let first = SessionLock::acquire(&paths).unwrap();
         let pid = read_pid(&dir.path().join("nested/session.pid"));
         assert_eq!(pid, Some(std::process::id()));
@@ -100,22 +99,51 @@ mod tests {
     #[test]
     fn a_dropped_lock_is_free_while_a_copy_of_its_descriptor_lives() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = ConfigPaths::in_dir(dir.path());
-        let held = SessionLock::acquire(&paths).unwrap();
+        let paths = dir.path();
+        let held = SessionLock::acquire(paths).unwrap();
         let forked_copy = held.file.try_clone().unwrap();
         drop(held);
-        SessionLock::acquire(&paths).unwrap();
+        SessionLock::acquire(paths).unwrap();
         drop(forked_copy);
     }
 
     #[test]
     fn a_held_lock_without_a_pid_file_names_no_pid() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = ConfigPaths::in_dir(dir.path());
-        let _held = SessionLock::acquire(&paths).unwrap();
+        let paths = dir.path();
+        let _held = SessionLock::acquire(paths).unwrap();
         fs::remove_file(dir.path().join("session.pid")).unwrap();
-        let err = SessionLock::acquire(&paths).unwrap_err();
+        let err = SessionLock::acquire(paths).unwrap_err();
         assert!(matches!(err, LockError::Held { pid: None }), "{err:?}");
         assert_eq!(err.to_string(), "another dstreamy session is live");
+    }
+
+    #[test]
+    fn two_accounts_lock_apart_and_one_account_twice_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::Ctx {
+            paths: dstreamy_core::ConfigPaths::in_dir(dir.path()),
+            gateway_url: String::new(),
+            account: None,
+        };
+        let accounts = ctx.paths.accounts();
+        accounts.save("a", "tok-a", None).unwrap();
+        accounts.save("b", "tok-b", None).unwrap();
+        let a = dstreamy_core::TokenSource::Account("a".into());
+        let b = dstreamy_core::TokenSource::Account("b".into());
+        let held_a = crate::accounts::session_lock(&ctx, &a).unwrap();
+        let held_b = crate::accounts::session_lock(&ctx, &b).unwrap();
+        assert!(matches!(
+            crate::accounts::session_lock(&ctx, &a),
+            Err(LockError::Held { .. })
+        ));
+        let legacy = crate::accounts::session_lock(&ctx, &dstreamy_core::TokenSource::Env).unwrap();
+        assert!(matches!(
+            crate::accounts::session_lock(&ctx, &dstreamy_core::TokenSource::Legacy),
+            Err(LockError::Held { .. })
+        ));
+        assert!(dir.path().join("accounts/a/session.lock").exists());
+        drop((held_a, held_b, legacy));
+        crate::accounts::session_lock(&ctx, &a).unwrap();
     }
 }

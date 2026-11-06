@@ -1,5 +1,6 @@
 //! Shared pieces of the `dstreamy` command line and its terminal UI.
 
+pub mod accounts;
 #[cfg(all(
     feature = "browser-login",
     any(target_os = "linux", target_os = "macos")
@@ -28,6 +29,8 @@ use lock::LockError;
 pub struct Ctx {
     pub paths: ConfigPaths,
     pub gateway_url: String,
+    /// `--account`; `None` uses the default account.
+    pub account: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +71,8 @@ pub enum CliError {
     Media(#[from] MediaError),
     #[error("a stream is already running")]
     AlreadyStreaming,
+    #[error("account {name} is streaming{}; stop that stream first", pid.map(|p| format!(" (pid {p})")).unwrap_or_default())]
+    AccountStreaming { name: String, pid: Option<u32> },
     #[error(transparent)]
     Lock(#[from] LockError),
     #[error("config [serve]: {0}")]

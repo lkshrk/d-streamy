@@ -258,11 +258,16 @@ enum Role {
 const FEATURES: [&str; 2] = ["start_grace_secs", "status_place"];
 /// Offered only where `login` can open the browser login window.
 pub const BROWSER_LOGIN: &str = "browser_login";
+/// Offered unless the token comes from `DSTREAMY_TOKEN`, which leaves no accounts to manage.
+pub const ACCOUNTS: &str = "accounts";
 
 fn hello_data(engine: &Engine, login: &login::Login, connection: u64) -> Value {
     let mut features = FEATURES.to_vec();
     if login.available() {
         features.push(BROWSER_LOGIN);
+    }
+    if !Engine::env_token() {
+        features.push(ACCOUNTS);
     }
     json!({
         "protocol": PROTOCOL,
@@ -601,6 +606,20 @@ impl Connection {
                                     }
                                 });
                             }
+                            Ok((id, Request::Account(request))) => {
+                                let key = next_key;
+                                next_key += 1;
+                                lock(&unanswered).insert(key, id);
+                                let engine = self.engine.clone();
+                                let replies = replies_tx.clone();
+                                let unanswered = unanswered.clone();
+                                tasks.spawn(async move {
+                                    let result = request.run(&engine).await;
+                                    if let Some(id) = lock(&unanswered).remove(&key) {
+                                        let _ = replies.send((id, result));
+                                    }
+                                });
+                            }
                             Ok((id, Request::Engine(command))) => {
                                 let key = next_key;
                                 next_key += 1;
@@ -706,6 +725,7 @@ enum Request {
     Subscribe,
     Shutdown,
     Login(login::LoginParams),
+    Account(AccountRequest),
     #[cfg(any(test, feature = "test-hooks"))]
     Test(hooks::Hook),
     Engine(engine::Command),
@@ -714,7 +734,14 @@ enum Request {
 impl Request {
     fn parse(value: Value, test_hooks: bool) -> Result<(String, Self), (Option<String>, Failure)> {
         let mut known: Vec<&str> = COMMANDS.to_vec();
-        known.extend(["status", "subscribe", "login"]);
+        known.extend([
+            "status",
+            "subscribe",
+            "login",
+            "accounts",
+            "select_account",
+            "logout_account",
+        ]);
         #[cfg(any(test, feature = "test-hooks"))]
         if test_hooks {
             known.extend(hooks::COMMANDS);
@@ -731,6 +758,12 @@ impl Request {
                 Ok(params) => Self::Login(params),
                 Err(failure) => return Err((Some(id), failure)),
             },
+            "accounts" | "select_account" | "logout_account" => {
+                match AccountRequest::parse(value) {
+                    Ok(request) => Self::Account(request),
+                    Err(failure) => return Err((Some(id), failure)),
+                }
+            }
             #[cfg(any(test, feature = "test-hooks"))]
             cmd if hooks::COMMANDS.contains(&cmd) => match hooks::Hook::parse(value) {
                 Ok(hook) => Self::Test(hook),
@@ -742,6 +775,32 @@ impl Request {
             }
         };
         Ok((id, request))
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+enum AccountRequest {
+    Accounts,
+    SelectAccount { account: String },
+    LogoutAccount { account: String },
+}
+
+impl AccountRequest {
+    fn parse(value: Value) -> Result<Self, Failure> {
+        let request: Self = serde_json::from_value(value).map_err(engine::invalid_params)?;
+        if let Self::SelectAccount { account } | Self::LogoutAccount { account } = &request {
+            dstreamy_core::accounts::validate_name(account).map_err(engine::invalid_params)?;
+        }
+        Ok(request)
+    }
+
+    async fn run(self, engine: &Engine) -> Result<Value, Failure> {
+        match self {
+            Self::Accounts => engine.accounts(),
+            Self::SelectAccount { account } => engine.select_account(&account).await,
+            Self::LogoutAccount { account } => engine.logout_account(&account).await,
+        }
     }
 }
 

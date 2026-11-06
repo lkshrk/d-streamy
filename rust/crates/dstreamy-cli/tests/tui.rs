@@ -49,6 +49,7 @@ impl Harness {
         let ctx = Ctx {
             paths,
             gateway_url: mock.gateway_url(),
+            account: None,
         };
         Self {
             mock,

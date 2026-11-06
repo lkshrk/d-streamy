@@ -13,7 +13,6 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 
 use crate::discord::{self, Persistence};
-use crate::lock::SessionLock;
 use crate::output::Out;
 use crate::signals::Signals;
 use crate::{CliError, Ctx, capture};
@@ -241,7 +240,8 @@ pub async fn run_with(
         out.warn(warning);
     }
     let capture = args.capture_config(&stream, &config);
-    let _lock = SessionLock::acquire(&ctx.paths)?;
+    let resolved = crate::accounts::resolve(ctx)?;
+    let _lock = crate::accounts::session_lock(ctx, &resolved.source)?;
     let restore_token = capture::restore_token(&config);
     let capture::Picked {
         source,
@@ -257,7 +257,7 @@ pub async fn run_with(
     let mut silence = SilenceWarning::default();
     let mut silence_check = tokio::time::interval(SILENCE_CHECK);
 
-    let client = Arc::new(discord::connect(ctx, Persistence::Long).await?);
+    let client = Arc::new(discord::connect_resolved(ctx, resolved, Persistence::Long).await?);
     let channels = match discord::voice_channels(&client, &args.guild).await {
         Ok(channels) => channels,
         Err(e) => {
