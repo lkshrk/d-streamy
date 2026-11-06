@@ -16,7 +16,9 @@
 #include <QLabel>
 #include <QLayout>
 #include <QMainWindow>
+#include <QMessageBox>
 #include <QPalette>
+#include <QPointer>
 #include <QPushButton>
 #include <QStatusBar>
 #include <QStyleFactory>
@@ -314,6 +316,25 @@ QJsonObject status_of(const State &s)
 // Replaces the next views' status bar while set.
 QJsonObject status_override;
 
+const char *const go_live_question = "Go live in Kids Lounge 🧃 on Beste Chatgruppe?";
+
+QJsonObject control_of(const State &s)
+{
+	bool stop = std::strcmp(s.action, "stop") == 0;
+	QString reason = QString::fromUtf8(s.line);
+	if (*s.fix)
+		reason += QLatin1Char('\n') + QString::fromUtf8(s.fix);
+	return QJsonObject{{"action", s.action},
+			   {"icon", stop ? "player-stop" : "player-play"},
+			   {"enabled", s.enabled},
+			   {"tooltip", s.enabled ? QString::fromUtf8(s.button) : reason},
+			   {"confirm", QJsonObject{{"text", stop ? QStringLiteral("Stop the Discord stream?")
+								 : QString::fromUtf8(go_live_question)},
+						   {"ok", stop ? "Stop" : "Go live"},
+						   {"cancel", "Cancel"},
+						   {"default_ok", !stop}}}};
+}
+
 std::string view(const State &s, const QJsonObject &a, bool loading = false, const char *login = nullptr,
 		 const char *login_action = "login", const QJsonValue &account = QJsonValue())
 {
@@ -333,6 +354,7 @@ std::string view(const State &s, const QJsonObject &a, bool loading = false, con
 		{"audio", a},
 		{"button",
 		 QJsonObject{{"label", QString::fromUtf8(s.button)}, {"action", s.action}, {"enabled", s.enabled}}},
+		{"control", control_of(s)},
 		{"login", login ? QJsonValue(QJsonObject{{"label", QString::fromUtf8(login)}, {"action", login_action}})
 				: QJsonValue()},
 		{"account", account}};
@@ -449,6 +471,74 @@ void shoot_status(const char *name)
 QToolButton *status_button()
 {
 	return find<QToolButton>("dstreamy-status");
+}
+
+QToolButton *status_action()
+{
+	return find<QToolButton>("dstreamy-status-action");
+}
+
+// The open Start/Stop confirm; one closed by an answer waits for its deferred delete, hidden.
+QMessageBox *confirm_box()
+{
+	QMessageBox *open = nullptr;
+	for (QWidget *top : QApplication::topLevelWidgets())
+		if (top->objectName() == QLatin1String("dstreamy-stream-confirm") && top->isVisible()) {
+			CHECK(!open);
+			open = qobject_cast<QMessageBox *>(top);
+		}
+	return open;
+}
+
+QPushButton *confirm_button(const char *which)
+{
+	QMessageBox *box = confirm_box();
+	return box ? box->findChild<QPushButton *>(
+			     QStringLiteral("dstreamy-stream-confirm-%1").arg(QLatin1String(which)))
+		   : nullptr;
+}
+
+void answer(const char *which)
+{
+	QPushButton *b = confirm_button(which);
+	CHECK(b != nullptr);
+	if (b)
+		b->click();
+	CHECK(wait_for([] { return !confirm_box(); }));
+}
+
+// A real press and release, not QAbstractButton::click, which a disabled button ignores.
+void mouse_click(QWidget *w)
+{
+	QPoint at = w->rect().center();
+	QMouseEvent press(QEvent::MouseButtonPress, at, w->mapToGlobal(at), Qt::LeftButton, Qt::LeftButton,
+			  Qt::NoModifier);
+	QMouseEvent release(QEvent::MouseButtonRelease, at, w->mapToGlobal(at), Qt::LeftButton, Qt::NoButton,
+			    Qt::NoModifier);
+	QApplication::sendEvent(w, &press);
+	QApplication::sendEvent(w, &release);
+	QApplication::processEvents();
+}
+
+void key(QWidget *w, Qt::Key k)
+{
+	QKeyEvent press(QEvent::KeyPress, k, Qt::NoModifier);
+	QApplication::sendEvent(w, &press);
+	QKeyEvent release(QEvent::KeyRelease, k, Qt::NoModifier);
+	QApplication::sendEvent(w, &release);
+	QApplication::processEvents();
+}
+
+// With DSTREAMY_UI_SHOTS=DIR, saves the confirm as DIR/confirm-NAME.png.
+void shoot_confirm(const char *name)
+{
+	QByteArray dir = qgetenv("DSTREAMY_UI_SHOTS");
+	QMessageBox *box = confirm_box();
+	if (dir.isEmpty() || !box)
+		return;
+	QString path = QString::fromLocal8Bit(dir) + QStringLiteral("/confirm-%1.png").arg(QLatin1String(name));
+	if (!box->grab().save(path))
+		std::fprintf(stderr, "could not save %s\n", qPrintable(path));
 }
 
 // The status button's shown parts in layout order: "dot:STATE", then each icon's name and text, then the duration.
@@ -571,6 +661,109 @@ void check_problem_status(QApplication &app, QToolButton *status)
 	shoot_status("audio-silent");
 	status_override = QJsonObject();
 	show(view(live, audio(true, false)));
+}
+
+// The status bar's Start/Stop: its icon and reason, the confirm it asks, and that it never opens the panel.
+void check_status_action(QToolButton *status)
+{
+	show(view(idle, audio(true, false)));
+	QToolButton *act = status_action();
+	CHECK(act && act->isVisible() && act->isEnabled());
+	if (!act)
+		return;
+	int height = status->fontMetrics().height();
+	CHECK(act->property("iconName").toString() == QLatin1String("player-play"));
+	CHECK(!act->icon().isNull() && act->iconSize() == QSize(height, height));
+	CHECK(QColor(act->property("color").toString()) == act->palette().color(QPalette::WindowText));
+	CHECK(plain(act->toolTip()) == QLatin1String("Start D-Streamy"));
+	auto *row = status->layout();
+	int at = row->indexOf(act);
+	CHECK(at > row->indexOf(status_part("text", "viewers")) &&
+	      at < row->indexOf(status->findChild<QLabel *>("dstreamy-status-duration")));
+	CHECK(panel() && !panel()->isVisible());
+	shoot_status("idle");
+
+	int starts = host.starts, stops = host.stops, closed = host.closed, loads = host.loads;
+	act->click();
+	QMessageBox *box = confirm_box();
+	CHECK(box && box->text() == QString::fromUtf8(go_live_question));
+	CHECK(box && box->parentWidget() == fake::window && box->windowModality() != Qt::NonModal);
+	CHECK(box && box->defaultButton() == confirm_button("ok"));
+	CHECK(confirm_button("ok") && confirm_button("ok")->text() == QLatin1String("Go live"));
+	CHECK(confirm_button("cancel") && confirm_button("cancel")->text() == QLatin1String("Cancel"));
+	CHECK(panel() && !panel()->isVisible() && host.closed == closed);
+	shoot_confirm("start");
+	act->click();
+	CHECK(confirm_box() == box);
+	if (box)
+		key(box, Qt::Key_Escape);
+	CHECK(wait_for([] { return !confirm_box(); }));
+	CHECK(host.starts == starts);
+	mouse_click(act);
+	CHECK(confirm_box() && panel() && !panel()->isVisible());
+	if (confirm_box())
+		key(confirm_box(), Qt::Key_Return);
+	CHECK(wait_for([] { return !confirm_box(); }));
+	CHECK(host.starts == starts + 1 && host.loads == loads && host.closed == closed);
+	act->click();
+	answer("cancel");
+	CHECK(host.starts == starts + 1);
+	act->click();
+	QPointer<QPushButton> ok = confirm_button("ok");
+	CHECK(ok != nullptr);
+	if (ok)
+		ok->click();
+	if (ok)
+		ok->click();
+	CHECK(wait_for([] { return !confirm_box(); }));
+	CHECK(host.starts == starts + 2);
+
+	act->click();
+	CHECK(confirm_box() != nullptr);
+	show(view(live, audio(true, false)));
+	CHECK(wait_for([] { return !confirm_box(); }));
+	CHECK(host.starts == starts + 2 && host.stops == stops);
+	CHECK(act->property("iconName").toString() == QLatin1String("player-stop") && act->isEnabled());
+	CHECK(plain(act->toolTip()) == QLatin1String("Stop D-Streamy"));
+	act->click();
+	CHECK(confirm_box() && confirm_box()->text() == QLatin1String("Stop the Discord stream?"));
+	CHECK(confirm_box() && confirm_box()->defaultButton() == confirm_button("cancel"));
+	CHECK(confirm_button("ok") && confirm_button("ok")->text() == QLatin1String("Stop"));
+	shoot_confirm("stop");
+	if (confirm_box())
+		key(confirm_box(), Qt::Key_Return);
+	CHECK(wait_for([] { return !confirm_box(); }));
+	CHECK(host.stops == stops);
+	act->click();
+	answer("ok");
+	CHECK(host.stops == stops + 1);
+
+	const State waiting{"busy",
+			    "●",
+			    "busy",
+			    "Logging in…",
+			    "Waiting for login in the browser window…",
+			    "Logging in…\nWaiting for login in the browser window…",
+			    "Start D-Streamy",
+			    "start",
+			    false};
+	show(view(waiting, audio(true, false)));
+	CHECK(!act->isEnabled() && act->property("iconName").toString() == QLatin1String("player-play"));
+	CHECK(plain(act->toolTip()) == QString::fromUtf8("Logging in…\nWaiting for login in the browser window…"));
+	act->click();
+	mouse_click(act);
+	CHECK(!confirm_box() && panel() && !panel()->isVisible());
+	CHECK(host.starts == starts + 2 && host.loads == loads && host.closed == closed);
+	shoot_status("disabled");
+
+	show(view(idle, audio(true, false)));
+	CHECK(dstreamy_ui_open_panel());
+	QApplication::processEvents();
+	closed = host.closed;
+	find<QPushButton>("dstreamy-action")->click();
+	CHECK(confirm_box() && panel() && !panel()->isVisible() && host.closed == closed + 1);
+	answer("cancel");
+	CHECK(host.starts == starts + 2);
 }
 
 // The panel's size when it is shown, before anything can move or resize it again.
@@ -786,7 +979,12 @@ int main(int argc, char **argv)
 	CHECK(!host.ticks.empty() && host.ticks.back() == std::make_pair(std::string("u1"), true));
 	CHECK(boxes.size() == 5 && wait_for([&] { return !boxes[1]->isChecked(); }));
 	find<QPushButton>("dstreamy-action")->click();
+	CHECK(host.starts == 0 && confirm_box() && !panel()->isVisible());
+	CHECK(confirm_box() && confirm_box()->text() == QString::fromUtf8(go_live_question));
+	answer("ok");
 	CHECK(host.starts == 1);
+	CHECK(dstreamy_ui_open_panel());
+	app.processEvents();
 
 	QJsonObject noted = audio(true, false);
 	noted["line"] = QStringLiteral("Track 1 is OBS's streaming and recording track");
@@ -839,7 +1037,16 @@ int main(int argc, char **argv)
 	CHECK(sources().size() == 5 && sources()[2]->isChecked());
 	shoot("live");
 	find<QPushButton>("dstreamy-action")->click();
+	CHECK(host.stops == 0 && confirm_box() && confirm_box()->text() == QLatin1String("Stop the Discord stream?"));
+	answer("cancel");
+	CHECK(host.stops == 0);
+	CHECK(dstreamy_ui_open_panel());
+	app.processEvents();
+	find<QPushButton>("dstreamy-action")->click();
+	answer("ok");
 	CHECK(host.stops == 1);
+	CHECK(dstreamy_ui_open_panel());
+	app.processEvents();
 
 	show(view(attention, audio(true, false)));
 	CHECK(text("dstreamy-state") == QLatin1String("Service not running"));
@@ -1001,16 +1208,16 @@ int main(int argc, char **argv)
 	CHECK(host.closed == closed + 1);
 	status->click();
 	app.processEvents();
-	CHECK(panel() && panel()->isVisible() && host.loads == 2);
+	CHECK(panel() && panel()->isVisible() && host.loads == 5);
 	CHECK(dstreamy_ui_open_panel());
-	CHECK(panel() && panel()->isVisible() && host.loads == 2);
+	CHECK(panel() && panel()->isVisible() && host.loads == 5);
 	QApplication::sendEvent(panel(), &esc);
 	app.processEvents();
 	CHECK(panel() && !panel()->isVisible());
 
 	CHECK(dstreamy_ui_open_panel());
 	app.processEvents();
-	CHECK(panel() && panel()->isVisible() && host.loads == 3);
+	CHECK(panel() && panel()->isVisible() && host.loads == 6);
 	QPoint outside = panel()->mapFromGlobal(window.mapToGlobal(QPoint(10, 10)));
 	QMouseEvent click(QEvent::MouseButtonPress, outside, panel()->mapToGlobal(outside), Qt::LeftButton,
 			  Qt::LeftButton, Qt::NoModifier);
@@ -1069,7 +1276,11 @@ int main(int argc, char **argv)
 	qApp->setStyleSheet(QString());
 	panel()->hide();
 
+	check_status_action(status);
+	status_action()->click();
+	CHECK(confirm_box() != nullptr);
 	dstreamy_ui_unload();
+	CHECK(!confirm_box());
 	host.unloaded = true;
 	CHECK(!dstreamy_ui_open_panel());
 	int views = host.views;
@@ -1084,7 +1295,11 @@ int main(int argc, char **argv)
 	host.json = view(idle, audio(false, false));
 	CHECK(dstreamy_ui_load(&good));
 	CHECK(window.statusBar()->findChild<QToolButton *>("dstreamy-status") != nullptr);
+	if (status_action())
+		status_action()->click();
+	CHECK(confirm_box() != nullptr);
 	fake::exit();
+	CHECK(!confirm_box());
 	host.unloaded = true;
 	views = host.views;
 	spin(1200);

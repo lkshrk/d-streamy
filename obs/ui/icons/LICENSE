@@ -1,6 +1,7 @@
 D-Streamy's status-bar icons are from Tabler Icons 3.31.0 (https://tabler.io/icons), built into
 the panel library from obs/ui/icons: missed.svg is movie-off, audio.svg volume, audio-silent.svg
-volume-3, audio-lost.svg volume-off, reconnects.svg refresh and viewers.svg eye, unchanged.
+volume-3, audio-lost.svg volume-off, reconnects.svg refresh, viewers.svg eye, player-play.svg
+player-play and player-stop.svg player-stop, unchanged.
 Tabler Icons is under the MIT License:
 
 MIT License

@@ -7,5 +7,7 @@
     <file>audio-lost.svg</file>
     <file>reconnects.svg</file>
     <file>viewers.svg</file>
+    <file>player-play.svg</file>
+    <file>player-stop.svg</file>
   </qresource>
 </RCC>

@@ -9,12 +9,14 @@
 #include <QGridLayout>
 #include <QGuiApplication>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QMainWindow>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPointer>
 #include <QPushButton>
@@ -186,6 +188,9 @@ struct Ui {
 	QPointer<StatusButton> status;
 	QPointer<QLabel> status_dot;
 	QPointer<QLabel> status_duration;
+	QPointer<QToolButton> status_action;
+	QPointer<QMessageBox> confirm_box;
+	QJsonObject control;
 	QStringList status_ids;
 	int style_generation = 0;
 	QPointer<Panel> panel;
@@ -219,7 +224,6 @@ struct Ui {
 	QPointer<QLabel> empty;
 	QPointer<QPushButton> action;
 	QByteArray shown;
-	QString pressed;
 	QString login_action;
 	QString account;
 	QString source_list;
@@ -370,6 +374,20 @@ QLabel *status_label(const QString &name)
 	return l;
 }
 
+void ask();
+
+QToolButton *status_action()
+{
+	auto *b = new QToolButton(ui.status);
+	b->setObjectName(QStringLiteral("dstreamy-status-action"));
+	b->setAutoRaise(true);
+	// Clicks on the button, enabled or not, never reach the item, which opens the panel.
+	b->setAttribute(Qt::WA_NoMousePropagation);
+	QObject::connect(b, &QToolButton::clicked, b, [] { guarded("start_stop", ask); });
+	b->show();
+	return b;
+}
+
 // One icon and one text label per counter, rebuilt only when the counters themselves change.
 void build_counters(const QJsonArray &counters)
 {
@@ -392,12 +410,14 @@ void build_counters(const QJsonArray &counters)
 		row->addWidget(status_label(QStringLiteral("dstreamy-status-text-") + id));
 	}
 	row->addSpacing(8);
+	ui.status_action = status_action();
+	row->addWidget(ui.status_action);
 	ui.status_duration = status_label(QStringLiteral("dstreamy-status-duration"));
 	row->addWidget(ui.status_duration);
 }
 
 // Tinting restyles the label, so it happens only when what it shows or the theme changed.
-bool tint_due(QLabel *l, const QString &look, int size, qreal ratio)
+bool tint_due(QWidget *l, const QString &look, int size, qreal ratio)
 {
 	QString key = QStringLiteral("%1|%2|%3|%4").arg(look).arg(size).arg(ratio).arg(ui.style_generation);
 	if (l->property("tintKey").toString() == key)
@@ -448,6 +468,37 @@ void render_status(const QJsonObject &status)
 	ui.status->setToolTip(plain_tip(tip));
 	ui.status->setAccessibleDescription(tip);
 	ui.status->updateGeometry();
+}
+
+void render_control(const QJsonObject &control)
+{
+	ui.control = control;
+	QToolButton *b = ui.status_action;
+	if (!b)
+		return;
+	b->setVisible(!control.isEmpty());
+	if (control.isEmpty())
+		return;
+	QString icon = control.value("icon").toString();
+	int size = ui.status->fontMetrics().height();
+	qreal ratio = ui.status->devicePixelRatioF();
+	if (tint_due(b, icon, size, ratio)) {
+		QColor color = b->palette().color(QPalette::WindowText);
+		QColor faded = color;
+		faded.setAlphaF(0.4f);
+		QIcon pixmaps;
+		pixmaps.addPixmap(icon_pixmap(icon, size, ratio, color), QIcon::Normal);
+		pixmaps.addPixmap(icon_pixmap(icon, size, ratio, faded), QIcon::Disabled);
+		b->setIcon(pixmaps);
+		b->setIconSize(QSize(size, size));
+		b->setProperty("iconName", icon);
+		b->setProperty("color", color.name(QColor::HexArgb));
+	}
+	b->setEnabled(control.value("enabled").toBool());
+	b->setProperty("action", control.value("action").toString());
+	QString tip = control.value("tooltip").toString();
+	b->setToolTip(plain_tip(tip));
+	b->setAccessibleName(tip);
 }
 
 QPushButton *button(const char *name, QWidget *parent)
@@ -740,8 +791,13 @@ void render()
 
 	QJsonObject view = doc.object();
 	QString color = QStringLiteral("color: %1;").arg(tone_color(view.value("tone").toString()));
-	if (ui.status)
+	if (ui.status) {
 		render_status(view.value("status").toObject());
+		render_control(view.value("control").toObject());
+	}
+	if (ui.confirm_box && (!ui.control.value("enabled").toBool() ||
+			       ui.control.value("action").toString() != ui.confirm_box->property("action").toString()))
+		ui.confirm_box->reject();
 
 	ui.panel->setProperty("tone", view.value("tone").toString());
 	ui.mark->setText(view.value("mark").toString());
@@ -795,7 +851,6 @@ void render()
 	QJsonObject button = view.value("button").toObject();
 	ui.action->setText(button.value("label").toString());
 	ui.action->setEnabled(button.value("enabled").toBool());
-	ui.pressed = button.value("action").toString();
 
 	if (ui.panel->isVisible()) {
 		place_panel();
@@ -804,15 +859,58 @@ void render()
 	}
 }
 
-void press()
+// Acts only if the view still offers what the user confirmed.
+void answered(bool yes, const QString &action)
 {
-	if (!ui.active)
+	ui.confirm_box = nullptr;
+	if (!yes || !ui.active)
 		return;
-	if (ui.pressed == QLatin1String("start"))
+	ui.shown.clear();
+	render();
+	if (!ui.control.value("enabled").toBool() || ui.control.value("action").toString() != action)
+		return;
+	if (action == QLatin1String("start"))
 		ui.host.start(ui.host.ctx);
-	else if (ui.pressed == QLatin1String("stop"))
+	else if (action == QLatin1String("stop"))
 		ui.host.stop(ui.host.ctx);
 	rerender();
+}
+
+// open(), not exec(): OBS's exit event must be able to tear the dialog down.
+void ask()
+{
+	if (!ui.active || ui.confirm_box || !ui.window)
+		return;
+	ui.shown.clear();
+	render();
+	if (!ui.active || !ui.control.value("enabled").toBool())
+		return;
+	QString action = ui.control.value("action").toString();
+	QJsonObject question = ui.control.value("confirm").toObject();
+	if (ui.panel && ui.panel->isVisible())
+		ui.panel->hide();
+	auto *box = new QMessageBox(ui.window);
+	box->setObjectName(QStringLiteral("dstreamy-stream-confirm"));
+	box->setWindowTitle(QStringLiteral("D-Streamy"));
+	box->setIcon(QMessageBox::Question);
+	box->setTextFormat(Qt::PlainText);
+	box->setText(question.value("text").toString());
+	QPushButton *ok = box->addButton(question.value("ok").toString(), QMessageBox::AcceptRole);
+	ok->setObjectName(QStringLiteral("dstreamy-stream-confirm-ok"));
+	QPushButton *cancel = box->addButton(question.value("cancel").toString(), QMessageBox::RejectRole);
+	cancel->setObjectName(QStringLiteral("dstreamy-stream-confirm-cancel"));
+	box->setDefaultButton(question.value("default_ok").toBool() ? ok : cancel);
+	box->setEscapeButton(cancel);
+	box->setProperty("action", action);
+	QObject::connect(box, &QMessageBox::finished, box, [box, ok] {
+		if (ui.confirm_box != box)
+			return;
+		box->deleteLater();
+		guarded("confirm_start_stop",
+			[box, ok] { answered(box->clickedButton() == ok, box->property("action").toString()); });
+	});
+	ui.confirm_box = box;
+	box->open();
 }
 
 bool open_panel()
@@ -1068,7 +1166,7 @@ Panel *build_panel()
 
 	ui.action = button("dstreamy-action", panel);
 	ui.action->setEnabled(false);
-	QObject::connect(ui.action, &QPushButton::clicked, ui.action, [] { guarded("start_stop", press); });
+	QObject::connect(ui.action, &QPushButton::clicked, ui.action, [] { guarded("start_stop", ask); });
 	rows->addWidget(ui.action, 0, Qt::AlignRight);
 	panel->setFixedWidth(320);
 	return owner.release();
@@ -1078,6 +1176,10 @@ void teardown()
 {
 	ui.active = false;
 	delete ui.timer;
+	if (ui.confirm_box) {
+		QObject::disconnect(ui.confirm_box, nullptr, nullptr, nullptr);
+		delete ui.confirm_box.data();
+	}
 	if (ui.window && ui.status)
 		ui.window->statusBar()->removeWidget(ui.status);
 	delete ui.status;
