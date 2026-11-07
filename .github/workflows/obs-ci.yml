@@ -124,6 +124,13 @@ jobs:
           path: ~/apt-archives
           key: ${{ steps.apt-check.outputs.key }}
 
+      - name: Point bindgen at the packaged libclang
+        # Runner images preinstall older LLVMs; mixing their libclang with newer clang headers breaks bindgen.
+        run: |
+          v=$(dpkg-query -W -f='${Depends}' libclang-dev | grep -oE 'libclang-[0-9]+-dev' | grep -oE '[0-9]+' | head -n 1)
+          test -e "/usr/lib/llvm-$v/lib/libclang.so"
+          echo "LIBCLANG_PATH=/usr/lib/llvm-$v/lib" >> "$GITHUB_ENV"
+
       - name: Restore OBS build
         id: obs
         uses: ./.github/actions/obs-prefix-fetch
