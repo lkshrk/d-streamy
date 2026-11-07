@@ -25,6 +25,7 @@ use crate::output::{Out, table};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
 const DEFINITION_MODE: u32 = 0o644;
 
 #[derive(Debug, clap::Args)]

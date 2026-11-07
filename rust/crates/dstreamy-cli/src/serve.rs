@@ -1021,10 +1021,15 @@ mod tests {
 
     #[tokio::test]
     async fn disconnected_commands_keep_their_connection_admission_permit() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let endpoint = Endpoint::new(dir.path().join("control.sock"));
+        #[cfg(unix)]
+        let endpoint = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            Endpoint::new(dir.path().join("control.sock"))
+        };
+        #[cfg(windows)]
+        let endpoint = Endpoint::new(format!(r"\\.\pipe\dstreamy-test-{}", std::process::id()));
         let listener = Listener::bind(&endpoint).await.unwrap();
         let client = dstreamy_ipc::connect(&endpoint).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();

@@ -1,6 +1,10 @@
+#[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Child, Stdio};
+#[cfg(unix)]
+use std::process::Child;
+use std::process::Stdio;
+#[cfg(unix)]
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -379,11 +383,13 @@ fn stream_rejects_bad_settings_and_unknown_channels() {
     assert!(err.contains("config.toml"), "{err}");
 }
 
+#[cfg(unix)]
 struct Lines {
     rx: mpsc::Receiver<String>,
     seen: Vec<String>,
 }
 
+#[cfg(unix)]
 impl Lines {
     fn spawn(pipe: impl std::io::Read + Send + 'static) -> Self {
         let (tx, rx) = mpsc::channel();

@@ -261,14 +261,20 @@ fn outcome(output: &Output) -> Result<Value, Failure> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
 
     use super::*;
 
     fn output(code: i32, stdout: &str, stderr: &str) -> Output {
         Output {
+            #[cfg(unix)]
             status: ExitStatus::from_raw(code << 8),
+            #[cfg(windows)]
+            status: ExitStatus::from_raw(code as u32),
             stdout: stdout.into(),
             stderr: stderr.into(),
         }
