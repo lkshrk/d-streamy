@@ -2255,6 +2255,7 @@ mod tests {
             for (release_during_start, self_stops) in [(true, false), (false, false), (true, true)]
             {
                 let f = Fixture::new().await;
+                let mut published = f.engine.subscribe_lossless();
                 f.engine
                     .start(
                         if self_stops {
@@ -2266,11 +2267,11 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+                published_until(&mut published, |s| matches!(s, SessionState::Streaming)).await;
                 let conn = f.engine.current().unwrap();
                 assert!(f.engine.catch_up(&conn).await);
+                while published.try_recv().is_ok() {}
                 let gate = f.engine.forward_gate.lock().await;
-                let mut published = f.engine.subscribe_lossless();
                 if self_stops {
                     f.wait_state(|s| matches!(s, SessionState::Stopped { .. }))
                         .await;
@@ -2332,15 +2333,10 @@ mod tests {
                     })
                 )));
                 f.engine.start(params(), None).await.unwrap();
-                f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
-                assert!(f.engine.catch_up(&conn).await);
-                let next: Vec<_> = std::iter::from_fn(|| published.try_recv().ok()).collect();
-                assert!(next.iter().any(|event| matches!(
-                    event,
-                    EngineEvent::Session(SessionEvent::State {
-                        state: SessionState::Streaming
-                    })
-                )));
+                let mut next =
+                    published_until(&mut published, |s| matches!(s, SessionState::Streaming)).await;
+                assert!(f.engine.catch_up(&f.engine.current().unwrap()).await);
+                next.extend(std::iter::from_fn(|| published.try_recv().ok()));
                 assert!(!next.iter().any(|event| matches!(
                     event,
                     EngineEvent::Session(SessionEvent::State {
@@ -2350,6 +2346,27 @@ mod tests {
                 f.engine.stop().await.unwrap();
                 f.engine.shutdown().await;
             }
+        }
+
+        /// The session updates its state watch before it broadcasts the event, so tests wait for the publication.
+        async fn published_until(
+            rx: &mut mpsc::Receiver<EngineEvent>,
+            done: impl Fn(&SessionState) -> bool,
+        ) -> Vec<EngineEvent> {
+            let mut seen = Vec::new();
+            timeout(T, async {
+                loop {
+                    let event = rx.recv().await.expect("engine events closed");
+                    let last = matches!(&event, EngineEvent::Session(SessionEvent::State { state }) if done(state));
+                    seen.push(event);
+                    if last {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("the state was never published");
+            seen
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
