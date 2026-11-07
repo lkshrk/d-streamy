@@ -551,6 +551,9 @@ impl Connection {
                     None | Some(Err(_)) => {
                         reading = false;
                         logins.abort_all();
+                        if !dstreamy_ipc::HALF_CLOSE {
+                            break End::Gone;
+                        }
                     }
                     Some(Ok(Err(e))) => {
                         let (id, failure) = malformed(None, &e.to_string());

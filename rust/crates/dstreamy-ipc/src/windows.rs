@@ -544,7 +544,7 @@ mod tests {
         client.send(serde_json::json!({"id": "1"})).await.unwrap();
         assert!(reader.next().await.unwrap().is_ok());
         writer.send(serde_json::json!({"id": "1"})).await.unwrap();
-        client.next().await.unwrap().unwrap();
+        client.next().await.unwrap().unwrap().unwrap();
         drop(client);
         let late = writer.send(serde_json::json!({"event": "late"})).await;
         let end = tokio::time::timeout(Duration::from_secs(5), reader.next())

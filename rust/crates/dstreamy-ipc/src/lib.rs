@@ -27,6 +27,9 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub use auth::authorize;
+
+/// Whether a peer can stop writing yet keep reading; without it, the end of reading means the peer is gone.
+pub const HALF_CLOSE: bool = cfg!(unix);
 pub use control::{ControlCodec, Malformed};
 pub use error::IpcError;
 pub use producer::{Frame, Kind, ProducerCodec, ProducerError};
