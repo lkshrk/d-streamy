@@ -66,6 +66,14 @@ Set `DSTREAMY_OBS_CONFIG` to the absolute path of `obs/build_x86_64/obs-config-R
 
 macOS app: `swift test` (it needs `rust/target/debug/dstreamy` and the mock Discord server, so run `cargo build --locked -p dstreamy-cli --features test-hooks -p dstreamy-mock-discord` in `rust/` first) and `bash scripts/build.sh`.
 
+## Releasing
+
+One tag releases everything: `vX.Y.Z` builds the `dstreamy` CLI (macOS arm64 and x86_64, Linux x86_64 and arm64), the macOS app with its bundled daemon, and the OBS plugin (Linux, macOS; Windows is built but not published), and attaches them all to one GitHub release ([release.yml](.github/workflows/release.yml)).
+
+- `scripts/tag-release.sh major|minor|patch|vX.Y.Z` sets the version in `rust/Cargo.toml`, `rust/Cargo.lock` and `obs/buildspec.json`, commits it, tags it and pushes. The workflow refuses a tag that does not match those versions.
+- Publishing waits until CI, Rust CI, OBS and Fuzz passed on the tagged commit, then signs and notarizes the macOS builds and bumps `Formula/dstreamy.rb` and `Casks/d-streamy.rb` in `lkshrk/homebrew-tap`.
+- To rehearse, push the commit to the `release-rehearsal` branch (`git push -f origin HEAD:release-rehearsal`). It builds, signs and notarizes when the secrets exist, checks the assets and shows the filled formula and cask, but publishes nothing.
+
 ## Pull requests
 
 - Fork, branch from `main`, and keep each PR focused on one change.

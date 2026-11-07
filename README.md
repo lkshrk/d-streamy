@@ -4,7 +4,7 @@ Streams a window, a display or OBS's output to a Discord voice channel through G
 
 Everything runs through one binary, `dstreamy`:
 
-- **`dstreamy`** (`rust/`): the CLI and TUI, the capture and encode backends (PipeWire and GStreamer on Linux, ScreenCaptureKit and VideoToolbox on macOS), the Discord protocol, and `dstreamy serve`, the service that OBS talks to. Released from `rs-v*` tags.
+- **`dstreamy`** (`rust/`): the CLI and TUI, the capture and encode backends (PipeWire and GStreamer on Linux, ScreenCaptureKit and VideoToolbox on macOS), the Discord protocol, and `dstreamy serve`, the service that OBS talks to. Released together with the app and the plugin from one `vX.Y.Z` tag ([Releasing](CONTRIBUTING.md#releasing)).
 - **OBS plugin** (`obs/`, `rust/crates/dstreamy-obs`): a status-bar panel in OBS that sends OBS's encoded H.264 and Opus to a running `dstreamy serve` ([ADR 0004](docs/adr/0004-persistent-service-and-external-producers.md), [ADR 0007](docs/adr/0007-obs-status-bar-panel.md)).
 - **macOS menu bar app** (`App/`): a thin SwiftUI frontend that spawns the bundled `dstreamy daemon` and talks to it over JSON on stdin and stdout ([ADR 0003](docs/adr/0003-macos-menu-bar-on-rust-daemon.md)).
 
@@ -96,7 +96,7 @@ dstreamy service uninstall   # stop, disable and remove it
 
 ### OBS plugin
 
-The plugin can be built from source. `release-obs.yml` defines preview packages for `obs-v*` tags and a manual rehearsal that publishes nothing by default. No published tag, completed rehearsal or signing run has been verified here. Check the actual release assets before relying on a download. OBS 32.2.2 is the build baseline; `obs-ci.yml` also defines Linux plugin tests against OBS 33.0.1. macOS and Windows jobs use the baseline, and Windows still cannot connect to the service. Flatpak OBS cannot reach the service's socket in its default sandbox, so use a native OBS package. Windows is not supported yet: the panel says so and disables Start and Stop.
+The plugin can be built from source. `release.yml` builds it for Linux, macOS and Windows for every `vX.Y.Z` release and attaches the Linux and macOS packages; the Windows package is built but not published. No published tag, completed rehearsal or signing run has been verified here. Check the actual release assets before relying on a download. OBS 32.2.2 is the build baseline; `obs-ci.yml` also defines Linux plugin tests against OBS 33.0.1. macOS and Windows jobs use the baseline, and Windows still cannot connect to the service. Flatpak OBS cannot reach the service's socket in its default sandbox, so use a native OBS package. Windows is not supported yet: the panel says so and disables Start and Stop.
 
 Build it against an OBS build or the OBS development packages (`cd obs`, then `cmake --preset ubuntu-x86_64` or `cmake --preset macos`, then `cmake --build --preset <the same>`; CI's exact steps are in `.github/workflows/obs-ci.yml`), then install the two modules where OBS looks for user plugins:
 

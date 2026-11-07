@@ -116,6 +116,24 @@ case "${CONFIRM}" in
   *) echo "Aborted."; exit 0 ;;
 esac
 
+set_version() {
+  local version=$1
+  sed -i.bak -E '/^\[workspace\.package\]/,/^\[/ s/^version = "[^"]*"/version = "'"$version"'"/' rust/Cargo.toml
+  rm rust/Cargo.toml.bak
+  grep -q "^version = \"$version\"" rust/Cargo.toml || { echo "Error: could not set the version in rust/Cargo.toml" >&2; exit 1; }
+  (cd rust && cargo update --workspace --offline --quiet)
+  local spec
+  spec=$(jq --indent 4 --arg v "$version" '.version = $v' obs/buildspec.json)
+  printf '%s\n' "$spec" > obs/buildspec.json
+}
+
+# The release workflow publishes only when the tag equals dstreamy-cli's version and the plugin's.
+set_version "${VERSION#v}"
+if ! git diff --quiet; then
+  git add rust/Cargo.toml rust/Cargo.lock obs/buildspec.json
+  git commit -m "chore: release ${VERSION}"
+fi
+
 git tag -a "${VERSION}" -m "Release ${VERSION}"
 git push origin "${BRANCH}" "${VERSION}"
 

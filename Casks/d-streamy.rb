@@ -2,7 +2,7 @@ cask "d-streamy" do
   version "0.9.0"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
-  url "https://github.com/lkshrk/d-streamy/releases/download/v#{version}/D-Streamy.zip"
+  url "https://github.com/lkshrk/d-streamy/releases/download/v#{version}/D-Streamy-#{version}-macos-universal.zip"
   name "D-Streamy"
   desc "Menu bar app that streams any macOS window to a Discord voice channel"
   homepage "https://github.com/lkshrk/d-streamy"

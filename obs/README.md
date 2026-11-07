@@ -15,7 +15,7 @@ Layout:
 
 The plugin builds against stock OBS Studio. Do not patch libobs or depend on unreleased host changes.
 
-Release packaging is defined in [release-obs.yml](../.github/workflows/release-obs.yml) for `obs-v*` tags, with a nonpublishing rehearsal by default. A workflow definition is not proof that packages were published or signing ran. The [install layouts](../README.md#obs-plugin) distinguish Linux prefix tarballs, macOS bundles and Windows folder zips; Windows service transport remains unsupported. Linux plugin CI includes 32.2.2 and 33.0.1; the cross-platform build baseline remains 32.2.2.
+Release packaging is defined in [release.yml](../.github/workflows/release.yml), which builds the plugin with the CLI and the app for each `vX.Y.Z` tag; the Windows package is built but not published. A workflow definition is not proof that packages were published or signing ran. The [install layouts](../README.md#obs-plugin) distinguish Linux prefix tarballs, macOS bundles and Windows folder zips; Windows service transport remains unsupported. Linux plugin CI includes 32.2.2 and 33.0.1; the cross-platform build baseline remains 32.2.2.
 
 ## Dependency pins
 

@@ -82,54 +82,55 @@ class WorkflowTests(unittest.TestCase):
             output = directory / "output"
             return result, output.read_text() if output.exists() else ""
 
+    VERSION_STEP = "Resolve the version and whether this run publishes"
+
     def test_exact_publication_refs(self):
-        for file, prefix in (("release-rust.yml", "rs-v"), ("release-obs.yml", "obs-v")):
-            script = step(file, "Resolve the version and whether this run publishes")
-            for ref, ref_type, accepted in ((prefix + "0.1.0", "tag", True), ("0.1.0", "tag", False),
-                                             ("wrong-v0.1.0", "tag", False), (prefix + "0.1.0", "branch", False),
-                                             (prefix + "0.2.0", "tag", False)):
-                with self.subTest(file=file, ref=ref, ref_type=ref_type):
-                    result, output = self.shell(script, dict(TAG=ref, REF_TYPE=ref_type,
-                        INPUT_PUBLISH="true", INPUT_VERSION="", GITHUB_EVENT_NAME="workflow_dispatch"))
-                    self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
-                    if accepted:
-                        self.assertIn("publish=true", output)
+        script = step("release.yml", self.VERSION_STEP)
+        for ref, ref_type, accepted in (("v0.1.0", "tag", True), ("0.1.0", "tag", False),
+                                         ("rs-v0.1.0", "tag", False), ("v0.1.0", "branch", False),
+                                         ("v0.2.0", "tag", False)):
+            with self.subTest(ref=ref, ref_type=ref_type):
+                result, output = self.shell(script, dict(TAG=ref, REF_TYPE=ref_type,
+                    INPUT_PUBLISH="true", GITHUB_EVENT_NAME="workflow_dispatch"))
+                self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+                if accepted:
+                    self.assertIn("publish=true", output)
 
     def test_rehearsal_describes_external_effects(self):
-        for file in ("release-rust.yml", "release-obs.yml"):
-            source = workflow(file)
-            with self.subTest(file=file):
-                self.assertNotIn("nothing was published", source)
-                self.assertIn("No GitHub release or Homebrew update was published", source)
-                self.assertIn("Workflow artifacts were uploaded", source)
-                self.assertIn("signing and notarization may contact Apple", source)
+        source = workflow("release.yml")
+        self.assertNotIn("nothing was published", source)
+        self.assertIn("No GitHub release or Homebrew update was published", source)
+        self.assertIn("Workflow artifacts were uploaded", source)
+        self.assertIn("signing and notarization may contact Apple", source)
 
     def test_push_requires_exact_publication_ref(self):
-        for file, prefix in (("release-rust.yml", "rs-v"), ("release-obs.yml", "obs-v")):
-            script = step(file, "Resolve the version and whether this run publishes")
-            for tag, accepted in ((prefix + "0.1.0", True), ("0.1.0", False)):
-                with self.subTest(file=file, tag=tag):
-                    result, output = self.shell(script, dict(TAG=tag, REF_TYPE="tag", INPUT_PUBLISH="",
-                        INPUT_VERSION="", GITHUB_EVENT_NAME="push"))
-                    self.assertEqual(result.returncode == 0, accepted)
-                    if accepted:
-                        self.assertIn("publish=true", output)
+        script = step("release.yml", self.VERSION_STEP)
+        for tag, accepted in (("v0.1.0", True), ("0.1.0", False)):
+            with self.subTest(tag=tag):
+                result, output = self.shell(script, dict(TAG=tag, REF_TYPE="tag", INPUT_PUBLISH="",
+                    GITHUB_EVENT_NAME="push"))
+                self.assertEqual(result.returncode == 0, accepted)
+                if accepted:
+                    self.assertIn("publish=true", output)
 
-    def test_dry_run_never_publishes(self):
-        for file in ("release-rust.yml", "release-obs.yml"):
-            with self.subTest(file=file):
-                result, output = self.shell(step(file, "Resolve the version and whether this run publishes"),
-                    dict(TAG="anything", REF_TYPE="branch", INPUT_PUBLISH="false", INPUT_VERSION="",
-                         GITHUB_EVENT_NAME="workflow_dispatch"))
+    def test_dry_run_and_rehearsal_branch_never_publish(self):
+        script = step("release.yml", self.VERSION_STEP)
+        for event, publish in (("workflow_dispatch", "false"), ("push", "")):
+            with self.subTest(event=event):
+                result, output = self.shell(script, dict(TAG="release-rehearsal", REF_TYPE="branch",
+                    INPUT_PUBLISH=publish, GITHUB_EVENT_NAME=event))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("publish=false", output)
 
-    def test_rust_version_validation_remains(self):
-        script = step("release-rust.yml", "Resolve the version and whether this run publishes")
-        for version, publish in (("0.2.0", "true"), ("not-semver", "false")):
-            result, _ = self.shell(script, dict(TAG="rs-v0.1.0", REF_TYPE="tag", INPUT_PUBLISH=publish,
-                INPUT_VERSION=version, GITHUB_EVENT_NAME="workflow_dispatch"))
-            self.assertNotEqual(result.returncode, 0)
+    def test_plugin_version_must_match_the_cli(self):
+        script = step("release.yml", self.VERSION_STEP)
+        jq = ("if [[ \"$*\" == *packages* ]]; then cat >/dev/null; printf '0.1.0\\n'; "
+              "elif [[ \"$*\" == '-r .version obs/buildspec.json' ]]; then printf '0.2.0\\n'; "
+              "else printf '0.1.0\\n'; fi")
+        result, _ = self.shell(script, dict(TAG="release-rehearsal", REF_TYPE="branch", INPUT_PUBLISH="",
+            GITHUB_EVENT_NAME="push"), jq_body=jq)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("obs/buildspec.json has version 0.2.0", result.stdout + result.stderr)
 
     def test_lipo_input_precedes_verify_arch(self):
         for path in (ROOT / ".github/workflows/release.yml", ROOT / "scripts/release.sh"):
@@ -163,7 +164,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_cli_notice_features_match_release(self):
-        package = step("release-rust.yml", "Package")
+        package = step("release.yml", "Package the CLI")
         self.assertRegex(package, r"--package dstreamy-cli\s+--features browser-login")
         self.assertIn('--target "$TARGET"', package)
         self.assertNotIn("--features browser-login", (ROOT / "scripts/build.sh").read_text())
@@ -175,11 +176,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIsNotNone(folder_match)
         assert folder_match is not None
         folder = folder_match.group(1)
-        source = workflow("release-obs.yml")
+        source = workflow("release.yml")
         for platform, base, extension, install_path in (
             ("linux", "$plugins", "so", "${CMAKE_INSTALL_LIBDIR}/obs-plugins/"),
             ("windows", "$bin", "dll", "${CMAKE_PROJECT_NAME}/bin/64bit/")):
-            section = re.split(r"\n  [a-z]+:\n", source.split(f"\n  {platform}:\n", 1)[1], maxsplit=1)[0]
+            section = re.split(r"\n  [a-z-]+:\n", source.split(f"\n  obs-{platform}:\n", 1)[1], maxsplit=1)[0]
             with self.subTest(platform=platform):
                 self.assertIn('DESTINATION "' + install_path + folder + '"', cmake)
                 self.assertIn(folder + "/obs-dstreamy-ui." + extension, section)
@@ -188,12 +189,12 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn('--output "' + notice + '"', section)
 
     def test_obs_notices_each_platform_before_signing(self):
-        source = workflow("release-obs.yml")
+        source = workflow("release.yml")
         for platform, target, destination in (
             ("linux", "x86_64-unknown-linux-gnu", '$plugins/dstreamy-ui/THIRD_PARTY_NOTICES.txt'),
             ("macos", "aarch64-apple-darwin", 'Resources/THIRD_PARTY_NOTICES.txt'),
             ("windows", "x86_64-pc-windows-msvc", '$bin/dstreamy-ui/THIRD_PARTY_NOTICES.txt')):
-            section = re.split(r"\n  [a-z]+:\n", source.split(f"\n  {platform}:\n", 1)[1], maxsplit=1)[0]
+            section = re.split(r"\n  [a-z-]+:\n", source.split(f"\n  obs-{platform}:\n", 1)[1], maxsplit=1)[0]
             with self.subTest(platform=platform):
                 self.assertIn("third-party-notices.py", section)
                 self.assertIn("--package dstreamy-obs", section)
