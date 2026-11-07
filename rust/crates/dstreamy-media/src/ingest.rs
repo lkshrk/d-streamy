@@ -10,6 +10,7 @@ pub const OPUS_MAX_PACKET: usize = 1500;
 /// Largest pts step between consecutive frames of one attachment, in either direction.
 pub const MAX_PTS_JUMP_US: i64 = 10_000_000;
 
+/// A producer frame that breaks an ADR 0004 ingest rule; the message is sent with `detached`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IngestError {
     #[error("video is not Annex B: it does not start with a start code")]
@@ -50,6 +51,7 @@ pub struct Ingest {
 }
 
 impl Ingest {
+    /// Checks H.264 keyframe flags and parameter sets; only accepted frames advance the PTS history.
     pub fn video(&mut self, data: &[u8], pts_us: i64, keyframe: bool) -> Result<(), IngestError> {
         if !starts_with_start_code(data) {
             return Err(IngestError::NotAnnexB);
@@ -80,6 +82,7 @@ impl Ingest {
         Ok(())
     }
 
+    /// Requires valid 20 ms Opus; rejected packets leave the signed-microsecond PTS history unchanged.
     pub fn audio(&mut self, data: &[u8], pts_us: i64) -> Result<(), IngestError> {
         match opus_duration_us(data)? {
             OPUS_PACKET_US => {}

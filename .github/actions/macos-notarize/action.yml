@@ -1,0 +1,42 @@
+name: Notarize an archive
+description: Submit a zip, dmg or pkg to Apple's notary service, print the log and fail unless it is accepted.
+inputs:
+  path:
+    description: Archive to submit.
+    required: true
+  key-p8:
+    description: Base64-encoded App Store Connect API key (.p8).
+    required: true
+  key-id:
+    description: Key ID of the API key.
+    required: true
+  issuer-id:
+    description: Issuer ID of the API key.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Submit and wait
+      shell: bash
+      env:
+        ARCHIVE: ${{ inputs.path }}
+        NOTARY_KEY_P8: ${{ inputs.key-p8 }}
+        NOTARY_KEY_ID: ${{ inputs.key-id }}
+        NOTARY_ISSUER_ID: ${{ inputs.issuer-id }}
+      run: |
+        set -euo pipefail
+        key="$RUNNER_TEMP/notary.p8"
+        echo "$NOTARY_KEY_P8" | base64 --decode > "$key"
+        submit=$(xcrun notarytool submit "$ARCHIVE" \
+          --key "$key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+          --output-format json --wait --timeout 30m)
+        echo "$submit"
+        id=$(/usr/bin/python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])' <<<"$submit")
+        status=$(/usr/bin/python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])' <<<"$submit")
+        echo "Notarization status: $status (id $id)"
+        xcrun notarytool log "$id" --key "$key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" || true
+        rm -f "$key"
+        if [ "$status" != "Accepted" ]; then
+          echo "::error::Notarization of $ARCHIVE not accepted (status $status); see the log above."
+          exit 1
+        fi

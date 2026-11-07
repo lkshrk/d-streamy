@@ -32,6 +32,7 @@ pub use utils::{
     StreamKey, StreamType, VideoCodec, generate_stream_key, normalize_video_codec, parse_stream_key,
 };
 pub use voice::{
-    ConnectionError, ConnectionKind, Flushed, MediaConnection, VideoAttributes, VideoGate,
-    VideoProgress, VoiceConnection, VoiceEvent, WebRtcError, WebRtcParams, WebRtcWrapper,
+    ConnectionError, ConnectionKind, Flushed, MediaConnection, MediaTimeouts, VideoAttributes,
+    VideoGate, VideoProgress, VoiceConnection, VoiceEvent, WebRtcError, WebRtcParams,
+    WebRtcWrapper,
 };

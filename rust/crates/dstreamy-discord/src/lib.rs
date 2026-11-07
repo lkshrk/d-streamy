@@ -17,5 +17,5 @@ pub use session::{
     StartError, StopReason,
 };
 pub use stream::{
-    StreamError, StreamHandle, StreamOptions, StreamStartError, StreamStats, start_stream,
+    E2ee, StreamError, StreamHandle, StreamOptions, StreamStartError, StreamStats, start_stream,
 };

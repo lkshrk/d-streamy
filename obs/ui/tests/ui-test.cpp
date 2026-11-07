@@ -1063,7 +1063,7 @@ int main(int argc, char **argv)
 
 	QJsonObject no_controls = audio(false, false);
 	no_controls["manage"] = QString();
-	no_controls["line"] = QStringLiteral("D-Streamy can't change Discord audio on Windows yet.");
+	no_controls["line"] = QStringLiteral("D-Streamy for OBS is not supported on Windows yet.");
 	show(view(idle, no_controls));
 	CHECK(visible("dstreamy-audio-line") && !visible("dstreamy-manage") && !visible("dstreamy-sources"));
 

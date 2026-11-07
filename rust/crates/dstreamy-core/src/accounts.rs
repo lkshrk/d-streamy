@@ -1,5 +1,6 @@
 //! Saved Discord accounts under `<config-dir>/accounts`, the default account, and the one-time move of the legacy token (ADR 0005).
 
+use std::fmt;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigError, io_err, read_token_file, write_private};
 
+/// Longest account name (ADR 0005: `a-z`, `0-9`, `_`, `.`, `-`).
 pub const MAX_NAME_LEN: usize = 32;
 /// The account a legacy token moves into when its user can't be looked up.
 pub const FALLBACK_NAME: &str = "default";
@@ -29,11 +31,14 @@ pub struct AccountUser {
     pub global_name: Option<String>,
 }
 
+/// One saved account as `dstreamy account list` and serve's `accounts` report it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountInfo {
     pub name: String,
     pub user: Option<AccountUser>,
     pub has_token: bool,
+    /// Why the token could not be read, such as an insecure file mode; `has_token` is false then.
+    pub token_error: Option<String>,
 }
 
 /// Where a token came from.
@@ -55,12 +60,23 @@ impl TokenSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The token a command will use and where it came from (`DSTREAMY_TOKEN`, an account, or the legacy file).
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedToken {
     pub source: TokenSource,
     pub token: String,
 }
 
+impl fmt::Debug for ResolvedToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedToken")
+            .field("source", &self.source)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Checks an account name against the ADR 0005 alphabet; the error says what is wrong.
 pub fn validate_name(name: &str) -> Result<(), ConfigError> {
     let mut chars = name.chars();
     let first_ok = chars
@@ -194,10 +210,17 @@ impl Accounts {
         Ok(self
             .names()?
             .into_iter()
-            .map(|name| AccountInfo {
-                user: self.user(&name),
-                has_token: self.load_token(&name).ok().flatten().is_some(),
-                name,
+            .map(|name| {
+                let (has_token, token_error) = match self.load_token(&name) {
+                    Ok(token) => (token.is_some(), None),
+                    Err(e) => (false, Some(e.to_string())),
+                };
+                AccountInfo {
+                    user: self.user(&name),
+                    has_token,
+                    token_error,
+                    name,
+                }
             })
             .collect())
     }
@@ -208,9 +231,22 @@ impl Accounts {
         toml::from_str(&text).ok()
     }
 
-    /// Records the user of an existing account; does nothing for an account that is gone.
-    pub fn remember_user(&self, name: &str, user: &AccountUser) -> Result<(), ConfigError> {
-        if !self.exists(name) || self.user(name).as_ref() == Some(user) {
+    /// Records READY metadata only while the resolved credential still owns the account.
+    pub fn remember_user(
+        &self,
+        name: &str,
+        token: &str,
+        user: &AccountUser,
+    ) -> Result<(), ConfigError> {
+        let _lock = self
+            .store_lock(Duration::from_secs(2))?
+            .ok_or_else(|| ConfigError::StoreBusy(self.dir.join(MIGRATION_LOCK)))?;
+        if !self.exists(name) || self.load_token(name)?.as_deref() != Some(token) {
+            return Ok(());
+        }
+        if let Some(current) = self.user(name)
+            && (current.id != user.id || current == *user)
+        {
             return Ok(());
         }
         self.write_user(name, user)
@@ -467,6 +503,12 @@ impl Migration<'_> {
                     Some(user) => accounts.name_for(user)?,
                     None => free_name(FALLBACK_NAME, &names),
                 };
+                // The user's account already has a token of its own, saved after the legacy one: keep it.
+                match accounts.load_token(&name) {
+                    Ok(Some(_)) => return self.remove_legacy(name),
+                    Ok(None) => {}
+                    Err(e) => return Err(e),
+                }
                 let created = !accounts.exists(&name);
                 if let Err(e) = self.copy(&name, user, fault) {
                     if created {
@@ -477,7 +519,12 @@ impl Migration<'_> {
                 name
             }
         };
-        let legacy = accounts.legacy_token_file();
+        self.remove_legacy(name)
+    }
+
+    /// Deletes the legacy file only while it still holds the token that was copied.
+    fn remove_legacy(&self, name: String) -> Result<String, ConfigError> {
+        let legacy = self.accounts.legacy_token_file();
         if read_token_file(&legacy)?.as_deref() != Some(self.token.as_str()) {
             return Ok(name);
         }
@@ -720,11 +767,100 @@ mod tests {
     #[test]
     fn remembering_a_user_skips_removed_accounts() {
         let (_dir, accounts) = store();
-        accounts.remember_user("gone", &user("1", "u")).unwrap();
+        accounts
+            .remember_user("gone", "1", &user("1", "u"))
+            .unwrap();
         assert!(!accounts.account_dir("gone").exists());
         accounts.save("a", "1", None).unwrap();
-        accounts.remember_user("a", &user("1", "u")).unwrap();
+        accounts.remember_user("a", "1", &user("1", "u")).unwrap();
         assert_eq!(accounts.user("a"), Some(user("1", "u")));
+    }
+
+    #[test]
+    fn a_delayed_ready_cannot_change_a_recreated_accounts_owner() {
+        let (_dir, accounts) = store();
+        accounts.save("a", "alice-token", None).unwrap();
+        let lock = accounts.store_lock(Duration::ZERO).unwrap().unwrap();
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let stale = accounts.clone();
+        let task = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            let result = stale.remember_user("a", "alice-token", &user("alice", "alice"));
+            finished.send(result).unwrap();
+        });
+        entering.recv().unwrap();
+        let premature = done.recv_timeout(Duration::from_millis(150));
+        accounts.remove("a").unwrap();
+        accounts
+            .save("a", "bob-token", Some(&user("bob", "bob")))
+            .unwrap();
+        drop(lock);
+        let bypassed = premature.is_ok();
+        let result = premature.unwrap_or_else(|_| done.recv().unwrap());
+        task.join().unwrap();
+        result.unwrap();
+        assert!(!bypassed, "metadata write bypassed the store lock");
+        assert_eq!(accounts.user("a"), Some(user("bob", "bob")));
+        assert_eq!(
+            accounts.load_token("a").unwrap().as_deref(),
+            Some("bob-token")
+        );
+    }
+
+    #[test]
+    fn a_ready_waiting_for_the_store_lock_cannot_resurrect_a_removed_account() {
+        let (_dir, accounts) = store();
+        accounts.save("a", "alice-token", None).unwrap();
+        let lock = accounts.store_lock(Duration::ZERO).unwrap().unwrap();
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let stale = accounts.clone();
+        let task = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            finished
+                .send(stale.remember_user("a", "alice-token", &user("alice", "alice")))
+                .unwrap();
+        });
+        entering.recv().unwrap();
+        assert!(done.recv_timeout(Duration::from_millis(150)).is_err());
+        accounts.remove("a").unwrap();
+        drop(lock);
+        done.recv().unwrap().unwrap();
+        task.join().unwrap();
+        assert!(!accounts.exists("a"));
+    }
+
+    #[test]
+    fn ready_metadata_requires_both_current_token_and_owner() {
+        let (_dir, accounts) = store();
+        accounts.save("a", "bob-token", None).unwrap();
+        accounts
+            .remember_user("a", "alice-token", &user("alice", "alice"))
+            .unwrap();
+        assert_eq!(accounts.user("a"), None);
+        accounts
+            .save("a", "bob-token", Some(&user("bob", "bob")))
+            .unwrap();
+        accounts
+            .remember_user("a", "bob-token", &user("alice", "alice"))
+            .unwrap();
+        assert_eq!(accounts.user("a"), Some(user("bob", "bob")));
+        accounts
+            .remember_user("a", "bob-token", &user("bob", "renamed"))
+            .unwrap();
+        assert_eq!(accounts.user("a"), Some(user("bob", "renamed")));
+    }
+
+    #[test]
+    fn a_resolved_token_debugs_without_the_token() {
+        let resolved = ResolvedToken {
+            source: TokenSource::Account("alice".into()),
+            token: "secret-token".into(),
+        };
+        let text = format!("{resolved:?}");
+        assert!(!text.contains("secret-token"), "{text}");
+        assert!(text.contains("alice"), "{text}");
     }
 
     #[test]
@@ -765,6 +901,48 @@ mod tests {
             Some("other")
         );
         assert_eq!(accounts.default_name().unwrap().as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn migration_keeps_the_token_an_account_of_the_same_user_already_has() {
+        let (_dir, accounts) = store();
+        let alice = user("1", "alice");
+        accounts.save("alice", "fresh", Some(&alice)).unwrap();
+        write_legacy(&accounts, "stale");
+        let name = accounts
+            .begin_migration(WAIT)
+            .unwrap()
+            .unwrap()
+            .finish(Some(&alice))
+            .unwrap();
+        assert_eq!(name, "alice");
+        assert_eq!(
+            accounts.load_token("alice").unwrap().as_deref(),
+            Some("fresh")
+        );
+        assert_eq!(accounts.names().unwrap(), ["alice"]);
+        assert!(!accounts.legacy_token_file().exists());
+    }
+
+    #[test]
+    fn migration_fills_in_the_users_account_that_lost_its_token() {
+        let (_dir, accounts) = store();
+        let alice = user("1", "alice");
+        accounts.save("alice", "old", Some(&alice)).unwrap();
+        fs::remove_file(accounts.token_file("alice")).unwrap();
+        write_legacy(&accounts, "legacy");
+        let name = accounts
+            .begin_migration(WAIT)
+            .unwrap()
+            .unwrap()
+            .finish(Some(&alice))
+            .unwrap();
+        assert_eq!(name, "alice");
+        assert_eq!(
+            accounts.load_token("alice").unwrap().as_deref(),
+            Some("legacy")
+        );
+        assert!(!accounts.legacy_token_file().exists());
     }
 
     #[test]

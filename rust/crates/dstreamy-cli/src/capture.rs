@@ -184,6 +184,10 @@ mod linux {
             self.inner.audio_activity()
         }
 
+        fn capture_drops(&self) -> dstreamy_media::CaptureDrops {
+            self.inner.capture_drops()
+        }
+
         async fn start(&mut self, config: CaptureConfig) -> Result<FrameReceiver, MediaError> {
             let started = self.inner.start(config).await;
             if started.is_ok() {

@@ -55,6 +55,7 @@ pub extern "C" fn obs_module_load() -> bool {
             log::error("obs_module_set_pointer was not called before obs_module_load");
             return false;
         }
+        hooks::install_observations();
         output::register();
         settings_source::register();
         audio::install();
@@ -77,6 +78,7 @@ pub extern "C" fn obs_module_unload() {
         frontend::shutdown();
         audio::shutdown();
         session::shutdown();
+        crate::hooks::observe("unloaded", || serde_json::json!({}));
         log::info("unloaded");
     });
 }

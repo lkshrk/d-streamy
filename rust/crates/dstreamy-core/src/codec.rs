@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+/// The video codec a stream announces to Discord; H.264 unless the user asks for H.265.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Codec {
     #[default]
@@ -10,6 +11,7 @@ pub enum Codec {
     H265,
 }
 
+/// A codec name that is neither `H264` nor `H265`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unknown codec {0:?}, expected \"H264\" or \"H265\"")]
 pub struct UnknownCodec(pub String);

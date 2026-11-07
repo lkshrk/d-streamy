@@ -1,3 +1,4 @@
+use dstreamy_discord::SessionState;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -35,7 +36,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Guilds => picker(
             frame,
             body,
-            "Guilds",
+            "Servers",
             &app.guilds,
             |g| {
                 if g.available {
@@ -96,8 +97,8 @@ fn header_line(app: &App) -> Line<'static> {
 
 fn loading_text(app: &App) -> &'static str {
     match app.connection {
-        Connection::Failed(_) => "no guilds: not connected",
-        _ => "loading guilds…",
+        Connection::Failed(_) => "no servers: not connected",
+        _ => "loading servers…",
     }
 }
 
@@ -108,6 +109,7 @@ fn hints_text(app: &App) -> &'static str {
         Screen::Settings => "↑↓ field · ←→ change · 0-9 , crop · Enter go live · Esc back · q quit",
         Screen::Live => match &app.live {
             Some(live) if live.stopping => "stopping…",
+            Some(live) if live.state == SessionState::Connecting => "joining… · q quit",
             Some(live) if live.active() => "s stop · q stop and quit",
             _ => "Enter settings · q quit",
         },
@@ -236,6 +238,19 @@ fn health_panel(frame: &mut Frame, area: Rect, live: &Live) {
         ));
         spans.push(Span::raw("    "));
     }
+    let encrypted = snapshot.stats.e2ee == dstreamy_discord::E2ee::Encrypted;
+    let label = match snapshot.stats.e2ee {
+        dstreamy_discord::E2ee::Encrypted => "on",
+        dstreamy_discord::E2ee::Unencrypted => "off",
+        dstreamy_discord::E2ee::Unknown => "unknown",
+    };
+    spans.push(toned(
+        format!(
+            "E2EE {label} · DAVE {}",
+            snapshot.stats.dave_protocol_version
+        ),
+        if encrypted { Tone::Good } else { Tone::Warn },
+    ));
     frame.render_widget(Line::from(spans), scores);
 
     let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]);
@@ -349,6 +364,8 @@ mod tests {
                 video_frames_sent: 900,
                 video_frames_dropped: 3,
                 viewer_keyframe_requests: 1,
+                e2ee: dstreamy_discord::E2ee::Encrypted,
+                dave_protocol_version: 1,
                 ..StreamStats::default()
             },
         })));
@@ -420,6 +437,8 @@ mod tests {
             health: StreamHealth::compute(&[StreamMetrics::default()], 30),
             stats: StreamStats {
                 viewers: Some(3),
+                e2ee: dstreamy_discord::E2ee::Unencrypted,
+                dave_protocol_version: 0,
                 ..StreamStats::default()
             },
         })));

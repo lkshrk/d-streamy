@@ -14,6 +14,7 @@ use crate::mixer::MicGuard;
 pub const UNSUPPORTED: &str =
     "D-Streamy for OBS is not supported on Windows yet, so Start and Stop are disabled";
 
+/// Colour of the state dot and the headline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tone {
@@ -23,6 +24,7 @@ pub enum Tone {
     Attention,
 }
 
+/// What the main button does: start or stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
@@ -30,6 +32,7 @@ pub enum Action {
     Stop,
 }
 
+/// A button the C++ side renders: label, action and whether it is enabled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Button {
     pub label: &'static str,
@@ -37,6 +40,7 @@ pub struct Button {
     pub enabled: bool,
 }
 
+/// The session part of the view JSON handed to the C++ panel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DockView {
     pub tone: Tone,
@@ -186,17 +190,39 @@ pub fn dock_view(
                     _ => (short, full),
                 };
                 let leak = mic.filter(|g| g.live);
-                detail_tooltip = Some(match leak {
+                let tooltip = match leak {
                     Some(guard) => format!("{}\n{tooltip}", guard.tooltip()),
+                    None => tooltip,
+                };
+                detail_tooltip = Some(match m.output_problem() {
+                    Some(problem) => format!("{}\n{tooltip}", problem.message),
                     None => tooltip,
                 });
                 match busy_or_live {
+                    DockState::Live { .. } if let Some(problem) = m.output_problem() => (
+                        Tone::Attention,
+                        problem.headline.to_owned(),
+                        problem.fix.to_owned(),
+                        button(STOP, Action::Stop, true),
+                    ),
                     DockState::Live { .. } if let Some(guard) = leak => (
                         Tone::Attention,
                         guard.headline(),
                         guard.fix(),
                         button(STOP, Action::Stop, true),
                     ),
+                    DockState::Live { .. }
+                        if live
+                            .and_then(|s| s.service)
+                            .is_some_and(|s| s.e2ee == crate::live::Encryption::Unencrypted) =>
+                    {
+                        (
+                            Tone::Attention,
+                            "Unencrypted stream".to_owned(),
+                            "Discord can read this stream".to_owned(),
+                            button(STOP, Action::Stop, true),
+                        )
+                    }
                     DockState::Live { channel, .. } => (
                         Tone::Live,
                         format!("Live · {channel}"),

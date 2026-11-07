@@ -1,7 +1,9 @@
 use crate::metrics::StreamMetrics;
 
+/// Opus frames per second at 20 ms each; the audio cadence a healthy stream shows.
 pub const AUDIO_FRAMES_PER_SEC: f64 = 50.0;
 
+/// A score bucket for the UI: `bad`, `warn` or `good`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthLevel {
@@ -11,6 +13,7 @@ pub enum HealthLevel {
 }
 
 impl HealthLevel {
+    /// Buckets a 0–1 score: good at 0.9, warn at 0.6, otherwise bad.
     pub fn from_score(score: f64) -> Self {
         if score >= 0.9 {
             Self::Good
@@ -30,6 +33,7 @@ impl HealthLevel {
     }
 }
 
+/// One interval's raw figures (fps, frame gaps, drops, audio frames) that the scoring reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HealthSample {
     pub fps: u64,
@@ -92,22 +96,29 @@ impl From<&StreamMetrics> for HealthSample {
     }
 }
 
+/// The scored view of a stream: session and recent scores per track, their levels and sparklines.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct StreamHealth {
     /// Session-average score, 0–100.
     pub video_score: u32,
+    /// Session-average audio score, 0–100.
     pub audio_score: u32,
     /// Level over the most recent [`StreamHealth::RECENT_WINDOW`] intervals.
     pub video_level: HealthLevel,
     pub audio_level: HealthLevel,
+    /// Most recent `SPARK_COUNT` intervals of video frame rates, oldest first.
     pub fps_series: Vec<f64>,
+    /// Opus frames sent per interval over the same sparkline window.
     pub audio_series: Vec<f64>,
 }
 
 impl StreamHealth {
+    /// Maximum intervals retained in each sparkline.
     pub const SPARK_COUNT: usize = 40;
+    /// Intervals used for the current levels, independently of session-average scores.
     pub const RECENT_WINDOW: usize = 10;
 
+    /// Scores the supplied history; empty history yields good levels and 100-point scores.
     pub fn compute(history: &[StreamMetrics], target_fps: u32) -> Self {
         let samples: Vec<HealthSample> = history.iter().map(HealthSample::from).collect();
         let video: Vec<f64> = samples.iter().map(|s| s.video_score(target_fps)).collect();

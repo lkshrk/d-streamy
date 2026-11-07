@@ -95,6 +95,19 @@ fn issue(c: &mut Controls, pending: Pending) -> Option<(u64, String)> {
     Some((c.issued, json))
 }
 
+fn observe_config_error(error: &ConfigError, track: u8) {
+    crate::hooks::observe("config_error", || {
+        let (kind, path) = match error {
+            ConfigError::NoFolder => ("no_folder", None),
+            ConfigError::Corrupt { path, .. } => ("corrupt", Some(path)),
+            ConfigError::Unreadable { path, .. } => ("unreadable", Some(path)),
+            ConfigError::Symlink { path } => ("symlink", Some(path)),
+            ConfigError::Failed(_) => ("write", None),
+        };
+        serde_json::json!({"kind":kind,"path":path,"track":track})
+    });
+}
+
 /// Writes save `generation` unless a newer one already reached the disk; only the newest save reports its error.
 fn flush((generation, json): (u64, String)) {
     let mut written = DISK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -103,6 +116,7 @@ fn flush((generation, json): (u64, String)) {
     controls(|c| {
         c.flushed = c.flushed.max(generation);
         if let Some(Err(e)) = result {
+            observe_config_error(&e, c.state.model.settings().audio_track);
             log::warn(&e.message(c.state.model.settings().audio_track));
             if generation == c.issued {
                 c.state.write_failed(e);
@@ -124,6 +138,7 @@ pub fn open_config() {
             let before = c.state.error().cloned();
             c.state.open(|| read, pending.write());
             if let Some(e) = c.state.error().filter(|e| Some(*e) != before.as_ref()) {
+                observe_config_error(e, c.state.model.settings().audio_track);
                 log::warn(&e.message(c.state.model.settings().audio_track));
             }
             issue(c, pending)
@@ -138,6 +153,7 @@ pub fn open_config() {
 fn config_step(c: &mut ConfigState, step: impl FnOnce(&mut ConfigState)) {
     step(c);
     if let Some(e) = c.error().filter(|e| !matches!(e, ConfigError::Failed(_))) {
+        observe_config_error(e, c.model.settings().audio_track);
         log::warn(&e.message(c.model.settings().audio_track));
     }
 }
@@ -203,10 +219,17 @@ impl Drop for DialogSource {
 static OPENING: AtomicBool = AtomicBool::new(false);
 
 /// A dialog created while another was open; it takes over at its first build, which OBS queues after the open.
-struct Successor(*mut sys::obs_source_t);
+struct Successor(*mut sys::obs_weak_source_t);
 
-// SAFETY: the pointer is only compared, and dereferenced on the UI thread while Tools > D-Streamy holds it.
+// SAFETY: weak source references are reference-counted by libobs and usable from any thread.
 unsafe impl Send for Successor {}
+
+impl Drop for Successor {
+    fn drop(&mut self) {
+        // SAFETY: the weak reference this module took in create.
+        unsafe { sys::obs_weak_source_release(self.0) };
+    }
+}
 
 static SUCCESSOR: Mutex<Option<Successor>> = Mutex::new(None);
 
@@ -232,19 +255,24 @@ pub fn not_opened(source: *mut sys::obs_source_t) {
 
 fn take_successor(source: *mut sys::obs_source_t) -> bool {
     let mut successor = SUCCESSOR.lock().unwrap_or_else(PoisonError::into_inner);
-    let ours = successor.as_ref().is_some_and(|s| s.0 == source);
+    let ours = successor.as_ref().is_some_and(|s| {
+        // SAFETY: the stored weak reference is live while locked; source is the current callback's source.
+        unsafe { sys::obs_weak_source_references_source(s.0, source) }
+    });
     if ours {
         successor.take();
     }
     ours
 }
 
-fn successor() -> Option<*mut sys::obs_source_t> {
-    SUCCESSOR
+fn successor() -> Option<DialogSource> {
+    let source = SUCCESSOR
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .as_ref()
-        .map(|s| s.0)
+        // SAFETY: the weak reference stays live while locked; NULL means the source was destroyed.
+        .map(|s| unsafe { sys::obs_weak_source_get_source(s.0) })?;
+    (!source.is_null()).then_some(DialogSource(source))
 }
 
 /// `source` becomes the dialog that refreshes, confirms and undoes, with what it shows now.
@@ -326,6 +354,7 @@ fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type, bool) {
         let quiet = idle && preview.error().is_none() && mic.is_none();
         let session = match &mic {
             _ if !cfg!(unix) => UNSUPPORTED.to_owned(),
+            _ if let Some(problem) = preview.output_problem() => problem.message.clone(),
             Some(guard) if !login => guard.message(),
             _ => preview.status_text(true),
         };
@@ -340,6 +369,7 @@ fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type, bool) {
         }
         let kind = match (preview.track_status(), preview.error()) {
             _ if cfg!(unix) && preview.logging_in() => sys::OBS_TEXT_INFO_NORMAL,
+            _ if preview.output_problem().is_some() => sys::OBS_TEXT_INFO_ERROR,
             _ if !cfg!(unix) || (mic.is_some() && !login) => sys::OBS_TEXT_INFO_WARNING,
             (TrackStatus::Pending { .. }, _) => sys::OBS_TEXT_INFO_WARNING,
             (TrackStatus::Idle { .. }, Some(_)) => sys::OBS_TEXT_INFO_ERROR,
@@ -361,12 +391,14 @@ extern "C" fn create(
     settings: *mut sys::obs_data_t,
     source: *mut sys::obs_source_t,
 ) -> *mut c_void {
-    guard("settings create", source.cast(), || {
+    guard("settings create", ptr::null_mut(), || {
         open_config();
         let guild = with_controls(|c| c.model.settings().guild_id.clone());
         session::load_lists(guild);
         if OPENING.load(Ordering::Acquire) && dialog_open() {
-            *SUCCESSOR.lock().unwrap_or_else(PoisonError::into_inner) = Some(Successor(source));
+            // SAFETY: source is the new source libobs is creating; Successor releases the weak reference.
+            let weak = unsafe { sys::obs_source_get_weak_source(source) };
+            *SUCCESSOR.lock().unwrap_or_else(PoisonError::into_inner) = Some(Successor(weak));
         } else {
             activate(source);
         }
@@ -573,6 +605,7 @@ pub fn collection_leaving() {
         .any(|o| o.touched != 0);
     keep_mixer_changes();
     if kept {
+        crate::hooks::observe("dialog_mixer_changes_kept", || serde_json::json!({}));
         log::info(
             "OBS is leaving the scene collection: the Discord track changes made in the open D-Streamy dialog \
              stay, whatever its close asks",
@@ -691,8 +724,8 @@ fn restore_picks(source: *mut sys::obs_source_t, opened: &Choice) {
     let next = successor().filter(|_| OPENING.load(Ordering::Acquire));
     if let Some(next) = next {
         settle_pending();
-        // SAFETY: Tools > D-Streamy holds the successor while OBS closes this dialog; OBS copies its settings later.
-        unsafe { write_picks(SourceSettings::of(next).0) };
+        // SAFETY: next holds a strong reference; SourceSettings releases its settings reference after the write.
+        unsafe { write_picks(SourceSettings::of(next.0).0) };
     } else if !crate::audio::request_settle()
         && let Some(r) = REVERTING
             .lock()
@@ -769,6 +802,7 @@ pub fn forget_unrestored() {
 /// On the UI thread once the call that armed it returned: a Cancel puts back the Discord tracks the dialog changed.
 pub fn settle() {
     settle_pending();
+    crate::hooks::settings_settled();
     log::debug("settled the settings dialog's pending Cancel");
 }
 
@@ -873,6 +907,7 @@ extern "C" fn update(data: *mut c_void, settings: *mut sys::obs_data_t) {
             None => {
                 // SAFETY: libobs passes the source's own settings.
                 let raw = unsafe { sys::obs_data_get_int(settings, AUDIO_TRACK.as_ptr()) };
+                crate::hooks::observe("audio_track_refused", || serde_json::json!({"track":raw}));
                 log::warn(&format!(
                     "ignored Discord audio track {raw}: pick Track 1 to Track 6"
                 ));
@@ -1169,9 +1204,10 @@ extern "C" fn guild_modified(
     _property: *mut sys::obs_property_t,
     _settings: *mut sys::obs_data_t,
 ) -> bool {
-    edited();
-    // Rebuilds the dialog, so the channel list shows the new server's channels.
-    true
+    guard("settings guild_modified", false, || {
+        edited();
+        true
+    })
 }
 
 /// The action whose confirm the dialog shows in place of Start and Stop; 0 for none.
@@ -1200,8 +1236,8 @@ extern "C" fn confirm_stream_clicked(
 ) -> bool {
     guard("settings confirm_stream", true, || {
         match STREAM_CONFIRM.swap(0, Ordering::AcqRel) {
-            CONFIRM_START => session::start(session::Wait::Dialog),
-            CONFIRM_STOP => session::stop(session::Wait::Dialog),
+            CONFIRM_START => session::start(),
+            CONFIRM_STOP => session::stop(),
             _ => {}
         }
         true
@@ -1225,7 +1261,7 @@ extern "C" fn login_clicked(
     _data: *mut c_void,
 ) -> bool {
     guard("settings login", true, || {
-        session::login(session::Wait::Dialog);
+        session::login();
         true
     })
 }
@@ -1268,7 +1304,7 @@ extern "C" fn use_account_clicked(
 ) -> bool {
     guard("settings use_account", true, || {
         if let Some(name) = button_account(property, ACCOUNT_USE_PREFIX) {
-            session::select_account(&name, session::Wait::Dialog);
+            session::select_account(&name);
         }
         true
     })
@@ -1280,7 +1316,7 @@ extern "C" fn add_account_clicked(
     _data: *mut c_void,
 ) -> bool {
     guard("settings add_account", true, || {
-        session::add_account(session::Wait::Dialog);
+        session::add_account();
         true
     })
 }
@@ -1306,7 +1342,7 @@ extern "C" fn confirm_logout_clicked(
 ) -> bool {
     guard("settings confirm_logout", true, || {
         if let Some(name) = change(|c, _| c.model.confirm_logout(true)) {
-            session::logout_account(&name, session::Wait::Dialog);
+            session::logout_account(&name);
         }
         true
     })
@@ -1492,6 +1528,14 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
             let blocked = shown.2;
             crate::hooks::dialog_built(&shown.0, guilds.len());
             set_status(status_prop, shown);
+            if with_controls(|c| c.model.loading().0) {
+                sys::obs_properties_add_text(
+                    props,
+                    c"lists_loading".as_ptr(),
+                    c"Loading Discord servers and voice channels…".as_ptr(),
+                    sys::OBS_TEXT_INFO,
+                );
+            }
             if let Some((label, clicked)) = login {
                 let label = c_text(label);
                 sys::obs_properties_add_button(props, LOGIN.as_ptr(), label.as_ptr(), clicked);
@@ -1751,6 +1795,44 @@ mod tests {
     }
 
     #[test]
+    fn stopped_output_cleanup_failure_precedes_mic_warning_until_stop_succeeds() {
+        use dstreamy_obs_producer::control::Started;
+        use dstreamy_obs_producer::dock::Canvas;
+        let _serial = start();
+        let mic = Source::new(crate::ui::tests::MIC, c"Mic");
+        let failure = "The output stopped; the Discord session may still be live; press Stop";
+        change(|c, _| {
+            c.open(|| Ok(None), |_| Ok(()));
+            c.model.select_guild("g");
+            c.model.select_channel("c");
+            c.model
+                .start(Canvas {
+                    fps_num: 30,
+                    fps_den: 1,
+                    output_width: 1280,
+                    output_height: 720,
+                })
+                .unwrap();
+            c.model.started(Ok(Started {
+                ownership: None,
+                channel: "c".into(),
+            }));
+            c.model.output_ended(Err(failure.into()));
+        });
+        let shown = status(None);
+        assert_eq!(shown.0, failure);
+        assert_eq!(shown.1, sys::OBS_TEXT_INFO_ERROR);
+        assert!(!shown.2, "Stop remains available");
+        change(|c, _| {
+            c.model.stop().unwrap();
+            c.model.stopped(Ok(()));
+        });
+        drop(mic);
+        assert_eq!(status(None).0, "Idle");
+        reset();
+    }
+
+    #[test]
     fn the_close_question_follows_the_dialog_s_mixer_changes_whoever_undoes_them() {
         let _serial = start();
         change(|c, _| c.model.take_over(6));
@@ -1819,7 +1901,7 @@ mod tests {
 
         let refused = opening(|| {
             let second = Dialog::create();
-            assert_eq!(successor(), Some(second.0));
+            assert_eq!(successor().map(|s| s.0), Some(second.0));
             assert!(first.is_the_dialog());
             second.0
         });
@@ -1833,7 +1915,7 @@ mod tests {
             3,
             "and keeps its confirm row"
         );
-        assert_eq!(successor(), None);
+        assert!(successor().is_none());
 
         let second = opening(|| {
             let second = Dialog::create();

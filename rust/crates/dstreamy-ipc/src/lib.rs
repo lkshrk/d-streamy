@@ -34,13 +34,14 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    /// Uses `location` as given: the trusted-base check of [`Endpoint::default_for_user`] is skipped.
+    /// Uses an explicit path; normal bind, accept and connect still enforce directory and peer trust.
     pub fn new(location: impl Into<PathBuf>) -> Self {
         Self {
             location: location.into(),
         }
     }
 
+    /// Selects a trusted per-user socket path, falling back under home when the runtime path is unusable.
     pub fn default_for_user() -> Result<Self, IpcError> {
         sys::default_location().map(Self::new)
     }
@@ -79,6 +80,7 @@ impl Peer {
         self.principal
     }
 
+    /// Kernel-reported PID when available; peer authorization uses user credentials instead.
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
@@ -88,6 +90,7 @@ impl Peer {
     }
 }
 
+/// The service side of the socket: binds in the per-user directory and drops peers of other users before reading (ADR 0004 IPC).
 pub struct Listener {
     inner: sys::Listener,
     endpoint: Endpoint,
@@ -96,6 +99,7 @@ pub struct Listener {
 }
 
 impl Listener {
+    /// Binds privately, refusing unsafe directories or an already-running listener.
     pub async fn bind(endpoint: &Endpoint) -> Result<Self, IpcError> {
         Self::bind_with(endpoint, sys::Access::Private, sys::own_principal()).await
     }
@@ -157,6 +161,7 @@ impl Listener {
     }
 }
 
+/// Connects to a service at `endpoint`, refusing one that runs as another user.
 pub async fn connect(endpoint: &Endpoint) -> Result<Stream, IpcError> {
     Ok(Stream {
         inner: sys::connect(endpoint.as_path(), sys::own_principal()).await?,
@@ -172,6 +177,7 @@ pub async fn connect_as_for_tests(endpoint: &Endpoint, own: u32) -> Result<Strea
     })
 }
 
+/// One accepted or connected socket, usable with tokio's `AsyncRead` and `AsyncWrite`.
 pub struct Stream {
     inner: sys::Stream,
 }

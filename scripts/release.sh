@@ -42,45 +42,9 @@ fi
 export UNIVERSAL=1
 
 echo "==> Building release (version $VERSION)..."
-SKIP_SIGN=1 "$SCRIPT_DIR/build.sh"
+VERSION="$VERSION" SKIP_SIGN=1 "$SCRIPT_DIR/build.sh"
 
 APP="$ROOT/bin/$APP_NAME.app"
-
-# Generate Info.plist
-cat > "$APP/Contents/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleIdentifier</key>
-    <string>${BUNDLE_ID}</string>
-    <key>CFBundleName</key>
-    <string>${APP_NAME}</string>
-    <key>CFBundleDisplayName</key>
-    <string>${APP_NAME}</string>
-    <key>CFBundleExecutable</key>
-    <string>${APP_NAME}</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>CFBundleShortVersionString</key>
-    <string>${VERSION}</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>NSScreenCaptureUsageDescription</key>
-    <string>D-Streamy needs screen recording access to capture your window for streaming.</string>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>D-Streamy needs microphone access to capture audio for streaming.</string>
-    <key>NSAudioCaptureUsageDescription</key>
-    <string>D-Streamy needs system audio access to capture window audio for streaming.</string>
-</dict>
-</plist>
-EOF
 
 # Generate entitlements
 ENTITLEMENTS=$(mktemp)

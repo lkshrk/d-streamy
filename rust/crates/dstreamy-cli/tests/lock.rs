@@ -127,15 +127,26 @@ struct Proc {
 
 impl Proc {
     /// The first line matching `f` that no earlier call returned, waiting for it if needed.
-    fn until(&mut self, what: &str, mut f: impl FnMut(&str) -> bool) -> String {
+    fn until(&mut self, what: &str, f: impl FnMut(&str) -> bool) -> String {
+        self.until_before(what, Instant::now() + T, f)
+    }
+
+    fn until_before(
+        &mut self,
+        what: &str,
+        deadline: Instant,
+        mut f: impl FnMut(&str) -> bool,
+    ) -> String {
         if let Some(i) = (0..self.seen.len()).find(|&i| !self.taken[i] && f(&self.seen[i])) {
             self.taken[i] = true;
             return self.seen[i].clone();
         }
-        let deadline = Instant::now() + T;
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let Ok(line) = self.lines.recv_timeout(left) else {
+            let received = match deadline.checked_duration_since(Instant::now()) {
+                Some(left) => self.lines.recv_timeout(left),
+                None => Err(mpsc::RecvTimeoutError::Timeout),
+            };
+            let Ok(line) = received else {
                 let stderr: Vec<String> = self.stderr.try_iter().collect();
                 panic!("no {what}; seen {:?}; stderr {stderr:?}", self.seen);
             };
@@ -155,7 +166,11 @@ impl Proc {
     }
 
     fn reply(&mut self, id: &str) -> Value {
-        let line = self.until(&format!("reply to {id}"), |l| {
+        self.reply_before(id, Instant::now() + T)
+    }
+
+    fn reply_before(&mut self, id: &str, deadline: Instant) -> Value {
+        let line = self.until_before(&format!("reply to {id}"), deadline, |l| {
             let v: Value = serde_json::from_str(l).unwrap();
             v["type"] != "event" && v["id"] == id
         });
@@ -313,22 +328,43 @@ fn a_start_right_after_a_takeover_keeps_its_lock() {
             .voice_state_from_other_session(MOCK_GUILD_ID, Some(MOCK_VOICE_CHANNEL_ID))
     );
     let deadline = Instant::now() + T;
+    let mut takeover_stop_seen = false;
     for n in 0.. {
-        let mut restart = start_request();
-        restart["id"] = json!(format!("restart-{n}"));
-        let reply = d.request(&restart);
-        if reply["type"] == "result" {
-            break;
-        }
-        assert_eq!(reply["code"], "already_running", "{reply}");
         assert!(
             Instant::now() < deadline,
             "the taken-over session never stopped"
         );
+        let mut restart = start_request();
+        restart["id"] = json!(format!("restart-{n}"));
+        d.send(&restart);
+        let reply = d.reply_before(restart["id"].as_str().unwrap(), deadline);
+        if reply["type"] == "result" {
+            break;
+        }
+        assert_eq!(reply["type"], "error", "{reply}");
+        match reply["code"].as_str() {
+            Some("already_running") => {}
+            Some("busy") => {
+                if !takeover_stop_seen {
+                    let line = d.until_before("takeover stopped state", deadline, |l| {
+                        let v: Value = serde_json::from_str(l).unwrap();
+                        v["event"]["event"] == "state" && v["event"]["state"]["state"] == "stopped"
+                    });
+                    let stopped: Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(
+                        stopped["event"]["state"]["reason"]["reason"], "voice_taken_over",
+                        "{stopped}"
+                    );
+                    takeover_stop_seen = true;
+                }
+            }
+            _ => panic!("unexpected restart response: {reply}"),
+        }
     }
     d.daemon_state("streaming");
     assert!(
         !h.lock_is_free(),
         "the earlier stop released the new run's lock"
     );
+    h.stream_is_refused_by(d.child.id());
 }

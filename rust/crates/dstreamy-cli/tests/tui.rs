@@ -331,3 +331,57 @@ async fn a_live_tui_session_holds_the_lock_until_it_stops() {
     .await;
     assert_eq!(code, ExitCode::SUCCESS);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_joining_frame_is_drawn_and_an_interrupt_cancels_the_start() {
+    let h = Harness::new().await;
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    let (keys, input) = mpsc::unbounded_channel();
+    let (screen_tx, screen) = watch::channel(String::new());
+    let mut interrupted = false;
+    let interrupt = keys.clone();
+    let tui = drive(
+        &mut terminal,
+        &h.ctx,
+        input,
+        Options {
+            include_platform: false,
+        },
+        None,
+        |t| {
+            let text = t.backend().to_string();
+            if !interrupted && text.contains("joining…") {
+                interrupted = true;
+                interrupt.send(Input::Key(Key::Interrupt)).unwrap();
+            }
+            screen_tx.send_replace(text);
+        },
+    );
+    let script = async {
+        let mut s = Script { keys, screen };
+        s.until("Mock Guild").await;
+        s.press(&[Key::Enter]);
+        s.until("General").await;
+        s.press(&[Key::Enter]);
+        s.until("Test pattern").await;
+        s.press(&[Key::Enter]);
+        s.until("Stream settings").await;
+        s.press(&[Key::Enter]);
+        std::future::pending::<()>().await;
+    };
+    tokio::pin!(script);
+    let result = timeout(T, async {
+        tokio::select! {
+            result = tui => result,
+            () = &mut script => panic!("script ended"),
+        }
+    })
+    .await
+    .expect("interrupt did not cancel the join")
+    .unwrap();
+    assert_eq!(result, ExitCode::SUCCESS);
+    assert!(interrupted, "the joining frame was not drawn");
+    assert!(
+        dstreamy_cli::lock::SessionLock::acquire(&h.ctx.paths.dir.join("accounts/default")).is_ok()
+    );
+}

@@ -36,9 +36,11 @@ pub enum DaveError {
     Decrypt(String),
     #[error("invalid protocol version: 0")]
     InvalidProtocolVersion,
+    #[error("end-to-end encryption is required but unavailable (DAVE protocol {0})")]
+    E2eeUnavailable(u16),
 }
 
-/// Result type returned from a [`processProposals`] call when a commit (and
+/// Result type returned from a [`DaveHandler::process_proposals`] call when a commit (and
 /// sometimes a welcome) needs to be sent back to Discord.
 pub struct CommitWelcome {
     /// The serialized MLS commit message (op 28 payload prefix).
@@ -52,6 +54,8 @@ pub struct DaveHandler {
     protocol_version: u16,
     user_id: u64,
     channel_id: u64,
+    require_e2ee: bool,
+    e2ee_unavailable: Option<u16>,
 }
 
 impl DaveHandler {
@@ -61,6 +65,27 @@ impl DaveHandler {
             protocol_version: 0,
             user_id,
             channel_id,
+            require_e2ee: false,
+            e2ee_unavailable: None,
+        }
+    }
+
+    pub fn require_e2ee(&mut self) -> Result<(), DaveError> {
+        self.require_e2ee = true;
+        self.check_e2ee()
+    }
+
+    pub fn e2ee_unavailable(&self) -> Option<u16> {
+        self.e2ee_unavailable
+    }
+
+    fn check_e2ee(&mut self) -> Result<(), DaveError> {
+        if self.require_e2ee && !self.is_ready() {
+            self.e2ee_unavailable.get_or_insert(self.protocol_version);
+        }
+        match self.e2ee_unavailable {
+            Some(version) => Err(DaveError::E2eeUnavailable(version)),
+            None => Ok(()),
         }
     }
 
@@ -170,9 +195,9 @@ impl DaveHandler {
         }
     }
 
-    /// Encrypt an Opus audio frame for E2EE (before SRTP transport encryption).
-    /// Returns the original packet unchanged if the session is not ready.
+    /// Encrypts Opus, refusing unready passthrough when E2EE is required.
     pub fn encrypt_opus(&mut self, packet: &[u8]) -> Result<Vec<u8>, DaveError> {
+        self.check_e2ee()?;
         match &mut self.inner {
             Some(s) if self.protocol_version != 0 && s.is_ready() => {
                 let out = s
@@ -184,14 +209,14 @@ impl DaveHandler {
         }
     }
 
-    /// Encrypt any media frame (video/audio with explicit codec).
-    /// Returns the original packet unchanged if the session is not ready.
+    /// Encrypts media, refusing unready passthrough when E2EE is required.
     pub fn encrypt(
         &mut self,
         media_type: MediaType,
         codec: Codec,
         packet: &[u8],
     ) -> Result<Vec<u8>, DaveError> {
+        self.check_e2ee()?;
         match &mut self.inner {
             Some(s) if self.protocol_version != 0 && s.is_ready() => {
                 let out = s

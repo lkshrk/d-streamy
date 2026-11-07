@@ -1,14 +1,19 @@
 use std::time::{Duration, Instant};
 
+/// Frame count and gap percentiles of one sampling interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameIntervalSnapshot {
     /// Frames recorded in the interval (not gaps between them).
     pub samples: u64,
+    /// 95th percentile of stored frame gaps, in rounded milliseconds.
     pub p95_ms: u64,
+    /// Largest stored gap, in rounded milliseconds.
     pub max_ms: u64,
+    /// Some gaps were omitted at the storage cap; `samples` still counts every frame.
     pub truncated: bool,
 }
 
+/// Records frame arrival gaps and summarises them per interval.
 #[derive(Debug, Clone)]
 pub struct FrameIntervalTracker {
     gaps: Vec<Duration>,
@@ -27,6 +32,7 @@ impl Default for FrameIntervalTracker {
 impl FrameIntervalTracker {
     pub const DEFAULT_MAX_SAMPLES: usize = 120;
 
+    /// Caps stored gaps at `max_samples` without limiting the total frame count.
     pub fn new(max_samples: usize) -> Self {
         Self {
             gaps: Vec::with_capacity(max_samples),
@@ -86,8 +92,11 @@ fn round_ms(d: Duration) -> u64 {
 /// Cumulative counters reported by the media pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PipelineStats {
+    /// Video frames accounted for, including frames lost before delivery.
     pub frame_count: u64,
+    /// Encoded video and audio payload bytes sent, excluding transport headers.
     pub bytes_sent: u64,
+    /// Audio frames accounted for before delivery; session input includes source losses.
     pub audio_frames_encoded: u64,
     pub audio_frames_sent: u64,
     pub audio_frames_dropped_not_ready: u64,
@@ -97,11 +106,15 @@ pub struct PipelineStats {
 /// Per-interval stream metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct StreamMetrics {
+    /// Successfully sent video frames per elapsed second, rounded to an integer.
     pub fps: u64,
     pub gap_p95_ms: u64,
     pub gap_max_ms: u64,
+    /// Gap statistics used a capped sample while frame counting continued.
     pub gap_trunc: bool,
+    /// Encoded payload rate in decimal kilobits per second.
     pub bitrate_kbps: u64,
+    /// Accounted video frames not represented by sent-frame samples in this interval.
     pub v_drop: u64,
     pub a_enc: u64,
     pub a_sent: u64,
@@ -120,10 +133,12 @@ impl MetricsSampler {
         Self::default()
     }
 
+    /// Discards the baseline; the next sample seeds it without reporting counter deltas.
     pub fn reset(&mut self) {
         self.prev = None;
     }
 
+    /// Uses cumulative counters and sent-frame gaps for the elapsed interval.
     /// The first call after construction or [`reset`](Self::reset) only seeds the baseline.
     pub fn sample(
         &mut self,

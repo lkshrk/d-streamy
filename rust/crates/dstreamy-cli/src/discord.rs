@@ -38,7 +38,11 @@ pub enum Persistence {
 }
 
 pub async fn connect(ctx: &Ctx, persistence: Persistence) -> Result<DiscordClient, CliError> {
-    connect_resolved(ctx, crate::accounts::resolve(ctx)?, persistence).await
+    let owned = ctx.clone();
+    let resolved = tokio::task::spawn_blocking(move || crate::accounts::resolve(&owned))
+        .await
+        .map_err(|e| CliError::Session(format!("resolving account: {e}")))??;
+    connect_resolved(ctx, resolved, persistence).await
 }
 
 /// Connects with an already chosen token, and records the account's user if it lacks one.
@@ -47,9 +51,12 @@ pub async fn connect_resolved(
     resolved: ResolvedToken,
     persistence: Persistence,
 ) -> Result<DiscordClient, CliError> {
-    let ResolvedToken { source, token } = resolved;
-    let client = connect_with(ctx, token, persistence).await?;
-    crate::accounts::remember_user(ctx, &source, client.user());
+    let client = connect_with(ctx, resolved.token.clone(), persistence).await?;
+    let owned = ctx.clone();
+    let user = client.user().clone();
+    tokio::task::spawn_blocking(move || crate::accounts::remember_user(&owned, &resolved, &user))
+        .await
+        .map_err(|e| CliError::Session(format!("saving account metadata: {e}")))?;
     Ok(client)
 }
 

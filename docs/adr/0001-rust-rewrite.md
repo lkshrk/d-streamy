@@ -22,7 +22,7 @@ D-Streamy is a SwiftUI menu bar app (ScreenCaptureKit + VideoToolbox) feeding a 
 - `discord-stream-rs` is young (v0.1.3, one maintainer), so it is vendored and we own its fixes; `@dank074/discord-video-stream` stays the reference for protocol changes.
 - A passing mock does not prove Discord compatibility; protocol drift shows up only in the manual live check.
 - The crop overlay becomes a numeric crop rectangle. On Wayland, the window is picked in the portal dialog (its restore token is persisted).
-- Swift and Bun code stay in the tree as reference until the manual checklist passes, then they are removed.
+- The Bun daemon and CaptureLib are removed (amended 2026-11-06: `capture/`, `src/`, `stubs/`, `package.json`, `bun.lock` and `tsconfig.json` are deleted, and CI no longer runs Bun). The Swift app stays as the macOS frontend (ADR 0003).
 
 ## Rejected
 

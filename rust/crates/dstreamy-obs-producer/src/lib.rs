@@ -21,7 +21,7 @@ pub use client::{Connection, Reports, StartError, attach, run};
 #[cfg(unix)]
 pub use dstreamy_ipc::Endpoint;
 pub use ring::{Oversized, Packet, Ring, RingStats, Track};
-pub use types::{End, Hello, Level, Log, MAX_SERVICE_TEXT};
+pub use types::{DetachReason, End, Hello, Level, Log, MAX_SERVICE_TEXT};
 
 /// How to start the service, appended to every "service is not running" message.
 #[cfg(target_os = "linux")]

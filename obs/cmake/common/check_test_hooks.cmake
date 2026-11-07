@@ -4,6 +4,8 @@ set(hooks
     panic_at_packet
     DSTREAMY_TEST_NO_CONTROL_THREAD
     DSTREAMY_TEST_OPEN_DIALOG
+    DSTREAMY_TEST_OUTPUT_ERROR_GATE
+    DSTREAMY_TEST_OBSERVATION_EMIT
 )
 # Read only from #[cfg(unix)] code, so a Windows build has none of these strings.
 set(unix_hooks

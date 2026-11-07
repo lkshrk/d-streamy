@@ -18,6 +18,7 @@ mod enabled {
         panic_at: i64,
         panic_in: PanicIn,
         destroy_delay_ms: u64,
+        output_error_gate: Option<std::path::PathBuf>,
     }
 
     impl Hooks {
@@ -45,6 +46,8 @@ mod enabled {
                     _ => PanicIn::Nowhere,
                 },
                 destroy_delay_ms: u64::try_from(delay).unwrap_or(0),
+                output_error_gate: std::env::var_os("DSTREAMY_TEST_OUTPUT_ERROR_GATE")
+                    .map(Into::into),
             }
         }
 
@@ -58,6 +61,12 @@ mod enabled {
             if self.panic_in == PanicIn::Stop {
                 panic!("test panic in Stop");
             }
+        }
+
+        pub fn output_error(&self) -> bool {
+            self.output_error_gate
+                .as_ref()
+                .is_some_and(|path| path.exists())
         }
 
         pub fn on_packet(&self, seen: i64) {
@@ -107,6 +116,10 @@ mod enabled {
     /// Logs every build of the dialog, which a real OBS does on its own thread.
     pub fn dialog_built(status: &str, servers: usize) {
         if open_dialog_trigger().is_some() {
+            super::observe(
+                "dialog_built",
+                || serde_json::json!({"servers":servers,"status":status}),
+            );
             crate::log::info(&format!(
                 "test hook: dialog built servers={servers} status={status}"
             ));
@@ -154,6 +167,10 @@ mod enabled {
 
         pub fn on_stop(&self) {}
 
+        pub fn output_error(&self) -> bool {
+            false
+        }
+
         pub fn on_packet(&self, _seen: i64) {}
 
         pub fn before_destroy(&self) {}
@@ -163,3 +180,68 @@ mod enabled {
 pub use enabled::{Hooks, dialog_built, no_control_thread, open_dialog_trigger};
 #[cfg(unix)]
 pub use enabled::{after_output_start, lists_gate, start_gate};
+
+/// Structured observations of decisions in test builds, independent of human log wording.
+pub fn observe(event: &str, fields: impl FnOnce() -> serde_json::Value) {
+    #[cfg(feature = "test-hooks")]
+    {
+        use std::ffi::{CString, c_char, c_int, c_void};
+        #[cfg_attr(
+            all(windows, target_env = "msvc"),
+            link(name = "legacy_stdio_definitions")
+        )]
+        unsafe extern "C" {
+            fn printf(format: *const c_char, ...) -> c_int;
+            fn fflush(stream: *mut c_void) -> c_int;
+        }
+        let mut row = fields();
+        row["event"] = serde_json::Value::String(format!("plugin_{event}"));
+        let row = CString::new(row.to_string()).expect("JSON escapes NUL bytes");
+        // SAFETY: the fixed format reads this live CString under the harness's C stdout lock.
+        unsafe {
+            printf(c"%s\n".as_ptr(), row.as_ptr());
+            fflush(std::ptr::null_mut());
+        }
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = (event, fields);
+}
+
+pub fn install_observations() {
+    #[cfg(feature = "test-hooks")]
+    // SAFETY: module load owns the live global signal handler; libobs copies the declaration.
+    unsafe {
+        dstreamy_obs_sys::signal_handler_add(
+            dstreamy_obs_sys::obs_get_signal_handler(),
+            c"void dstreamy_test_settings_settled()".as_ptr(),
+        );
+    }
+}
+
+pub fn settings_settled() {
+    #[cfg(feature = "test-hooks")]
+    // SAFETY: the registered signal has no parameters and its handler is live during plugin callbacks.
+    unsafe {
+        let mut data = dstreamy_obs_sys::calldata_t::default();
+        dstreamy_obs_sys::signal_handler_signal(
+            dstreamy_obs_sys::obs_get_signal_handler(),
+            c"dstreamy_test_settings_settled".as_ptr(),
+            &mut data,
+        );
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+#[unsafe(export_name = "DSTREAMY_TEST_OBSERVATION_EMIT")]
+pub extern "C" fn observation_probe(sequence: u32) {
+    crate::guard::guard("observation probe", (), || {
+        observe("framing_probe", || {
+            serde_json::json!({
+                "sequence": sequence,
+                "payload": "Grüße 🧃".repeat(1024),
+                "note": "first\nsecond",
+                "nul": "\0",
+            })
+        });
+    });
+}

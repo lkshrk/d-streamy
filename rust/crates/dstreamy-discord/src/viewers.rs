@@ -96,7 +96,7 @@ impl Viewers {
         }
         debug!(
             event = name,
-            stream_key = %payload.stream_key,
+            stream_key = ?payload.stream_key,
             expected = ?self.expected_key,
             ours,
             viewer_ids = ids_type,

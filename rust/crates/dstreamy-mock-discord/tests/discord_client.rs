@@ -89,3 +89,34 @@ async fn real_client_over_zlib_streams_and_resumes() {
     client.close().await;
     mock.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_the_client_ends_its_voice_and_stream_sockets() {
+    let mock = MockDiscord::start().await.unwrap();
+    let mut opts = GatewayOptions::new(SecretString::from(MOCK_TOKEN)).with_url(mock.gateway_url());
+    opts.reconnect_delay_min = Duration::from_millis(10);
+    opts.reconnect_delay_max = Duration::from_millis(50);
+    let client = timeout(T, DiscordClient::connect(opts))
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let mut streamer = client.streamer();
+        streamer.set_ice_servers(vec![]);
+        streamer.set_setting_engine(rtc::loopback_settings(false));
+    }
+    let mut voice = client.join_voice(Some(MOCK_GUILD_ID.into()), MOCK_VOICE_CHANNEL_ID.into());
+    timeout(T, voice.ready()).await.unwrap().unwrap();
+    let mut stream = client.create_stream().unwrap();
+    timeout(T, stream.ready()).await.unwrap().unwrap();
+    assert_eq!(mock.open_voice_sockets().len(), 2);
+
+    timeout(T, client.close()).await.unwrap();
+    timeout(T, async {
+        while !mock.open_voice_sockets().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("voice sockets left open after close");
+}

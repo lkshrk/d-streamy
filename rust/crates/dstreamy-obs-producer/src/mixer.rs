@@ -23,6 +23,7 @@ pub struct SourceRow {
     pub on: bool,
 }
 
+/// The audio track section as the view shows it: unmanaged, managed, or warning about the microphone (ADR 0007).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioView {
     /// Nothing is changed on any source until the user takes the track over.
@@ -52,6 +53,7 @@ pub fn is_input_device(id: &str) -> bool {
     id.ends_with("_input_capture") || matches!(id, "jack_output_capture" | "sndio_output_capture")
 }
 
+/// The mixer bit of an OBS audio track (1 to 6).
 pub fn track_bit(track: u8) -> u32 {
     debug_assert!(AUDIO_TRACKS.contains(&track));
     1 << (u32::from(track) - 1)
@@ -66,14 +68,17 @@ pub fn with_track(mixers: u32, track: u8, on: bool) -> u32 {
     }
 }
 
+/// Button label that takes a track over.
 pub fn take_over_label(track: u8) -> String {
     format!("Manage {}", track_name(track))
 }
 
+/// Button label that stops managing a track.
 pub fn release_label(track: u8) -> String {
     format!("Stop managing {}", track_name(track))
 }
 
+/// Button label that manages the Discord track instead of the current one.
 pub fn instead_label(track: u8) -> String {
     format!("Use {} instead", track_name(track))
 }
@@ -106,7 +111,9 @@ pub fn take_over_effect(track: u8, live: bool) -> String {
     }
 }
 
+/// The take-over confirm's yes button.
 pub const CONFIRM: &str = "Manage";
+/// The confirm's cancel button.
 pub const NOT_NOW: &str = "Not now";
 /// Where the mic check is explained: what it looks at, and what it can't see.
 pub const MIC_CHECK: &str = "D-Streamy checks microphones and Mic/Aux sources, not video capture devices \
@@ -253,6 +260,7 @@ pub fn notices(model: &DockModel, sources: &[AudioSource]) -> Vec<Notice> {
     shown
 }
 
+/// Shown in the audio section while OBS has no audio source.
 pub const NO_SOURCES: &str = "OBS has no audio source yet. Add one, and it shows up here.";
 
 /// The names of microphone-type sources with `track` on, sorted.

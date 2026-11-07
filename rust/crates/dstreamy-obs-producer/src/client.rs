@@ -1,6 +1,7 @@
 //! The producer side of the `dstreamy serve` IPC: `hello`, then frames out and events in.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::fmt;
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::live::ServiceHealth;
 use crate::ring::{MAX_PACKET, Oversized, Packet, Ring, Track};
-use crate::types::{End, Hello, Level, Log, service_text};
+use crate::types::{DetachReason, End, Hello, Level, Log, service_text};
 
 /// Above serve's 5 s wait for the session to announce the producer's video.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -29,6 +30,7 @@ pub const STOP_DEADLINE: Duration = Duration::from_millis(1500);
 type Lines = FramedRead<ReadHalf<dstreamy_ipc::Stream>, ControlCodec>;
 type Sink = FramedWrite<WriteHalf<dstreamy_ipc::Stream>, ProducerCodec>;
 
+/// Why the producer connection could not attach; `is_not_running` picks the "start the service" hint.
 #[derive(Debug)]
 pub enum StartError {
     Connect(IpcError),
@@ -79,6 +81,7 @@ impl Connection {
     }
 }
 
+/// Connects to the service as a producer and sends `hello`; returns once `attached` arrived.
 pub async fn attach(endpoint: &Endpoint, hello: &Hello) -> Result<Connection, StartError> {
     let stream = dstreamy_ipc::connect(endpoint)
         .await
@@ -157,13 +160,18 @@ pub async fn run<T>(
     log: &dyn Log,
 ) -> End<T> {
     let Connection { lines, sink, .. } = connection;
+    let stopped = RefCell::new(None);
+    let stop = async {
+        let reason = stop.await;
+        *stopped.borrow_mut() = Some(reason);
+    };
     let reader = read_events(lines, reports, log);
     let writer = write_packets(sink, ring, video_extra_data, stop, log);
     tokio::pin!(reader, writer);
     tokio::select! {
         biased;
         written = &mut writer => match written {
-            WriterEnd::Stopped(t) => End::Stopped(t),
+            WriterEnd::Stopped(()) => End::Stopped(stopped.borrow_mut().take().expect("stop resolved")),
             WriterEnd::Refused(e) => End::Refused(e),
             WriterEnd::Failed(e) => {
                 log.log(Level::Debug, &format!("{e}; reading pending events"));
@@ -172,7 +180,72 @@ pub async fn run<T>(
                     .unwrap_or(End::Closed(e))
             }
         },
-        ended = &mut reader => ended,
+        ended = &mut reader => match stopped.borrow_mut().take() {
+            Some(reason) => End::Stopped(reason),
+            None => ended,
+        },
+    }
+}
+
+/// Retries closed IPC connections for up to 5 s per outage, preserving the ring; a consumed Stop is terminal.
+pub async fn run_reconnecting<T>(
+    service: (&Endpoint, &Hello),
+    mut connection: Connection,
+    ring: &Ring,
+    mut video_extra_data: impl FnMut() -> Option<Vec<u8>>,
+    reports: Reports<'_>,
+    stop: impl Future<Output = T>,
+    log: &dyn Log,
+) -> End<T> {
+    tokio::pin!(stop);
+    loop {
+        let end = run(
+            connection,
+            ring,
+            &mut video_extra_data,
+            Reports {
+                viewers: reports.viewers,
+                health: reports.health,
+            },
+            &mut stop,
+            log,
+        )
+        .await;
+        let End::Closed(mut message) = end else {
+            return end;
+        };
+        (reports.health)(None);
+        (reports.viewers)(None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            let attached = async {
+                tokio::time::sleep(backoff).await;
+                tokio::time::timeout_at(deadline, attach(service.0, service.1)).await
+            };
+            let result = tokio::select! {
+                biased;
+                stopped = &mut stop => return End::Stopped(stopped),
+                result = attached => result,
+            };
+            match result {
+                Ok(Ok(next)) => {
+                    log.log(Level::Info, "reattached to the D-Streamy service");
+                    ring.reattach();
+                    connection = next;
+                    break;
+                }
+                Ok(Err(error @ StartError::Refused { .. })) => {
+                    return End::Closed(format!("{message}; reattach: {error}"));
+                }
+                Ok(Err(error)) => message = error.to_string(),
+                Err(_) => return End::Closed(format!("{message}; reattach timed out after 5 s")),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return End::Closed(format!("{message}; reattach timed out after 5 s"));
+            }
+            backoff = (backoff * 2).min(Duration::from_secs(1));
+        }
     }
 }
 
@@ -205,7 +278,9 @@ async fn read_events<T>(mut lines: Lines, reports: Reports<'_>, log: &dyn Log) -
             Some("health") => (reports.health)(ServiceHealth::from_event(&event)),
             Some("detached") => {
                 break End::Detached {
-                    reason: service_text(event["reason"].as_str().unwrap_or("unknown")),
+                    reason: DetachReason::from_service(
+                        event["reason"].as_str().unwrap_or("unknown"),
+                    ),
                     message: service_text(event["message"].as_str().unwrap_or_default()),
                 };
             }
@@ -265,6 +340,7 @@ async fn write_packets<T>(
         }
         ring.count_sent(bytes);
         if let Some(pts_us) = keyframe_pts_us {
+            log.keyframe_sent(pts_us, monotonic_ns(arrived));
             log.log(
                 Level::Debug,
                 &format!(
@@ -275,6 +351,7 @@ async fn write_packets<T>(
         }
     };
     ring.close();
+    log.stop_drain_started(ring.stats().queued);
     log.log(
         Level::Debug,
         &format!(
@@ -316,13 +393,13 @@ async fn write_packets<T>(
     match tokio::time::timeout(STOP_DEADLINE, finish).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => log.log(Level::Warn, &format!("finishing the stream: {e}")),
-        Err(_) => log.log(
-            Level::Warn,
-            &format!(
-                "the service read nothing for {} ms after the stop; dropping the connection",
+        Err(_) => {
+            log.stop_drain_timed_out(STOP_DEADLINE.as_millis() as u64);
+            log.log(Level::Warn, &format!(
+                "the stop drain exceeded {} ms; dropping the remaining queued packets and connection",
                 STOP_DEADLINE.as_millis()
-            ),
-        ),
+            ));
+        }
     }
     WriterEnd::Stopped(stopped)
 }

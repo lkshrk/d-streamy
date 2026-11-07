@@ -1,0 +1,34 @@
+name: Import the Developer ID certificate
+description: Create a temporary keychain holding the Developer ID certificate so codesign can use it.
+inputs:
+  cert-p12:
+    description: Base64-encoded .p12 with the Developer ID Application certificate and key.
+    required: true
+  cert-password:
+    description: Password of the .p12.
+    required: true
+  keychain-password:
+    description: Password for the temporary keychain.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Create the signing keychain
+      shell: bash
+      env:
+        CERT_P12: ${{ inputs.cert-p12 }}
+        CERT_PASSWORD: ${{ inputs.cert-password }}
+        KEYCHAIN_PASSWORD: ${{ inputs.keychain-password }}
+      run: |
+        set -euo pipefail
+        KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+        echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+        security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+        security set-keychain-settings -lut 21600 "$KEYCHAIN"
+        security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+        security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+          -T /usr/bin/codesign
+        security set-key-partition-list -S apple-tool:,apple:,codesign: \
+          -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+        security list-keychain -d user | tr -d '"' | xargs security list-keychain -d user -s "$KEYCHAIN"
+        rm -f "$RUNNER_TEMP/cert.p12"

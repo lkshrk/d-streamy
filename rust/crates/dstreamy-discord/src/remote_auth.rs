@@ -22,6 +22,10 @@ const LOGIN_URL: &str = "https://discord.com/api/v9/users/@me/remote-auth/login"
 const ORIGIN: &str = "https://discord.com";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Local cap on a QR session, whatever lifetime the gateway announces.
+const MAX_SESSION: Duration = Duration::from_secs(300);
+/// Nonce, user payload and token: the only ciphertexts a session decrypts (ADR 0011).
+const MAX_DECRYPTS: u8 = 3;
 
 #[derive(Debug, Error)]
 pub enum RemoteAuthError {
@@ -74,7 +78,7 @@ pub async fn login(mut progress: impl FnMut(Progress)) -> Result<String, RemoteA
 
     let mut session = Session::new(keys);
     let mut heartbeat = None;
-    let mut deadline = None;
+    let mut deadline = Instant::now() + MAX_SESSION;
     let ticket = loop {
         let beat = async {
             match &mut heartbeat {
@@ -84,12 +88,7 @@ pub async fn login(mut progress: impl FnMut(Progress)) -> Result<String, RemoteA
                 None => std::future::pending().await,
             }
         };
-        let expire = async {
-            match deadline {
-                Some(at) => tokio::time::sleep_until(at).await,
-                None => std::future::pending().await,
-            }
-        };
+        let expire = tokio::time::sleep_until(deadline);
         let msg = tokio::select! {
             msg = stream.next() => msg,
             () = beat => {
@@ -121,7 +120,7 @@ pub async fn login(mut progress: impl FnMut(Progress)) -> Result<String, RemoteA
                 reply,
             } => {
                 heartbeat = Some(interval_at(Instant::now() + every, every));
-                deadline = Some(Instant::now() + lifetime);
+                deadline = deadline.min(Instant::now() + lifetime);
                 send(&mut sink, reply).await?;
             }
             Step::Send(reply) => send(&mut sink, reply).await?,
@@ -192,6 +191,7 @@ fn parse_exchange(status: u16, body: &str) -> Result<String, RemoteAuthError> {
 struct Keys {
     private: RsaPrivateKey,
     spki: Vec<u8>,
+    decrypts: u8,
 }
 
 impl Keys {
@@ -203,23 +203,34 @@ impl Keys {
             .to_public_key_der()
             .map_err(|e| RemoteAuthError::Protocol(format!("encoding the key: {e}")))?
             .into_vec();
-        Ok(Self { private, spki })
+        Ok(Self {
+            private,
+            spki,
+            decrypts: 0,
+        })
     }
 
     fn fingerprint(&self) -> String {
         URL_SAFE_NO_PAD.encode(Sha256::digest(&self.spki))
     }
 
-    fn decrypt(&self, b64: &str) -> Result<Vec<u8>, RemoteAuthError> {
+    // Blinding reduces, but does not remove, the RUSTSEC-2023-0071 timing leak (ADR 0011).
+    fn decrypt(&mut self, b64: &str) -> Result<Vec<u8>, RemoteAuthError> {
+        if self.decrypts >= MAX_DECRYPTS {
+            return Err(RemoteAuthError::Protocol(
+                "the gateway sent more ciphertexts than a login needs".into(),
+            ));
+        }
+        self.decrypts += 1;
         let bytes = STANDARD
             .decode(b64)
             .map_err(|e| RemoteAuthError::Protocol(format!("bad base64: {e}")))?;
         self.private
-            .decrypt(Oaep::new::<Sha256>(), &bytes)
+            .decrypt_blinded(&mut rsa::rand_core::OsRng, Oaep::new::<Sha256>(), &bytes)
             .map_err(|e| RemoteAuthError::Protocol(format!("decrypting: {e}")))
     }
 
-    fn decrypt_text(&self, b64: &str) -> Result<String, RemoteAuthError> {
+    fn decrypt_text(&mut self, b64: &str) -> Result<String, RemoteAuthError> {
         String::from_utf8(self.decrypt(b64)?)
             .map_err(|_| RemoteAuthError::Protocol("decrypted text is not UTF-8".into()))
     }
@@ -240,11 +251,24 @@ enum Step {
 
 struct Session {
     keys: Keys,
+    hello_seen: bool,
+    nonce_seen: bool,
 }
 
 impl Session {
     fn new(keys: Keys) -> Self {
-        Self { keys }
+        Self {
+            keys,
+            hello_seen: false,
+            nonce_seen: false,
+        }
+    }
+
+    fn once(seen: &mut bool, op: &str) -> Result<(), RemoteAuthError> {
+        if std::mem::replace(seen, true) {
+            return Err(RemoteAuthError::Protocol(format!("repeated {op}")));
+        }
+        Ok(())
     }
 
     fn handle(&mut self, packet: &Value) -> Result<Step, RemoteAuthError> {
@@ -260,15 +284,19 @@ impl Session {
                 .ok_or_else(|| RemoteAuthError::Protocol(format!("missing {name}")))
         };
         match packet["op"].as_str().unwrap_or_default() {
-            "hello" => Ok(Step::Hello {
-                heartbeat: millis("heartbeat_interval")?,
-                timeout: millis("timeout_ms")?,
-                reply: json!({
+            "hello" => {
+                Self::once(&mut self.hello_seen, "hello")?;
+                Ok(Step::Hello {
+                    heartbeat: millis("heartbeat_interval")?,
+                    timeout: millis("timeout_ms")?,
+                    reply: json!({
                     "op": "init",
                     "encoded_public_key": STANDARD.encode(&self.keys.spki),
-                }),
-            }),
+                    }),
+                })
+            }
             "nonce_proof" => {
+                Self::once(&mut self.nonce_seen, "nonce_proof")?;
                 let nonce = self.keys.decrypt(field("encrypted_nonce")?)?;
                 Ok(Step::Send(json!({
                     "op": "nonce_proof",
@@ -401,8 +429,36 @@ mod tests {
     }
 
     #[test]
+    fn hello_and_nonce_proof_are_accepted_once() {
+        let mut s = session();
+        let hello = json!({"op": "hello", "heartbeat_interval": 41250, "timeout_ms": 142637});
+        s.handle(&hello).unwrap();
+        assert!(
+            matches!(s.handle(&hello), Err(RemoteAuthError::Protocol(m)) if m.contains("hello"))
+        );
+        let nonce = json!({"op": "nonce_proof", "encrypted_nonce": encrypt_for(&s.keys, b"n")});
+        s.handle(&nonce).unwrap();
+        assert!(
+            matches!(s.handle(&nonce), Err(RemoteAuthError::Protocol(m)) if m.contains("nonce"))
+        );
+    }
+
+    #[test]
+    fn decryption_stops_after_the_login_budget() {
+        let mut keys = Keys::generate().unwrap();
+        let encrypted = encrypt_for(&keys, b"x");
+        for _ in 0..MAX_DECRYPTS {
+            assert_eq!(keys.decrypt(&encrypted).unwrap(), b"x");
+        }
+        assert!(matches!(
+            keys.decrypt(&encrypted),
+            Err(RemoteAuthError::Protocol(_))
+        ));
+    }
+
+    #[test]
     fn the_exchanged_token_decrypts() {
-        let keys = Keys::generate().unwrap();
+        let mut keys = Keys::generate().unwrap();
         let encrypted = encrypt_for(&keys, b"my.token.value");
         assert_eq!(keys.decrypt_text(&encrypted).unwrap(), "my.token.value");
     }

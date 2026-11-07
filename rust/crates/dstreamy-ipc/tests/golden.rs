@@ -1,5 +1,6 @@
-//! Golden fixtures shared with the C plugin; `DSTREAMY_BLESS=1` rewrites the generated ones.
+//! Golden fixtures shared with the C plugin; `DSTREAMY_BLESS=1` rewrites the generated ones, never under `CI`.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,7 +14,12 @@ fn fixtures() -> PathBuf {
 }
 
 fn bless() -> bool {
-    std::env::var_os("DSTREAMY_BLESS").is_some_and(|v| v == "1")
+    let bless = std::env::var_os("DSTREAMY_BLESS").is_some_and(|v| v == "1");
+    assert!(
+        !(bless && std::env::var_os("CI").is_some()),
+        "DSTREAMY_BLESS=1 rewrites the fixtures and is refused where CI is set"
+    );
+    bless
 }
 
 fn decode_lines(bytes: &[u8]) -> Vec<Result<Value, Malformed>> {
@@ -74,6 +80,10 @@ fn producer_reverse_channel_events() {
         ),
         (&json!(2), &json!(50), &json!(2))
     );
+    assert_eq!(lines[6]["e2ee"], "encrypted");
+    assert_eq!(lines[6]["dave_protocol_version"], 1);
+    assert_eq!(lines[7]["e2ee"], "unknown");
+    assert_eq!(lines[7]["dave_protocol_version"], Value::Null);
     assert_eq!(lines[7]["reconnecting"], true);
     assert_eq!(lines[7]["fps"], Value::Null);
     assert_eq!(lines[7]["audio_dropouts"], Value::Null);
@@ -283,6 +293,15 @@ fn ingest_streams() -> Vec<(&'static str, &'static str, &'static str, Vec<Frame>
             ],
         ),
         (
+            "ingest_pts_jump",
+            "ADR 0004 ingest: a pts step over 10 s on either track",
+            "jumps more than 10 s",
+            vec![
+                video(0, true, sps_pps_idr),
+                video(10_033_333, false, p_slice),
+            ],
+        ),
+        (
             "ingest_opus_40ms",
             "RFC 6716 §3.1",
             "not 20 ms",
@@ -357,10 +376,48 @@ fn write_or_check(path: &Path, expected: &[u8]) {
         let actual = fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert!(
             actual == expected,
-            "{} differs from the encoder",
-            path.display()
+            "{} differs from the encoder (DSTREAMY_BLESS=1 accepts the encoder's):\n{}",
+            path.display(),
+            diff(&actual, expected)
         );
     }
+}
+
+/// Fixture lines against the encoder's (`-` fixture, `+` encoder), or the first differing byte of a binary one.
+fn diff(actual: &[u8], expected: &[u8]) -> String {
+    let mut out = String::new();
+    if let (Ok(a), Ok(e)) = (std::str::from_utf8(actual), std::str::from_utf8(expected)) {
+        let (a, e): (Vec<&str>, Vec<&str>) = (a.lines().collect(), e.lines().collect());
+        for i in 0..a.len().max(e.len()) {
+            match (a.get(i), e.get(i)) {
+                (Some(x), Some(y)) if x == y => {}
+                (x, y) => {
+                    if let Some(x) = x {
+                        let _ = writeln!(out, "{}: -{x}", i + 1);
+                    }
+                    if let Some(y) = y {
+                        let _ = writeln!(out, "{}: +{y}", i + 1);
+                    }
+                }
+            }
+        }
+        return out;
+    }
+    let at = actual
+        .iter()
+        .zip(expected)
+        .position(|(x, y)| x != y)
+        .unwrap_or(actual.len().min(expected.len()));
+    let window = |b: &[u8]| hex(&b[at.saturating_sub(8)..(at + 8).min(b.len())]);
+    let _ = writeln!(
+        out,
+        "byte {at}: fixture {} bytes, encoder {} bytes\n-{}\n+{}",
+        actual.len(),
+        expected.len(),
+        window(actual),
+        window(expected)
+    );
+    out
 }
 
 fn pretty(value: &Value) -> Vec<u8> {

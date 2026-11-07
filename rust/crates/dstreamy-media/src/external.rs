@@ -17,6 +17,7 @@ use crate::{
     TargetKind, VideoCodec,
 };
 
+/// The `target` of a session fed by producers (ADR 0004); only `serve` accepts it.
 pub const EXTERNAL_TARGET_ID: &str = "external";
 /// RFC 6716 §3.1 and §3.2.2: TOC config 31 (CELT FB 20 ms), mono, code 0, one frame.
 pub const OPUS_SILENCE_FRAME: [u8; 3] = [0xF8, 0xFF, 0xFE];
@@ -29,25 +30,37 @@ const TICK_US: [i64; 2] = [12, 21];
 pub const FIRST_FRAMES_WAIT: Duration = Duration::from_millis(500);
 /// Bounds that keep every deadline representable as an `Instant`.
 pub const MAX_GRACE: Duration = Duration::from_secs(3600);
+/// Upper bound of `[serve] stall_ms` (ADR 0004).
 pub const MAX_STALL: Duration = Duration::from_secs(600);
 const VIDEO: usize = 0;
 const AUDIO: usize = 1;
 const CHANNEL_CAPACITY: usize = 1;
 const QUEUE_CAPACITY: usize = FRAME_CHANNEL_CAPACITY - CHANNEL_CAPACITY;
-/// Bytes the source queue may hold; with 8 MiB frames the count limit alone would allow about 500 MiB.
+/// Queue/first-frame budget; with one 8 MiB codec frame, a producer uses about 72 MiB worst case.
 pub const QUEUE_MAX_BYTES: usize = 64 << 20;
+/// How far behind the wall clock idle silence catches up after a long sleep; older frames are skipped.
+const IDLE_CATCH_UP: Duration = Duration::from_millis(500);
+/// A producer must restore video with a keyframe within one maximum keyframe interval after a loss.
+pub const RESYNC_BOUND: Duration = Duration::from_secs(2);
 
+/// What is sent after a producer detached (ADR 0004 `[serve] idle`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IdleMode {
+    /// Up to five 20 ms Opus silence packets after detach, then no idle media.
     #[default]
     Documented,
+    /// No media while detached.
     None,
+    /// One Opus silence packet every 20 ms while detached.
     Continuous,
 }
 
+/// Grace, stall and idle settings of an external source, from `[serve]` and a `start`'s `grace_secs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalOptions {
+    /// Allowed absence after source start, detach or a whole-producer stall.
     pub grace: Duration,
+    /// Media inactivity before a producer is stalled; also detects video gaps while audio flows.
     pub stall: Duration,
     pub idle: IdleMode,
 }
@@ -78,6 +91,7 @@ impl Default for ExternalOptions {
     }
 }
 
+/// What a producer's `hello` declares: codec, size and frame rate, which the session announces to Discord.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProducerInfo {
     pub codec: VideoCodec,
@@ -138,6 +152,7 @@ impl From<MediaFrame> for ProducerFrame {
     }
 }
 
+/// An `ExternalOptions` value outside the ADR 0004 bounds.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OptionsError {
     #[error("stall {0:?} is shorter than the {FIRST_FRAMES_WAIT:?} first-frames wait")]
@@ -148,6 +163,7 @@ pub enum OptionsError {
     GraceTooLong(Duration),
 }
 
+/// Why a producer could not attach: no session, or a producer already attached.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AttachError {
     #[error("no session holds the external source")]
@@ -158,21 +174,26 @@ pub enum AttachError {
     Incompatible(String),
 }
 
+/// Why a frame was refused by an attachment that is closed or over its limits.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SendError {
     #[error("the attachment is closed: {0}")]
     Closed(CloseReason),
 }
 
+/// Why an attachment ended: the producer stopped, a rule failed, or the session let go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseReason {
     Ended,
     Failed(String),
+    /// The producer handle was dropped without an explicit close.
     Dropped,
     /// The session's capture config, known only at `start`, rules the producer out.
     Incompatible(String),
     GraceExpired,
     SourceGone,
+    /// A new producer attached while this one was stalled.
+    Replaced,
 }
 
 impl fmt::Display for CloseReason {
@@ -184,16 +205,21 @@ impl fmt::Display for CloseReason {
             Self::Incompatible(message) => write!(f, "incompatible: {message}"),
             Self::GraceExpired => f.write_str("no media within the grace period"),
             Self::SourceGone => f.write_str("the session ended"),
+            Self::Replaced => f.write_str("replaced by a new producer while stalled"),
         }
     }
 }
 
+/// Why the source has no media right now: the producer left, or it stalled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptReason {
     Detached,
     Stalled,
+    /// Audio still arrives but video stopped.
+    VideoStalled,
 }
 
+/// The external source as `status` and `source` events report it (ADR 0004).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceState {
     Detached,
@@ -303,12 +329,16 @@ struct Current {
     link: Arc<Link>,
     keyframes: watch::Sender<u64>,
     gate: Gate,
+    /// When a loss closed the gate; `None` for the gate an attach or a restart closes, which only a keyframe opens.
+    gate_closed_at: Option<Instant>,
     offset: Option<i64>,
     first_in: [Option<i64>; 2],
     first_at: Option<Instant>,
     held: Vec<Held>,
     active_at: Instant,
+    video_at: Option<Instant>,
     stalled: bool,
+    video_stalled: bool,
     /// False until the producer may send; the stall timer only runs while true.
     timing: bool,
 }
@@ -318,15 +348,40 @@ impl Current {
         self.keyframes.send_modify(|n| *n += 1);
     }
 
-    fn ready(&self) -> bool {
-        self.first_in.iter().all(Option::is_some)
-            || self.held.len() >= QUEUE_CAPACITY
-            || self.held.iter().map(|h| h.frame.len()).sum::<usize>() >= QUEUE_MAX_BYTES
+    fn close_gate_after_loss(&mut self, gate: Gate, now: Instant) {
+        self.gate = gate;
+        self.gate_closed_at.get_or_insert(now);
+        self.request_keyframe();
     }
 
-    fn drop_held(&mut self) {
+    fn open_gate(&mut self) {
+        self.gate = Gate::Open;
+        self.gate_closed_at = None;
+    }
+
+    fn holds(&self, len: usize) -> bool {
+        self.held.len() < QUEUE_CAPACITY
+            && self.held.iter().map(|h| h.frame.len()).sum::<usize>() + len <= QUEUE_MAX_BYTES
+    }
+
+    /// True when it dropped anything, which breaks the video continuity the gate must then restore.
+    fn drop_held(&mut self) -> bool {
+        let dropped = !self.held.is_empty();
         for held in self.held.drain(..) {
             self.link.drop_frame(held.frame.track());
+        }
+        dropped
+    }
+
+    fn status(&self) -> SourceState {
+        match self.video_at {
+            Some(since) if self.video_stalled => SourceState::Interrupted {
+                since,
+                reason: InterruptReason::VideoStalled,
+            },
+            _ => SourceState::Producing {
+                attachment: self.id,
+            },
         }
     }
 }
@@ -505,9 +560,13 @@ impl State {
             .filter(|c| c.offset.is_none())
             .and_then(|c| c.first_at)
             .map(|t| t + FIRST_FRAMES_WAIT);
+        let gate = cur.and_then(|c| c.gate_closed_at).map(|t| t + RESYNC_BOUND);
         let expiry = self.absent_since(first_start).map(|t| t + options.grace);
         let idle = self.idle.as_ref().map(|i| i.next);
-        [stall, held, expiry, idle].into_iter().flatten().min()
+        [stall, held, gate, expiry, idle]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Applies every timer due at `now`; false once the grace period has run out.
@@ -533,13 +592,30 @@ impl State {
             let last = cur.active_at.max(first_start);
             if now >= last + inner.options.stall {
                 cur.stalled = true;
-                cur.drop_held();
+                if cur.drop_held() {
+                    cur.close_gate_after_loss(Gate::Resync, now);
+                }
                 warn!(attachment = cur.id, "producer stalled");
                 inner.set_status(SourceState::Interrupted {
                     since: last,
                     reason: InterruptReason::Stalled,
                 });
             }
+        }
+        if let Some(cur) = self.current.as_mut()
+            && cur.gate_closed_at.is_some_and(|t| now >= t + RESYNC_BOUND)
+        {
+            let id = cur.id;
+            cur.drop_held();
+            self.clear_queue();
+            self.detach_at(
+                inner,
+                id,
+                CloseReason::Incompatible(
+                    "no keyframe within 2 s after video loss; restart the producer and set its keyframe interval to at most 2 s".to_owned(),
+                ),
+                now,
+            );
         }
         if self
             .absent_since(first_start)
@@ -560,6 +636,12 @@ impl State {
             inner.set_status(SourceState::Detached);
             inner.wake.notify_one();
             return false;
+        }
+        if let Some(idle) = self.idle.as_mut()
+            && let Some(floor) = now.checked_sub(IDLE_CATCH_UP)
+            && idle.next < floor
+        {
+            idle.next = floor;
         }
         while let Some(idle) = self.idle.as_mut()
             && idle.next <= now
@@ -599,8 +681,7 @@ impl State {
             && !queued_keyframe
             && let Some(cur) = self.current.as_mut()
         {
-            cur.gate = Gate::Overflow;
-            cur.request_keyframe();
+            cur.close_gate_after_loss(Gate::Overflow, Instant::now());
             self.overflow_keyframe_requests += 1;
         }
     }
@@ -635,7 +716,7 @@ impl State {
         };
         if let ProducerFrame::Video { keyframe, .. } = &frame {
             if *keyframe {
-                cur.gate = Gate::Open;
+                cur.open_gate();
             } else if cur.gate != Gate::Open {
                 cur.link.drop_frame(VIDEO);
                 return;
@@ -671,6 +752,10 @@ impl State {
     fn detach(&mut self, inner: &Inner, id: u64, reason: CloseReason) {
         let now = Instant::now();
         self.advance(inner, now);
+        self.detach_at(inner, id, reason, now);
+    }
+
+    fn detach_at(&mut self, inner: &Inner, id: u64, reason: CloseReason, now: Instant) {
         if self.current.as_ref().is_none_or(|c| c.id != id) {
             return;
         }
@@ -861,14 +946,19 @@ impl CaptureSource for ExternalSource {
             }
             let now = Instant::now();
             state.config = Some(config);
-            state.first_start.get_or_insert(now);
+            state.first_start = Some(now);
             state.running_since = Some(now);
             if let Some(idle) = state.idle.as_mut() {
                 idle.next = idle.next.max(now);
             }
             if let Some(cur) = state.current.as_mut() {
                 cur.gate = Gate::Resync;
+                cur.gate_closed_at = None;
+                cur.stalled = false;
+                cur.video_stalled = false;
                 cur.request_keyframe();
+                self.inner
+                    .set_status(SourceState::Producing { attachment: cur.id });
             }
         }
         self.task = Some(tokio::spawn(drive(self.inner.clone(), tx)));
@@ -938,6 +1028,7 @@ pub struct ExternalHandle {
 }
 
 impl ExternalHandle {
+    /// Starts a producer's stall timer immediately; a compatible hello may replace a fully stalled attachment.
     pub fn attach(&self, info: ProducerInfo) -> Result<Attachment, AttachError> {
         let attachment = self.attach_paused(info)?;
         attachment.start_stall_timer();
@@ -951,10 +1042,15 @@ impl ExternalHandle {
         if !state.advance(&inner, Instant::now()) {
             return Err(AttachError::NoSession);
         }
-        if state.current.is_some() {
-            return Err(AttachError::Busy);
-        }
         check_producer(&info, state.config.as_ref()).map_err(AttachError::Incompatible)?;
+        match state.current.as_ref() {
+            Some(cur) if cur.stalled => {
+                let id = cur.id;
+                state.detach(&inner, id, CloseReason::Replaced);
+            }
+            Some(_) => return Err(AttachError::Busy),
+            None => {}
+        }
         state.next_id += 1;
         let id = state.next_id;
         let (keyframes, requests) = watch::channel(0);
@@ -967,12 +1063,15 @@ impl ExternalHandle {
             link: link.clone(),
             keyframes,
             gate: Gate::Resync,
+            gate_closed_at: None,
             offset: None,
             first_in: [None; 2],
             first_at: None,
             held: Vec::new(),
             active_at: Instant::now(),
+            video_at: None,
             stalled: false,
+            video_stalled: false,
             timing: false,
         });
         state.idle = None;
@@ -1019,6 +1118,7 @@ impl ExternalHandle {
     }
 }
 
+/// A producer's handle on the external source: feeds frames and closes; the session never sees it.
 pub struct Attachment {
     inner: Weak<Inner>,
     id: u64,
@@ -1047,12 +1147,35 @@ impl Attachment {
             .filter(|c| c.id == self.id)
             .ok_or_else(closed)?;
         cur.active_at = now;
-        if cur.stalled {
-            cur.stalled = false;
-            cur.gate = Gate::Resync;
-            cur.request_keyframe();
+        let resumed = std::mem::take(&mut cur.stalled);
+        // A video stall is told by audio arriving `stall` after the last video frame, so no timer and no flicker when both tracks stop.
+        let video_changed = match &frame {
+            ProducerFrame::Video { .. } => {
+                cur.video_at = Some(now);
+                std::mem::take(&mut cur.video_stalled)
+            }
+            ProducerFrame::Audio { .. } => {
+                let stalled = cur
+                    .video_at
+                    .is_some_and(|at| !cur.video_stalled && now >= at + inner.options.stall);
+                if stalled {
+                    cur.video_stalled = true;
+                    warn!(
+                        attachment = cur.id,
+                        "producer video stalled while audio flows"
+                    );
+                }
+                stalled
+            }
+        };
+        if resumed {
+            if cur.gate != Gate::Open {
+                cur.request_keyframe();
+            }
             info!(attachment = cur.id, "producer resumed");
-            inner.set_status(SourceState::Producing { attachment: cur.id });
+        }
+        if resumed || video_changed {
+            inner.set_status(cur.status());
         }
         if state.running_since.is_none() {
             self.link.skip();
@@ -1063,7 +1186,7 @@ impl Attachment {
         cur.first_at.get_or_insert(now);
         if let ProducerFrame::Video { keyframe, .. } = &frame {
             if *keyframe {
-                cur.gate = Gate::Open;
+                cur.open_gate();
             } else if cur.gate != Gate::Open {
                 match cur.gate {
                     Gate::Overflow => self.link.drop_frame(VIDEO),
@@ -1074,11 +1197,15 @@ impl Attachment {
         }
         match cur.offset {
             Some(_) => state.forward(frame, now),
-            None => {
+            None if cur.holds(frame.len()) => {
                 cur.held.push(Held { frame, at: now });
-                if cur.ready() {
+                if cur.first_in.iter().all(Option::is_some) {
                     state.release_held();
                 }
+            }
+            None => {
+                state.release_held();
+                state.forward(frame, now);
             }
         }
         drop(guard);
@@ -1118,6 +1245,7 @@ impl Attachment {
         self.link.closed()
     }
 
+    /// Detaches this producer while preserving the source timeline and applying absence grace.
     pub fn close(mut self, reason: CloseReason) {
         self.detach(reason);
         self.closed = true;

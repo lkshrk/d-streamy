@@ -6,7 +6,7 @@ mod support;
 use std::time::{Duration, Instant};
 
 use dstreamy_cli::engine::ANNOUNCE_INTERVAL;
-use dstreamy_media::QUEUE_MAX_BYTES;
+use dstreamy_media::{OPUS_SILENCE_FRAME, QUEUE_MAX_BYTES};
 use dstreamy_mock_discord::opcodes::voice::OP_VIDEO;
 use dstreamy_mock_discord::{
     MOCK_GUILD_ID, MOCK_VOICE_CHANNEL_ID, Recorded, RecordedVideoFrame, VoiceKind,
@@ -143,18 +143,78 @@ fn op_12_follows_each_producer_and_comes_before_its_media() {
     }
 }
 
+fn paused_long_enough(producing: Instant, announced: Instant, stall: Duration) -> bool {
+    announced
+        .checked_duration_since(producing)
+        .is_some_and(|wait| wait > stall)
+}
+
+#[test]
+fn process_initialization_does_not_count_as_a_paused_attachment() {
+    let previous = Instant::now();
+    let spawned = previous + Duration::from_millis(100);
+    let producing = spawned + Duration::from_millis(800);
+    let announced = producing + Duration::from_millis(100);
+    let stall = Duration::from_millis(500);
+    assert!(paused_long_enough(spawned, announced, stall));
+    assert!(!paused_long_enough(producing, announced, stall));
+    assert!(paused_long_enough(
+        previous + Duration::from_millis(200),
+        announced,
+        stall
+    ));
+}
+
 #[test]
 fn waiting_for_a_rate_limited_op_12_does_not_count_as_a_stall() {
+    const STALL: Duration = Duration::from_millis(500);
     let h = Harness::new("[serve]\nstall_ms = 500\n");
     let _s = h.serve();
     let mut c = h.external_session();
+    let mut announced = video_ops(&h.mock.recorded()).len();
+    let mut previous = None;
+    let mut previous_attachment = None;
     for want in [(640, 360, 15), (160, 90, 30)] {
         let args = size_args(want.0, want.1, want.2);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut p = h.producer(&args);
+        let source = c.source("paused producer", |e| {
+            e["state"] == "producing" && e["attachment"].as_u64() != previous_attachment
+        });
+        let producing = Instant::now();
         let id = p.attached();
-        c.source("producing", |e| e["attachment"] == id);
-        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(source["event"]["attachment"], id);
+        previous_attachment = Some(id);
+        let (index, at) = h.wait(&format!("op 12 {want:?}"), |r| {
+            let ops: Vec<_> = r
+                .ops
+                .iter()
+                .filter(|o| o.is(Some(VoiceKind::Stream), OP_VIDEO))
+                .collect();
+            let sizes = video_ops(r);
+            sizes[announced.min(sizes.len())..]
+                .iter()
+                .position(|&op| op == want)
+                .map(|i| (announced + i + 1, ops[announced + i].received_at))
+        });
+        announced = index;
+        if let Some(before) = previous {
+            assert!(
+                producing.duration_since(before) < ANNOUNCE_INTERVAL - STALL,
+                "producer attached too late after the last op 12 to exercise the limiter"
+            );
+            assert!(
+                paused_long_enough(producing, at, STALL),
+                "actual paused attachment was not held longer than the stall limit"
+            );
+        }
+        previous = Some(at);
+        h.wait("media after the op 12", |r| {
+            stream_video(r)
+                .iter()
+                .any(|v| v.received_at >= at)
+                .then_some(())
+        });
         p.kill();
         c.source("detached", |e| e["reason"] == "detached");
     }
@@ -216,7 +276,10 @@ fn a_producer_restarted_within_grace_continues_the_stream() {
     c.source("interrupted", |e| {
         e["state"] == "interrupted" && e["reason"] == "detached"
     });
-    std::thread::sleep(Duration::from_millis(1_000));
+    let silence_before = silence(&before);
+    h.wait("the documented idle silence", |r| {
+        (silence(r) >= silence_before + 5).then_some(())
+    });
     let second = h.producer(&[]);
     let id2 = second.attached();
     assert_ne!(id, id2);
@@ -290,6 +353,29 @@ fn without_a_restart_the_session_stops_with_capture_ended_after_grace() {
         "{:?}",
         killed.elapsed()
     );
+}
+
+fn silence(r: &Recorded) -> usize {
+    r.audio
+        .iter()
+        .filter(|a| a.kind == VoiceKind::Stream && a.data == OPUS_SILENCE_FRAME)
+        .count()
+}
+
+/// Polls `status` until the source has been interrupted for at least `ms`.
+fn interrupted_for(c: &mut Client, ms: u64) {
+    let started = Instant::now();
+    loop {
+        let status = c.status();
+        if status["source"]["for_ms"].as_u64() >= Some(ms) {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "still not interrupted for {ms} ms: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn detached_reason(h: &Harness, kind: &str) -> Value {
@@ -450,7 +536,7 @@ fn audio_and_video_stay_aligned_across_a_producer_restart() {
         if n < 2 {
             p.kill();
             c.source("interrupted", |e| e["state"] == "interrupted");
-            std::thread::sleep(Duration::from_millis(1_000));
+            interrupted_for(&mut c, 600);
         }
         sent.push(p.lines());
     }
@@ -559,11 +645,6 @@ impl Overload {
     }
 }
 
-/// Runs a producer for at most `secs` and samples the source queue depth every 50 ms.
-fn overload_run(burst: Option<u32>, secs: u64) -> Overload {
-    overload_run_with(burst, secs, &[])
-}
-
 fn overload_run_with(burst: Option<u32>, secs: u64, extra: &[&str]) -> Overload {
     let h = Harness::new("");
     let s = h.serve();
@@ -574,7 +655,7 @@ fn overload_run_with(burst: Option<u32>, secs: u64, extra: &[&str]) -> Overload 
     }
     let mut args: Vec<&str> = args.iter().map(String::as_str).collect();
     args.extend(extra);
-    let mut p = h.producer(&args);
+    let p = h.producer(&args);
     p.attached();
     let mut depths = Vec::new();
     let started = Instant::now();
@@ -641,57 +722,85 @@ fn assert_within_capacity(run: &Overload) {
     );
 }
 
-const RSS_MARGIN_KIB: u64 = 8 * 1024;
+// Process code, stacks and allocator arenas account for up to 96 MiB beyond the queue and 40 in-flight frame copies.
+const RSS_PROCESS_SLACK_KIB: u64 = 96 * 1024;
 
 #[test]
-fn a_burst_10_producer_keeps_serve_memory_within_a_margin_of_a_real_time_baseline() {
-    let baseline = overload_run(None, 10);
-    let burst = overload_run(Some(10), 10);
-    assert_within_capacity(&baseline);
-    assert_within_capacity(&burst);
-    assert!(
-        burst.peak_rss_kib <= baseline.peak_rss_kib + RSS_MARGIN_KIB,
-        "serve peak RSS {} KiB is more than {RSS_MARGIN_KIB} KiB over the {} KiB baseline",
-        burst.peak_rss_kib,
-        baseline.peak_rss_kib
+fn a_burst_10_producer_keeps_serve_memory_bounded() {
+    let pad = 2 << 20;
+    let bound_kib = (QUEUE_MAX_BYTES as u64 + 40 * pad) / 1024 + RSS_PROCESS_SLACK_KIB;
+    let target = (bound_kib + bound_kib / 2) * 1024;
+    let started = Instant::now();
+    let burst = overload_run_with(
+        Some(10),
+        60,
+        &[
+            "--pad-keyframes",
+            &pad.to_string(),
+            "--until-bytes",
+            &target.to_string(),
+        ],
     );
+    assert_within_capacity(&burst);
+    let real_time = u64::from(FPS) * started.elapsed().as_secs();
     assert!(
-        burst.video_received() > 5 * baseline.video_received(),
-        "the burst was not faster than real time: serve took {} vs {} video frames; burst session {}, source {}",
+        burst.video_received() > 5 * real_time,
+        "serve took {} video frames in {:?}, not 5x real time ({real_time}); session {}, source {}",
         burst.video_received(),
-        baseline.video_received(),
+        started.elapsed(),
         burst.session,
         burst.source
+    );
+    assert!(
+        burst.sent_bytes >= target,
+        "sent {} of {target} bytes",
+        burst.sent_bytes
+    );
+    assert!(
+        burst.peak_rss_kib <= bound_kib,
+        "serve peak RSS {} KiB exceeds the fixed {bound_kib} KiB bound",
+        burst.peak_rss_kib
     );
 }
 
 #[test]
 fn a_producer_faster_than_serve_can_send_is_dropped_not_buffered() {
-    let baseline = overload_run(None, 5);
-    let flood = overload_run(Some(200), 5);
+    let pad = 2 << 20;
+    let bound_kib = (QUEUE_MAX_BYTES as u64 + 40 * pad) / 1024 + RSS_PROCESS_SLACK_KIB;
+    let target = (bound_kib + bound_kib / 2) * 1024;
+    let flood = overload_run_with(
+        Some(200),
+        60,
+        &[
+            "--pad-keyframes",
+            &pad.to_string(),
+            "--until-bytes",
+            &target.to_string(),
+        ],
+    );
     assert_within_capacity(&flood);
     assert!(
-        flood.dropped() > baseline.dropped(),
-        "drop counters did not rise: baseline {} {}, flood {} {}",
-        baseline.session,
-        baseline.source,
+        flood.dropped() > 0,
+        "no drops: {} {}",
         flood.session,
         flood.source
     );
     assert!(
-        flood.peak_rss_kib <= baseline.peak_rss_kib + RSS_MARGIN_KIB,
-        "serve peak RSS {} KiB is more than {RSS_MARGIN_KIB} KiB over the {} KiB baseline",
-        flood.peak_rss_kib,
-        baseline.peak_rss_kib
+        flood.sent_bytes >= target,
+        "sent {} of {target} bytes",
+        flood.sent_bytes
+    );
+    assert!(
+        flood.peak_rss_kib <= bound_kib,
+        "serve peak RSS {} KiB exceeds the fixed {bound_kib} KiB bound",
+        flood.peak_rss_kib
     );
 }
 
 #[test]
 fn a_flood_of_8_mib_keyframes_keeps_serve_memory_bounded() {
-    let baseline = overload_run(None, 5);
     let pad = (8 << 20) - 64;
-    // Queues and in-flight copies measured up to ~260 MiB with glibc arenas; keeping what was sent would exceed it.
-    let bound_kib = (QUEUE_MAX_BYTES as u64 + 40 * (8 << 20)) / 1024;
+    let bound_kib = (QUEUE_MAX_BYTES as u64 + 40 * (8 << 20)) / 1024 + RSS_PROCESS_SLACK_KIB;
     let target = (bound_kib + bound_kib / 2) * 1024 + (16 << 20);
     let flood = overload_run_with(
         Some(50),
@@ -705,31 +814,176 @@ fn a_flood_of_8_mib_keyframes_keeps_serve_memory_bounded() {
     );
     assert_within_capacity(&flood);
     let source_lost = flood.source["dropped_video"].as_u64().unwrap();
-    assert!(
-        source_lost > 0,
-        "the source queue never overflowed: {}",
-        flood.source
-    );
+    assert!(source_lost > 0, "source never overflowed: {}", flood.source);
     let requested = flood.source["overflow_keyframe_requests"].as_u64().unwrap();
     assert!(
         requested > 0,
-        "no keyframe request after overflow: {}",
+        "no overflow keyframe request: {}",
         flood.source
     );
-    assert!(
-        flood.keyframe_requests > 0,
-        "the producer saw no keyframe request"
-    );
+    assert!(flood.keyframe_requests > 0, "no producer keyframe request");
     assert!(
         flood.sent_bytes >= target,
-        "the flood sent only {} of {} KiB within its time cap",
-        flood.sent_bytes / 1024,
-        target / 1024
+        "sent {} of {target} bytes",
+        flood.sent_bytes
     );
     assert!(
-        flood.peak_rss_kib <= baseline.peak_rss_kib + bound_kib,
-        "serve peak RSS {} KiB is more than {bound_kib} KiB over the {} KiB baseline",
-        flood.peak_rss_kib,
-        baseline.peak_rss_kib
+        flood.peak_rss_kib <= bound_kib,
+        "serve peak RSS {} KiB exceeds the fixed {bound_kib} KiB bound",
+        flood.peak_rss_kib
     );
+}
+
+#[test]
+fn a_stalled_producer_is_replaced_by_the_next_hello() {
+    let h = Harness::new("[serve]\nstall_ms = 500\n");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let first = h.producer(&["--stall-after", "1000", "--stall-for", "4000"]);
+    let id = first.attached();
+    let before = h.stream_media(15, 25);
+    c.source("stalled", |e| {
+        e["state"] == "interrupted" && e["reason"] == "stalled"
+    });
+    let second = h.producer(&[]);
+    let id2 = second.attached();
+    assert_ne!(id, id2);
+    let detached = first.wait_line("detached", |v| v["event"]["type"] == "detached");
+    assert_eq!(detached["event"]["reason"], "replaced", "{detached}");
+    c.source("producing again", |e| {
+        e["state"] == "producing" && e["attachment"] == id2
+    });
+    let (v0, a0) = (stream_video(&before).len(), producer_audio(&before).len());
+    let recorded = h.stream_media(v0 + 30, a0 + 50);
+    let video = stream_video(&recorded);
+    assert!(is_keyframe(&video[after_gap(&video)].data));
+    assert_eq!(c.status()["source"]["attachment"], id2);
+}
+
+#[test]
+fn a_stop_publishes_source_detached_last() {
+    let h = Harness::new("");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let p = h.producer(&[]);
+    let id = p.attached();
+    c.source("producing", |e| {
+        e["state"] == "producing" && e["attachment"] == id
+    });
+    c.send(&json!({"id": "stop", "cmd": "stop"}));
+    assert_eq!(c.reply("stop")["type"], "result");
+    c.source("detached after stop", |e| e["state"] == "detached");
+    assert!(c.status()["source"].is_null());
+}
+
+#[test]
+fn health_follows_attached_and_grace_adds_no_audio_dropouts() {
+    let h = Harness::new("[serve]\ngrace_secs = 30\n");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let first = h.producer(&["--duration", "2500"]);
+    first.attached();
+    h.stream_media(30, 50);
+    let last = first.wait_line("health", |v| {
+        v["event"]["type"] == "health" && v["event"]["audio_dropouts"].is_number()
+    });
+    let dropouts = last["event"]["audio_dropouts"].as_u64().unwrap();
+    c.source("interrupted", |e| {
+        e["state"] == "interrupted" && e["reason"] == "detached"
+    });
+    for _ in 0..3 {
+        c.until("a health interval without a producer", |m| {
+            m["event"]["event"] == "health"
+        });
+    }
+    let second = h.producer(&[]);
+    second.attached();
+    let health = second.wait_line("health", |v| v["event"]["type"] == "health");
+    let lines = second.lines();
+    let at = |pred: &dyn Fn(&Value) -> bool| lines.iter().position(pred).unwrap();
+    assert!(
+        at(&|v| v.get("hello").is_some()) < at(&|v| v["event"]["type"] == "health"),
+        "{lines:?}"
+    );
+    assert_eq!(health["event"]["reconnecting"], false, "{health}");
+    assert_eq!(
+        health["event"]["audio_dropouts"], dropouts,
+        "intervals without a producer are not dropouts: {health}"
+    );
+}
+
+#[test]
+fn a_discord_reconnect_keeps_the_producer_and_loses_no_frames() {
+    let h = Harness::new("");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let p = h.producer(&[]);
+    let id = p.attached();
+    let before = h.stream_media(30, 50);
+    // 4006 is not resumable, so the session reconnects the stream instead of resuming in place.
+    assert!(h.mock.drop_voice(VoiceKind::Stream, Some(4006)));
+    c.until("reconnecting", |m| {
+        m["event"]["state"]["state"] == "reconnecting"
+    });
+    c.until("streaming again", |m| {
+        m["event"]["state"]["state"] == "streaming"
+    });
+    let (v0, a0) = (stream_video(&before).len(), producer_audio(&before).len());
+    let recorded = h.stream_media(v0 + 30, a0 + 50);
+    let video = stream_video(&recorded);
+    let audio = stream_audio(&recorded);
+    increasing(
+        "video",
+        &video.iter().map(|v| v.rtp_timestamp).collect::<Vec<_>>(),
+    );
+    increasing(
+        "audio",
+        &audio.iter().map(|a| a.rtp_timestamp).collect::<Vec<_>>(),
+    );
+    let status = c.status();
+    assert_eq!(status["source"]["state"], "producing", "{status}");
+    assert_eq!(status["source"]["attachment"], id, "{status}");
+    let stats = &status["source"]["stats"];
+    assert_eq!(
+        (
+            stats["skipped"].as_u64(),
+            stats["dropped_video"].as_u64(),
+            stats["dropped_audio"].as_u64()
+        ),
+        (Some(0), Some(0), Some(0)),
+        "the source queue bridges the reconnect: {status}"
+    );
+    assert!(
+        !p.lines().iter().any(|v| v["event"]["type"] == "detached"),
+        "the producer was detached by the reconnect"
+    );
+}
+
+#[test]
+fn producer_health_reports_the_negotiated_encryption_state() {
+    for version in [0, 1] {
+        let h = Harness::with_mock(
+            "",
+            dstreamy_mock_discord::MockConfig {
+                dave_protocol_version: version,
+                ..dstreamy_mock_discord::MockConfig::default()
+            },
+        );
+        let _s = h.serve();
+        let _c = h.external_session();
+        let p = h.producer(&[]);
+        p.attached();
+        let health = p.wait_line("negotiated encryption health", |v| {
+            v["event"]["type"] == "health" && v["event"]["dave_protocol_version"] == version
+        });
+        assert_eq!(
+            health["event"]["e2ee"],
+            if version == 0 {
+                "unencrypted"
+            } else {
+                "encrypted"
+            },
+            "{health}"
+        );
+    }
 }

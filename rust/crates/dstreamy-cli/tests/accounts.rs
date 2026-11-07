@@ -339,3 +339,54 @@ fn an_account_without_a_token_can_still_be_removed() {
     assert!(text.contains("removed account second"), "{text}");
     assert_eq!(names(&h.list()), ["mockuser"]);
 }
+
+#[cfg(unix)]
+#[test]
+fn an_insecure_token_file_is_reported_with_the_fix_instead_of_as_no_token() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new();
+    ok(h.first().arg("login").write_stdin(MOCK_TOKEN));
+    let token_file = h.dir().join("accounts/mockuser/token");
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let list = h.list();
+    assert_eq!(list[0]["has_token"], false);
+    let error = list[0]["token_error"].as_str().unwrap();
+    assert!(error.contains("chmod 600"), "{error}");
+    let (table, _) = ok(h.first().args(["account", "list"]));
+    assert!(table.contains("chmod 600"), "{table}");
+    assert!(!table.contains("no token"), "{table}");
+    let err = failed(h.first().arg("guilds"));
+    assert!(err.contains("chmod 600"), "{err}");
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(h.list()[0]["has_token"], true);
+    assert!(h.list()[0].get("token_error").is_none());
+}
+
+#[test]
+fn removing_the_default_account_moves_the_default_to_the_next_one() {
+    let h = Harness::new();
+    ok(h.first().arg("login").write_stdin(MOCK_TOKEN));
+    ok(h.second().arg("login").write_stdin(SECOND_TOKEN));
+    ok(h.first().args(["account", "use", "second"]));
+    let defaults = |list: &Value| -> Vec<bool> {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["default"].as_bool().unwrap())
+            .collect()
+    };
+    assert_eq!(defaults(&h.list()), [false, true]);
+    let (text, notes) = ok(h.first().args(["account", "remove", "second"]));
+    assert!(text.contains("removed account second"), "{text}");
+    assert!(notes.contains("the default account is mockuser"), "{notes}");
+    let list = h.list();
+    assert_eq!(names(&list), ["mockuser"]);
+    assert_eq!(defaults(&list), [true]);
+    assert_eq!(
+        std::fs::read_to_string(h.dir().join("default-account"))
+            .unwrap()
+            .trim(),
+        "mockuser"
+    );
+    ok(h.first().arg("guilds"));
+}

@@ -131,11 +131,14 @@ fn key_input(key: KeyEvent) -> Option<Input> {
 
 struct Live {
     client: Arc<DiscordClient>,
-    session: Session,
+    /// Shared with the task that joins a stream, so the loop keeps drawing meanwhile.
+    session: Arc<Session>,
     events: broadcast::Receiver<SessionEvent>,
     portal: Option<PortalBook>,
     lock: Option<SessionLock>,
 }
+
+type Starting = JoinHandle<Result<(), String>>;
 
 /// `on_draw` sees every frame; with `signals`, a second interrupt during shutdown exits at once.
 pub async fn drive<B: Backend>(
@@ -169,6 +172,7 @@ where
         async move { discord::connect_resolved(&ctx, resolved?, Persistence::Long).await }
     }));
     let mut live: Option<Live> = None;
+    let mut starting: Option<Starting> = None;
     let mut tasks = vec![targets];
 
     let result = loop {
@@ -188,7 +192,7 @@ where
                     Ok(Ok(client)) => {
                         let client = Arc::new(client);
                         let user = client.user().username.clone();
-                        let session = Session::new(client.clone());
+                        let session = Arc::new(Session::new(client.clone()));
                         let events = session.subscribe();
                         tasks.push(tokio::spawn({
                             let client = client.clone();
@@ -204,11 +208,22 @@ where
                     Err(e) => Msg::ConnectFailed(e.to_string()),
                 }
             },
+            joined = async { starting.as_mut().expect("guarded").await }, if starting.is_some() => {
+                starting = None;
+                release_if_stopped(&mut live);
+                match joined {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(e)) => Msg::StartFailed(e),
+                    Err(e) => Msg::StartFailed(e.to_string()),
+                }
+            },
             event = next_event(&mut live) => match event {
                 Ok(event) => {
                     if matches!(event, SessionEvent::State { .. }) {
                         remember_token(ctx, &mut live, &mut app);
-                        release_if_stopped(&mut live);
+                        if starting.is_none() {
+                            release_if_stopped(&mut live);
+                        }
                     }
                     Msg::session(event)
                 }
@@ -217,7 +232,9 @@ where
                     let Some(l) = &live else { continue };
                     let state = l.session.state().borrow().clone();
                     remember_token(ctx, &mut live, &mut app);
-                    release_if_stopped(&mut live);
+                    if starting.is_none() {
+                        release_if_stopped(&mut live);
+                    }
                     Msg::session(SessionEvent::State { state })
                 }
                 Err(RecvError::Closed) => unreachable!("the session holds the event sender"),
@@ -241,8 +258,11 @@ where
                 }
             }
             Effect::Start(request) => {
-                if let Err(e) = start(ctx, &source, &mut live, &mut app, request).await {
-                    app.update(Msg::StartFailed(e));
+                match begin_start(ctx, &source, &mut live, &mut app, request) {
+                    Ok(handle) => starting = Some(handle),
+                    Err(e) => {
+                        app.update(Msg::StartFailed(e));
+                    }
                 }
             }
             Effect::Stop => {
@@ -288,6 +308,10 @@ where
     for task in tasks {
         task.abort();
     }
+    if let Some(handle) = starting {
+        handle.abort();
+        let _ = handle.await;
+    }
     if let Some(Live {
         client,
         session,
@@ -296,7 +320,10 @@ where
         ..
     }) = live.take()
     {
-        stream::teardown(session, client).await;
+        match Arc::try_unwrap(session) {
+            Ok(session) => stream::teardown(session, client).await,
+            Err(_) => tracing::warn!("the session is still shared; leaving without stopping it"),
+        }
         if let Some(mut book) = portal
             && let Err(e) = book.save(&ctx.paths)
         {
@@ -372,19 +399,16 @@ fn remember_token(ctx: &Ctx, live: &mut Option<Live>, app: &mut App) {
     }
 }
 
-async fn start(
+/// Takes the session lock and prepares the capture, then joins on a task; the lock stays until the session stops.
+fn begin_start(
     ctx: &Ctx,
     source: &TokenSource,
     live: &mut Option<Live>,
     app: &mut App,
     request: StartRequest,
-) -> Result<(), String> {
+) -> Result<Starting, String> {
     let Some(l) = live else {
         return Err("not connected to Discord".to_owned());
-    };
-    let lock = match l.lock.take() {
-        Some(lock) => lock,
-        None => crate::accounts::session_lock(ctx, source).map_err(|e| e.to_string())?,
     };
     let mut config = Config::load(&ctx.paths.config_file).map_err(|e| e.to_string())?;
     let restore_token = capture::restore_token(&config);
@@ -403,20 +427,23 @@ async fn start(
         request.crop,
         config.audio_source.clone(),
     );
-    l.portal = Some(PortalBook::new(restore_token, picked.portal_token));
-    stream::start(
-        &l.session,
-        request.guild_id,
-        request.channel_id,
-        picked.source,
-        capture,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    if !stream::has_stopped(&l.session) {
-        l.lock = Some(lock);
+    if l.lock.is_none() {
+        l.lock = Some(crate::accounts::session_lock(ctx, source).map_err(|e| e.to_string())?);
     }
-    Ok(())
+    l.portal = Some(PortalBook::new(restore_token, picked.portal_token));
+    let session = l.session.clone();
+    Ok(tokio::spawn(async move {
+        stream::start(
+            &session,
+            request.guild_id,
+            request.channel_id,
+            picked.source,
+            capture,
+            request.stream.require_e2ee,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }))
 }
 
 /// A saved portal restore token is kept while the portal target stays selected.

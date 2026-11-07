@@ -38,20 +38,20 @@ if(OS_MACOS)
   )
 elseif(OS_WINDOWS)
   # A subfolder: libobs tries every library in the module's own folder as a module.
-  set_target_properties(${ui_target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${plugin_rundir}/${ui_target}>")
-  install(TARGETS ${ui_target} RUNTIME DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit/${ui_target}")
-  install(FILES "$<TARGET_PDB_FILE:${ui_target}>" DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit/${ui_target}" OPTIONAL)
+  set_target_properties(${ui_target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${plugin_rundir}/dstreamy-ui>")
+  install(TARGETS ${ui_target} RUNTIME DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit/dstreamy-ui")
+  install(FILES "$<TARGET_PDB_FILE:${ui_target}>" DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit/dstreamy-ui" OPTIONAL)
   install(
     FILES icons/LICENSE
-    DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit/${ui_target}"
+    DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit/dstreamy-ui"
     RENAME THIRD_PARTY_NOTICES.txt
   )
 else()
-  set_target_properties(${ui_target} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${plugin_rundir}/${ui_target}")
-  install(TARGETS ${ui_target} LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/obs-plugins/${ui_target}")
+  set_target_properties(${ui_target} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${plugin_rundir}/dstreamy-ui")
+  install(TARGETS ${ui_target} LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/obs-plugins/dstreamy-ui")
   install(
     FILES icons/LICENSE
-    DESTINATION "${CMAKE_INSTALL_LIBDIR}/obs-plugins/${ui_target}"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/obs-plugins/dstreamy-ui"
     RENAME THIRD_PARTY_NOTICES.txt
   )
 endif()

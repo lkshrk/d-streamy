@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use dstreamy_core::TOKEN_ENV;
-use dstreamy_ipc::control::{LOGIN_ENV, LOGIN_WINDOW_LIMIT};
+use dstreamy_ipc::control::{LOGIN_ENV, LOGIN_WINDOW_LIMIT, login_env_value_ok};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -29,16 +29,18 @@ pub struct LoginParams {
 impl LoginParams {
     pub fn parse(value: Value) -> Result<Self, Failure> {
         let params: Self = serde_json::from_value(value).map_err(invalid_params)?;
-        if let Some(name) = params
-            .env
-            .iter()
-            .flat_map(HashMap::keys)
-            .find(|name| !LOGIN_ENV.contains(&name.as_str()))
-        {
-            return Err(invalid_params(format!(
-                "env may only set {}, not {name}",
-                LOGIN_ENV.join(", ")
-            )));
+        for (name, value) in params.env.iter().flatten() {
+            if !LOGIN_ENV.contains(&name.as_str()) {
+                return Err(invalid_params(format!(
+                    "env may only set {}, not {name}",
+                    LOGIN_ENV.join(", ")
+                )));
+            }
+            if !login_env_value_ok(name, value) {
+                return Err(invalid_params(format!(
+                    "env {name} is not a value a graphical session sets"
+                )));
+            }
         }
         if let Some(account) = &params.account {
             dstreamy_core::accounts::validate_name(account).map_err(invalid_params)?;
@@ -78,7 +80,12 @@ impl Login {
         self.program.is_some() && !self.env_token
     }
 
-    pub async fn run(&self, engine: &Arc<Engine>, params: LoginParams) -> Result<Value, Failure> {
+    pub async fn run(
+        &self,
+        engine: &Arc<Engine>,
+        params: LoginParams,
+        slot: Arc<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<Value, Failure> {
         let Some(program) = &self.program else {
             return Err(Failure::new(
                 "login_unavailable",
@@ -114,6 +121,7 @@ impl Login {
             .arg("--config-dir")
             .arg(&self.ctx.paths.dir)
             .args(["login", "--browser", "--window-only"])
+            .env_remove(TOKEN_ENV)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -167,7 +175,11 @@ impl Login {
         let account = user["account"].as_str().map(str::to_owned);
         // Detached, so a client leaving now can't cancel it and leave the old token's connection open.
         let engine = engine.clone();
-        let _ = tokio::spawn(async move { engine.logged_in_as(account).await }).await;
+        let _ = tokio::spawn(async move {
+            let _slot = slot;
+            engine.logged_in_as(account).await
+        })
+        .await;
         tracing::info!("logged in from the login window");
         Ok(user)
     }
@@ -307,6 +319,20 @@ mod tests {
         );
         let bad = LoginParams::parse(json!({"cmd": "login", "env": {"DISPLAY": 0}})).unwrap_err();
         assert_eq!(bad.code, "invalid_params");
+        let exec = LoginParams::parse(json!({
+            "cmd": "login",
+            "env": {"DBUS_SESSION_BUS_ADDRESS": "unixexec:path=/bin/sh"},
+        }))
+        .unwrap_err();
+        assert_eq!(exec.code, "invalid_params");
+        assert!(
+            exec.message.contains("DBUS_SESSION_BUS_ADDRESS"),
+            "{}",
+            exec.message
+        );
+        let relative =
+            LoginParams::parse(json!({"cmd": "login", "env": {"XAUTHORITY": "auth"}})).unwrap_err();
+        assert_eq!(relative.code, "invalid_params");
         let named = LoginParams::parse(json!({"cmd": "login", "account": "alt"})).unwrap();
         assert_eq!(named.account.as_deref(), Some("alt"));
         let bad = LoginParams::parse(json!({"cmd": "login", "account": "../x"})).unwrap_err();

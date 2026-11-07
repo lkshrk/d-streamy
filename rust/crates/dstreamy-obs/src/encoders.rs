@@ -329,6 +329,12 @@ fn create_video(config: &Config) -> Result<EncoderRef, String> {
             "the canvas's video".to_owned()
         }
     };
+    crate::hooks::observe("own_video_encoder", || {
+        serde_json::json!({
+            "id":config.video_encoder,"width":width,"height":height,"fps":fps,
+            "gpu_mix": path.starts_with("a GPU mix"), "format": unsafe { format_name(effective_format(encoder.get())) }
+        })
+    });
     log::info(&format!(
         "own video encoder {} at {width}×{height}, {fps} FPS, {} kbps, from {path}",
         config.video_encoder, config.bitrate_kbps
@@ -365,6 +371,10 @@ pub fn prepare(output: OutputPtr, owned: &Mutex<Owned>) -> Result<(), String> {
     unsafe {
         let attached = sys::obs_output_get_audio_encoder(output.0, 0);
         if !attached.is_null() && attached != audio {
+            crate::hooks::observe(
+                "audio_encoder_replaced",
+                || serde_json::json!({"previous":text(sys::obs_encoder_get_id(attached)),"current":"ffmpeg_opus"}),
+            );
             log::info(&format!(
                 "replacing the attached audio encoder {} with D-Streamy's own Opus encoder",
                 text(sys::obs_encoder_get_id(attached))
@@ -390,6 +400,7 @@ pub fn prepare(output: OutputPtr, owned: &Mutex<Owned>) -> Result<(), String> {
                 if problems.is_empty() {
                     // SAFETY: the output is inactive; it takes its own reference.
                     unsafe { sys::obs_output_set_video_encoder(output.0, candidate) };
+                    crate::hooks::observe("shared_video_encoder", || serde_json::json!({"id":id}));
                     log::info(&format!("sharing the stream's video encoder {id}"));
                     return Ok(());
                 }
@@ -397,6 +408,14 @@ pub fn prepare(output: OutputPtr, owned: &Mutex<Owned>) -> Result<(), String> {
                 if !config.fallback {
                     return Err(message);
                 }
+                crate::hooks::observe("share_refused", || {
+                    serde_json::json!({
+                        "id":id, "b_frames":problems.iter().any(|p| matches!(p, Problem::BFrames { .. })),
+                        "inactive":problems.iter().any(|p| matches!(p, Problem::StreamNotRunning)),
+                        "color_format":problems.iter().any(|p| matches!(p, Problem::ColorFormat { .. })),
+                        "custom_options":problems.iter().any(|p| matches!(p, Problem::CustomOptions { .. }))
+                    })
+                });
                 log::warn(&format!(
                     "not sharing the stream's video encoder {id} ({message}), so D-Streamy uses its own"
                 ));

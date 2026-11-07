@@ -9,8 +9,10 @@ use crate::crop::CropRect;
 use crate::stream_config::{InvalidStreamConfig, StreamConfig};
 use crate::target::CaptureTarget;
 
+/// Environment variable whose token wins over every saved account (ADR 0005).
 pub const TOKEN_ENV: &str = "DSTREAMY_TOKEN";
 
+/// Why the config directory, `config.toml`, a token or an account could not be used.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("no home directory to place the config in")]
@@ -114,6 +116,7 @@ impl Default for ServeConfig {
     }
 }
 
+/// `[serve] idle`: what Discord gets after a producer detached (ADR 0004); maps onto the media crate's `IdleMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdleSetting {
@@ -285,6 +288,7 @@ mod tests {
                 bitrate_kbps: 8_500,
                 codec: Codec::H265,
                 audio_gain: 1.5,
+                require_e2ee: true,
             },
             target: Some(CaptureTarget::Portal {
                 restore_token: Some("tok-123".into()),

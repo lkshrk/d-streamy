@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use dstreamy_core::{FrameIntervalSnapshot, FrameIntervalTracker};
-use dstreamy_media::{CaptureSource, EncodedVideoFrame, FrameReceiver, MediaFrame};
+use dstreamy_media::{CaptureDrops, CaptureSource, EncodedVideoFrame, FrameReceiver, MediaFrame};
 use tokio::sync::{Notify, RwLock, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout};
@@ -80,6 +80,7 @@ struct Shared {
     /// Latest mapped pts per track (video, audio) in µs plus one, 0 before the first frame.
     last_pts: [AtomicU64; 2],
     source: RwLock<Option<Box<dyn CaptureSource>>>,
+    capture_drops_base: CaptureDrops,
     /// Every followed connection's progress as last applied, for a pump restarted on one of them.
     carried: Mutex<Carried>,
 }
@@ -108,6 +109,20 @@ impl Shared {
             source.request_keyframe();
             self.stats().stats.keyframe_requests += 1;
         }
+    }
+
+    fn sample_capture_drops(&self, drops: CaptureDrops) {
+        let mut state = self.stats();
+        state.stats.source_video_frames_dropped = state.stats.source_video_frames_dropped.max(
+            self.capture_drops_base
+                .video_frames
+                .saturating_add(drops.video_frames),
+        );
+        state.stats.source_audio_frames_dropped = state.stats.source_audio_frames_dropped.max(
+            self.capture_drops_base
+                .audio_frames
+                .saturating_add(drops.audio_frames),
+        );
     }
 
     fn note_pts(&self, track: Track, pts: Duration) {
@@ -194,6 +209,14 @@ impl Shared {
 pub(crate) struct StatsUpdater(Arc<Shared>);
 
 impl StatsUpdater {
+    pub(crate) fn stats(&self) -> StreamStats {
+        let mut state = self.0.stats();
+        state.prune(Instant::now());
+        let mut stats = state.stats.clone();
+        stats.fps = state.video_sent_at.len() as f64 / FPS_WINDOW.as_secs_f64();
+        stats
+    }
+
     pub(crate) fn update(&self, f: impl FnOnce(&mut StreamStats)) {
         f(&mut self.0.stats().stats);
     }
@@ -273,6 +296,10 @@ impl MediaPump {
                 options.max_queued_audio,
             )),
             frame_ready: Notify::new(),
+            capture_drops_base: CaptureDrops {
+                video_frames: stats.stats.source_video_frames_dropped,
+                audio_frames: stats.stats.source_audio_frames_dropped,
+            },
             stats: Mutex::new(stats),
             configured_fps: AtomicU32::new(options.capture.fps),
             last_pts: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -315,11 +342,12 @@ impl MediaPump {
     }
 
     pub(crate) fn stats(&self) -> StreamStats {
-        let mut state = self.shared.stats();
-        state.prune(Instant::now());
-        let mut stats = state.stats.clone();
-        stats.fps = state.video_sent_at.len() as f64 / FPS_WINDOW.as_secs_f64();
-        stats
+        if let Ok(source) = self.shared.source.try_read()
+            && let Some(source) = source.as_ref()
+        {
+            self.shared.sample_capture_drops(source.capture_drops());
+        }
+        self.stats_updater().stats()
     }
 
     pub(crate) fn update_stats(&self, f: impl FnOnce(&mut StreamStats)) {
@@ -420,9 +448,12 @@ impl MediaPump {
         let Some(mut source) = source else {
             return (None, Ok(self.stats()));
         };
+        self.shared.sample_capture_drops(source.capture_drops());
         let result = match timeout(TASK_JOIN_TIMEOUT, source.stop()).await {
-            Ok(Ok(())) => Ok(self.stats()),
-            Ok(Err(e)) => Err(e.into()),
+            Ok(result) => {
+                self.shared.sample_capture_drops(source.capture_drops());
+                result.map(|()| self.stats()).map_err(Into::into)
+            }
             Err(_) => Err(StreamError::Timeout("stopping the capture source")),
         };
         (Some(source), result)
@@ -932,6 +963,11 @@ mod tests {
     struct SilentSource {
         frames: Option<tokio::sync::mpsc::Sender<MediaFrame>>,
         requests: Arc<AtomicU64>,
+        drops: Arc<[AtomicU64; 2]>,
+        stop_drops: CaptureDrops,
+        stop_error: bool,
+        stop_pending: bool,
+        fail_next_start: Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[async_trait::async_trait]
@@ -946,19 +982,214 @@ mod tests {
             &mut self,
             _: dstreamy_media::CaptureConfig,
         ) -> Result<FrameReceiver, dstreamy_media::MediaError> {
+            if self.fail_next_start.swap(false, Ordering::Relaxed) {
+                return Err(dstreamy_media::MediaError::Backend("start failed".into()));
+            }
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             self.frames = Some(tx);
+            self.drops
+                .iter()
+                .for_each(|d| d.store(0, Ordering::Relaxed));
             Ok(rx)
         }
 
         async fn stop(&mut self) -> Result<(), dstreamy_media::MediaError> {
-            self.frames = None;
+            if self.frames.take().is_some() {
+                if self.stop_pending {
+                    std::future::pending::<()>().await;
+                }
+                self.drops[0].fetch_add(self.stop_drops.video_frames, Ordering::Relaxed);
+                self.drops[1].fetch_add(self.stop_drops.audio_frames, Ordering::Relaxed);
+            }
+            if self.stop_error {
+                return Err(dstreamy_media::MediaError::Backend("stop failed".into()));
+            }
             Ok(())
+        }
+
+        fn capture_drops(&self) -> dstreamy_media::CaptureDrops {
+            dstreamy_media::CaptureDrops {
+                video_frames: self.drops[0].load(Ordering::Relaxed),
+                audio_frames: self.drops[1].load(Ordering::Relaxed),
+            }
         }
 
         fn request_keyframe(&self) {
             self.requests.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[tokio::test]
+    async fn source_drop_totals_are_sampled_without_inflating_transport_losses() {
+        let source = SilentSource::default();
+        let drops = source.drops.clone();
+        let options = StreamOptions::new(dstreamy_media::CaptureConfig::default());
+        let pump = MediaPump::start(Box::new(source), &options, None)
+            .await
+            .ok()
+            .unwrap();
+        pump.update_stats(|stats| {
+            stats.video_frames_dropped = 7;
+            stats.audio_frames_dropped = 11;
+        });
+        drops[0].store(3, Ordering::Relaxed);
+        drops[1].store(5, Ordering::Relaxed);
+        for _ in 0..2 {
+            let stats = pump.stats();
+            assert_eq!(stats.source_video_frames_dropped, 3);
+            assert_eq!(stats.source_audio_frames_dropped, 5);
+            assert_eq!(stats.video_frames_dropped, 7);
+            assert_eq!(stats.audio_frames_dropped, 11);
+        }
+        drops[0].store(4, Ordering::Relaxed);
+        drops[1].store(6, Ordering::Relaxed);
+        let (_, result) = pump.stop().await;
+        let stats = result.unwrap();
+        assert_eq!(stats.source_video_frames_dropped, 4);
+        assert_eq!(stats.source_audio_frames_dropped, 6);
+    }
+
+    #[tokio::test]
+    async fn source_drop_totals_continue_across_capture_restarts() {
+        let source = SilentSource::default();
+        let drops = source.drops.clone();
+        let options = StreamOptions::new(dstreamy_media::CaptureConfig::default());
+        let pump = MediaPump::start(Box::new(source), &options, None)
+            .await
+            .ok()
+            .unwrap();
+        drops[0].store(3, Ordering::Relaxed);
+        drops[1].store(5, Ordering::Relaxed);
+        let (source, resume, result) = pump.stop_resumable().await;
+        assert_eq!(result.unwrap().source_video_frames_dropped, 3);
+        let pump = MediaPump::start_resumed(source.unwrap(), &options, None, Some(resume))
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(pump.stats().source_video_frames_dropped, 3);
+        assert_eq!(pump.stats().source_audio_frames_dropped, 5);
+        drops[0].store(2, Ordering::Relaxed);
+        drops[1].store(4, Ordering::Relaxed);
+        assert_eq!(pump.stats().source_video_frames_dropped, 5);
+        assert_eq!(pump.stats().source_audio_frames_dropped, 9);
+        let _ = pump.stop().await;
+    }
+
+    #[tokio::test]
+    async fn source_drop_totals_include_shutdown_losses_and_survive_failed_restarts() {
+        let source = SilentSource {
+            stop_drops: CaptureDrops {
+                video_frames: 2,
+                audio_frames: 4,
+            },
+            ..SilentSource::default()
+        };
+        let drops = source.drops.clone();
+        let fail_next_start = source.fail_next_start.clone();
+        let options = StreamOptions::new(dstreamy_media::CaptureConfig::default());
+        let pump = MediaPump::start(Box::new(source), &options, None)
+            .await
+            .ok()
+            .unwrap();
+        drops[0].store(3, Ordering::Relaxed);
+        drops[1].store(5, Ordering::Relaxed);
+        let shared = pump.shared.clone();
+        let (source, resume, result) = pump.stop_resumable().await;
+        let stats = result.unwrap();
+        assert_eq!(stats.source_video_frames_dropped, 5);
+        assert_eq!(stats.source_audio_frames_dropped, 9);
+        assert_eq!(resume.stats.source_video_frames_dropped, 5);
+        shared.sample_capture_drops(CaptureDrops {
+            video_frames: 1,
+            audio_frames: 1,
+        });
+        assert_eq!(shared.stats().stats.source_video_frames_dropped, 5);
+        let mut source = source.unwrap();
+        source.stop().await.unwrap();
+        assert_eq!(
+            source.capture_drops(),
+            CaptureDrops {
+                video_frames: 5,
+                audio_frames: 9
+            }
+        );
+        fail_next_start.store(true, Ordering::Relaxed);
+        let (source, _) = MediaPump::start(source, &options, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            source.capture_drops(),
+            CaptureDrops {
+                video_frames: 5,
+                audio_frames: 9
+            }
+        );
+        let pump = MediaPump::start_resumed(source, &options, None, Some(resume))
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(pump.stats().source_video_frames_dropped, 5);
+        assert_eq!(pump.stats().source_audio_frames_dropped, 9);
+        assert_eq!(drops[0].load(Ordering::Relaxed), 0);
+        assert_eq!(drops[1].load(Ordering::Relaxed), 0);
+        let (source, result) = pump.stop().await;
+        assert_eq!(result.unwrap().source_video_frames_dropped, 7);
+        assert_eq!(source.unwrap().capture_drops().video_frames, 2);
+    }
+
+    #[tokio::test]
+    async fn source_drop_totals_include_completed_teardown_even_when_stop_reports_an_error() {
+        let source = SilentSource {
+            stop_drops: CaptureDrops {
+                video_frames: 2,
+                audio_frames: 4,
+            },
+            stop_error: true,
+            ..SilentSource::default()
+        };
+        let options = StreamOptions::new(dstreamy_media::CaptureConfig::default());
+        let pump = MediaPump::start(Box::new(source), &options, None)
+            .await
+            .ok()
+            .unwrap();
+        let (source, resume, result) = pump.stop_resumable().await;
+        assert!(result.unwrap_err().to_string().contains("stop failed"));
+        assert_eq!(resume.stats.source_video_frames_dropped, 2);
+        assert_eq!(resume.stats.source_audio_frames_dropped, 4);
+        assert_eq!(source.unwrap().capture_drops().video_frames, 2);
+    }
+
+    #[tokio::test]
+    async fn source_drop_totals_remain_a_lower_bound_when_stop_times_out() {
+        let source = SilentSource {
+            stop_pending: true,
+            ..SilentSource::default()
+        };
+        let drops = source.drops.clone();
+        let options = StreamOptions::new(dstreamy_media::CaptureConfig::default());
+        let pump = MediaPump::start(Box::new(source), &options, None)
+            .await
+            .ok()
+            .unwrap();
+        drops[0].store(3, Ordering::Relaxed);
+        drops[1].store(5, Ordering::Relaxed);
+        let (_, resume, result) = pump.stop_resumable().await;
+        assert!(matches!(
+            result,
+            Err(StreamError::Timeout("stopping the capture source"))
+        ));
+        assert_eq!(resume.stats.source_video_frames_dropped, 3);
+        assert_eq!(resume.stats.source_audio_frames_dropped, 5);
+    }
+
+    #[tokio::test]
+    async fn sources_without_drop_reporting_keep_zero_source_totals() {
+        let conn = offline_connection();
+        let pump = pump(&conn).await;
+        assert_eq!(pump.stats().source_video_frames_dropped, 0);
+        assert_eq!(pump.stats().source_audio_frames_dropped, 0);
+        let _ = pump.stop().await;
     }
 
     fn oversized(pts_us: u64, keyframe: bool) -> MediaFrame {

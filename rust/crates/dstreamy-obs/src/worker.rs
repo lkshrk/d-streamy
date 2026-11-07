@@ -84,7 +84,15 @@ fn run(
         ));
     }
     runtime.block_on(async {
-        while let Some(command) = commands.recv().await {
+        let mut pending = std::collections::VecDeque::new();
+        loop {
+            let command = match pending.pop_front() {
+                Some(command) => command,
+                None => match commands.recv().await {
+                    Some(command) => command,
+                    None => break,
+                },
+            };
             match command {
                 Command::Start { hello, endpoint } => {
                     let outcome = AssertUnwindSafe(session(shared, hello, endpoint, &mut commands))
@@ -96,6 +104,14 @@ fn run(
                                 guard::record_panic("worker", payload.as_ref())
                             ))
                         });
+                    while let Ok(command) = commands.try_recv() {
+                        match command {
+                            Command::EncodeError => {
+                                shared.encode_error.store(true, Ordering::Release)
+                            }
+                            other => pending.push_back(other),
+                        }
+                    }
                     guard::guard("worker", (), || finish(shared, outcome));
                     // A Shutdown may have been consumed by the session's stop; the flag doesn't get lost.
                     if shared.is_destroying() {
@@ -168,6 +184,10 @@ async fn session(
         },
         reason = next_reason(commands) => return Outcome::Cancelled(reason),
     };
+    crate::hooks::observe(
+        "attached",
+        || serde_json::json!({"attachment":connection.attachment()}),
+    );
     log::info(&format!(
         "attached to the D-Streamy service as producer {}",
         connection.attachment()
@@ -185,7 +205,8 @@ async fn session(
     let output = shared.output;
     crate::session::set_viewers(None);
     crate::session::set_health(None);
-    let end = producer::run(
+    let end = producer::client::run_reconnecting(
+        (&endpoint, &hello),
         connection,
         &shared.ring,
         || video_extra_data(output),
@@ -229,6 +250,7 @@ fn video_extra_data(output: OutputPtr) -> Option<Vec<u8>> {
         if !sys::obs_encoder_get_extra_data(venc, &mut data, &mut size)
             || data.is_null()
             || size == 0
+            || size > dstreamy_obs_producer::ring::MAX_PACKET
         {
             return None;
         }
@@ -278,6 +300,12 @@ fn ended(shared: &Shared, end: End<Reason>) {
         End::Stopped(Reason::Shutdown) => {
             // SAFETY: destroy waits in join for this thread, so the output is still allocated.
             unsafe { sys::obs_output_end_data_capture(output.0) };
+        }
+        End::Detached { reason, message } if reason.is_clean() => {
+            log::info(&format!(
+                "the D-Streamy service ended the stream ({reason}): {message}"
+            ));
+            signal_stop(output, SUCCESS);
         }
         End::Detached { reason, message } => fail(
             output,

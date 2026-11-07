@@ -3,10 +3,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dstreamy_core::Config;
+use dstreamy_core::{Config, lock};
 #[cfg(any(test, feature = "test-hooks"))]
 use dstreamy_discord::SessionEvent;
 use dstreamy_ipc::{ControlCodec, Endpoint, Listener, ProducerCodec, Stream};
@@ -36,6 +36,8 @@ pub const PROTOCOL: u64 = 2;
 const LAG_FLUSH: Duration = Duration::from_secs(10);
 const CLOSE_FLUSH: Duration = Duration::from_secs(2);
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+/// How often finished commands of disconnected clients are reaped while any are left.
+const ORPHAN_SWEEP: Duration = Duration::from_secs(1);
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `attached` waits for op 12 with the producer's video, which is rate limited to one a second.
 const ANNOUNCE_WAIT: Duration = Duration::from_secs(5);
@@ -66,6 +68,11 @@ enum Phase {
 
 type TaskSet = JoinSet<()>;
 
+struct Orphan {
+    tasks: TaskSet,
+    _slot: Arc<OwnedSemaphorePermit>,
+}
+
 pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliError> {
     let config = Config::load(&ctx.paths.config_file)?;
     engine::external_options(&config.serve)?;
@@ -89,12 +96,15 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
     let login_program = None;
     let login = Arc::new(login::Login::new(ctx, login_program));
     let (phase_tx, phase) = watch::channel(Phase::Running);
+    // One entry per shutdown command or disconnect, taken by the accept loop at once.
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
-    let (orphans_tx, mut orphans_rx) = mpsc::unbounded_channel::<TaskSet>();
+    let (orphans_tx, mut orphans_rx) = mpsc::unbounded_channel::<Orphan>();
     let (drained_tx, mut drained_rx) = mpsc::channel::<()>(1);
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let refusing = Arc::new(Semaphore::new(MAX_REFUSING));
-    let mut orphans: Vec<TaskSet> = Vec::new();
+    let mut orphans: Vec<Orphan> = Vec::new();
+    let mut sweep = tokio::time::interval(ORPHAN_SWEEP);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut signals = Signals::new();
     let mut connections = JoinSet::new();
     let mut next_id = 0u64;
@@ -116,7 +126,7 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
                             test_hooks: opts.test_hooks,
                             #[cfg(any(test, feature = "test-hooks"))]
                             slots: slots.clone(),
-                            _slot: slot,
+                            _slot: Arc::new(slot),
                         };
                         connections.spawn(conn.run(stream));
                     }
@@ -132,11 +142,9 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
             },
             Some(set) = orphans_rx.recv() => {
                 orphans.push(set);
-                orphans.retain_mut(|set| {
-                    while set.try_join_next().is_some() {}
-                    !set.is_empty()
-                });
+                reap(&mut orphans);
             }
+            _ = sweep.tick(), if !orphans.is_empty() => reap(&mut orphans),
             Some(done) = shutdown_rx.recv() => break Some(done),
             () = signals.recv() => break None,
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
@@ -149,9 +157,9 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
         while let Ok(set) = orphans_rx.try_recv() {
             orphans.push(set);
         }
-        for set in &mut orphans {
-            set.abort_all();
-            while set.join_next().await.is_some() {}
+        for orphan in &mut orphans {
+            orphan.tasks.abort_all();
+            while orphan.tasks.join_next().await.is_some() {}
         }
         engine.shutdown().await;
     };
@@ -178,6 +186,13 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
         tracing::debug!("connections still open at exit");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn reap(orphans: &mut Vec<Orphan>) {
+    orphans.retain_mut(|orphan| {
+        while orphan.tasks.try_join_next().is_some() {}
+        !orphan.tasks.is_empty()
+    });
 }
 
 enum Admit {
@@ -261,7 +276,7 @@ pub const BROWSER_LOGIN: &str = "browser_login";
 /// Offered unless the token comes from `DSTREAMY_TOKEN`, which leaves no accounts to manage.
 pub const ACCOUNTS: &str = "accounts";
 
-fn hello_data(engine: &Engine, login: &login::Login, connection: u64) -> Value {
+async fn hello_data(engine: &Engine, login: &login::Login, connection: u64) -> Value {
     let mut features = FEATURES.to_vec();
     if login.available() {
         features.push(BROWSER_LOGIN);
@@ -275,7 +290,7 @@ fn hello_data(engine: &Engine, login: &login::Login, connection: u64) -> Value {
         "platform": std::env::consts::OS,
         "connection": connection,
         "features": features,
-        "status": engine.status(),
+        "status": engine.status().await,
     })
 }
 
@@ -325,18 +340,14 @@ struct Connection {
     phase: watch::Receiver<Phase>,
     shutdown: mpsc::UnboundedSender<oneshot::Sender<()>>,
     /// Commands still running when the client left; the service aborts and awaits them before its engine shuts down.
-    orphans: mpsc::UnboundedSender<TaskSet>,
+    orphans: mpsc::UnboundedSender<Orphan>,
     /// Dropped once this connection's commands are finished or aborted and awaited.
     drained: Option<mpsc::Sender<()>>,
     capacity: usize,
     test_hooks: bool,
     #[cfg(any(test, feature = "test-hooks"))]
     slots: Arc<Semaphore>,
-    _slot: OwnedSemaphorePermit,
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
+    _slot: Arc<OwnedSemaphorePermit>,
 }
 
 /// Encodes `message` into the writer's buffer, or an `internal` error when it can't be encoded.
@@ -378,7 +389,10 @@ impl Connection {
             Ok((id, Role::Control)) => {
                 queue(
                     &mut writer,
-                    Message::reply(Some(id), Ok(hello_data(&self.engine, &self.login, self.id))),
+                    Message::reply(
+                        Some(id),
+                        Ok(hello_data(&self.engine, &self.login, self.id).await),
+                    ),
                 );
                 self.control(reader, writer).await;
             }
@@ -450,6 +464,7 @@ impl Connection {
         let mut events: Option<broadcast::Receiver<EngineEvent>> = None;
         let mut pending: VecDeque<Message> = VecDeque::new();
         let mut queued_events = 0usize;
+        // At most MAX_IN_FLIGHT entries: reading pauses at that many pending messages and running commands.
         let (replies_tx, mut replies) =
             mpsc::unbounded_channel::<(String, Result<Value, Failure>)>();
         let unanswered: Arc<Mutex<HashMap<u64, String>>> = Arc::default();
@@ -551,10 +566,10 @@ impl Connection {
                                 pending.push_back(Message::reply(Some(id), Err(failure)));
                             }
                             Ok((id, Request::Hello)) => {
-                                pending.push_back(Message::reply(Some(id), Ok(hello_data(&self.engine, &self.login, self.id))));
+                                pending.push_back(Message::reply(Some(id), Ok(hello_data(&self.engine, &self.login, self.id).await)));
                             }
                             Ok((id, Request::Status)) => {
-                                let status = serde_json::to_value(self.engine.status())
+                                let status = serde_json::to_value(self.engine.status().await)
                                     .map_err(|e| Failure::new("internal", e.to_string()));
                                 pending.push_back(Message::reply(Some(id), status));
                             }
@@ -602,8 +617,9 @@ impl Connection {
                                 let login = self.login.clone();
                                 let replies = replies_tx.clone();
                                 let unanswered = unanswered.clone();
+                                let slot = self._slot.clone();
                                 logins.spawn(async move {
-                                    let result = login.run(&engine, params).await;
+                                    let result = login.run(&engine, params, slot).await;
                                     if let Some(id) = lock(&unanswered).remove(&key) {
                                         let _ = replies.send((id, result));
                                     }
@@ -646,12 +662,18 @@ impl Connection {
         match end {
             End::Eof | End::Gone => {
                 drop(logins);
-                let _ = self.orphans.send(tasks);
+                let _ = self.orphans.send(Orphan {
+                    tasks,
+                    _slot: self._slot.clone(),
+                });
                 self.drained = None;
             }
             End::Lagged => {
                 drop(logins);
-                let _ = self.orphans.send(tasks);
+                let _ = self.orphans.send(Orphan {
+                    tasks,
+                    _slot: self._slot.clone(),
+                });
                 self.drained = None;
                 let failure = Failure::new("lagged", "events were not read in time; disconnecting");
                 queue(&mut writer, Message::reply(None, Err(failure)));
@@ -800,7 +822,7 @@ impl AccountRequest {
 
     async fn run(self, engine: &Engine) -> Result<Value, Failure> {
         match self {
-            Self::Accounts => engine.accounts(),
+            Self::Accounts => engine.accounts().await,
             Self::SelectAccount { account } => engine.select_account(&account).await,
             Self::LogoutAccount { account } => engine.logout_account(&account).await,
         }
@@ -995,6 +1017,152 @@ mod tests {
         assert!(matches!(admit(&slots, &refusing), Admit::Refuse(_)));
         drop(served);
         assert!(matches!(admit(&slots, &refusing), Admit::Serve(_)));
+    }
+
+    #[tokio::test]
+    async fn disconnected_commands_keep_their_connection_admission_permit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = Endpoint::new(dir.path().join("control.sock"));
+        let listener = Listener::bind(&endpoint).await.unwrap();
+        let client = dstreamy_ipc::connect(&endpoint).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let ctx = Ctx::new(
+            dstreamy_core::ConfigPaths::in_dir(dir.path()),
+            "ws://127.0.0.1:1".into(),
+            None,
+        );
+        let engine = Engine::new(
+            &ctx,
+            engine::Options {
+                include_platform: false,
+                ..engine::Options::default()
+            },
+        );
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let _reserved = slots
+            .clone()
+            .acquire_many_owned((MAX_CONNECTIONS - 1) as u32)
+            .await
+            .unwrap();
+        let slot = slots.clone().try_acquire_owned().unwrap();
+        let (_phase_tx, phase) = watch::channel(Phase::Running);
+        let (shutdown, _shutdown_rx) = mpsc::unbounded_channel();
+        let (orphans, mut orphaned) = mpsc::unbounded_channel();
+        let (drained, _drained_rx) = mpsc::channel(1);
+        let connection = Connection {
+            id: 1,
+            engine: engine.clone(),
+            login: Arc::new(login::Login::new(&ctx, None)),
+            phase,
+            shutdown,
+            orphans,
+            drained: Some(drained),
+            capacity: 8,
+            test_hooks: true,
+            slots: slots.clone(),
+            _slot: Arc::new(slot),
+        };
+        let running = tokio::spawn(connection.run(stream));
+        let mut client = tokio_util::codec::Framed::new(client, ControlCodec::new());
+        client
+            .send(json!({"id":"hello","cmd":"hello","role":"control","protocol":2}))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap().unwrap()["id"],
+            "hello"
+        );
+        client
+            .send(json!({"id":"sub","cmd":"subscribe"}))
+            .await
+            .unwrap();
+        assert_eq!(client.next().await.unwrap().unwrap().unwrap()["id"], "sub");
+        client
+            .send(json!({"id":"hold","cmd":"test_hold","ms":0}))
+            .await
+            .unwrap();
+        let held = timeout(Duration::from_secs(2), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(held["event"]["message"], "test hold false");
+        drop(client);
+        engine.inject_for_tests(SessionEvent::Error {
+            message: "force a write after peer close".into(),
+            fatal: false,
+        });
+        let orphan = timeout(Duration::from_secs(2), orphaned.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "disconnected pending work released admission capacity"
+        );
+        assert!(matches!(
+            admit(&slots, &Arc::new(Semaphore::new(MAX_REFUSING))),
+            Admit::Refuse(_)
+        ));
+        let mut orphan = orphan;
+        orphan.tasks.abort_all();
+        while orphan.tasks.join_next().await.is_some() {}
+        assert_eq!(slots.available_permits(), 0);
+        let mut finished = vec![orphan];
+        reap(&mut finished);
+        assert!(finished.is_empty());
+        assert_eq!(slots.available_permits(), 1);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn orphan_groups_hold_the_global_cap_until_completion_or_awaited_cancellation() {
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let refusing = Arc::new(Semaphore::new(MAX_REFUSING));
+        let mut orphans = Vec::new();
+        let mut releases = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            let Admit::Serve(slot) = admit(&slots, &refusing) else {
+                panic!("below cap")
+            };
+            let (release, done) = oneshot::channel::<()>();
+            let mut tasks = JoinSet::new();
+            tasks.spawn(async move {
+                let _ = done.await;
+            });
+            orphans.push(Orphan {
+                tasks,
+                _slot: Arc::new(slot),
+            });
+            releases.push(release);
+        }
+        reap(&mut orphans);
+        assert_eq!(orphans.len(), MAX_CONNECTIONS);
+        for _ in 0..MAX_CONNECTIONS {
+            assert!(matches!(admit(&slots, &refusing), Admit::Refuse(_)));
+        }
+        releases.remove(0).send(()).unwrap();
+        orphans[0].tasks.join_next().await.unwrap().unwrap();
+        assert_eq!(slots.available_permits(), 0);
+        reap(&mut orphans);
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(orphans.len(), MAX_CONNECTIONS - 1);
+        for orphan in &mut orphans {
+            orphan.tasks.abort_all();
+            while orphan.tasks.join_next().await.is_some() {}
+        }
+        assert_eq!(slots.available_permits(), 1);
+        reap(&mut orphans);
+        assert!(orphans.is_empty());
+        assert_eq!(slots.available_permits(), MAX_CONNECTIONS);
     }
 
     #[test]

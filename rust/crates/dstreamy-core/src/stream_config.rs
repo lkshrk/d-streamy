@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::codec::Codec;
 use crate::crop::CropRect;
 
+/// A stream setting outside what Discord Go Live accepts (ADR 0004 limits).
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum InvalidStreamConfig {
     #[error(
@@ -112,6 +113,7 @@ impl From<Resolution> for String {
     }
 }
 
+/// The frame rates Go Live accepts: 15, 30 or 60.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(try_from = "u32", into = "u32")]
 pub enum Fps {
@@ -165,6 +167,7 @@ pub struct StreamConfig {
     pub bitrate_kbps: u32,
     pub codec: Codec,
     pub audio_gain: f32,
+    pub require_e2ee: bool,
 }
 
 impl StreamConfig {
@@ -190,6 +193,7 @@ impl Default for StreamConfig {
             bitrate_kbps: 6_000,
             codec: Codec::default(),
             audio_gain: 1.0,
+            require_e2ee: false,
         }
     }
 }

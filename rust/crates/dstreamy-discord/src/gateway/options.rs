@@ -27,7 +27,7 @@ pub struct GatewayOptions {
     pub invalid_session_delay: Duration,
     pub reconnect_delay_min: Duration,
     pub reconnect_delay_max: Duration,
-    /// Consecutive connections that end before READY/RESUMED before the client gives up.
+    /// Consecutive connections that end before READY/RESUMED, or within 30 s of it, before the client gives up.
     pub max_failed_attempts: u32,
     /// Receives every dispatch in order, without the lag a broadcast subscriber can hit.
     pub dispatch_tx: Option<mpsc::UnboundedSender<Dispatch>>,

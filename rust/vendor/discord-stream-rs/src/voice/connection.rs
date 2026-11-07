@@ -7,15 +7,20 @@ use crate::voice::types::{
     DavePrepareTransition, GatewayMessage, Hello, Ready, SelectProtocolAck,
 };
 use crate::voice::webrtc::{Flushed, VideoGate, VideoProgress, WebRtcError, WebRtcWrapper};
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::{Connector, connect_async_tls_with_config, tungstenite::Message};
+use tokio::time::Instant;
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config, tungstenite::Message,
+};
 use tracing::{debug, error, warn};
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 
@@ -23,7 +28,21 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 pub const MAX_CONNECT_ATTEMPTS: u32 = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// Sockets opened within `RECONNECT_WINDOW` before the connection gives up on a flapping server.
+pub const MAX_SESSIONS_PER_WINDOW: usize = 10;
+const RECONNECT_WINDOW: Duration = Duration::from_secs(60);
+const MAX_DEFERRED_COMMANDS: usize = 64;
+/// DAVE transitions announced but never executed are kept at most this many; the oldest go first.
+const MAX_PENDING_TRANSITIONS: usize = 16;
+/// Voice channels hold far fewer members; past this, CLIENTS_CONNECT ids are dropped.
+const MAX_CONNECTED_USERS: usize = 10_000;
 const MAX_UNACKED_HEARTBEATS: u32 = 3;
+/// Discord sends about 13.75 s; the clamp keeps a hostile HELLO from spamming or silencing heartbeats.
+const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type WsSink = SplitSink<Ws, Message>;
 
 // An explicit provider keeps working if another crate also enables rustls' aws-lc-rs backend.
 static TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
@@ -54,6 +73,12 @@ pub enum ConnectionError {
     NotConnected,
     #[error("Invalid DAVE channel id from {0:?}")]
     InvalidChannelId(String),
+    #[error("voice endpoint {0:?} is not a Discord host; refusing to connect")]
+    UntrustedEndpoint(String),
+    #[error("voice gateway protocol error: {0}")]
+    Protocol(&'static str),
+    #[error("media path failed: {0}")]
+    MediaFailed(String),
 }
 
 /// The WebRTC + SSRC parameters received in the Ready message.
@@ -75,7 +100,6 @@ pub struct VideoAttributes {
 }
 
 /// Events emitted by the voice connection to callers.
-#[derive(Debug)]
 pub enum VoiceEvent {
     Ready(WebRtcParams),
     SelectProtocolAck {
@@ -84,10 +108,56 @@ pub enum VoiceEvent {
     },
     Resumed,
     MlsCommitWelcome(Vec<u8>),
+    /// The peer connection is dead while the WebSocket is up; the caller should rebuild the connection.
+    MediaFailed {
+        reason: String,
+    },
     /// The connection stopped for good; `code` is the WebSocket close code.
     Closed {
         code: Option<u16>,
     },
+}
+
+// The answer SDP carries the ICE password, so only its size is shown.
+impl std::fmt::Debug for VoiceEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready(params) => f.debug_tuple("Ready").field(params).finish(),
+            Self::SelectProtocolAck { sdp, dave_version } => f
+                .debug_struct("SelectProtocolAck")
+                .field("sdp_len", &sdp.len())
+                .field("dave_version", dave_version)
+                .finish(),
+            Self::Resumed => f.write_str("Resumed"),
+            Self::MlsCommitWelcome(payload) => f
+                .debug_tuple("MlsCommitWelcome")
+                .field(&payload.len())
+                .finish(),
+            Self::MediaFailed { reason } => f
+                .debug_struct("MediaFailed")
+                .field("reason", reason)
+                .finish(),
+            Self::Closed { code } => f.debug_struct("Closed").field("code", code).finish(),
+        }
+    }
+}
+
+/// How long the media path may stay down before `VoiceEvent::MediaFailed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaTimeouts {
+    /// A peer connection `Disconnected` for this long is reported as failed.
+    pub disconnected_grace: Duration,
+    /// After `Failed`, how long the in-place restart (a new SELECT_PROTOCOL) may take to connect.
+    pub restart_timeout: Duration,
+}
+
+impl Default for MediaTimeouts {
+    fn default() -> Self {
+        Self {
+            disconnected_grace: Duration::from_secs(5),
+            restart_timeout: Duration::from_secs(10),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,13 +169,24 @@ pub enum ConnectionKind {
     },
 }
 
-#[derive(Debug)]
 enum Command {
     Send(Message),
     SetSession(String),
     SetTokens { server: String, token: String },
-    RestartWebRtc,
+    PeerState(RTCPeerConnectionState),
     Stop,
+}
+
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Send(_) => f.write_str("Send"),
+            Self::SetSession(_) => f.write_str("SetSession"),
+            Self::SetTokens { .. } => f.write_str("SetTokens"),
+            Self::PeerState(state) => f.debug_tuple("PeerState").field(state).finish(),
+            Self::Stop => f.write_str("Stop"),
+        }
+    }
 }
 
 struct Shared {
@@ -153,6 +234,19 @@ impl MediaConnection {
 
     pub fn dave_ready(&self) -> bool {
         lock(&self.shared.dave).is_ready()
+    }
+
+    pub fn require_e2ee(&self) -> Result<(), DaveError> {
+        lock(&self.shared.dave).require_e2ee()
+    }
+
+    pub fn e2ee_unavailable(&self) -> Option<u16> {
+        lock(&self.shared.dave).e2ee_unavailable()
+    }
+
+    /// The negotiated DAVE protocol version; 0 means Discord runs this call without E2EE.
+    pub fn dave_protocol_version(&self) -> u16 {
+        lock(&self.shared.dave).protocol_version()
     }
 
     /// Bumped for every viewer PLI or FIR; the sender should emit a keyframe.
@@ -294,6 +388,26 @@ impl MediaConnection {
         let _ = self.shared.cmd_tx.send(Command::Stop);
     }
 
+    /// As if webrtc-rs reported the peer connection `Failed`.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn simulate_peer_failed(&self) {
+        let _ = self
+            .shared
+            .cmd_tx
+            .send(Command::PeerState(RTCPeerConnectionState::Failed));
+    }
+
+    /// As if webrtc-rs reported the peer connection `Disconnected`.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn simulate_peer_disconnected(&self) {
+        let _ = self
+            .shared
+            .cmd_tx
+            .send(Command::PeerState(RTCPeerConnectionState::Disconnected));
+    }
+
     pub(crate) fn set_session(&self, session_id: String) {
         let _ = self.shared.cmd_tx.send(Command::SetSession(session_id));
     }
@@ -342,6 +456,11 @@ pub struct VoiceConnection {
     shared: Option<Arc<Shared>>,
     ready_tx: Option<oneshot::Sender<Result<MediaConnection, ConnectionError>>>,
     event_tx: mpsc::UnboundedSender<VoiceEvent>,
+
+    media_timeouts: MediaTimeouts,
+    /// When the media path counts as failed unless the peer connection connects first.
+    media_deadline: Option<(Instant, String)>,
+    media_failed: bool,
 }
 
 impl VoiceConnection {
@@ -416,11 +535,18 @@ impl VoiceConnection {
             shared: None,
             ready_tx: None,
             event_tx,
+            media_timeouts: MediaTimeouts::default(),
+            media_deadline: None,
+            media_failed: false,
         }
     }
 
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    pub fn set_media_timeouts(&mut self, timeouts: MediaTimeouts) {
+        self.media_timeouts = timeouts;
     }
 
     pub fn set_session(&mut self, session_id: String) {
@@ -480,12 +606,38 @@ impl VoiceConnection {
         let mut resuming = false;
         let mut failed_connects = 0;
         let mut last_code = None;
+        let mut last_error = None;
+        let mut deferred = Vec::new();
+        let mut sessions: VecDeque<Instant> = VecDeque::new();
         while !self.closed {
             let Some(server) = self.server.clone() else {
                 break;
             };
-            let url = ws_url(&server);
-            let ws = match tokio::time::timeout(
+            let url = match ws_url(&server) {
+                Ok(url) => url,
+                Err(e) => {
+                    error!("{e}");
+                    last_error = Some(e);
+                    break;
+                }
+            };
+            let now = Instant::now();
+            while sessions
+                .front()
+                .is_some_and(|t| now.duration_since(*t) >= RECONNECT_WINDOW)
+            {
+                sessions.pop_front();
+            }
+            if sessions.len() >= MAX_SESSIONS_PER_WINDOW {
+                warn!(
+                    "Voice WS to {} dropped {} times within {:?}; giving up",
+                    url,
+                    sessions.len(),
+                    RECONNECT_WINDOW
+                );
+                break;
+            }
+            let connecting = tokio::time::timeout(
                 CONNECT_TIMEOUT,
                 connect_async_tls_with_config(
                     &url,
@@ -493,31 +645,38 @@ impl VoiceConnection {
                     false,
                     Some(Connector::Rustls(TLS_CONFIG.clone())),
                 ),
-            )
-            .await
-            {
+            );
+            let connected = tokio::select! {
+                result = connecting => result,
+                () = self.park(&mut cmd_rx, &mut deferred) => break,
+            };
+            let ws = match connected {
                 Ok(Ok((ws, _))) => ws,
                 Ok(Err(e)) => {
                     warn!("Voice WS connect to {} failed: {}", url, e);
                     failed_connects += 1;
-                    if failed_connects >= MAX_CONNECT_ATTEMPTS {
+                    if failed_connects >= MAX_CONNECT_ATTEMPTS
+                        || self.pause(&mut cmd_rx, &mut deferred).await
+                    {
                         break;
                     }
-                    tokio::time::sleep(RECONNECT_DELAY).await;
                     continue;
                 }
                 Err(_) => {
                     warn!("Voice WS connect to {} timed out", url);
                     failed_connects += 1;
-                    if failed_connects >= MAX_CONNECT_ATTEMPTS {
+                    if failed_connects >= MAX_CONNECT_ATTEMPTS
+                        || self.pause(&mut cmd_rx, &mut deferred).await
+                    {
                         break;
                     }
                     continue;
                 }
             };
             debug!("Voice WS connected to {}", url);
+            sessions.push_back(Instant::now());
 
-            let code = self.session(ws, resuming, &mut cmd_rx).await;
+            let code = self.session(ws, resuming, &mut cmd_rx, &mut deferred).await;
             last_code = code;
             let can_resume = code.is_none_or(|c| c == 4015 || c < 4000);
             if self.closed || !can_resume {
@@ -530,9 +689,12 @@ impl VoiceConnection {
                 if failed_connects >= MAX_CONNECT_ATTEMPTS {
                     break;
                 }
-                tokio::time::sleep(RECONNECT_DELAY).await;
             }
-            resuming = true;
+            // A session that never reached READY has nothing to resume; identify again.
+            resuming |= self.established;
+            if self.pause(&mut cmd_rx, &mut deferred).await {
+                break;
+            }
         }
 
         self.closed = true;
@@ -540,19 +702,56 @@ impl VoiceConnection {
             shared.webrtc.lock().await.close().await;
         }
         if let Some(tx) = self.ready_tx.take() {
-            let _ = tx.send(Err(ConnectionError::Closed));
+            let _ = tx.send(Err(last_error.unwrap_or(ConnectionError::Closed)));
         }
         let _ = self.event_tx.send(VoiceEvent::Closed { code: last_code });
+    }
+
+    /// Handles commands while no socket is up; returns once the connection is stopped.
+    async fn park(
+        &mut self,
+        cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
+        deferred: &mut Vec<Command>,
+    ) {
+        loop {
+            match cmd_rx.recv().await {
+                Some(Command::Stop) | None => {
+                    self.closed = true;
+                    return;
+                }
+                Some(Command::SetSession(session_id)) => self.session_id = Some(session_id),
+                Some(Command::SetTokens { server, token }) => {
+                    self.server = Some(server);
+                    self.token = Some(token);
+                }
+                Some(cmd) => {
+                    if deferred.len() < MAX_DEFERRED_COMMANDS {
+                        deferred.push(cmd);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Waits `RECONNECT_DELAY` unless stopped first; true when stopped.
+    async fn pause(
+        &mut self,
+        cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
+        deferred: &mut Vec<Command>,
+    ) -> bool {
+        tokio::select! {
+            () = tokio::time::sleep(RECONNECT_DELAY) => false,
+            () = self.park(cmd_rx, deferred) => true,
+        }
     }
 
     /// Drive one WebSocket until it closes; returns its close code.
     async fn session(
         &mut self,
-        ws: tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
+        ws: Ws,
         resuming: bool,
         cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
+        deferred: &mut Vec<Command>,
     ) -> Option<u16> {
         let (mut sink, mut stream) = ws.split();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
@@ -568,13 +767,29 @@ impl VoiceConnection {
         self.unacked_heartbeats = 0;
         self.established = false;
         let mut heartbeat: Option<tokio::time::Interval> = None;
+        for cmd in deferred.drain(..) {
+            if let Err(code) = self.apply_command(cmd, &mut sink, &out_tx).await {
+                return code;
+            }
+        }
 
         loop {
+            let media_deadline = self.media_deadline.as_ref().map(|(at, _)| *at);
             tokio::select! {
+                _ = tokio::time::sleep_until(media_deadline.unwrap_or_else(Instant::now)), if media_deadline.is_some() => {
+                    self.on_media_deadline();
+                }
                 msg = stream.next() => match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Err(e) = self.handle_text(&text, &out_tx).await {
                             error!("Voice WS text error: {}", e);
+                            // Before the caller has its connection, no message can still make this socket usable.
+                            if let Some(ready) = self.ready_tx.take() {
+                                let _ = ready.send(Err(e));
+                                self.closed = true;
+                                let _ = sink.send(Message::Close(None)).await;
+                                return None;
+                            }
                         }
                         if let Some(period) = self.heartbeat_interval.take() {
                             heartbeat = Some(tokio::time::interval_at(
@@ -618,30 +833,95 @@ impl VoiceConnection {
                         return None;
                     }
                 }
-                cmd = cmd_rx.recv() => match cmd {
-                    Some(Command::Send(msg)) => {
-                        if sink.send(msg).await.is_err() {
-                            return None;
-                        }
+                cmd = cmd_rx.recv() => {
+                    let cmd = cmd.unwrap_or(Command::Stop);
+                    if let Err(code) = self.apply_command(cmd, &mut sink, &out_tx).await {
+                        return code;
                     }
-                    Some(Command::SetSession(session_id)) => self.session_id = Some(session_id),
-                    Some(Command::SetTokens { server, token }) => {
-                        self.server = Some(server);
-                        self.token = Some(token);
-                    }
-                    Some(Command::RestartWebRtc) => {
-                        if let Err(e) = self.start_webrtc(&out_tx).await {
-                            error!("WebRTC restart failed: {}", e);
-                        }
-                    }
-                    Some(Command::Stop) | None => {
-                        self.closed = true;
-                        let _ = sink.send(Message::Close(None)).await;
-                        return Some(1000);
-                    }
-                },
+                }
             }
         }
+    }
+
+    /// `Err(code)` ends the session with that close code.
+    async fn apply_command(
+        &mut self,
+        cmd: Command,
+        sink: &mut WsSink,
+        out_tx: &mpsc::UnboundedSender<Message>,
+    ) -> Result<(), Option<u16>> {
+        match cmd {
+            Command::Send(msg) => sink.send(msg).await.map_err(|_| None),
+            Command::SetSession(session_id) => {
+                self.session_id = Some(session_id);
+                Ok(())
+            }
+            Command::SetTokens { server, token } => {
+                self.server = Some(server);
+                self.token = Some(token);
+                Ok(())
+            }
+            Command::PeerState(state) => {
+                self.on_peer_state(state, out_tx).await;
+                Ok(())
+            }
+            Command::Stop => {
+                self.closed = true;
+                let _ = sink.send(Message::Close(None)).await;
+                Err(Some(1000))
+            }
+        }
+    }
+
+    async fn on_peer_state(
+        &mut self,
+        state: RTCPeerConnectionState,
+        out_tx: &mpsc::UnboundedSender<Message>,
+    ) {
+        debug!("peer connection state {state}");
+        match state {
+            RTCPeerConnectionState::Connected => {
+                self.media_deadline = None;
+                self.media_failed = false;
+            }
+            RTCPeerConnectionState::Disconnected => {
+                if self.media_deadline.is_none() && !self.media_failed {
+                    let grace = self.media_timeouts.disconnected_grace;
+                    let at = Instant::now() + grace;
+                    let reason = format!("peer connection disconnected for {grace:?}");
+                    self.media_deadline = Some((at, reason));
+                }
+            }
+            RTCPeerConnectionState::Failed => {
+                if self.media_failed {
+                    return;
+                }
+                // Whether Discord accepts a second SELECT_PROTOCOL on a live session is unverified; the deadline covers a refusal.
+                let limit = self.media_timeouts.restart_timeout;
+                let reason = format!(
+                    "peer connection failed and its restart did not connect within {limit:?}"
+                );
+                self.media_deadline = Some((Instant::now() + limit, reason));
+                warn!("peer connection failed; restarting it with a new SELECT_PROTOCOL");
+                if let Err(e) = self.start_webrtc(out_tx).await {
+                    error!("WebRTC restart failed: {}", e);
+                    self.on_media_deadline();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_media_deadline(&mut self) {
+        let Some((_, reason)) = self.media_deadline.take() else {
+            return;
+        };
+        if self.media_failed {
+            return;
+        }
+        self.media_failed = true;
+        warn!("media path dead: {reason}");
+        let _ = self.event_tx.send(VoiceEvent::MediaFailed { reason });
     }
 
     fn build_identify(&self) -> String {
@@ -712,9 +992,7 @@ impl VoiceConnection {
         let pc = webrtc.init(params).await?;
         let cmd_tx = shared.cmd_tx.clone();
         pc.on_peer_connection_state_change(Box::new(move |state| {
-            if state == RTCPeerConnectionState::Failed {
-                let _ = cmd_tx.send(Command::RestartWebRtc);
-            }
+            let _ = cmd_tx.send(Command::PeerState(state));
             Box::pin(async {})
         }));
         let sdp = webrtc.create_offer().await?;
@@ -749,14 +1027,17 @@ impl VoiceConnection {
         match op {
             Some(VoiceOpCode::Hello) => {
                 let hello: Hello = serde_json::from_value(msg.d)?;
-                self.heartbeat_interval = Some(Duration::from_millis(
-                    hello.heartbeat_interval.max(1.0) as u64,
-                ));
+                let interval = Duration::from_millis(hello.heartbeat_interval.max(0.0) as u64);
+                self.heartbeat_interval =
+                    Some(interval.clamp(MIN_HEARTBEAT_INTERVAL, MAX_HEARTBEAT_INTERVAL));
             }
             Some(VoiceOpCode::Ready) => {
                 self.established = true;
                 let ready: Ready = serde_json::from_value(msg.d)?;
-                let stream = ready.streams.first().ok_or(ConnectionError::NotConnected)?;
+                let stream = ready
+                    .streams
+                    .first()
+                    .ok_or(ConnectionError::Protocol("READY names no video stream"))?;
                 let params = WebRtcParams {
                     address: ready.ip.clone(),
                     port: ready.port,
@@ -776,8 +1057,9 @@ impl VoiceConnection {
             Some(VoiceOpCode::SelectProtocolAck) => {
                 let ack: SelectProtocolAck = serde_json::from_value(msg.d)?;
                 let Some(sdp) = ack.sdp else {
-                    error!("SELECT_PROTOCOL_ACK without SDP; only WebRTC is supported");
-                    return Ok(());
+                    return Err(ConnectionError::Protocol(
+                        "SELECT_PROTOCOL_ACK without SDP; only WebRTC is supported",
+                    ));
                 };
                 let dave_version = ack.dave_protocol_version.unwrap_or(0);
                 self.init_dave(dave_version, tx);
@@ -806,7 +1088,9 @@ impl VoiceConnection {
             }
             Some(VoiceOpCode::ClientsConnect) => {
                 if let Ok(cc) = serde_json::from_value::<ClientsConnect>(msg.d) {
-                    self.connected_users.extend(cc.user_ids);
+                    let room = MAX_CONNECTED_USERS.saturating_sub(self.connected_users.len());
+                    self.connected_users
+                        .extend(cc.user_ids.into_iter().take(room));
                 }
             }
             Some(VoiceOpCode::ClientDisconnect) => {
@@ -817,8 +1101,7 @@ impl VoiceConnection {
             Some(VoiceOpCode::DavePrepareTransition) => {
                 if let Ok(d) = serde_json::from_value::<DavePrepareTransition>(msg.d) {
                     debug!("DAVE prepare transition {:?}", d);
-                    self.pending_transitions
-                        .insert(d.transition_id, d.protocol_version);
+                    self.remember_transition(d.transition_id, d.protocol_version);
                     if d.transition_id == 0 {
                         self.execute_pending_transition(0);
                     } else {
@@ -912,7 +1195,7 @@ impl VoiceConnection {
                     Ok(()) => {
                         if transition_id > 0 {
                             let version = self.dave().protocol_version();
-                            self.pending_transitions.insert(transition_id, version);
+                            self.remember_transition(transition_id, version);
                             self.send_opcode(
                                 tx,
                                 VoiceOpCode::DaveTransitionReady,
@@ -933,6 +1216,17 @@ impl VoiceConnection {
         }
 
         Ok(())
+    }
+
+    fn remember_transition(&mut self, transition_id: u64, protocol_version: u16) {
+        self.pending_transitions
+            .insert(transition_id, protocol_version);
+        while self.pending_transitions.len() > MAX_PENDING_TRANSITIONS {
+            let Some(oldest) = self.pending_transitions.keys().min().copied() else {
+                break;
+            };
+            self.pending_transitions.remove(&oldest);
+        }
     }
 
     fn execute_pending_transition(&mut self, transition_id: u64) {
@@ -997,13 +1291,43 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// `wss://{endpoint}/?v=8`; an endpoint that already has a ws(s) scheme is used as is.
-pub fn ws_url(endpoint: &str) -> String {
+/// `wss://{host}/?v=8` for a Discord voice host; a scheme in `endpoint` is dropped.
+pub fn ws_url(endpoint: &str) -> Result<String, ConnectionError> {
+    #[cfg(feature = "test-hooks")]
     if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        format!("{}/?v=8", endpoint.trim_end_matches('/'))
-    } else {
-        format!("wss://{endpoint}/?v=8")
+        return Ok(format!("{}/?v=8", endpoint.trim_end_matches('/')));
     }
+    discord_ws_url(endpoint)
+}
+
+fn discord_ws_url(endpoint: &str) -> Result<String, ConnectionError> {
+    discord_voice_authority(endpoint)
+        .map(|authority| format!("wss://{authority}/?v=8"))
+        .ok_or_else(|| ConnectionError::UntrustedEndpoint(endpoint.to_owned()))
+}
+
+/// The lower-cased `host[:port]` of `endpoint` when the host is under `discord.media` or `discord.gg`.
+fn discord_voice_authority(endpoint: &str) -> Option<String> {
+    let rest = endpoint
+        .strip_prefix("wss://")
+        .or_else(|| endpoint.strip_prefix("ws://"))
+        .unwrap_or(endpoint);
+    let authority = rest.split(['/', '?', '#']).next()?.to_ascii_lowercase();
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority.as_str(), None),
+    };
+    if port.is_some_and(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let dns_name = !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
+    let discord = ["discord.media", "discord.gg"]
+        .iter()
+        .any(|d| host == *d || host.strip_suffix(d).is_some_and(|h| h.ends_with('.')));
+    (dns_name && discord).then_some(authority)
 }
 
 /// `Object.values(CodecPayloadType)` as sent in SELECT_PROTOCOL.
@@ -1114,6 +1438,31 @@ mod tests {
     }
 
     #[test]
+    fn debug_output_never_carries_the_answer_sdp() {
+        let event = VoiceEvent::SelectProtocolAck {
+            sdp: "a=ice-pwd:secret".into(),
+            dave_version: 1,
+        };
+        let shown = format!("{event:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("sdp_len"));
+    }
+
+    #[test]
+    fn pending_transitions_keep_the_newest_ids_only() {
+        let mut conn = conn();
+        for id in 1..=(MAX_PENDING_TRANSITIONS as u64 + 4) {
+            conn.remember_transition(id, 1);
+        }
+        assert_eq!(conn.pending_transitions.len(), MAX_PENDING_TRANSITIONS);
+        assert!(!conn.pending_transitions.contains_key(&1));
+        assert!(
+            conn.pending_transitions
+                .contains_key(&(MAX_PENDING_TRANSITIONS as u64 + 4))
+        );
+    }
+
+    #[test]
     fn select_protocol_codecs_match_js_payload_types() {
         let codecs = codecs_payload();
         let pts: Vec<(String, u64)> = codecs
@@ -1170,12 +1519,57 @@ mod tests {
     }
 
     #[test]
-    fn ws_url_forms() {
+    fn discord_hosts_get_wss_whatever_scheme_the_gateway_sent() {
+        for endpoint in [
+            "c-ams.discord.media:443",
+            "wss://c-ams.discord.media:443",
+            "ws://c-ams.discord.media:443",
+            "C-AMS.Discord.Media:443/",
+        ] {
+            assert_eq!(
+                discord_ws_url(endpoint).unwrap(),
+                "wss://c-ams.discord.media:443/?v=8",
+                "{endpoint}"
+            );
+        }
         assert_eq!(
-            ws_url("c-ams.discord.media:443"),
-            "wss://c-ams.discord.media:443/?v=8"
+            discord_ws_url("rtc.discord.gg").unwrap(),
+            "wss://rtc.discord.gg/?v=8"
         );
-        assert_eq!(ws_url("ws://127.0.0.1:9000/"), "ws://127.0.0.1:9000/?v=8");
+    }
+
+    #[test]
+    fn hosts_outside_discord_are_refused() {
+        for endpoint in [
+            "attacker.example",
+            "ws://attacker.example:80",
+            "wss://attacker.example",
+            "discord.media.attacker.example",
+            "notdiscord.media",
+            "c-ams.discord.media@attacker.example",
+            "attacker.example@c-ams.discord.media",
+            "c-ams.discord.media:443x",
+            "127.0.0.1:9000",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    discord_ws_url(endpoint),
+                    Err(ConnectionError::UntrustedEndpoint(_))
+                ),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_builds_keep_explicit_local_endpoints() {
+        assert_eq!(
+            ws_url("ws://127.0.0.1:9000/").unwrap(),
+            "ws://127.0.0.1:9000/?v=8"
+        );
+        assert!(ws_url("127.0.0.1:9000").is_err());
     }
 
     #[test]

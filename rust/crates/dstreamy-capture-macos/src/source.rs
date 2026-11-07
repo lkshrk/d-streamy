@@ -1,11 +1,12 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use dstreamy_media::{
-    CaptureConfig, CaptureSource, CaptureTarget, FRAME_CHANNEL_CAPACITY, FrameReceiver, MediaError,
-    MediaFrame, OPUS_CHANNELS, OPUS_SAMPLE_RATE, OpusEncoder, TargetKind,
+    CaptureConfig, CaptureSource, CaptureTarget, EncodedVideoFrame, FRAME_CHANNEL_CAPACITY,
+    FrameReceiver, MediaError, MediaFrame, OPUS_CHANNELS, OPUS_SAMPLE_RATE, OpusEncoder,
+    TargetKind,
 };
 use objc2_core_video::CVPixelBuffer;
 use screencapturekit::cg::CGRect;
@@ -30,6 +31,8 @@ const AUDIO_BITRATE_BPS: u32 = 128_000;
 const REFRESH_POLL: Duration = Duration::from_millis(50);
 /// One more than the default so the retained last frame does not starve the capture queue.
 const QUEUE_DEPTH: u32 = 4;
+/// A second at 30 fps of encodes failing in a row ends the capture instead of freezing the picture.
+const ENCODE_FAILURE_LIMIT: u32 = 30;
 
 type SharedSender = Arc<Mutex<Option<mpsc::Sender<MediaFrame>>>>;
 
@@ -37,6 +40,8 @@ type SharedSender = Arc<Mutex<Option<mpsc::Sender<MediaFrame>>>>;
 #[derive(Default)]
 pub struct MacCaptureSource {
     running: Option<Running>,
+    dropped_video: Arc<AtomicU64>,
+    dropped_audio: Arc<AtomicU64>,
     keyframe_requested: Arc<AtomicBool>,
 }
 
@@ -74,6 +79,13 @@ impl MacCaptureSource {
 
 #[async_trait]
 impl CaptureSource for MacCaptureSource {
+    fn capture_drops(&self) -> dstreamy_media::CaptureDrops {
+        dstreamy_media::CaptureDrops {
+            video_frames: self.dropped_frames(),
+            audio_frames: self.dropped_audio_packets(),
+        }
+    }
+
     async fn list_targets(&self) -> Result<Vec<CaptureTarget>, MediaError> {
         blocking(list_targets).await
     }
@@ -99,6 +111,8 @@ impl CaptureSource for MacCaptureSource {
         }
         let keyframe_requested = Arc::clone(&self.keyframe_requested);
         let (running, rx) = blocking(move || start(config, keyframe_requested)).await?;
+        self.dropped_video = running.pipeline.dropped_video.clone();
+        self.dropped_audio = running.pipeline.dropped_audio.clone();
         self.running = Some(running);
         Ok(rx)
     }
@@ -112,6 +126,18 @@ impl CaptureSource for MacCaptureSource {
 
     fn request_keyframe(&self) {
         self.keyframe_requested.store(true, Ordering::Relaxed);
+    }
+}
+
+impl MacCaptureSource {
+    /// Encoded video frames lost since the latest successful start, retained after stop.
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped_video.load(Ordering::Relaxed)
+    }
+
+    /// Opus packets lost since the latest successful start, retained after stop.
+    pub fn dropped_audio_packets(&self) -> u64 {
+        self.dropped_audio.load(Ordering::Relaxed)
     }
 }
 
@@ -265,6 +291,7 @@ fn start(
     let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
     let sender: SharedSender = Arc::new(Mutex::new(Some(tx)));
     let frame_dropped = Arc::new(AtomicBool::new(false));
+    let dropped_video = Arc::new(AtomicU64::new(0));
     let encoder = VtEncoder::with_sink(
         VtEncoderConfig {
             width: dims.output_width,
@@ -276,10 +303,12 @@ fn start(
         {
             let sender = Arc::clone(&sender);
             let frame_dropped = Arc::clone(&frame_dropped);
+            let dropped_video = Arc::clone(&dropped_video);
             move |frame| {
-                if !send(&sender, MediaFrame::Video(frame)) {
+                send(&sender, MediaFrame::Video(frame), || {
                     frame_dropped.store(true, Ordering::Relaxed);
-                }
+                    dropped_video.fetch_add(1, Ordering::Relaxed);
+                });
             }
         },
     )?;
@@ -288,6 +317,8 @@ fn start(
         sender,
         keyframe_requested,
         frame_dropped,
+        dropped_video,
+        dropped_audio: Arc::new(AtomicU64::new(0)),
         clock: Mutex::new(None),
         failure: Mutex::new(None),
         audio_gain: config.audio_gain,
@@ -301,7 +332,7 @@ fn start(
         .with_pixel_format(PixelFormat::BGRA)
         .with_queue_depth(QUEUE_DEPTH)
         .with_scales_to_fit(true)
-        .with_shows_cursor(false)
+        .with_shows_cursor(true)
         .with_minimum_frame_interval(&CMTime::new(
             1,
             i32::try_from(config.fps).unwrap_or(i32::MAX),
@@ -358,12 +389,11 @@ fn spawn_refresher(pipeline: Weak<Pipeline>) -> Result<(), MediaError> {
         .map_err(backend)
 }
 
-/// Returns false when the frame was dropped because the receiver is full.
-fn send(sender: &SharedSender, frame: MediaFrame) -> bool {
+fn send(sender: &SharedSender, frame: MediaFrame, on_full: impl FnOnce()) {
     let guard = sender.lock().unwrap_or_else(PoisonError::into_inner);
     match guard.as_ref().map(|tx| tx.try_send(frame)) {
-        Some(Err(TrySendError::Full(_))) => false,
-        Some(Ok(())) | Some(Err(TrySendError::Closed(_))) | None => true,
+        Some(Err(TrySendError::Full(_))) => on_full(),
+        Some(Ok(())) | Some(Err(TrySendError::Closed(_))) | None => {}
     }
 }
 
@@ -372,6 +402,8 @@ struct Pipeline {
     keyframe_requested: Arc<AtomicBool>,
     /// Set on backpressure; only a new frame serves it, so a stalled receiver cannot drive idle re-encodes.
     frame_dropped: Arc<AtomicBool>,
+    dropped_video: Arc<AtomicU64>,
+    dropped_audio: Arc<AtomicU64>,
     clock: Mutex<Option<i128>>,
     failure: Mutex<Option<String>>,
     audio_gain: f32,
@@ -405,29 +437,42 @@ impl Pipeline {
         };
         // SAFETY: the sample buffer retains its image buffer for as long as `sample` is borrowed.
         let frame = unsafe { &*image.cast::<CVPixelBuffer>() };
-        let mut video = self.video.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(video) = video.as_mut() else {
+        let mut guard = self.video.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(video) = guard.as_mut() else {
             return;
         };
         let force = self.keyframe_requested.swap(false, Ordering::Relaxed)
             | self.frame_dropped.swap(false, Ordering::Relaxed);
-        if video.encode(frame, pts_us, force, Instant::now()).is_err() {
-            self.keyframe_requested.store(true, Ordering::Relaxed);
+        let result = video.encode(frame, pts_us, force, Instant::now());
+        let failures = video.failures();
+        // Released before `after_encode`, which may take the lock again to finish.
+        drop(guard);
+        self.after_encode(result, failures);
+    }
+
+    /// Asks for a keyframe after a failed encode and ends the capture once they keep failing.
+    fn after_encode(&self, result: Result<Vec<EncodedVideoFrame>, MediaError>, failures: u32) {
+        let Err(error) = result else {
+            return;
+        };
+        self.keyframe_requested.store(true, Ordering::Relaxed);
+        if failures >= ENCODE_FAILURE_LIMIT {
+            self.fail(format!(
+                "video encoding failed {failures} times in a row: {error}"
+            ));
         }
     }
 
     /// Returns false once the pipeline has finished.
     fn refresh(&self) -> bool {
-        let mut video = self.video.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(video) = video.as_mut() else {
+        let mut guard = self.video.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(video) = guard.as_mut() else {
             return false;
         };
-        if video
-            .refresh(&self.keyframe_requested, Instant::now())
-            .is_err()
-        {
-            self.keyframe_requested.store(true, Ordering::Relaxed);
-        }
+        let result = video.refresh(&self.keyframe_requested, Instant::now());
+        let failures = video.failures();
+        drop(guard);
+        self.after_encode(result, failures);
         true
     }
 
@@ -470,7 +515,9 @@ impl Pipeline {
             .unwrap_or_else(PoisonError::into_inner)
             .push(&pcm, pts_us);
         for packet in packets {
-            send(&self.sender, MediaFrame::Audio(packet));
+            send(&self.sender, MediaFrame::Audio(packet), || {
+                self.dropped_audio.fetch_add(1, Ordering::Relaxed);
+            });
         }
     }
 
@@ -479,6 +526,16 @@ impl Pipeline {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Records the first failure and ends the capture.
+    fn fail(&self, message: String) {
+        let mut failure = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
+        if failure.is_none() {
+            *failure = Some(message);
+        }
+        drop(failure);
+        self.finish();
     }
 
     /// Flushes the encoder and closes the frame channel.
@@ -514,11 +571,91 @@ struct StopOnError(Arc<Pipeline>);
 
 impl SCStreamDelegateTrait for StopOnError {
     fn did_stop_with_error(&self, error: screencapturekit::error::SCError) {
-        *self
-            .0
-            .failure
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(format!("capture stopped: {error}"));
-        self.0.finish();
+        self.0.fail(format!("capture stopped: {error}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn audio_frame() -> MediaFrame {
+        MediaFrame::Audio(dstreamy_media::AudioFrame {
+            data: vec![1],
+            pts_us: 0,
+        })
+    }
+
+    #[test]
+    fn closing_the_sender_waits_for_full_drop_accounting() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(audio_frame()).unwrap();
+        let sender = Arc::new(Mutex::new(Some(tx)));
+        let drops = Arc::new(AtomicU64::new(0));
+        let (entered, reached) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let callback = {
+            let sender = sender.clone();
+            let drops = drops.clone();
+            std::thread::spawn(move || {
+                send(&sender, audio_frame(), || {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    drops.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+        };
+        reached.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            sender.try_lock().is_err(),
+            "accounting escaped the sender barrier"
+        );
+        let shutdown = {
+            let sender = sender.clone();
+            let drops = drops.clone();
+            std::thread::spawn(move || {
+                sender.lock().unwrap().take();
+                drops.load(Ordering::Relaxed)
+            })
+        };
+        release.send(()).unwrap();
+        callback.join().unwrap();
+        assert_eq!(shutdown.join().unwrap(), 1);
+        send(&sender, audio_frame(), || {
+            drops.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_counts_survive_stop_and_a_failed_start_without_counting_closed_receivers() {
+        let mut source = MacCaptureSource::new();
+        source.dropped_video.store(3, Ordering::Relaxed);
+        source.dropped_audio.store(5, Ordering::Relaxed);
+        source.stop().await.unwrap();
+        assert_eq!(
+            source.capture_drops(),
+            dstreamy_media::CaptureDrops {
+                video_frames: 3,
+                audio_frames: 5
+            }
+        );
+        assert!(
+            source
+                .start(CaptureConfig {
+                    audio_source: Some("unsupported".into()),
+                    ..CaptureConfig::default()
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(source.capture_drops().video_frames, 3);
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let sender = Arc::new(Mutex::new(Some(tx)));
+        send(&sender, audio_frame(), || {
+            source.dropped_audio.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(source.capture_drops().audio_frames, 5);
     }
 }

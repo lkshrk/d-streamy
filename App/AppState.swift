@@ -25,6 +25,8 @@ final class AppState: ObservableObject {
 
     @Published var targets: [CaptureTarget] = []
     @Published var selectedTarget: CaptureTarget?
+    @Published var targetsError: String?
+    @Published var targetsCaptureFailed = false
 
     // Overlay points, bottom-left origin, over a window `cropViewSize` points large.
     @Published var cropRect: CGRect?
@@ -33,6 +35,7 @@ final class AppState: ObservableObject {
 
     @Published var streamState: StreamState = .idle
     @Published var health: HealthSnapshot?
+    @Published var encryption = EncryptionStatus()
     @Published var streamStartedAt: Date?
 
     @Published var healthLevel: HealthLevel = .good
@@ -47,9 +50,13 @@ final class AppState: ObservableObject {
     @Published var videoCodec: String { didSet { defaults.set(videoCodec, forKey: "videoCodec") } }
 
     private var daemon: DaemonClient?
+    private let daemonFactory: (() -> DaemonClient)?
     private var launching: Task<DaemonClient?, Never>?
     private var startInFlight = false
+    private var startUnresolved = false
+    private var stopInFlight = false
     private var cancelRequested = false
+    private var stopTimeouts = 0
     private var cropSentForStart = false
     private let defaults = UserDefaults.standard
     let cropOverlayController = CropOverlayController()
@@ -77,7 +84,9 @@ final class AppState: ObservableObject {
         }
     }
 
-    init() {
+    init(bootstrapOnLaunch: Bool = true, daemon: DaemonClient? = nil, daemonFactory: (() -> DaemonClient)? = nil) {
+        self.daemon = daemon
+        self.daemonFactory = daemonFactory
         maxWidth = defaults.object(forKey: "maxWidth") as? Int ?? 1920
         maxHeight = defaults.object(forKey: "maxHeight") as? Int ?? 1080
         fps = defaults.object(forKey: "fps") as? Int ?? 30
@@ -102,7 +111,11 @@ final class AppState: ObservableObject {
             self?.isCropOverlayVisible = false
         }
 
-        Task { await bootstrap() }
+        if let daemon { observe(daemon) }
+
+        if bootstrapOnLaunch {
+            Task { await bootstrap() }
+        }
     }
 
     var canCropSelectedContent: Bool {
@@ -121,10 +134,22 @@ final class AppState: ObservableObject {
                 isAuthenticated = true
             }
         } catch {
-            authError = error.localizedDescription
+            report(error)
         }
         await refreshTargets()
         if isAuthenticated { await fetchGuilds() }
+    }
+
+    /// Only the daemon's two auth codes mean the login is bad; everything else is a daemon or network failure.
+    private func report(_ error: Error) {
+        if let failure = error as? DaemonError, failure.code == "not_logged_in" || failure.code == "invalid_token" {
+            isAuthenticated = false
+            guilds = []
+            channels = []
+            authError = failure.message
+        } else {
+            daemonError = error.localizedDescription
+        }
     }
 
     private func ensureDaemon() async -> DaemonClient? {
@@ -138,17 +163,17 @@ final class AppState: ObservableObject {
     }
 
     private func launchDaemon() async -> DaemonClient? {
-        guard let url = DaemonBinary.locate() else {
-            daemonError = "dstreamy not found. Build it with `cargo build -p dstreamy-cli` or set DSTREAMY_BIN."
-            return nil
+        let client: DaemonClient
+        if let daemonFactory {
+            client = daemonFactory()
+        } else {
+            guard let url = DaemonBinary.locate() else {
+                daemonError = "dstreamy not found. Build it with `cargo build -p dstreamy-cli` or set DSTREAMY_BIN."
+                return nil
+            }
+            client = DaemonClient(executableURL: url)
         }
-        let client = DaemonClient(executableURL: url)
-        client.onEvent = { [weak self] event in
-            DispatchQueue.main.async { MainActor.assumeIsolated { self?.handle(event) } }
-        }
-        client.onExit = { [weak self, weak client] status in
-            DispatchQueue.main.async { MainActor.assumeIsolated { self?.daemonExited(client, status: status) } }
-        }
+        observe(client)
         do {
             try client.launch()
             try await client.handshake()
@@ -162,6 +187,18 @@ final class AppState: ObservableObject {
         return client
     }
 
+    private func observe(_ client: DaemonClient) {
+        client.onEvent = { [weak self, weak client] event in
+            DispatchQueue.main.async { MainActor.assumeIsolated {
+                guard let self, let client, client === self.daemon else { return }
+                self.handle(event)
+            } }
+        }
+        client.onExit = { [weak self, weak client] status in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.daemonExited(client, status: status) } }
+        }
+    }
+
     private func daemonExited(_ client: DaemonClient?, status: Int32) {
         guard let client, client === daemon else { return }
         daemon = nil
@@ -169,17 +206,21 @@ final class AppState: ObservableObject {
             streamState = .error("dstreamy exited (status \(status))")
             endStream()
         }
+        if status != 0 {
+            daemonError = "dstreamy exited unexpectedly (status \(status)). It restarts with the next action."
+        }
     }
 
     func fetchGuilds() async {
         guard isAuthenticated, let daemon = await ensureDaemon() else { return }
         do {
             guilds = try await daemon.request(.guilds, timeout: .seconds(30))
+            daemonError = nil
             if let saved = selectedGuild, guilds.contains(where: { $0.id == saved.id }) {
                 await fetchChannels(guildId: saved.id)
             }
         } catch {
-            authError = error.localizedDescription
+            report(error)
         }
     }
 
@@ -188,9 +229,10 @@ final class AppState: ObservableObject {
         do {
             let all: [ChannelInfo] = try await daemon.request(.channels(guildId: guildId), timeout: .seconds(30))
             channels = all.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            daemonError = nil
         } catch {
             channels = []
-            authError = error.localizedDescription
+            report(error)
         }
     }
 
@@ -205,12 +247,10 @@ final class AppState: ObservableObject {
             try await daemon.request(.setToken(token), as: Empty.self, timeout: .seconds(30))
             isAuthenticated = true
             authError = nil
+            daemonError = nil
             await fetchGuilds()
         } catch {
-            isAuthenticated = false
-            guilds = []
-            channels = []
-            authError = error.localizedDescription
+            report(error)
         }
     }
 
@@ -229,8 +269,12 @@ final class AppState: ObservableObject {
         guard let daemon = await ensureDaemon() else { return }
         do {
             targets = try await daemon.request(.targets, timeout: .seconds(15))
+            targetsError = nil
+            targetsCaptureFailed = false
         } catch {
             log.error("targets failed: \(error.localizedDescription, privacy: .public)")
+            targetsError = error.localizedDescription
+            targetsCaptureFailed = (error as? DaemonError)?.code == "capture"
             return
         }
         if let current = selectedTarget {
@@ -238,6 +282,15 @@ final class AppState: ObservableObject {
         } else if let restored = restoredTarget(from: targets) {
             selectTarget(restored)
         }
+    }
+
+    /// A daemon that was denied Screen Recording keeps failing after the grant until it is relaunched.
+    func retryTargets() async {
+        if targetsCaptureFailed, !streamState.canStop, let daemon {
+            self.daemon = nil
+            await daemon.shutdown()
+        }
+        await refreshTargets()
     }
 
     func selectTarget(_ target: CaptureTarget) {
@@ -261,25 +314,33 @@ final class AppState: ObservableObject {
         return sameApp.first { $0.title == title } ?? sameApp.first
     }
 
-    func startStream() async {
-        guard selectedTarget != nil,
+    func startStream(timeout: Duration = .seconds(60)) async {
+        guard !startInFlight, !startUnresolved, !stopInFlight, !streamState.canStop,
+              selectedTarget != nil,
               let guild = selectedGuild,
               let channel = selectedChannel,
               isAuthenticated else { return }
+        startInFlight = true
+        defer { startInFlight = false }
+        cancelRequested = false
+        stopTimeouts = 0
+        daemonError = nil
+        streamState = .connecting
+        encryption = EncryptionStatus()
+        health = nil
+        streamStartedAt = nil
+        cropSentForStart = true
         guard let daemon = await ensureDaemon() else {
             streamState = .error(daemonError ?? "dstreamy is not running")
             return
         }
-
-        streamState = .connecting
-        health = nil
-        streamStartedAt = nil
-        startInFlight = true
-        cancelRequested = false
-        cropSentForStart = true
-        defer { startInFlight = false }
+        guard !cancelRequested else { return }
         await refreshTargets()
-        guard !cancelRequested, let target = selectedTarget else { return }
+        guard !cancelRequested else { return }
+        guard let target = selectedTarget else {
+            streamState = .error("No source selected")
+            return
+        }
         let request = StartRequest(
             guildId: guild.id,
             channelId: channel.id,
@@ -292,30 +353,105 @@ final class AppState: ObservableObject {
             gain: Double(audioGain)
         )
         log.info("start target=\(target.id, privacy: .public) guild=\(guild.id, privacy: .public) channel=\(channel.id, privacy: .public)")
+        startUnresolved = true
         do {
-            try await daemon.request(.start(request), as: Empty.self, timeout: .seconds(60))
-            if cancelRequested {
-                _ = try? await daemon.send(.stop, timeout: .seconds(15))
-            }
+            try await daemon.request(.start(request), as: Empty.self, timeout: timeout)
+            guard daemon === self.daemon, !cancelRequested else { return }
+            startUnresolved = false
         } catch {
-            guard !cancelRequested, streamState.canStop else { return }
-            streamState = .error(error.localizedDescription)
-            endStream()
+            guard daemon === self.daemon else { return }
+            if let failure = error as? DaemonError {
+                report(failure)
+                await terminateStoppedDaemon(daemon, message: "Start was rejected: \(failure.message). dstreamy was terminated before retrying.")
+            } else if !daemon.isRunning {
+                streamState = .error(error.localizedDescription)
+                endStream()
+            } else if cancelRequested || !streamState.canStop {
+                await terminateStoppedDaemon(daemon, message: "Start has not been confirmed. dstreamy was terminated before retrying. \(error.localizedDescription)")
+            } else {
+                daemonError = "Start has not been confirmed. It may still complete. Cancel before retrying. \(error.localizedDescription)"
+            }
         }
     }
 
     func stopStream(timeout: Duration = .seconds(15)) async {
-        if startInFlight { cancelRequested = true }
-        if let daemon, daemon.isRunning {
-            do {
-                let stats: StreamStats = try await daemon.request(.stop, timeout: timeout)
-                log.info("stopped sent=\(stats.videoFramesSent) dropped=\(stats.videoFramesDropped)")
-            } catch {
-                log.error("stop failed: \(error.localizedDescription, privacy: .public)")
+        guard !stopInFlight else { return }
+        stopInFlight = true
+        defer { stopInFlight = false }
+        let mustTerminate = startUnresolved || startInFlight
+        if mustTerminate { cancelRequested = true }
+        guard let daemon, daemon.isRunning else {
+            streamState = .idle
+            endStream()
+            return
+        }
+        do {
+            let timeout = stopTimeouts > 0 ? min(timeout, .seconds(5)) : timeout
+            let stats: StreamStats = try await daemon.request(.stop, timeout: timeout)
+            log.info("stopped sent=\(stats.videoFramesSent) dropped=\(stats.videoFramesDropped)")
+        } catch DaemonClientError.timedOut(_) {
+            guard daemon === self.daemon else { return }
+            if mustTerminate {
+                await terminateStoppedDaemon(daemon)
+                return
             }
+            guard streamState.canStop else { return }
+            stopTimeouts += 1
+            log.error("stop timed out (\(self.stopTimeouts))")
+            guard stopTimeouts >= 2 else {
+                daemonError = "dstreamy has not confirmed the stop yet. Stopping again will terminate it."
+                return
+            }
+            await terminateStoppedDaemon(daemon)
+            return
+        } catch {
+            guard daemon === self.daemon else { return }
+            log.error("stop failed: \(error.localizedDescription, privacy: .public)")
+            if mustTerminate {
+                await terminateStoppedDaemon(daemon)
+                return
+            }
+            if daemon.isRunning, streamState.canStop {
+                stopTimeouts += 1
+                if stopTimeouts >= 2 {
+                    await terminateStoppedDaemon(daemon)
+                    return
+                }
+                daemonError = "dstreamy has not confirmed the stop. Stopping again will terminate it. \(error.localizedDescription)"
+            } else if streamState.canStop {
+                streamState = .idle
+                endStream()
+            }
+            return
+        }
+        guard daemon === self.daemon else { return }
+        if mustTerminate {
+            await terminateStoppedDaemon(daemon)
+            return
+        }
+        guard streamState.canStop else { return }
+        stopTimeouts += 1
+        if stopTimeouts >= 2 {
+            await terminateStoppedDaemon(daemon)
+            return
+        }
+        daemonError = "dstreamy replied to Stop, but its stopped state has not been confirmed. Stopping again will terminate it."
+    }
+
+    private func terminateStoppedDaemon(_ daemon: DaemonClient, message: String? = nil) async {
+        guard daemon === self.daemon else { return }
+        self.daemon = nil
+        await daemon.shutdown(grace: .seconds(1))
+        guard self.daemon == nil else { return }
+        guard !daemon.isRunning else {
+            self.daemon = daemon
+            streamState = .connecting
+            daemonError = "dstreamy is still running. Try Stop again before starting another stream."
+            return
         }
         streamState = .idle
         endStream()
+        daemonError = message ?? "dstreamy was terminated to confirm the pending stop. It restarts with the next action."
     }
 
     func shutdownForQuit() async {
@@ -329,8 +465,15 @@ final class AppState: ObservableObject {
     }
 
     private func endStream() {
+        cancelRequested = true
+        startUnresolved = false
         cropUpdateTask?.cancel()
+        if stopTimeouts > 0 {
+            stopTimeouts = 0
+            daemonError = nil
+        }
         health = nil
+        encryption = EncryptionStatus()
         streamStartedAt = nil
         resetHealth()
     }
@@ -339,13 +482,15 @@ final class AppState: ObservableObject {
         switch event {
         case .state(let state):
             log.info("session state \(String(describing: state), privacy: .public)")
-            guard !cancelRequested else { return }
             switch state {
             case .idle:
                 if streamState.canStop { streamState = .idle; endStream() }
             case .connecting:
+                guard !cancelRequested else { return }
                 streamState = .connecting
+                encryption = EncryptionStatus()
             case .streaming:
+                guard !cancelRequested else { return }
                 streamState = .streaming
                 if streamStartedAt == nil { streamStartedAt = Date() }
                 if !cropSentForStart {
@@ -353,17 +498,26 @@ final class AppState: ObservableObject {
                     sendCropUpdate()
                 }
             case .reconnecting(let attempt):
+                guard !cancelRequested else { return }
                 streamState = .reconnecting(attempt)
+                encryption = EncryptionStatus()
             case .stopped(.requested):
                 streamState = .idle
                 endStream()
             case .stopped(let reason):
                 streamState = .error(reason.message)
                 endStream()
+            case .unknown(let state):
+                log.error("ignoring unknown session state \(state, privacy: .public)")
             }
         case .health(let snapshot):
-            guard streamState.canStop else { return }
+            guard !cancelRequested, streamState.canStop else { return }
             health = snapshot
+            if let state = snapshot.stats.e2ee {
+                encryption = EncryptionStatus(state: state, daveProtocolVersion: snapshot.stats.daveProtocolVersion)
+            } else if let version = snapshot.stats.daveProtocolVersion {
+                encryption.daveProtocolVersion = version
+            }
             healthLevel = snapshot.health.overallLevel
             updateBlink()
         case .channelMoved(let guildId, let channelId):
@@ -374,12 +528,21 @@ final class AppState: ObservableObject {
             }
         case .resumed:
             log.info("connection resumed")
+        case .e2ee(let state, let version):
+            guard !cancelRequested, streamState.canStop else { return }
+            encryption = EncryptionStatus(state: state, daveProtocolVersion: version)
         case .error(let message, let fatal):
             log.error("session error fatal=\(fatal) \(message, privacy: .public)")
             if fatal {
-                streamState = .error(message)
-                endStream()
+                if streamState.canStop || startInFlight || startUnresolved {
+                    daemonError = "\(message). Stop before starting another stream."
+                } else {
+                    streamState = .error(message)
+                    endStream()
+                }
             }
+        case .unknown(let event):
+            log.error("ignoring unknown event \(event, privacy: .public)")
         }
     }
 

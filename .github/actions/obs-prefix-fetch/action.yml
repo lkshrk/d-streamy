@@ -1,6 +1,6 @@
 name: Fetch the OBS prefix
 description: >-
-  Restore a pinned OBS install prefix from a recent successful rust-rewrite push or dispatch run of obs-ci,
+  Restore a pinned OBS install prefix from a recent successful default-branch push or dispatch run of obs-ci,
   else from the Actions cache.
 inputs:
   key:
@@ -16,20 +16,21 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Find the prefix in a rust-rewrite run
+    - name: Find the prefix in a default-branch run
       id: find
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
         REPO: ${{ github.repository }}
+        BRANCH_NAME: ${{ github.event.repository.default_branch }}
         ARTIFACT: ${{ inputs.key }}.tar.gz
       run: |
         set -euo pipefail
-        branch=$(gh api "repos/$REPO/branches/rust-rewrite" --jq .commit.sha) || branch=
+        branch=$(gh api "repos/$REPO/branches/$BRANCH_NAME" --jq .commit.sha) || branch=
         candidates=
         if [ -n "$branch" ]; then
-          candidates=$(gh api "repos/$REPO/actions/artifacts?name=$ARTIFACT&per_page=100" --jq '
-            [.artifacts[] | select((.expired | not) and .workflow_run.head_branch == "rust-rewrite"
+          candidates=$(gh api "repos/$REPO/actions/artifacts?name=$ARTIFACT&per_page=100" | jq -r --arg branch "$BRANCH_NAME" '
+            [.artifacts[] | select((.expired | not) and .workflow_run.head_branch == $branch
               and .workflow_run.head_repository_id == .workflow_run.repository_id)]
             | sort_by(.created_at) | reverse | .[:10][] | "\(.workflow_run.id) \(.workflow_run.head_sha)"') || candidates=
         fi
@@ -46,7 +47,7 @@ runs:
           echo "run-id=$id" >> "$GITHUB_OUTPUT"
           exit 0
         done <<<"$candidates"
-        echo "No usable $ARTIFACT from a successful rust-rewrite run; trying the cache"
+        echo "No usable $ARTIFACT from a successful $BRANCH_NAME run; trying the cache"
 
     - name: Download the prefix
       id: download

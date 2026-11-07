@@ -36,38 +36,42 @@ expect() {
   fi
 }
 
+expect_event() {
+  local name=$1 event=$2
+  shift 2
+  python3 -I "$(dirname "$0")/check-plugin-events.py" "$logs/$name.log" "$event" "$@"
+}
+
 if [[ ${OS:-} == Windows_NT ]]; then
   absent="/dstreamy-absent/d/s.sock"
   not_running="D-Streamy for OBS doesn't support Windows yet"
-  not_running_line="^HARNESS expected_error code=-2: D-Streamy for OBS doesn't support Windows yet"
 else
   absent="${TMPDIR:-/tmp}/dstreamy-absent-$$/d/s.sock"
   not_running="The D-Streamy service is not running"
-  not_running_line="^HARNESS expected_error code=-2: The D-Streamy service is not running \(no service is listening at $absent; start it [^)]*serve.\)"
 fi
 
 run not-running --no-encoders --seconds 3 --output-settings "{\"endpoint\": \"$absent\"}" --expect-error "$not_running" "$@"
-expect not-running '\[obs-dstreamy\] loaded \(version '
-expect not-running "$not_running_line"
-expect not-running '^HARNESS alive after the stop: [1-9][0-9]* more frames rendered'
-expect not-running 'HARNESS shutdown libobs_leaks=0'
-expect not-running 'HARNESS result=PASS'
+expect_event not-running module_loaded "name=obs-dstreamy"
+expect_event not-running expected_error "code=-2" "message~=$not_running"
+expect_event not-running alive "rendered>0"
+expect_event not-running shutdown "libobs_leaks=0"
+expect_event not-running result "value=PASS"
 
 run start-panic --no-encoders --output-settings '{"panic_in": "start"}' --expect-panics 1 \
   --expect-error "panic caught in start: test panic in Start" "$@"
 expect start-panic '\[obs-dstreamy\] panic caught in start: test panic in Start'
-expect start-panic '^HARNESS expected_error start: D-Streamy plugin error \(panic caught in start'
-expect start-panic 'HARNESS shutdown libobs_leaks=0'
-expect start-panic 'HARNESS result=PASS'
+expect_event start-panic expected_error_start "message~=panic caught in start"
+expect_event start-panic shutdown "libobs_leaks=0"
+expect_event start-panic result "value=PASS"
 
 # The expected error is matched inside the harness, so keep it ASCII: Windows passes argv in the ANSI code page.
 settings_error() {
   local name=$1 error=$2 full=$3
   shift 3
   run "$name" --seconds 3 --expect-error "$error" "$@"
-  expect "$name" "^HARNESS expected_error start: .*$full"
-  expect "$name" 'HARNESS shutdown libobs_leaks=0'
-  expect "$name" 'HARNESS result=PASS'
+  expect_event "$name" expected_error_start "message~=$full"
+  expect_event "$name" shutdown "libobs_leaks=0"
+  expect_event "$name" result "value=PASS"
 }
 
 share=(--video-encoder obs_x264 --audio-encoder ffmpeg_opus --stream-output)

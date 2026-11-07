@@ -924,8 +924,7 @@ void ask()
 {
 	if (!ui.active || ui.confirm_box || !ui.window)
 		return;
-	ui.shown.clear();
-	render();
+	rerender();
 	if (!ui.active || !ui.control.value("enabled").toBool())
 		return;
 	QString action = ui.control.value("action").toString();

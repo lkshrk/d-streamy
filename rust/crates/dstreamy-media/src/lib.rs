@@ -6,6 +6,7 @@ mod encoder;
 mod error;
 mod external;
 mod frame;
+#[cfg(feature = "openh264")]
 mod h264;
 mod ingest;
 mod opus;
@@ -26,9 +27,12 @@ pub use frame::{
     AudioFrame, EncodedVideoFrame, MediaFrame, OPUS_CHANNELS, OPUS_FRAME_DURATION_US,
     OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE, VideoCodec,
 };
+#[cfg(feature = "openh264")]
 pub use h264::OpenH264Encoder;
 pub use ingest::{Ingest, IngestError};
 pub use opus::OpusEncoder;
-pub use source::{CaptureConfig, CaptureSource, CropRect, FRAME_CHANNEL_CAPACITY, FrameReceiver};
+pub use source::{
+    CaptureConfig, CaptureDrops, CaptureSource, CropRect, FRAME_CHANNEL_CAPACITY, FrameReceiver,
+};
 pub use target::{AudioSource, AudioSourceKind, CaptureTarget, TargetKind};
-pub use test_pattern::{TEST_PATTERN_TARGET_ID, TestPatternSource};
+pub use test_pattern::{TEST_PATTERN_AVAILABLE, TEST_PATTERN_TARGET_ID, TestPatternSource};

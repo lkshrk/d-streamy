@@ -8,7 +8,9 @@ use crate::control::{
 };
 use crate::settings::{fit_1080p, target_fps};
 
+/// The plugin's own video encoder when the user never changed it.
 pub const DEFAULT_VIDEO_ENCODER: &str = "obs_x264";
+/// Bitrate of the plugin's own encoder when the user never changed it.
 pub const DEFAULT_BITRATE_KBPS: i64 = 6000;
 /// The range the output's bitrate property offers.
 pub const BITRATE_KBPS: std::ops::RangeInclusive<i64> = 500..=50_000;
@@ -20,6 +22,7 @@ pub const DEFAULT_AUDIO_TRACK: u8 = 6;
 const LEGACY_DEFAULT_TRACK: u8 = 1;
 /// Version 2 moved configs still on the old default Track 1 to Track 6.
 pub const CONFIG_VERSION: u32 = 2;
+/// Title of the audio track section in the panel and the dialog.
 pub const AUDIO_TRACK_TITLE: &str = "Discord audio track";
 
 /// OBS's fixed name for a mixer track; D-Streamy keeps no labels of its own.
@@ -35,6 +38,7 @@ pub fn next_go_live(track: u8) -> String {
 /// serve refuses a longer per-start grace (ADR 0004).
 pub const MAX_GRACE_SECS: u64 = 3600;
 
+/// Own encoder or the stream's shared one (ADR 0004 encoders).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoMode {
@@ -196,6 +200,7 @@ pub struct Canvas {
     pub output_height: u32,
 }
 
+/// The panel's session state as the view shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum DockState {
@@ -267,12 +272,18 @@ impl Problem {
     }
 }
 
+/// Status line while a login runs.
 pub const LOGGING_IN: &str = "Logging in…";
 const LOGIN_FAILED: &str = "Login failed";
+/// Status line while serve's login window is open.
 pub const WAITING_FOR_LOGIN: &str = "Waiting for login in the browser window…";
+/// Status line while `select_account` is pending.
 pub const SWITCHING_ACCOUNT: &str = "Switching account…";
+/// Tooltip of the disabled account picker while live.
 pub const LIVE_NO_SWITCH: &str = "Stop the stream to switch accounts";
+/// Tooltip of the disabled Log out while live.
 pub const LIVE_NO_LOGOUT: &str = "Stop the stream to log out";
+/// Tooltip of the account row while a login window waits.
 pub const LOGIN_WAITS: &str = "Finish or cancel the login first";
 const ADD_AGAIN: &str = "Use Add account… again";
 const GUILD_GONE: &str = "Server not available";
@@ -288,15 +299,23 @@ const STREAM_STOPPED: &str = "Stream stopped";
 
 /// What the dock suggests for a start or stop that couldn't finish; the caller knows the cause.
 pub const FIX_LOG: &str = "See the OBS log";
+/// Fix line when only an OBS restart helps.
 pub const FIX_RESTART_OBS: &str = "Restart OBS";
+/// Fix line when the output can only restart with OBS.
 pub const FIX_AFTER_CLOSING: &str = "Start again after OBS restarts";
+/// Fix line for a canvas the encoder rules reject.
 pub const FIX_VIDEO: &str = "Check OBS's Settings › Video";
+/// Fix line for an encoder setting the rules reject.
 pub const FIX_OUTPUT_SETTING: &str = "Change the OBS setting it names";
+/// Fix line when a retry is all it takes.
 pub const FIX_PRESS_START: &str = "Press Start again";
+/// Fix line for a session the service lost track of.
 pub const FIX_START_THEN_STOP: &str = "Press Start, then Stop";
 
+/// Fix line while no server and channel are picked.
 pub const PICK_CHANNEL: &str = "Pick a server and a voice channel first";
 
+/// The panel's whole state: settings, session, accounts, tracks and the current problem (ADR 0007).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockModel {
     settings: DockSettings,
@@ -522,7 +541,10 @@ impl DockModel {
                 "Starting on {}…",
                 track_name(self.applying.unwrap_or(self.settings.audio_track))
             ),
-            DockState::Live { .. } => format!("Live on {live}{pending}"),
+            DockState::Live { .. } => self.output_problem().map_or_else(
+                || format!("Live on {live}{pending}"),
+                |problem| problem.message.clone(),
+            ),
             DockState::Stopping => "Stopping…".into(),
         }
     }
@@ -533,6 +555,13 @@ impl DockModel {
 
     pub fn state(&self) -> &DockState {
         &self.state
+    }
+
+    /// A stopped output whose Discord session could not be ended still needs an explicit Stop.
+    pub fn output_problem(&self) -> Option<&Problem> {
+        self.error.as_ref().filter(|problem| {
+            matches!(self.state, DockState::Live { .. }) && problem.headline == STREAM_STOPPED
+        })
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -613,10 +642,12 @@ impl DockModel {
                 }
             }
             Err(e) => {
-                self.error = Some(Problem {
-                    lists: true,
-                    ..Problem::control(&e)
-                });
+                if self.output_problem().is_none() {
+                    self.error = Some(Problem {
+                        lists: true,
+                        ..Problem::control(&e)
+                    });
+                }
                 None
             }
         }
@@ -650,10 +681,12 @@ impl DockModel {
             Err(e) => {
                 self.channels.clear();
                 self.channels_listed = None;
-                self.error = Some(Problem {
-                    lists: true,
-                    ..Problem::control(&e)
-                });
+                if self.output_problem().is_none() {
+                    self.error = Some(Problem {
+                        lists: true,
+                        ..Problem::control(&e)
+                    });
+                }
             }
         }
     }
@@ -1167,6 +1200,25 @@ impl DockModel {
                 self.error = None;
             }
             Err(e) => self.error = Some(Problem::new(STOP_UNFINISHED, FIX_START_THEN_STOP, e)),
+        }
+    }
+
+    pub fn output_ended(&mut self, result: Result<String, String>) {
+        if !matches!(self.state, DockState::Live { .. }) {
+            return;
+        }
+        match result {
+            Ok(message) => {
+                self.settings.owned = None;
+                self.ended(Some(message));
+            }
+            Err(message) => {
+                self.error = Some(Problem::new(
+                    STREAM_STOPPED,
+                    "Press Stop to end the Discord session",
+                    message,
+                ));
+            }
         }
     }
 
@@ -2280,6 +2332,69 @@ mod tests {
         assert_eq!(m.state(), &DockState::Idle);
         assert_eq!(m.error(), Some("timed out"));
         assert_eq!(m.persisted(), Some(&ownership(3)));
+    }
+
+    #[test]
+    fn a_failed_output_keeps_stop_available_until_the_service_session_ends() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership(3)))));
+        let message = "The Discord session is still live; press Stop";
+        m.output_ended(Err(message.into()));
+        assert!(matches!(m.state(), DockState::Live { .. }));
+        assert_eq!(m.status_text(true), message);
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+        assert_eq!(m.stop(), Some(Some(ownership(3))));
+        m.stopped(Ok(()));
+        assert_eq!(m.status_text(true), "Idle");
+        assert!(m.output_problem().is_none());
+        assert_eq!(m.persisted(), None);
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(None)));
+        assert!(m.status_text(true).starts_with("Live on "));
+        assert!(m.output_problem().is_none());
+    }
+
+    #[test]
+    fn a_terminal_output_warning_survives_reopen_and_list_refreshes_until_stop() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership(3)))));
+        let failure = "Output ended; cleanup failed; press Stop";
+        m.output_ended(Err(failure.into()));
+        m.reload(m.settings().clone());
+        m.lists_requested();
+        m.accounts_loaded(Err(ControlError::NotRunning("offline".into())));
+        m.guilds_loaded(Err(ControlError::NotRunning("offline".into())));
+        assert_eq!(m.status_text(true), failure);
+        m.channels_loaded("g", Err(ControlError::NotRunning("offline".into())));
+        assert_eq!(m.status_text(true), failure);
+        m.guilds_loaded(Ok(vec![]));
+        assert!(m.guild_unavailable());
+        assert_eq!(m.status_text(true), failure);
+        m.guilds_loaded(Ok(vec![named("g")]));
+        m.channels_loaded("g", Ok(vec![]));
+        assert!(m.channel_unavailable());
+        assert_eq!(m.status_text(true), failure);
+        m.channels_loaded("g", Ok(vec![named("c")]));
+        m.lists_finished();
+        assert_eq!(m.loading(), (false, false));
+        assert_eq!(m.status_text(true), failure);
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+        assert_eq!(m.stop(), Some(Some(ownership(3))));
+        m.stopped(Ok(()));
+        assert!(m.output_problem().is_none());
+        assert_eq!(m.status_text(true), "Idle");
+    }
+
+    #[test]
+    fn an_output_failure_that_ends_its_service_session_forgets_ownership() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership(3)))));
+        m.output_ended(Ok("encoder failed".into()));
+        assert_eq!(m.state(), &DockState::Idle);
+        assert!(m.persisted().is_none());
     }
 
     #[test]

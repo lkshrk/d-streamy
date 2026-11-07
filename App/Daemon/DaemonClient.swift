@@ -40,6 +40,7 @@ final class DaemonClient: @unchecked Sendable {
     private var input: FileHandle?
     private var buffer = Data()
     private var pending: [String: CheckedContinuation<JSONValue, Error>] = [:]
+    private var timeouts: [String: Task<Void, Never>] = [:]
     private var nextId = 0
     private var exitStatus: Int32?
     private var outputClosed = false
@@ -52,6 +53,7 @@ final class DaemonClient: @unchecked Sendable {
 
     deinit {
         process?.terminate()
+        for timeout in timeouts.values { timeout.cancel() }
         for continuation in pending.values {
             continuation.resume(throwing: DaemonClientError.notRunning)
         }
@@ -79,6 +81,7 @@ final class DaemonClient: @unchecked Sendable {
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
+                self?.logPartialLine()
                 self?.finish { $0.outputClosed = true }
             } else {
                 self?.receive(data)
@@ -140,17 +143,17 @@ final class DaemonClient: @unchecked Sendable {
         var line = try DaemonCoding.encoder.encode(DaemonRequest(id: id, command: command))
         line.append(0x0A)
 
-        if let timeout {
-            Task { [weak self] in
-                try? await Task.sleep(for: timeout)
-                self?.resolve(id, with: .failure(DaemonClientError.timedOut(command.name)))
-            }
-        }
-
         return try await withCheckedThrowingContinuation { continuation in
             let handle: FileHandle? = lock.withLock {
                 guard process?.isRunning == true, let input else { return nil }
                 pending[id] = continuation
+                if let timeout {
+                    timeouts[id] = Task { [weak self] in
+                        try? await Task.sleep(for: timeout)
+                        guard !Task.isCancelled else { return }
+                        self?.resolve(id, with: .failure(DaemonClientError.timedOut(command.name)))
+                    }
+                }
                 return input
             }
             guard let handle else {
@@ -165,7 +168,7 @@ final class DaemonClient: @unchecked Sendable {
         }
     }
 
-    /// Asks the daemon to exit, closing stdin and then terminating it if it lingers.
+    /// Asks the daemon to exit, closing stdin, then escalates to SIGTERM and SIGKILL if it lingers.
     func shutdown(grace: Duration = .seconds(3)) async {
         guard isRunning else { return }
         _ = try? await send(.shutdown, timeout: grace)
@@ -174,11 +177,23 @@ final class DaemonClient: @unchecked Sendable {
             return input
         }
         try? handle?.close()
+        if await exits(within: grace) { return }
+        terminate()
+        if await exits(within: grace) { return }
+        let pid: pid_t? = lock.withLock { process?.processIdentifier }
+        if let pid {
+            log.error("daemon pid=\(pid) ignored SIGTERM; sending SIGKILL")
+            _ = kill(pid, SIGKILL)
+        }
+        _ = await exits(within: .seconds(1))
+    }
+
+    private func exits(within grace: Duration) async -> Bool {
         let deadline = ContinuousClock.now + grace
         while isRunning, ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(50))
         }
-        terminate()
+        return !isRunning
     }
 
     func terminate() {
@@ -223,8 +238,20 @@ final class DaemonClient: @unchecked Sendable {
         }
     }
 
+    private func logPartialLine() {
+        let rest: Data = lock.withLock {
+            defer { buffer = Data() }
+            return buffer
+        }
+        guard !rest.isEmpty else { return }
+        log.error("daemon stdout ended mid-line: \(String(decoding: rest, as: UTF8.self), privacy: .public)")
+    }
+
     private func resolve(_ id: String, with result: Result<JSONValue, Error>) {
-        let continuation = lock.withLock { pending.removeValue(forKey: id) }
+        let (continuation, timeout) = lock.withLock {
+            (pending.removeValue(forKey: id), timeouts.removeValue(forKey: id))
+        }
+        timeout?.cancel()
         continuation?.resume(with: result)
     }
 
@@ -235,6 +262,8 @@ final class DaemonClient: @unchecked Sendable {
             guard let status = exitStatus, outputClosed, process != nil else { return nil }
             process = nil
             input = nil
+            for timeout in timeouts.values { timeout.cancel() }
+            timeouts = [:]
             defer { pending = [:] }
             return (status, Array(pending.values))
         }

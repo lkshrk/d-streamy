@@ -25,6 +25,7 @@ unsafe impl Send for LastFrame {}
 pub(crate) struct VideoState {
     encoder: VtEncoder,
     last: Option<LastFrame>,
+    failures: u32,
 }
 
 impl VideoState {
@@ -32,7 +33,13 @@ impl VideoState {
         Self {
             encoder,
             last: None,
+            failures: 0,
         }
+    }
+
+    /// Encodes that failed since the last one that succeeded.
+    pub(crate) fn failures(&self) -> u32 {
+        self.failures
     }
 
     pub(crate) fn encode(
@@ -46,7 +53,14 @@ impl VideoState {
             Some(last) => pts_us.max(last.pts_us + 1),
             None => pts_us,
         };
-        let units = self.encoder.encode(frame, pts_us, force_keyframe)?;
+        let units = match self.encoder.encode(frame, pts_us, force_keyframe) {
+            Ok(units) => units,
+            Err(e) => {
+                self.failures = self.failures.saturating_add(1);
+                return Err(e);
+            }
+        };
+        self.failures = 0;
         self.last = Some(LastFrame {
             buffer: frame.retain(),
             pts_us,

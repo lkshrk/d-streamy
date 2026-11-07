@@ -23,8 +23,6 @@ const MAX_PATH_LEN: usize = 103;
 #[cfg(not(target_vendor = "apple"))]
 const MAX_PATH_LEN: usize = 107;
 
-#[cfg(target_vendor = "apple")]
-const RUNTIME_DIR_VAR: &str = "TMPDIR";
 #[cfg(not(target_vendor = "apple"))]
 const RUNTIME_DIR_VAR: &str = "XDG_RUNTIME_DIR";
 
@@ -46,7 +44,27 @@ pub(crate) fn own_principal() -> Principal {
 }
 
 pub(crate) fn default_location() -> Result<PathBuf, IpcError> {
-    default_location_in(std::env::var_os(RUNTIME_DIR_VAR).as_deref())
+    default_location_in(runtime_dir().as_deref())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn runtime_dir() -> Option<std::ffi::OsString> {
+    std::env::var_os(RUNTIME_DIR_VAR)
+}
+
+/// `confstr` is the same across launchd and terminal processes; `TMPDIR` need not be.
+#[cfg(target_vendor = "apple")]
+fn runtime_dir() -> Option<std::ffi::OsString> {
+    let mut buf = vec![0 as libc::c_char; libc::PATH_MAX as usize];
+    // SAFETY: the buffer is valid for its length; confstr writes at most `len` bytes, NUL-terminated.
+    let needed =
+        unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr(), buf.len()) };
+    if needed == 0 || needed > buf.len() {
+        return None;
+    }
+    // SAFETY: a non-zero return within the buffer means a NUL-terminated string was written.
+    let dir = unsafe { CStr::from_ptr(buf.as_ptr()) };
+    Some(OsStr::from_bytes(dir.to_bytes()).to_owned())
 }
 
 pub(crate) fn default_location_in(runtime_dir: Option<&OsStr>) -> Result<PathBuf, IpcError> {

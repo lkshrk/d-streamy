@@ -42,6 +42,8 @@ const RATE_RESERVED: u32 = 10;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Caps HELLO's interval so `Instant` arithmetic cannot overflow.
 const MAX_HEARTBEAT_INTERVAL_MS: u64 = 10 * 60 * 1000;
+/// A session that ends sooner after READY counts as a failed attempt, so a close loop backs off and ends.
+const HEALTHY_SESSION_MIN: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 struct Packet {
@@ -156,13 +158,14 @@ impl Runner {
                 .session
                 .as_ref()
                 .and_then(|s| s.resume_url.clone())
-                .filter(|u| u.starts_with("wss://") || !self.opts.url.starts_with("wss://"))
+                .filter(|u| resume_url_allowed(u, &self.opts.url))
                 .unwrap_or_else(|| self.opts.url.clone());
             let url = connect_url(&base, self.opts.compress);
             let opened = tokio::select! {
                 _ = self.shutdown.changed() => None,
                 socket = open(&url, &self.connector, self.opts.handshake_timeout) => Some(socket),
             };
+            let started = Instant::now();
             let end = match opened {
                 None => End::Shutdown,
                 Some(Ok(socket)) => self.session_loop(socket).await,
@@ -180,20 +183,24 @@ impl Runner {
                 End::Fatal(e) => break e,
                 End::Reconnect {
                     code,
-                    resume,
+                    resume: resumable,
                     healthy,
                 } => {
-                    if !resume {
+                    if !resumable {
                         self.session = None;
                         self.seq = None;
                     }
                     let resume = self.session.is_some();
                     self.emit(GatewayEvent::Disconnected { code, resume });
+                    let healthy = healthy && started.elapsed() >= HEALTHY_SESSION_MIN;
                     failures = if healthy { 0 } else { failures + 1 };
                     if failures >= self.opts.max_failed_attempts {
                         break GatewayError::Exhausted(failures);
                     }
-                    let delay = self.backoff(failures.max(1));
+                    let mut delay = self.backoff(failures.max(1));
+                    if !resumable {
+                        delay += self.identify_delay();
+                    }
                     info!(?code, resume, ?delay, "gateway reconnecting");
                     tokio::select! {
                         _ = self.shutdown.changed() => break GatewayError::Closed,
@@ -219,6 +226,13 @@ impl Runner {
             .saturating_mul(1 << (failures - 1).min(16));
         exp.min(self.opts.reconnect_delay_max)
             .mul_f64(rand::rng().random_range(0.5..=1.0))
+    }
+
+    /// The wait before a fresh IDENTIFY, as Discord asks after an invalid session.
+    fn identify_delay(&self) -> Duration {
+        self.opts
+            .invalid_session_delay
+            .mul_f64(rand::rng().random_range(0.2..=1.0))
     }
 
     async fn session_loop(&mut self, socket: Socket) -> End {
@@ -445,9 +459,7 @@ impl Runner {
                 } else {
                     self.session = None;
                     self.seq = None;
-                    let max = self.opts.invalid_session_delay;
-                    let delay = max.mul_f64(rand::rng().random_range(0.2..=1.0));
-                    *identify_at = Some(Instant::now() + delay);
+                    *identify_at = Some(Instant::now() + self.identify_delay());
                 }
             }
             OP_DISPATCH => {
@@ -632,4 +644,97 @@ async fn close(sink: &mut Sink, code: u16) {
     };
     // The socket is being abandoned either way; a failed close frame changes nothing.
     let _ = timeout(WRITE_TIMEOUT, sink.send(Message::Close(Some(frame)))).await;
+}
+
+/// RESUME carries the token, so a `resume_gateway_url` from READY is followed only to a Discord host over wss.
+fn resume_url_allowed(resume_url: &str, configured_url: &str) -> bool {
+    if [resume_url, configured_url].iter().any(|url| {
+        url.bytes()
+            .any(|b| b.is_ascii_control() || b == b'\\' || b == b'#')
+    }) {
+        return false;
+    }
+    let Ok(uri) = resume_url.parse::<tokio_tungstenite::tungstenite::http::Uri>() else {
+        return false;
+    };
+    let Some(authority) = uri.authority().filter(|a| !a.as_str().contains('@')) else {
+        return false;
+    };
+    #[cfg(any(test, feature = "test-hooks"))]
+    if uri.scheme_str() == Some("ws")
+        && let Ok(configured) = configured_url.parse::<tokio_tungstenite::tungstenite::http::Uri>()
+        && configured.scheme_str() == Some("ws")
+        && configured.authority() == uri.authority()
+        && (authority.host().eq_ignore_ascii_case("localhost")
+            || authority
+                .host()
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback()))
+    {
+        return true;
+    }
+    if uri.scheme_str() != Some("wss") {
+        return false;
+    }
+    if authority.as_str().contains(':')
+        && authority.as_str().rsplit_once(':').is_none_or(|(_, port)| {
+            port.is_empty()
+                || !port.bytes().all(|b| b.is_ascii_digit())
+                || port.parse::<u16>().is_err()
+        })
+    {
+        return false;
+    }
+    let host = authority.host().to_ascii_lowercase();
+    host == "discord.gg" || host.ends_with(".discord.gg")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_urls_outside_discord_fall_back_to_the_configured_gateway() {
+        let live = "wss://gateway.discord.gg";
+        for url in [
+            "wss://gateway.discord.gg",
+            "wss://gateway-us-east1-b.discord.gg/",
+            "wss://Gateway.Discord.GG:443/?v=9",
+        ] {
+            assert!(resume_url_allowed(url, live), "{url}");
+        }
+        for url in [
+            "ws://gateway.discord.gg",
+            "wss://attacker.example",
+            "wss://discord.gg.attacker.example",
+            "wss://gateway.discord.gg@attacker.example",
+            "wss://notdiscord.gg",
+            "wss://discord.gg:@attacker.example",
+            "wss://attacker.example:443@discord.gg",
+            "wss://discord.gg:bad",
+            "wss://discord.gg:65536",
+            "wss://discord.gg:",
+            "wss://discord.gg\\attacker.example",
+            "wss://discord.gg./",
+            "wss://discord.gg/\n",
+            "wss://discord.gg#fragment",
+            "",
+        ] {
+            assert!(!resume_url_allowed(url, live), "{url}");
+        }
+        assert!(resume_url_allowed("ws://127.0.0.1:5/x", "ws://127.0.0.1:5"));
+        assert!(!resume_url_allowed(
+            "wss://attacker.example",
+            "ws://127.0.0.1:5"
+        ));
+        assert!(!resume_url_allowed(
+            "ws://127.0.0.1:6/x",
+            "ws://127.0.0.1:5"
+        ));
+        assert!(!resume_url_allowed(
+            "ws://attacker.example",
+            "ws://attacker.example"
+        ));
+    }
 }

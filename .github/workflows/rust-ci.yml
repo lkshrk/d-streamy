@@ -68,6 +68,7 @@ jobs:
       - name: Trace replay tests
         run: cargo test --workspace --locked --test trace_replay
         env:
+          DSTREAMY_TRACE_REPLAY_STRICT: "1"
           DSTREAMY_BIN: ${{ github.workspace }}/rust/target/debug/dstreamy
       - name: Doc tests
         run: cargo test --workspace --locked --doc
@@ -78,43 +79,57 @@ jobs:
           DSTREAMY_CROSS_USER_TESTS: "1"
 
   rust-linux:
-    runs-on: ubuntu-24.04
+    name: rust-linux-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: x86_64
+            nextest_sha256: 223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            nextest_sha256: 81469eb963ef883fd590e60189e77d6aba3d91b418591d3391f50fe3e9480d2b
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: rust
+    env:
+      APT_CACHE: apt-rust-linux-${{ matrix.os }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
       - name: Restore apt archives
-        id: apt-restore
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/apt-archives
-          key: apt-rust-linux-ubuntu-24.04-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: apt-rust-linux-ubuntu-24.04-
+          key: ${{ env.APT_CACHE }}-${{ github.run_id }}
+          restore-keys: ${{ env.APT_CACHE }}-
       - name: Install system dependencies
         timeout-minutes: 30
         run: |
           "$GITHUB_WORKSPACE/.github/scripts/apt-install.sh" \
             clang libclang-dev libpipewire-0.3-dev libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly libopus-dev
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
       - name: Check apt archives
         id: apt-check
         if: always()
         run: |
           sudo chown -R "$USER" ~/apt-archives ~/apt-archives.manifest 2>/dev/null || true
-          if [ -f ~/apt-archives.manifest ] &&
-            ! find ~/apt-archives -type f ! -name lock ! -path '*/partial/*' -printf '%P %s\n' | sort | cmp -s - ~/apt-archives.manifest; then
+          listing="$RUNNER_TEMP/apt-listing"
+          find ~/apt-archives -type f ! -name lock ! -path '*/partial/*' -printf '%P %s\n' 2>/dev/null | sort >"$listing" || true
+          if [ -f ~/apt-archives.manifest ] && ! cmp -s "$listing" ~/apt-archives.manifest; then
             echo changed=true >>"$GITHUB_OUTPUT"
           fi
+          echo "key=$APT_CACHE-$(sha256sum <"$listing" | cut -c1-16)" >>"$GITHUB_OUTPUT"
       - name: Save apt archives
         if: always() && steps.apt-check.outputs.changed == 'true'
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/apt-archives
-          key: ${{ steps.apt-restore.outputs.cache-primary-key }}
+          key: ${{ steps.apt-check.outputs.key }}
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -123,15 +138,17 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Install cargo-nextest
+        env:
+          ARCHIVE: cargo-nextest-0.9.148-${{ matrix.arch }}-unknown-linux-gnu.tar.gz
+          SHA256: ${{ matrix.nextest_sha256 }}
         run: |
           set -euo pipefail
-          archive="cargo-nextest-0.9.148-x86_64-unknown-linux-gnu.tar.gz"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
-            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.148/$archive"
-          echo "223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc  $RUNNER_TEMP/$archive" | sha256sum -c -
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$ARCHIVE" \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.148/$ARCHIVE"
+          echo "$SHA256  $RUNNER_TEMP/$ARCHIVE" | sha256sum -c -
           rm -f "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-nextest"
           mkdir -p "$RUNNER_TEMP/bin"
-          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/bin" cargo-nextest
+          tar -xzf "$RUNNER_TEMP/$ARCHIVE" -C "$RUNNER_TEMP/bin" cargo-nextest
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           PATH="$RUNNER_TEMP/bin:$PATH" cargo nextest --version
       - name: Build mock-producer
@@ -147,6 +164,7 @@ jobs:
       - name: Trace replay tests
         run: cargo test --workspace --locked --test trace_replay
         env:
+          DSTREAMY_TRACE_REPLAY_STRICT: "1"
           DSTREAMY_BIN: ${{ github.workspace }}/rust/target/debug/dstreamy
       - name: Doc tests
         run: cargo test --workspace --locked --doc
@@ -160,18 +178,23 @@ jobs:
             exit 1
           fi
           out=$(cargo tree --locked --target all -e features,normal -i discord-stream-rs --workspace)
-          if grep -F 'feature "test-rtp-start"' <<<"$out"; then
-            echo "discord-stream-rs test-rtp-start is enabled through a normal dependency" >&2
+          if grep -E 'feature "(test-hooks|test-rtp-start)"' <<<"$out"; then
+            echo "discord-stream-rs test-only features are enabled through a normal dependency" >&2
             exit 1
           fi
           out=$(cargo tree --locked --target all -e features,normal -i dstreamy-cli --workspace)
-          if grep -F 'feature "test-hooks"' <<<"$out"; then
-            echo "dstreamy-cli test-hooks is enabled through a normal dependency" >&2
+          if grep -E 'feature "(test-hooks|test-pattern)"' <<<"$out"; then
+            echo "dstreamy-cli test-hooks or test-pattern is enabled through a normal dependency" >&2
             exit 1
           fi
           out=$(cargo tree --locked --target all -e features,normal -i dstreamy-discord --workspace)
           if grep -F 'feature "test-hooks"' <<<"$out"; then
             echo "dstreamy-discord test-hooks is enabled through a normal dependency" >&2
+            exit 1
+          fi
+          out=$(cargo tree --locked --target all -e features,normal -p dstreamy-cli -i dstreamy-media)
+          if grep -F 'feature "openh264"' <<<"$out"; then
+            echo "dstreamy-media openh264 is enabled through a normal dependency" >&2
             exit 1
           fi
       - name: Default binary links no webview
@@ -216,40 +239,43 @@ jobs:
     defaults:
       run:
         working-directory: rust
+    env:
+      APT_CACHE: apt-browser-login-linux-ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
       - name: Restore apt archives
-        id: apt-restore
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/apt-archives
-          key: apt-browser-login-linux-ubuntu-24.04-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: apt-browser-login-linux-ubuntu-24.04-
+          key: ${{ env.APT_CACHE }}-${{ github.run_id }}
+          restore-keys: ${{ env.APT_CACHE }}-
       - name: Install system dependencies
         timeout-minutes: 30
         run: |
           "$GITHUB_WORKSPACE/.github/scripts/apt-install.sh" \
             clang libclang-dev libpipewire-0.3-dev libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly libopus-dev \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
             libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev xvfb
       - name: Check apt archives
         id: apt-check
         if: always()
         run: |
           sudo chown -R "$USER" ~/apt-archives ~/apt-archives.manifest 2>/dev/null || true
-          if [ -f ~/apt-archives.manifest ] &&
-            ! find ~/apt-archives -type f ! -name lock ! -path '*/partial/*' -printf '%P %s\n' | sort | cmp -s - ~/apt-archives.manifest; then
+          listing="$RUNNER_TEMP/apt-listing"
+          find ~/apt-archives -type f ! -name lock ! -path '*/partial/*' -printf '%P %s\n' 2>/dev/null | sort >"$listing" || true
+          if [ -f ~/apt-archives.manifest ] && ! cmp -s "$listing" ~/apt-archives.manifest; then
             echo changed=true >>"$GITHUB_OUTPUT"
           fi
+          echo "key=$APT_CACHE-$(sha256sum <"$listing" | cut -c1-16)" >>"$GITHUB_OUTPUT"
       - name: Save apt archives
         if: always() && steps.apt-check.outputs.changed == 'true'
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/apt-archives
-          key: ${{ steps.apt-restore.outputs.cache-primary-key }}
+          key: ${{ steps.apt-check.outputs.key }}
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -283,38 +309,41 @@ jobs:
     defaults:
       run:
         working-directory: rust
+    env:
+      APT_CACHE: apt-service-linux-ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
       - name: Restore apt archives
-        id: apt-restore
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/apt-archives
-          key: apt-service-linux-ubuntu-24.04-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: apt-service-linux-ubuntu-24.04-
+          key: ${{ env.APT_CACHE }}-${{ github.run_id }}
+          restore-keys: ${{ env.APT_CACHE }}-
       - name: Install system dependencies
         timeout-minutes: 30
         run: |
           "$GITHUB_WORKSPACE/.github/scripts/apt-install.sh" \
             clang libclang-dev libpipewire-0.3-dev libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev libopus-dev
+            libgstreamer-plugins-base1.0-dev
       - name: Check apt archives
         id: apt-check
         if: always()
         run: |
           sudo chown -R "$USER" ~/apt-archives ~/apt-archives.manifest 2>/dev/null || true
-          if [ -f ~/apt-archives.manifest ] &&
-            ! find ~/apt-archives -type f ! -name lock ! -path '*/partial/*' -printf '%P %s\n' | sort | cmp -s - ~/apt-archives.manifest; then
+          listing="$RUNNER_TEMP/apt-listing"
+          find ~/apt-archives -type f ! -name lock ! -path '*/partial/*' -printf '%P %s\n' 2>/dev/null | sort >"$listing" || true
+          if [ -f ~/apt-archives.manifest ] && ! cmp -s "$listing" ~/apt-archives.manifest; then
             echo changed=true >>"$GITHUB_OUTPUT"
           fi
+          echo "key=$APT_CACHE-$(sha256sum <"$listing" | cut -c1-16)" >>"$GITHUB_OUTPUT"
       - name: Save apt archives
         if: always() && steps.apt-check.outputs.changed == 'true'
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/apt-archives
-          key: ${{ steps.apt-restore.outputs.cache-primary-key }}
+          key: ${{ steps.apt-check.outputs.key }}
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -330,7 +359,8 @@ jobs:
           systemctl --version | head -n1
           sudo loginctl enable-linger "$USER"
           echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
-          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export XDG_RUNTIME_DIR
           for _ in $(seq 1 60); do
             state=$(systemctl --user is-system-running 2>/dev/null || true)
             echo "user manager: ${state:-unreachable}"
@@ -347,47 +377,33 @@ jobs:
         if: failure()
         run: journalctl --user -u dstreamy.service --no-pager -n 200 || true
 
-  rust-fuzz:
+  cargo-deny:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: rust/fuzz
+    timeout-minutes: 15
     env:
-      # Pinned in docs/specs.md (cargo-fuzz row).
-      FUZZ_TOOLCHAIN: nightly-2026-07-20
-      FUZZ_CLI_VERSION: 0.13.2
-      FUZZ_CLI_SHA256: b5b704018b63e0f151c17a057ac53b5111e1db545d1b9f72fee79f08a545931c
+      DENY_VERSION: 0.20.2
+      DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - name: Install the pinned nightly
-        run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          workspaces: rust/fuzz
-          key: fuzz
-      - name: Install cargo-fuzz
+      - name: Install toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: rustup toolchain install
+      - name: Install cargo-deny
         run: |
           set -euo pipefail
-          host=$(rustc +"$FUZZ_TOOLCHAIN" -vV | sed -n 's/^host: //p')
-          case "$host" in
-            x86_64-*-linux-*) ;;
-            *) echo "cargo-fuzz is pinned to its x86_64 Linux musl build; this runner's host is ${host:-unknown}" >&2; exit 1 ;;
-          esac
-          # The release binary is musl-built and would otherwise default to its own musl target.
-          echo "FUZZ_TARGET=$host" >> "$GITHUB_ENV"
-          archive="cargo-fuzz-$FUZZ_CLI_VERSION-x86_64-unknown-linux-musl.tar.gz"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
-            "https://github.com/rust-fuzz/cargo-fuzz/releases/download/$FUZZ_CLI_VERSION/$archive"
-          echo "$FUZZ_CLI_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
-          rm -f "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-fuzz"
+          dir="cargo-deny-$DENY_VERSION-x86_64-unknown-linux-musl"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$dir.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$DENY_VERSION/$dir.tar.gz"
+          echo "$DENY_SHA256  $RUNNER_TEMP/$dir.tar.gz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/bin"
-          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/bin" cargo-fuzz
+          tar -xzf "$RUNNER_TEMP/$dir.tar.gz" -C "$RUNNER_TEMP/bin" --strip-components 1 "$dir/cargo-deny"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-          PATH="$RUNNER_TEMP/bin:$PATH" cargo +"$FUZZ_TOOLCHAIN" fuzz --version | grep -Fw "$FUZZ_CLI_VERSION"
-      - name: Fuzz control_line
-        run: cargo +"$FUZZ_TOOLCHAIN" fuzz run --target "$FUZZ_TARGET" control_line -- -max_total_time=60
-      - name: Fuzz producer_frame
-        run: cargo +"$FUZZ_TOOLCHAIN" fuzz run --target "$FUZZ_TARGET" producer_frame -- -max_total_time=60
+          PATH="$RUNNER_TEMP/bin:$PATH" cargo deny --version
+      - name: Advisories, licenses, bans and sources (main workspace)
+        working-directory: rust
+        run: cargo deny --locked check
+      - name: Advisories, licenses, bans and sources (plugin workspace)
+        working-directory: rust/crates/dstreamy-obs
+        run: cargo deny --locked --config ../../deny.toml check

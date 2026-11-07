@@ -233,6 +233,10 @@ pub fn restore(before: &[(String, u32)], touched: u32, managed_at_open: u32) {
             APPLYING.with(|a| a.set(false));
         });
     }
+    crate::hooks::observe(
+        "tracks_restored",
+        || serde_json::json!({"sources":plan.len()}),
+    );
     log::info(&format!(
         "D-Streamy put back the Discord tracks on {} audio sources",
         plan.len()
@@ -316,6 +320,12 @@ pub fn collection_loaded() {
             }
             (track, mics)
         });
+        if let Some(track) = track.filter(|_| !mics.is_empty()) {
+            crate::hooks::observe(
+                "track_adoption_refused",
+                || serde_json::json!({"track":track,"microphones":mics}),
+            );
+        }
         match (track, mics.is_empty()) {
             (Some(t), true) => log::info(&format!(
                 "D-Streamy managed Track {t} before it kept this per scene collection: this scene \

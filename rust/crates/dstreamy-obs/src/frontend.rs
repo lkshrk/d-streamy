@@ -168,6 +168,7 @@ extern "C" fn on_event(event: c_int, _private_data: *mut c_void) {
     guard("frontend event", (), || match u32::try_from(event) {
         Ok(sys::DSTREAMY_FRONTEND_EVENT_EXIT) => {
             EXITED.store(true, Ordering::Release);
+            crate::hooks::observe("frontend_exit", || serde_json::json!({}));
             log::info(
                 "OBS's frontend is exiting: D-Streamy stops before OBS stops audio and video",
             );
@@ -215,10 +216,18 @@ pub fn install() {
             return;
         }
         Err(Missing::Frontend) => {
+            crate::hooks::observe(
+                "frontend_unavailable",
+                || serde_json::json!({"reason":"frontend"}),
+            );
             log::info("no OBS frontend: Tools > D-Streamy is unavailable");
             return;
         }
         Err(Missing::Symbol(name)) => {
+            crate::hooks::observe(
+                "frontend_unavailable",
+                || serde_json::json!({"reason":"symbol","symbol":name}),
+            );
             log::warn(&format!(
                 "OBS frontend lacks {name}: Tools > D-Streamy is unavailable"
             ));
@@ -236,6 +245,7 @@ pub fn add_tools_entry() {
     if let Some(add) = frontend.add_tools_menu_item {
         // SAFETY: module load runs on the UI thread; the frontend copies the name.
         unsafe { add(TOOLS_ITEM.as_ptr(), Some(open_settings), ptr::null_mut()) };
+        crate::hooks::observe("tools_entry_added", || serde_json::json!({}));
         log::info("added Tools > D-Streamy");
         if let Some(trigger) = crate::hooks::open_dialog_trigger() {
             click_when(trigger);

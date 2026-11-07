@@ -112,12 +112,12 @@ async fn close_waits_for_the_servers_close_before_dropping_the_socket() {
     let (client, mut conn) = connect(&server, options(&server.url)).await;
     conn.dispatch(2, "SESSIONS_REPLACE", json!([])).await;
     let closing = tokio::spawn(client.close());
-    sleep(Duration::from_millis(300)).await;
+    assert_eq!(conn.close_frame().await, Some(1000));
     assert!(
         !closing.is_finished(),
-        "the client dropped the socket before the server's Close"
+        "the client finished closing before the server replied to its Close"
     );
-    assert_eq!(conn.closed().await, Some(1000));
+    conn.flush().await;
     timeout(Duration::from_secs(1), closing)
         .await
         .expect("the client missed the server's Close and waited out its timeout")
@@ -504,5 +504,30 @@ async fn unbounded_subscribers_never_lag() {
     .await
     .unwrap();
     assert_eq!(seen, 600);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn a_gateway_that_closes_right_after_ready_counts_as_a_failed_attempt() {
+    let server = Server::bind().await;
+    let mut opts = options(&server.url);
+    opts.max_failed_attempts = 2;
+    let (client, mut conn) = connect(&server, opts).await;
+    let mut events = client.subscribe();
+    conn.close(4000).await;
+    let mut conn = server.accept().await;
+    conn.hello(45_000).await;
+    conn.recv_op(6).await;
+    conn.close(4000).await;
+    let closed = wait_for(&mut events, |e| matches!(e, GatewayEvent::Closed(_))).await;
+    assert!(
+        matches!(closed, GatewayEvent::Closed(GatewayError::Exhausted(2))),
+        "{closed:?}"
+    );
+    assert!(
+        server
+            .no_connection_within(Duration::from_millis(100))
+            .await
+    );
     client.close().await;
 }

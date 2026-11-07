@@ -1,3 +1,5 @@
+//! Codec properties at proptest's default 256 cases; `PROPTEST_CASES=<n>` overrides it.
+
 use dstreamy_ipc::control::MAX_LINE;
 use dstreamy_ipc::producer::{HEADER_LEN, MAX_FRAME_LEN};
 use dstreamy_ipc::{ControlCodec, Frame, Kind, Malformed, ProducerCodec, ProducerError};
@@ -126,8 +128,6 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(8))]
-
     #[test]
     fn oversized_control_line_resyncs(extra in 1usize..(3 * MAX_LINE), chunk in 4096usize..(1 << 18)) {
         let mut bytes = vec![b'x'; MAX_LINE + extra];

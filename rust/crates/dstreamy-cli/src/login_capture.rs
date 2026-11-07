@@ -313,6 +313,7 @@ pub struct BrowserState {
     capture_expired: bool,
     validation_expired: bool,
     last_failure: Option<Failure>,
+    quiet_failure: Option<Failure>,
     finished: bool,
 }
 
@@ -331,8 +332,14 @@ impl BrowserState {
             capture_expired: false,
             validation_expired: false,
             last_failure: None,
+            quiet_failure: None,
             finished: false,
         }
+    }
+
+    /// A failed check that left the Discord page in place, before Discord reported a sign-in; taken once.
+    pub fn take_quiet_failure(&mut self) -> Option<Failure> {
+        self.quiet_failure.take()
     }
 
     pub fn view(&self) -> View {
@@ -495,10 +502,14 @@ impl BrowserState {
             Validation::Rejected => self.last_failure = Some(Failure::Rejected),
             Validation::Transient => self.last_failure = Some(Failure::Unreachable),
         }
-        self.start_next(now).or_else(|| {
+        let next = self.start_next(now);
+        if next.is_none() {
             self.settle();
-            None
-        })
+            if self.view == View::Discord && !self.signed_in {
+                self.quiet_failure = self.last_failure;
+            }
+        }
+        next
     }
 
     fn candidate(&mut self, candidate: Candidate, now: Instant) -> Option<Command> {

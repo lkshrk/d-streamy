@@ -119,6 +119,7 @@ async fn run(
                     close(&mut ws, code).await;
                     return;
                 }
+                Some(Control::VoiceJson(..) | Control::VoiceBinary(..)) => {}
                 Some(Control::Close(None) | Control::Reset) | None => return,
             },
         }
@@ -312,6 +313,9 @@ pub(crate) fn voice_state_update(shared: &Shared, state: &mut State, d: &Value) 
     shared.dispatch(state, "VOICE_STATE_UPDATE", payload);
     if let Some((guild_id, channel_id)) = state.move_during_join.take() {
         move_to_channel(shared, state, &guild_id, &channel_id);
+    }
+    for payload in std::mem::take(&mut state.others_during_join) {
+        shared.dispatch(state, "VOICE_STATE_UPDATE", payload);
     }
     if std::mem::take(&mut state.kick_during_join) {
         leave_voice(shared, state);

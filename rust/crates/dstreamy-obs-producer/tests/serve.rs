@@ -410,7 +410,9 @@ fn a_service_shutdown_detaches_the_producer() {
         end
     });
     match end {
-        End::Detached { reason, .. } => assert_eq!(reason, "shutdown"),
+        End::Detached { reason, .. } => {
+            assert_eq!(reason, dstreamy_obs_producer::DetachReason::Shutdown)
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -456,7 +458,11 @@ fn an_ingest_refusal_surfaces_as_detached() {
     );
     match end {
         End::Detached { reason, message } => {
-            assert_eq!(reason, "incompatible", "{message}");
+            assert_eq!(
+                reason,
+                dstreamy_obs_producer::DetachReason::Incompatible,
+                "{message}"
+            );
             assert!(
                 message.contains("IDR slice in a frame not flagged as a keyframe"),
                 "{message}"

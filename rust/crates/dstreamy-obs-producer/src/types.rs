@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 /// Service text shown in OBS is cut to this many characters.
 pub const MAX_SERVICE_TEXT: usize = 300;
 
+/// Log level mapped onto libobs's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
     Debug,
@@ -12,8 +13,12 @@ pub enum Level {
     Warn,
 }
 
+/// Where the libobs-free half logs to; the plugin forwards to `blog`, tests collect.
 pub trait Log {
     fn log(&self, level: Level, message: &str);
+    fn keyframe_sent(&self, _pts_us: i64, _arrived_ns: i64) {}
+    fn stop_drain_started(&self, _queued: usize) {}
+    fn stop_drain_timed_out(&self, _deadline_ms: u64) {}
 }
 
 /// What the producer declares in its `hello`.
@@ -46,16 +51,57 @@ impl Hello {
     }
 }
 
+/// The service's attachment-end reason, preserving sanitized unknown values for future versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetachReason {
+    Stopped,
+    Shutdown,
+    Incompatible,
+    Oversized,
+    Unknown(String),
+}
+
+impl DetachReason {
+    pub fn from_service(value: &str) -> Self {
+        match value {
+            "stopped" => Self::Stopped,
+            "shutdown" => Self::Shutdown,
+            "incompatible" => Self::Incompatible,
+            "oversized" => Self::Oversized,
+            other => Self::Unknown(service_text(other)),
+        }
+    }
+
+    /// Only an explicit stop or service shutdown is a clean service detach.
+    pub fn is_clean(&self) -> bool {
+        matches!(self, Self::Stopped | Self::Shutdown)
+    }
+}
+
+impl std::fmt::Display for DetachReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Stopped => "stopped",
+            Self::Shutdown => "shutdown",
+            Self::Incompatible => "incompatible",
+            Self::Oversized => "oversized",
+            Self::Unknown(reason) => reason,
+        })
+    }
+}
+
 /// Why a run ended.
 #[derive(Debug, PartialEq, Eq)]
 pub enum End<T> {
     /// The stop future fired; queued packets and an end-of-stream frame were sent if the connection allowed.
     Stopped(T),
     Detached {
-        reason: String,
+        reason: DetachReason,
         message: String,
     },
+    /// IPC ended without a service detach reason; reconnection may still be attempted.
     Closed(String),
+    /// A packet could not satisfy the producer's format or size requirements.
     Refused(String),
 }
 

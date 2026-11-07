@@ -26,7 +26,7 @@ Each `<name>.bin` is a byte stream of producer frames (`u32 BE length | u8 kind 
 | `av_stream`, `pts_extremes` | Valid streams, including negative and extreme pts. Generated. |
 | `opus_keyframe_flag_ignored` | An Opus frame with flag bit 0 set, which decodes with `keyframe: false`. Hand-built. |
 | `err_*` | One frame-level error each. |
-| `ingest_*` | One ingest rule each: no start code, IDR without the keyframe flag, keyframe without SPS, pts ≠ dts (B-frames), a 40 ms Opus packet. Generated. |
+| `ingest_*` | One ingest rule each: no start code, IDR without the keyframe flag, keyframe without SPS, pts ≠ dts (B-frames), a pts step over 10 s, a 40 ms Opus packet. Generated. |
 
 ## OBS traces
 

@@ -55,7 +55,6 @@ impl Family {
         }
     }
 
-    /// The free-form options field, whose contents can override any other key.
     fn custom_options(self) -> Option<(&'static str, &'static str)> {
         match self {
             Self::X264 => Some(("x264opts", "x264 Options (separated by space)")),
@@ -178,7 +177,7 @@ impl Problem {
                 family.keyint_label()
             ),
             Self::CustomOptions { label } => {
-                format!("D-Streamy needs the custom options empty: {STREAM_ENCODER_PATH} › {label}")
+                format!("D-Streamy cannot share custom options that override B-frames, keyframes or Annex B headers: {STREAM_ENCODER_PATH} › {label}")
             }
             Self::Size { width, height } => format!(
                 "D-Streamy needs an output size of at most 1920×1080 with even sides, not {width}×{height}: {VIDEO_PATH} › Output (Scaled) Resolution"
@@ -326,10 +325,47 @@ pub fn check_video_encoder(s: &EncoderSettings) -> Vec<Problem> {
         return vec![Problem::UnknownEncoder { id: s.id.clone() }];
     };
     let mut problems = Vec::new();
-    if let Some((key, label)) = family.custom_options()
-        && !s.string(key).trim().is_empty()
-    {
-        problems.push(Problem::CustomOptions { label });
+    if let Some((key, label)) = family.custom_options() {
+        let unsafe_options = if family == Family::X264 {
+            s.string(key).split_whitespace().any(|option| {
+                let Some((key, value)) = option.split_once('=') else {
+                    return true;
+                };
+                let Ok(value) = value.parse::<i32>() else {
+                    return true;
+                };
+                !matches!((key, value), ("scenecut", 0..=100) | ("aq-mode", 0..=3))
+            })
+        } else {
+            s.string(key)
+                .split([' ', ':', ',', ';', '\t', '\n'])
+                .any(|option| {
+                    let key = option
+                        .split('=')
+                        .next()
+                        .unwrap_or_default()
+                        .trim_start_matches('-');
+                    matches!(
+                        key.to_ascii_lowercase().as_str(),
+                        "bframes"
+                            | "b-frames"
+                            | "bf"
+                            | "keyint"
+                            | "min-keyint"
+                            | "keyint_sec"
+                            | "g"
+                            | "repeat-headers"
+                            | "repeat_headers"
+                            | "annexb"
+                            | "frameintervalp"
+                            | "goplength"
+                            | "idrperiod"
+                    )
+                })
+        };
+        if unsafe_options {
+            problems.push(Problem::CustomOptions { label });
+        }
     }
     if b_frames(family, s) != 0 {
         problems.push(Problem::BFrames { family });
@@ -385,6 +421,7 @@ pub fn mixer_index(track: i64) -> Result<usize, Problem> {
     }
 }
 
+/// Whether the start can keep the current Opus encoder or must create one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioPlan {
     Keep,
@@ -401,6 +438,7 @@ pub fn audio_plan(bound: Option<usize>, wanted: usize, active: bool) -> AudioPla
     }
 }
 
+/// Checks an audio encoder against the Opus rules of ADR 0004.
 pub fn check_audio(
     codec: &str,
     sample_rate: u32,
@@ -547,6 +585,44 @@ mod tests {
             case(json!({"preset": "ultrafast", "tune": "animation"})),
             [b()]
         );
+    }
+
+    #[test]
+    fn custom_x264_field_overrides_cannot_bypass_b_frame_prediction() {
+        let defaults =
+            json!({"preset": "veryfast", "profile": "baseline", "tune": "", "keyint_sec": 2});
+        for options in [
+            "crf=0",
+            "qp=0",
+            "profile=main",
+            "preset=slow profile=main",
+            "tune=animation profile=main",
+            "--profile=high",
+            "PROFILE=main",
+        ] {
+            let problems = check_video_encoder(&settings(
+                "obs_x264",
+                defaults.clone(),
+                json!({"x264opts": options}),
+            ));
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| matches!(p, Problem::CustomOptions { .. })),
+                "{options}: {problems:?}"
+            );
+        }
+        for options in ["scenecut=0", "aq-mode=2", "scenecut=0 aq-mode=2"] {
+            assert!(
+                check_video_encoder(&settings(
+                    "obs_x264",
+                    defaults.clone(),
+                    json!({"x264opts": options})
+                ))
+                .is_empty(),
+                "{options}"
+            );
+        }
     }
 
     #[test]
@@ -716,7 +792,18 @@ mod tests {
     }
 
     #[test]
-    fn custom_options_must_be_empty_whatever_they_say() {
+    fn harmless_custom_options_do_not_refuse_share_mode() {
+        let defaults = json!({"preset": "veryfast", "keyint_sec": 2});
+        let got = settings(
+            "obs_x264",
+            defaults,
+            json!({"bf": 0, "x264opts": "scenecut=0 aq-mode=1"}),
+        );
+        assert!(check_video_encoder(&got).is_empty());
+    }
+
+    #[test]
+    fn custom_options_that_override_stream_invariants_are_refused() {
         let defaults = json!({"preset": "veryfast", "keyint_sec": 2, "x264opts": ""});
         let problems = check_video_encoder(&settings(
             "obs_x264",

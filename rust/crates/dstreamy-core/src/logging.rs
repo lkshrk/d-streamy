@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+/// Size at which `dstreamy.log` rotates.
 pub const DEFAULT_MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+/// Rotated log files kept next to `dstreamy.log`.
 pub const DEFAULT_KEPT_LOGS: usize = 1;
 
 /// Log file capped at `max_bytes` that rotates to `<path>.1..=keep`; write errors are swallowed.

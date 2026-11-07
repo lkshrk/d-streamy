@@ -1,3 +1,4 @@
+/// Whether a capture target is a display or a window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetKind {
     Display,
@@ -15,6 +16,7 @@ pub struct CaptureTarget {
     pub height: u32,
 }
 
+/// Whether an audio device plays sound or records it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AudioSourceKind {
     /// What plays on an output device.

@@ -35,6 +35,11 @@ const AUDIO_ABANDON_FLUSH: Duration = Duration::from_secs(35);
 
 /// Every audio element's name starts with this, so errors of a branch already replaced are still recognised.
 const AUDIO_ELEMENT_PREFIX: &str = "dstreamy-audio-";
+const VIDEO_SOURCE_NAME: &str = "dstreamy-video-source";
+const VIDEO_QUEUE_NAME: &str = "dstreamy-video-queue";
+/// Told when the compositor ends the share: the window closed, "stop sharing", or a revoked permission.
+pub(crate) const SOURCE_GONE: &str =
+    "the shared window or screen went away; start again to pick a new one";
 
 pub(crate) enum VideoInput {
     PipeWire {
@@ -81,10 +86,12 @@ impl AudioInput {
 pub(crate) fn available_factories() -> Vec<&'static str> {
     [
         "vah264enc",
+        "vah264lpenc",
         "vaapih264enc",
         "nvh264enc",
         "x264enc",
         "vah265enc",
+        "vah265lpenc",
         "vaapih265enc",
         "nvh265enc",
         "x265enc",
@@ -189,10 +196,38 @@ fn audio_caps() -> gst::Caps {
         .build()
 }
 
+/// The GStreamer package that ships `factory`, by its upstream module name.
+pub(crate) fn package_of(factory: &str) -> Option<&'static str> {
+    Some(match factory {
+        "pipewiresrc" => "gst-plugin-pipewire (part of PipeWire)",
+        "pulsesrc" | "videocrop" => "gst-plugins-good",
+        "videoconvert" | "videoscale" | "videorate" | "queue" | "capsfilter" | "appsink"
+        | "audioconvert" | "audioresample" | "volume" => "gst-plugins-base",
+        "x264enc" => "gst-plugins-ugly",
+        "x265enc" | "h264parse" | "h265parse" => "gst-plugins-bad",
+        f if f.starts_with("vaapi") => "gstreamer-vaapi",
+        f if f.starts_with("va") => "gst-plugins-bad with its VA plugin (gst-plugin-va)",
+        f if f.starts_with("nv") => "gst-plugins-bad with its nvcodec plugin and the NVIDIA driver",
+        _ => return None,
+    })
+}
+
+pub(crate) fn no_encoder(codec: VideoCodec) -> MediaError {
+    let software = match codec {
+        VideoCodec::H264 => "gst-plugins-ugly (x264enc)",
+        VideoCodec::H265 => "gst-plugins-bad (x265enc)",
+    };
+    MediaError::Unsupported(format!(
+        "no GStreamer encoder for {codec:?}; install {software} for software encoding, \
+         or gst-plugins-bad with its VA plugin (Intel/AMD) or nvcodec plugin (NVIDIA) for hardware encoding"
+    ))
+}
+
 fn make(factory: &str) -> Result<gst::Element, MediaError> {
-    gst::ElementFactory::make(factory)
-        .build()
-        .map_err(|e| MediaError::Backend(format!("cannot create {factory}: {e}")))
+    gst::ElementFactory::make(factory).build().map_err(|e| {
+        let install = package_of(factory).map_or_else(String::new, |p| format!("; install {p}"));
+        MediaError::Backend(format!("cannot create {factory}: {e}{install}"))
+    })
 }
 
 fn capsfilter(caps: gst::Caps) -> Result<gst::Element, MediaError> {
@@ -227,6 +262,8 @@ fn video_source(input: &VideoInput, fps: u32) -> Result<Vec<gst::Element>, Media
             set_if_present(&src, "path", &node_id.to_string());
             set_if_present(&src, "do-timestamp", "true");
             set_if_present(&src, "keepalive-time", &(1000 / fps.max(1)).to_string());
+            // Without it the source resends the last frame forever once the compositor drops the link.
+            set_if_present(&src, "on-disconnect", "error");
             Ok(vec![src])
         }
         #[cfg(test)]
@@ -342,6 +379,8 @@ struct Output {
     tx: Mutex<Option<mpsc::Sender<MediaFrame>>>,
     stop: AtomicBool,
     video_frames: AtomicU64,
+    /// Frames the leaky queue threw away because conversion or encoding fell behind.
+    dropped_frames: AtomicU64,
     audio_buffers: AtomicU64,
     /// The audio branch generation whose stream the server moved off the chosen device, and where to.
     moved: Mutex<Option<(u64, String)>>,
@@ -354,6 +393,7 @@ impl Output {
             tx: Mutex::new(Some(tx)),
             stop: AtomicBool::new(false),
             video_frames: AtomicU64::new(0),
+            dropped_frames: AtomicU64::new(0),
             audio_buffers: AtomicU64::new(0),
             moved: Mutex::new(None),
             error: Mutex::new(None),
@@ -367,6 +407,16 @@ impl Output {
     fn close(&self) {
         self.stop.store(true, Ordering::Relaxed);
         self.tx.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+
+    /// Ends the capture with `message` as its error; nothing once it is stopped.
+    fn fail(&self, message: String) {
+        if self.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        tracing::error!("{message}");
+        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+        self.close();
     }
 
     // Polls instead of `blocking_send` so a stalled receiver cannot block pipeline shutdown.
@@ -1057,14 +1107,18 @@ impl AudioRetry {
 }
 
 /// The message for an audio source that failed at start.
-fn audio_start_error(device: Option<&str>, err: &str) -> MediaError {
+fn audio_start_message(device: Option<&str>, err: &str) -> String {
     match device {
-        Some(id) => MediaError::Backend(format!(
+        Some(id) => format!(
             "audio source {id:?} is not available ({err}); D-Streamy does not fall back to another device, \
              so pick one from `dstreamy audio-sources`"
-        )),
-        None => MediaError::Backend(format!("audio capture failed: {err}")),
+        ),
+        None => format!("audio capture failed: {err}"),
     }
+}
+
+fn audio_start_error(device: Option<&str>, err: &str) -> MediaError {
+    MediaError::Backend(audio_start_message(device, err))
 }
 
 struct Built {
@@ -1097,18 +1151,27 @@ fn build(
     let pipeline = gst::Pipeline::new();
 
     let mut chain = video_source(video, config.fps)?;
+    chain[0].set_property("name", VIDEO_SOURCE_NAME);
     let video_source = chain.last().expect("video source has elements").clone();
-    chain.push(
-        gst::ElementFactory::make("queue")
-            .property("max-size-buffers", 3u32)
-            .property("max-size-bytes", 0u32)
-            .property("max-size-time", 0u64)
-            .property_from_str("leaky", "downstream")
-            .build()
-            .map_err(|e| MediaError::Backend(format!("cannot create queue: {e}")))?,
-    );
+    let queue = gst::ElementFactory::make("queue")
+        .name(VIDEO_QUEUE_NAME)
+        .property("max-size-buffers", 3u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 0u64)
+        .property_from_str("leaky", "downstream")
+        .build()
+        .map_err(|e| MediaError::Backend(format!("cannot create queue: {e}")))?;
+    // A leaky queue drops one buffer per overrun; nothing else reports those drops.
+    queue.connect("overrun", false, {
+        let output = Arc::clone(output);
+        move |_| {
+            output.dropped_frames.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    });
+    chain.push(queue);
     chain.push(make("videorate")?);
-    chain.push(make("videoconvert")?);
+    // Cropping first keeps the conversion to the rest of the frame and works on the compositor's RGB.
     if let Some(crop) = config.crop {
         let videocrop = make("videocrop")?;
         videocrop.set_property("left", i32::try_from(crop.x).unwrap_or(i32::MAX));
@@ -1119,6 +1182,7 @@ fn build(
         chain.push(videocrop);
         chain.push(capsfilter(crop_caps(crop))?);
     }
+    chain.push(make("videoconvert")?);
     chain.push(make("videoscale")?);
     chain.push(capsfilter(scale_caps(config, spec.input_format))?);
     let encoder = make(spec.factory)?;
@@ -1174,6 +1238,12 @@ fn bus_error(err: &gst::message::Error) -> MediaError {
     MediaError::Backend(bus_error_text(err))
 }
 
+/// `pipewiresrc` with `on-disconnect=error` posts this once the compositor destroyed the stream's link.
+fn video_gone(err: &gst::message::Error) -> bool {
+    err.src().is_some_and(|s| s.name() == VIDEO_SOURCE_NAME)
+        && err.error().matches(gst::ResourceError::NotFound)
+}
+
 /// Why a candidate pipeline failed to start: only `Retry` moves on to the next encoder.
 enum StartError {
     Retry(MediaError),
@@ -1186,6 +1256,9 @@ fn classify(err: &gst::message::Error, built: &Built, crop: Option<CropRect>) ->
         && let Err(e) = check_crop_fits(crop, width, height)
     {
         return StartError::Fatal(e);
+    }
+    if video_gone(err) {
+        return StartError::Fatal(MediaError::Backend(SOURCE_GONE.to_owned()));
     }
     if let Some(audio) = built
         .audio
@@ -1249,9 +1322,14 @@ fn probe(built: &Built, output: &Output, crop: Option<CropRect>) -> Result<(), S
             gst::MessageView::Error(err) => {
                 return Err(classify(err, built, crop));
             }
-            _ => {
+            _ if started() => {
                 output.close();
                 return Ok(());
+            }
+            _ => {
+                return Err(StartError::Fatal(MediaError::Backend(
+                    "the capture ended before the first frame".to_owned(),
+                )));
             }
         }
     }
@@ -1306,10 +1384,7 @@ impl Capture {
         options: &AudioOptions,
     ) -> Result<(Self, FrameReceiver), MediaError> {
         if candidates.is_empty() {
-            return Err(MediaError::Unsupported(format!(
-                "no GStreamer encoder for {:?}",
-                config.codec
-            )));
+            return Err(no_encoder(config.codec));
         }
         let mut last_err = None;
         for spec in candidates {
@@ -1383,6 +1458,11 @@ impl Capture {
         self.encoder
     }
 
+    #[cfg(test)]
+    pub(crate) fn dropped_frames(&self) -> u64 {
+        self.output.dropped_frames.load(Ordering::Relaxed)
+    }
+
     /// The pipeline error that ended the stream, if any.
     pub(crate) fn error(&self) -> Option<String> {
         self.output
@@ -1390,6 +1470,11 @@ impl Capture {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// A handle that ends the capture from outside the pipeline, e.g. when the portal session closes.
+    pub(crate) fn ender(&self) -> Ender {
+        Ender(self.output.clone())
     }
 
     pub(crate) fn request_keyframe(&self) {
@@ -1402,24 +1487,46 @@ impl Capture {
     }
 
     /// Blocking: tears the pipeline down and closes the frame channel.
-    pub(crate) fn stop(mut self) {
-        self.shutdown();
+    pub(crate) fn stop(mut self) -> Result<(), MediaError> {
+        self.shutdown()
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> Result<(), MediaError> {
         self.output.close();
         // Joined first so a rebuild in progress cannot leave playing elements in a stopped pipeline.
         if let Some(thread) = self.bus_thread.take() {
             let _ = thread.join();
         }
-        // Ignored: a failed transition to Null still releases the elements on drop.
-        let _ = self.pipeline.set_state(gst::State::Null);
+        self.pipeline
+            .set_state(gst::State::Null)
+            .map_err(|e| MediaError::Backend(format!("stopping capture pipeline: {e}")))?;
+        let (result, state, _) = self.pipeline.state(gst::ClockTime::ZERO);
+        if result.is_err() || state != gst::State::Null {
+            return Err(MediaError::Backend(
+                "capture pipeline did not reach NULL; source loss counts remain a lower bound"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
 impl Drop for Capture {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
+    }
+}
+
+pub(crate) struct Ender(Arc<Output>);
+
+impl Ender {
+    pub(crate) fn dropped_frames(&self) -> u64 {
+        self.0.dropped_frames.load(Ordering::Relaxed)
+    }
+
+    /// Closes the frame channel with `message` as the capture's error; nothing once it is stopped.
+    pub(crate) fn fail(&self, message: &str) {
+        self.0.fail(message.to_owned());
     }
 }
 
@@ -1445,12 +1552,17 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
     let mut retry = AudioRetry::default();
     let mut lost = false;
     let mut buffers_at_attach = output.audio_buffers.load(Ordering::Relaxed);
-    let fail = |error: MediaError| {
-        tracing::error!("{error}");
-        *output.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
-        output.close();
-    };
+    let fail = |message: String| output.fail(message);
+    let (mut drops_reported, mut drops_reported_at) = (0, Instant::now());
     while !output.stop.load(Ordering::Relaxed) {
+        let dropped = output.dropped_frames.load(Ordering::Relaxed);
+        if dropped > drops_reported && drops_reported_at.elapsed() >= WARNING_LOG_INTERVAL {
+            tracing::warn!(
+                "video: {} frames dropped before encoding; the converter or encoder cannot keep up",
+                dropped - drops_reported
+            );
+            (drops_reported, drops_reported_at) = (dropped, Instant::now());
+        }
         if let Some(branch) = audio.as_mut() {
             let flowed = output.audio_buffers.load(Ordering::Relaxed) > 0;
             let moved = output
@@ -1464,7 +1576,7 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
             if let Some((_, current)) = moved {
                 let why = format!("the server put the stream on {current:?}");
                 if !flowed {
-                    fail(audio_start_error(branch.device.as_deref(), &why));
+                    fail(audio_start_message(branch.device.as_deref(), &why));
                     continue;
                 }
                 branch.lose(pipeline, &why, lost);
@@ -1483,7 +1595,7 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
                             lost = true;
                             retry.failed(Instant::now());
                         } else {
-                            fail(MediaError::Backend(format!("audio capture failed: {why}")));
+                            fail(format!("audio capture failed: {why}"));
                             continue;
                         }
                     }
@@ -1558,14 +1670,18 @@ fn watch_bus(pipeline: &gst::Pipeline, output: &Arc<Output>, mut audio: Option<A
                     continue;
                 }
                 fail(if flowed {
-                    MediaError::Backend(format!("audio capture failed: {}", bus_error_text(err)))
+                    format!("audio capture failed: {}", bus_error_text(err))
                 } else {
-                    audio_start_error(branch.device.as_deref(), &bus_error_text(err))
+                    audio_start_message(branch.device.as_deref(), &bus_error_text(err))
                 });
                 continue;
             }
-            *output.error.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(bus_error(err).to_string());
+            fail(if video_gone(err) {
+                SOURCE_GONE.to_owned()
+            } else {
+                bus_error_text(err)
+            });
+            continue;
         }
         output.close();
     }
@@ -1619,7 +1735,7 @@ mod tests {
         while let Some(frame) = rx.blocking_recv() {
             frames.push(frame);
         }
-        capture.stop();
+        capture.stop().unwrap();
         (encoder, frames)
     }
 
@@ -1705,6 +1821,19 @@ mod tests {
         assert!(set_if_present(&enc, "pass", "cbr"));
         assert!(set_if_present(&enc, "key-int-max", "60"));
         assert_eq!(enc.property::<u32>("key-int-max"), 60);
+    }
+
+    #[test]
+    fn missing_elements_and_encoders_say_what_to_install() {
+        init();
+        assert_eq!(package_of("vah264lpenc"), package_of("vah264enc"));
+        assert_ne!(package_of("vah264enc"), package_of("vaapih264enc"));
+        assert_eq!(package_of("dstreamy-missing"), None);
+        let err = make("dstreamy-missing-enc").unwrap_err().to_string();
+        assert!(!err.contains("install"), "{err}");
+        assert!(package_of("pipewiresrc").unwrap().contains("PipeWire"));
+        let err = no_encoder(VideoCodec::H264).to_string();
+        assert!(err.contains("x264enc") && err.contains("VA"), "{err}");
     }
 
     #[test]
@@ -2176,7 +2305,7 @@ mod tests {
                 .is_some()
         );
         assert_eq!(capture.error(), None);
-        capture.stop();
+        capture.stop().unwrap();
     }
 
     /// Posts an error on `pipeline`'s bus as if from an element named `name`.
@@ -2225,7 +2354,147 @@ mod tests {
         assert!(error.contains("audio capture failed: "), "{error}");
         assert!(error.contains("injected"), "{error}");
         assert!(!activity.is_lost());
-        capture.stop();
+        capture.stop().unwrap();
+    }
+
+    fn live_video_capture() -> (Capture, FrameReceiver) {
+        init();
+        let cfg = config(320, 240);
+        let input = VideoInput::Test {
+            width: 320,
+            height: 240,
+            frames: -1,
+        };
+        Capture::start(input, None, &cfg, &x264(&cfg)).unwrap()
+    }
+
+    fn wait_closed(rx: &mut FrameReceiver) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !rx.is_closed() && Instant::now() < deadline {
+            while rx.try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(rx.is_closed(), "the capture did not end");
+    }
+
+    #[test]
+    fn a_video_source_whose_link_was_destroyed_ends_the_capture_saying_the_share_went_away() {
+        let (capture, mut rx) = live_video_capture();
+        post_error_as(
+            &capture.pipeline,
+            VIDEO_SOURCE_NAME,
+            gst::ResourceError::NotFound,
+        );
+        wait_closed(&mut rx);
+        assert_eq!(capture.error().as_deref(), Some(SOURCE_GONE));
+        capture.stop().unwrap();
+    }
+
+    #[test]
+    fn other_pipeline_errors_keep_their_own_text() {
+        let (capture, mut rx) = live_video_capture();
+        post_error_as(&capture.pipeline, "enc", gst::ResourceError::NotFound);
+        wait_closed(&mut rx);
+        let error = capture.error().expect("the capture ended without an error");
+        assert!(error.contains("injected"), "{error}");
+        assert!(!error.contains(SOURCE_GONE), "{error}");
+        capture.stop().unwrap();
+    }
+
+    #[test]
+    fn an_ender_closes_the_channel_with_the_first_message_it_is_given() {
+        let (capture, mut rx) = live_video_capture();
+        let ender = capture.ender();
+        ender.fail("the portal session closed");
+        ender.fail("too late");
+        wait_closed(&mut rx);
+        assert_eq!(
+            capture.error().as_deref(),
+            Some("the portal session closed")
+        );
+        capture.stop().unwrap();
+    }
+
+    #[test]
+    fn queue_overruns_count_as_dropped_frames() {
+        let (capture, _rx) = live_video_capture();
+        assert_eq!(capture.dropped_frames(), 0);
+        let queue = capture.pipeline.by_name(VIDEO_QUEUE_NAME).unwrap();
+        queue.emit_by_name::<()>("overrun", &[]);
+        queue.emit_by_name::<()>("overrun", &[]);
+        assert_eq!(capture.dropped_frames(), 2);
+        capture.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_source_counters_include_overruns_during_shutdown_and_survive_failed_start() {
+        use dstreamy_media::CaptureSource;
+        let (mut capture, mut rx) = live_video_capture();
+        let queue = capture.pipeline.by_name(VIDEO_QUEUE_NAME).unwrap();
+        let old_bus = capture.bus_thread.take().unwrap();
+        capture.bus_thread = Some(std::thread::spawn(move || {
+            old_bus.join().unwrap();
+            queue.emit_by_name::<()>("overrun", &[]);
+            queue.emit_by_name::<()>("overrun", &[]);
+        }));
+        let ender = capture.ender();
+        let mut source = crate::source::LinuxCaptureSource::new();
+        source.retain_drops(ender);
+        let stopping = tokio::task::spawn_blocking(move || capture.stop());
+        while rx.recv().await.is_some() {}
+        stopping.await.unwrap().unwrap();
+        assert_eq!(source.dropped_frames(), 2);
+        source.stop().await.unwrap();
+        assert_eq!(source.dropped_frames(), 2);
+        let failed = source
+            .start(CaptureConfig {
+                target_id: Some("missing".into()),
+                ..CaptureConfig::default()
+            })
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(source.capture_drops().video_frames, 2);
+    }
+
+    #[test]
+    fn a_failed_null_transition_is_reported_as_incomplete_teardown() {
+        use glib::subclass::types::ObjectSubclassIsExt;
+        init();
+        let source = glib::Object::new::<BlockingSrc>();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add(&source).unwrap();
+        pipeline.set_state(gst::State::Ready).unwrap();
+        source.imp().fail_stop.store(true, Ordering::Relaxed);
+        let (tx, _rx) = mpsc::channel(1);
+        let capture = Capture {
+            pipeline: pipeline.clone(),
+            video_sink: gst_app::AppSink::builder().build(),
+            output: Output::new(tx),
+            bus_thread: None,
+            encoder: "none",
+        };
+        let error = capture.stop().unwrap_err().to_string();
+        assert!(error.contains("stopping capture pipeline"), "{error}");
+        source.imp().fail_stop.store(false, Ordering::Relaxed);
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    #[test]
+    fn a_stream_that_ends_before_its_first_frame_fails_the_start() {
+        init();
+        let cfg = config(320, 240);
+        let input = VideoInput::Test {
+            width: 320,
+            height: 240,
+            frames: 0,
+        };
+        match Capture::start(input, None, &cfg, &x264(&cfg)) {
+            Err(MediaError::Backend(msg)) => {
+                assert!(msg.contains("before the first frame"), "{msg}")
+            }
+            Err(e) => panic!("unexpected error {e}"),
+            Ok(_) => panic!("an empty stream started"),
+        }
     }
 
     #[test]
@@ -2426,7 +2695,7 @@ mod tests {
         );
         assert!(!activity.is_lost());
         assert_eq!(capture.error(), None);
-        capture.stop();
+        capture.stop().unwrap();
     }
 
     #[test]
@@ -2484,7 +2753,7 @@ mod tests {
         };
         std::thread::sleep(BUS_POLL.into());
         let stopping = Instant::now();
-        capture.stop();
+        capture.stop().unwrap();
         assert!(
             stopping.elapsed() < Duration::from_secs(1),
             "stop took {:?}",
@@ -2697,6 +2966,7 @@ mod tests {
         pub struct BlockingSrc {
             pad: gst::Pad,
             pub(super) released: (Mutex<bool>, Condvar),
+            pub(super) fail_stop: std::sync::atomic::AtomicBool,
         }
 
         impl BlockingSrc {
@@ -2731,6 +3001,7 @@ mod tests {
                 Self {
                     pad,
                     released: (Mutex::new(false), Condvar::new()),
+                    fail_stop: std::sync::atomic::AtomicBool::new(false),
                 }
             }
         }
@@ -2776,6 +3047,11 @@ mod tests {
                 &self,
                 transition: gst::StateChange,
             ) -> Result<gst::StateChangeSuccess, gst::StateChangeError> {
+                if transition == gst::StateChange::ReadyToNull
+                    && self.fail_stop.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Err(gst::StateChangeError);
+                }
                 let changed = self.parent_change_state(transition)?;
                 // As pipewiresrc: the wait comes after the parent activated the pads, so a flush reaches it.
                 if transition == gst::StateChange::ReadyToPaused {
@@ -2914,7 +3190,7 @@ mod tests {
         );
         assert!(!activity.is_lost());
         assert_eq!(capture.error(), None);
-        capture.stop();
+        capture.stop().unwrap();
         drop(back);
     }
 
@@ -3012,7 +3288,7 @@ mod tests {
             format!("{chosen}.monitor")
         );
         assert!(!activity.is_lost());
-        capture.stop();
+        capture.stop().unwrap();
         drop((a, b));
     }
 
@@ -3021,7 +3297,7 @@ mod tests {
         while let Some(frame) = rx.blocking_recv() {
             frames.push(frame);
         }
-        capture.stop();
+        capture.stop().unwrap();
         frames
     }
 
@@ -3101,7 +3377,7 @@ mod tests {
         capture.request_keyframe();
         let forced = (0..20).any(|_| next_video().keyframe);
         assert!(forced, "no keyframe within 20 frames of the request");
-        capture.stop();
+        capture.stop().unwrap();
         while rx.blocking_recv().is_some() {}
     }
 }

@@ -72,11 +72,11 @@ enum Command {
     /// List, choose or remove the saved accounts
     #[command(subcommand)]
     Account(AccountCommand),
-    /// List the account's guilds
+    /// List the account's servers (guilds)
     Guilds,
-    /// List the voice channels of a guild
+    /// List the voice channels of a server
     Channels {
-        /// Guild id, see `dstreamy guilds`
+        /// Server id, see `dstreamy guilds`
         guild: String,
     },
     /// List the windows and displays that can be captured
@@ -97,7 +97,7 @@ enum Command {
         #[arg(long, hide = true)]
         skip_platform: bool,
     },
-    /// Serve the JSON protocol of the macOS menu bar app on stdin and stdout
+    /// Run as the macOS menu bar app's backend, speaking its JSON protocol on stdin and stdout
     ///
     /// Logs go to dstreamy.log in the config directory, and to stderr with -v.
     Daemon {
@@ -110,6 +110,9 @@ enum Command {
     /// dstreamy.log in the config directory, and to stderr with -v.
     Serve {
         /// Socket path; defaults to a private per-user directory
+        ///
+        /// Its directory is created mode 0700, or must already be yours with that mode, so
+        /// a shared directory such as /tmp is refused.
         #[arg(long, value_name = "PATH")]
         endpoint: Option<PathBuf>,
         #[cfg(feature = "test-hooks")]
@@ -125,9 +128,9 @@ enum Command {
         #[arg(long, hide = true, value_name = "PATH")]
         login_program: Option<PathBuf>,
     },
-    /// Keep `dstreamy serve` running under the user's service manager
+    /// Keep `dstreamy serve` running under the user's service manager (Linux only)
     ///
-    /// Linux: a systemd user unit in ~/.config/systemd/user. A restart of the service ends
+    /// Linux: a systemd user unit in ~/.config/systemd/user. Other platforms are not supported yet. A restart of the service ends
     /// the Discord session; nothing is carried over.
     Service(service::ServiceArgs),
 }
@@ -138,7 +141,7 @@ enum AccountCommand {
     List,
     /// Make an account the default for commands without --account
     Use { name: String },
-    /// Delete an account's saved token
+    /// Remove the account and its saved token
     Remove { name: String },
 }
 
@@ -162,11 +165,23 @@ fn main() -> ExitCode {
             return ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(2));
         }
     };
-    let out = Out::new(cli.json);
+    #[cfg(all(
+        feature = "browser-login",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    if let Command::Login { browser: true, .. } = cli.command {
+        dstreamy_cli::browser_login::prepare_environment();
+    }
+    let out = if matches!(cli.command, Command::Daemon { .. }) {
+        Out::for_daemon(cli.json)
+    } else {
+        Out::new(cli.json)
+    };
     let ctx = match context(&cli) {
         Ok(ctx) => ctx,
         Err(e) => {
             out.error(e);
+            out.drain_stderr();
             return ExitCode::FAILURE;
         }
     };
@@ -180,13 +195,6 @@ fn main() -> ExitCode {
     // `stream` prints its own warning and note for these, so stderr would show them twice.
     let own_reports = matches!(cli.command, Command::Stream(_)).then_some(AUDIO_DEVICE_TARGET);
     init_logging(&out, cli.verbose, log_file, to_stderr, own_reports);
-    #[cfg(all(
-        feature = "browser-login",
-        any(target_os = "linux", target_os = "macos")
-    ))]
-    if let Command::Login { browser: true, .. } = cli.command {
-        dstreamy_cli::browser_login::prepare_environment();
-    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -194,6 +202,7 @@ fn main() -> ExitCode {
         Ok(runtime) => runtime,
         Err(e) => {
             out.error(format_args!("starting the async runtime: {e}"));
+            out.drain_stderr();
             return ExitCode::FAILURE;
         }
     };
@@ -236,13 +245,17 @@ fn main() -> ExitCode {
     let result = runtime.block_on(run(cli.command, credentials, &ctx, &out));
     // Background tasks (webrtc, the gateway) must not keep the process alive after the command.
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
-    match result {
+    let code = match result {
         Ok(code) => code,
         Err(e) => {
             out.error(e);
             ExitCode::FAILURE
         }
+    };
+    if code != ExitCode::from(dstreamy_cli::stream::FORCED_EXIT) {
+        out.drain_stderr();
     }
+    code
 }
 
 fn init_logging(
@@ -316,11 +329,11 @@ fn context(cli: &Cli) -> Result<Ctx, CliError> {
         Some(dir) => ConfigPaths::in_dir(dir),
         None => ConfigPaths::discover()?,
     };
-    Ok(Ctx {
+    Ok(Ctx::new(
         paths,
-        gateway_url: cli.gateway_url.clone(),
-        account: cli.account.clone(),
-    })
+        cli.gateway_url.clone(),
+        cli.account.clone(),
+    ))
 }
 
 async fn run(
@@ -529,6 +542,7 @@ async fn login(ctx: &Ctx, out: &Out, credentials: Credentials) -> Result<ExitCod
     };
     let accounts = ctx.paths.accounts();
     let account_user = accounts::account_user(&user);
+    let store = accounts::store_lock(ctx)?;
     let name = match &ctx.account {
         Some(name) => name.clone(),
         None => accounts.name_for(&account_user)?,
@@ -540,7 +554,6 @@ async fn login(ctx: &Ctx, out: &Out, credentials: Credentials) -> Result<ExitCod
             owner: owner.username,
         });
     }
-    let store = accounts::store_lock(ctx)?;
     accounts.save(&name, &token, Some(&account_user))?;
     drop(store);
     let default = accounts.default_name()?.as_deref() == Some(name.as_str());
@@ -575,6 +588,8 @@ struct AccountRow {
     global_name: Option<String>,
     default: bool,
     has_token: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_error: Option<String>,
 }
 
 fn account(ctx: &Ctx, out: &Out, command: AccountCommand) -> Result<ExitCode, CliError> {
@@ -590,6 +605,7 @@ fn account(ctx: &Ctx, out: &Out, command: AccountCommand) -> Result<ExitCode, Cl
                     username: a.user.as_ref().map(|u| u.username.clone()),
                     global_name: a.user.and_then(|u| u.global_name),
                     has_token: a.has_token,
+                    token_error: a.token_error,
                     name: a.name,
                 })
                 .collect();
@@ -607,8 +623,12 @@ fn account(ctx: &Ctx, out: &Out, command: AccountCommand) -> Result<ExitCode, Cl
                             (Some(u), None) => u.clone(),
                             (None, _) => "-".to_owned(),
                         };
-                        let token = if a.has_token { "" } else { "no token" };
-                        vec![mark.to_owned(), a.name.clone(), user, token.to_owned()]
+                        let token = match (&a.has_token, &a.token_error) {
+                            (true, _) => String::new(),
+                            (false, Some(e)) => e.clone(),
+                            (false, None) => "no token".to_owned(),
+                        };
+                        vec![mark.to_owned(), a.name.clone(), user, token]
                     })
                     .collect();
                 out.raw(&table(&cells));

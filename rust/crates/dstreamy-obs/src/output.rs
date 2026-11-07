@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use dstreamy_obs_producer::{Hello, Packet, Ring, Track};
+use dstreamy_obs_producer::{Hello, Oversized, Packet, Ring, Track};
 use dstreamy_obs_sys as sys;
 use tokio::sync::mpsc;
 
@@ -52,8 +52,14 @@ impl Shared {
     }
 
     pub fn send(&self, command: Command) {
-        if self.commands.send(command).is_err() {
+        if let Err(error) = self.commands.send(command) {
             log::warn("the D-Streamy worker thread is gone");
+            if matches!(error.0, Command::Stop | Command::StopFailed(_)) {
+                // SAFETY: stop owns a live output; libobs resets stopping_event before calling it (obs-output.c:482).
+                unsafe {
+                    sys::obs_output_signal_stop(self.output.0, sys::OBS_OUTPUT_SUCCESS as c_int)
+                };
+            }
         }
     }
 
@@ -87,12 +93,14 @@ impl Output {
     }
 
     /// The only work done on the encoder thread: one copy into the ring.
-    fn enqueue(&self, packet: &sys::encoder_packet) {
-        let data = if packet.data.is_null() || packet.size == 0 {
-            Vec::new()
-        } else {
-            // SAFETY: libobs hands a packet whose `data` holds `size` bytes for the duration of the call.
-            unsafe { std::slice::from_raw_parts(packet.data, packet.size) }.to_vec()
+    unsafe fn enqueue(&self, packet: &sys::encoder_packet) {
+        // SAFETY: the callback keeps the encoder packet bytes live for this call.
+        let data = match unsafe { packet_data(packet) } {
+            Ok(data) => data,
+            Err(oversized) => {
+                self.shared.ring.refuse(oversized);
+                return;
+            }
         };
         let track = if packet.type_ == sys::OBS_ENCODER_VIDEO {
             Track::Video
@@ -109,6 +117,24 @@ impl Output {
             arrived: Instant::now(),
         });
     }
+}
+
+unsafe fn packet_data(packet: &sys::encoder_packet) -> Result<Vec<u8>, Oversized> {
+    if packet.size > dstreamy_obs_producer::ring::MAX_PACKET {
+        return Err(Oversized {
+            track: if packet.type_ == sys::OBS_ENCODER_VIDEO {
+                Track::Video
+            } else {
+                Track::Audio
+            },
+            len: packet.size,
+        });
+    }
+    if packet.data.is_null() || packet.size == 0 {
+        return Ok(Vec::new());
+    }
+    // SAFETY: libobs holds size bytes for this callback; the size was checked before creating the slice.
+    Ok(unsafe { std::slice::from_raw_parts(packet.data, packet.size) }.to_vec())
 }
 
 /// # Safety
@@ -260,8 +286,10 @@ extern "C" fn output_destroy(data: *mut c_void) {
 }
 
 extern "C" fn output_start(data: *mut c_void) -> bool {
-    // SAFETY: libobs passes the pointer create returned.
-    let state = unsafe { state(data) };
+    // SAFETY: libobs passes NULL or the live pointer create returned.
+    let Some(state) = (unsafe { state_or_null(data) }) else {
+        return false;
+    };
     let output = state.shared.output;
     guard_with(
         "start",
@@ -297,9 +325,18 @@ fn start(state: &Output) -> bool {
     }
     // SAFETY: `output` is the live output being started; the encoders it returns are owned by it.
     let encoders = unsafe {
-        if !sys::obs_output_can_begin_data_capture(output.0, 0)
-            || !sys::obs_output_initialize_encoders(output.0, 0)
-        {
+        if !sys::obs_output_can_begin_data_capture(output.0, 0) {
+            set_last_error(
+                output,
+                "OBS refused to begin D-Streamy's data capture; wait for the previous output to stop, then try again",
+            );
+            return false;
+        }
+        if !sys::obs_output_initialize_encoders(output.0, 0) {
+            set_last_error(
+                output,
+                "OBS could not initialize D-Streamy's encoders; check the encoder settings and the OBS log",
+            );
             return false;
         }
         let venc = sys::obs_output_get_video_encoder(output.0);
@@ -341,8 +378,10 @@ fn start(state: &Output) -> bool {
 }
 
 extern "C" fn output_stop(data: *mut c_void, _ts: u64) {
-    // SAFETY: libobs passes the pointer create returned.
-    let state = unsafe { state(data) };
+    // SAFETY: libobs passes NULL or the live pointer create returned.
+    let Some(state) = (unsafe { state_or_null(data) }) else {
+        return;
+    };
     guard_with(
         "stop",
         (),
@@ -359,8 +398,10 @@ extern "C" fn output_stop(data: *mut c_void, _ts: u64) {
 }
 
 extern "C" fn output_encoded_packet(data: *mut c_void, packet: *mut sys::encoder_packet) {
-    // SAFETY: libobs passes the pointer create returned.
-    let state = unsafe { state(data) };
+    // SAFETY: libobs passes NULL or the live pointer create returned.
+    let Some(state) = (unsafe { state_or_null(data) }) else {
+        return;
+    };
     guard_with(
         "encoded_packet",
         (),
@@ -369,7 +410,11 @@ extern "C" fn output_encoded_packet(data: *mut c_void, packet: *mut sys::encoder
             match unsafe { packet.as_ref() } {
                 Some(packet) => {
                     state.count(packet);
-                    state.enqueue(packet);
+                    if state.hooks.output_error() {
+                        state.shared.fail("test output failure");
+                    }
+                    // SAFETY: libobs owns the packet bytes for this callback.
+                    unsafe { state.enqueue(packet) };
                 }
                 // Never signal here: this thread can hold video input_mutex. The worker reports it.
                 None => {
@@ -457,6 +502,30 @@ pub fn register() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callbacks_after_a_failed_create_accept_null_data() {
+        assert!(!output_start(ptr::null_mut()));
+        output_stop(ptr::null_mut(), 0);
+        output_encoded_packet(ptr::null_mut(), ptr::null_mut());
+    }
+
+    #[test]
+    fn oversized_encoder_data_is_refused_before_dereferencing_it() {
+        let packet = sys::encoder_packet {
+            type_: sys::OBS_ENCODER_VIDEO,
+            data: std::ptr::dangling_mut(),
+            size: dstreamy_obs_producer::ring::MAX_PACKET + 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            unsafe { packet_data(&packet) },
+            Err(Oversized {
+                track: Track::Video,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn counters_of_an_output_whose_create_failed_are_zero() {

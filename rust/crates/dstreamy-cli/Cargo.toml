@@ -25,7 +25,7 @@ getrandom = { version = "0.3", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "registry"] }
 url = "2"
-webrtc = "0.14"
+webrtc = "=0.14.0"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 tao = { version = "0.37", optional = true }
@@ -58,7 +58,9 @@ libc = "0.2"
 [features]
 # Pulls in a system webview (WebKitGTK on Linux), so default builds leave it out.
 browser-login = ["dep:tao", "dep:wry", "dep:muda", "dep:webkit2gtk", "dep:gtk", "dep:getrandom"]
-test-hooks = ["dstreamy-discord/test-rtp-start"]
+# Streams the diagnostic test pattern with a source-built OpenH264 (ADR 0010).
+test-pattern = ["dstreamy-media/openh264"]
+test-hooks = ["test-pattern", "dstreamy-discord/test-rtp-start", "dstreamy-discord/test-hooks"]
 
 [lints]
 workspace = true

@@ -1,16 +1,16 @@
 //! The command engine behind `dstreamy daemon` and `dstreamy serve`: one Discord connection, at most one stream.
 
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use dstreamy_core::{
     Codec, ConfigError, CropRect, Fps, HealthLevel, IdleSetting, Resolution, ServeConfig,
-    StreamConfig, StreamMetrics, TOKEN_ENV, TokenSource,
+    StreamConfig, StreamMetrics, TOKEN_ENV, TokenSource, lock,
 };
 use dstreamy_discord::{
-    DiscordClient, GatewayError, HealthSnapshot, Session, SessionError, SessionEvent, SessionState,
-    StreamStats,
+    DiscordClient, E2ee, GatewayError, HealthSnapshot, Session, SessionError, SessionEvent,
+    SessionState, StreamStats,
 };
 use dstreamy_media::{
     CaptureConfig, CaptureSource, EXTERNAL_TARGET_ID, ExternalHandle, ExternalOptions,
@@ -38,7 +38,7 @@ const FORWARDER_DRAIN: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
     pub include_platform: bool,
-    /// Capacity of the `events()` broadcast; lossless subscribers are unbounded.
+    /// Capacity of event subscriptions; lossless subscribers disconnect on overflow.
     pub event_capacity: usize,
     /// Accepts `start` with target `external`; protocol 1 never does.
     pub allow_external: bool,
@@ -66,6 +66,8 @@ pub enum EngineEvent {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LiveHealth {
     pub reconnecting: bool,
+    pub e2ee: E2ee,
+    pub dave_protocol_version: Option<u16>,
     /// Times the session went reconnecting.
     pub reconnect_episodes: u64,
     /// Voice or stream connection resumes, which need no reconnect.
@@ -76,6 +78,8 @@ pub struct LiveHealth {
     pub video_level: Option<HealthLevel>,
     /// Video frames dropped on the way to Discord.
     pub dropped_video: u64,
+    pub source_dropped_video: u64,
+    pub source_dropped_audio: u64,
     /// Intervals in which fewer than [`AUDIO_DROPOUT_BELOW`] Opus frames reached Discord.
     pub audio_dropouts: u64,
 }
@@ -91,13 +95,15 @@ impl LiveHealth {
     /// `current` is `None` before the stream starts or after it stops.
     fn on_state(current: Option<Self>, state: &SessionState) -> Option<Self> {
         match state {
-            SessionState::Connecting => Some(Self::default()),
+            SessionState::Connecting => None,
             SessionState::Streaming => Some(Self {
                 reconnecting: false,
                 ..current.unwrap_or_default()
             }),
             SessionState::Reconnecting { .. } => current.map(|h| Self {
                 reconnecting: true,
+                e2ee: E2ee::Unknown,
+                dave_protocol_version: None,
                 reconnect_episodes: h.reconnect_episodes + u64::from(!h.reconnecting),
                 ..h
             }),
@@ -105,16 +111,26 @@ impl LiveHealth {
         }
     }
 
-    fn on_health(current: Option<Self>, snapshot: &HealthSnapshot) -> Option<Self> {
+    /// `source_interrupted` is true when the source produced nothing for part of the interval, which is not a dropout.
+    fn on_health(
+        current: Option<Self>,
+        snapshot: &HealthSnapshot,
+        source_interrupted: bool,
+    ) -> Option<Self> {
         let current = current.unwrap_or_default();
-        let dropout = snapshot.metrics.a_sent < AUDIO_DROPOUT_BELOW;
+        let dropout = !source_interrupted && snapshot.metrics.a_sent < AUDIO_DROPOUT_BELOW;
         Some(Self {
             audio_dropouts: current.audio_dropouts + u64::from(dropout),
             resumes: snapshot.stats.resumes,
+            e2ee: snapshot.stats.e2ee,
+            dave_protocol_version: (snapshot.stats.e2ee != E2ee::Unknown)
+                .then_some(snapshot.stats.dave_protocol_version),
             metrics: Some(snapshot.metrics),
             audio_level: Some(snapshot.health.audio_level),
             video_level: Some(snapshot.health.video_level),
             dropped_video: snapshot.stats.video_frames_dropped,
+            source_dropped_video: snapshot.stats.source_video_frames_dropped,
+            source_dropped_audio: snapshot.stats.source_audio_frames_dropped,
             ..current
         })
     }
@@ -192,6 +208,7 @@ impl From<&SourceState> for SourceView {
                 reason: Some(match reason {
                     InterruptReason::Detached => "detached",
                     InterruptReason::Stalled => "stalled",
+                    InterruptReason::VideoStalled => "video_stalled",
                 }),
                 for_ms: Some(u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)),
                 ..view("interrupted")
@@ -264,7 +281,10 @@ impl From<CliError> for Failure {
             | CliError::AccountOfAnotherUser { .. }
             | CliError::UnknownAudioSource(_) => "invalid_params",
             CliError::NotLoggedIn => {
-                return Self::new("not_logged_in", "not logged in; send set_token first");
+                return Self::new(
+                    "not_logged_in",
+                    "not logged in: use Log in, or run `dstreamy login`",
+                );
             }
             CliError::Gateway(GatewayError::Rejected(AUTH_FAILED)) => {
                 return Self::new("invalid_token", "Discord rejected the token");
@@ -345,6 +365,7 @@ pub struct StartParams {
     pub audio_source: Option<String>,
     /// Replaces `[serve] grace_secs` for this external session only.
     pub grace_secs: Option<u64>,
+    pub require_e2ee: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -415,36 +436,43 @@ impl Running {
     }
 }
 
+#[derive(Default)]
+struct StatsCache {
+    stats: Option<StreamStats>,
+    terminal_consumed: bool,
+}
+
 pub struct Engine {
     me: Weak<Engine>,
     ctx: Ctx,
     opts: Options,
     events: broadcast::Sender<EngineEvent>,
-    lossless: Mutex<Vec<mpsc::UnboundedSender<EngineEvent>>>,
+    lossless: Mutex<Vec<mpsc::Sender<EngineEvent>>>,
     conn: Mutex<Option<Arc<Conn>>>,
     /// Held while the connection is created, replaced or torn down, and while a stream starts.
-    lifecycle: tokio::sync::Mutex<()>,
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
     updating: tokio::sync::Mutex<()>,
-    last_stats: Mutex<Option<StreamStats>>,
+    last_stats: Mutex<StatsCache>,
     viewers: watch::Sender<Option<u32>>,
     health: watch::Sender<Option<LiveHealth>>,
     running: Mutex<Option<Running>>,
     /// Set before the session starts, so a session that stops at once never leaves it behind.
     place: Mutex<Option<Placed>>,
     conn_seq: std::sync::atomic::AtomicU64,
+    published_session_events: AtomicU64,
     /// The token changed while a session streamed; its connection is replaced once the session is over.
     stale_token: std::sync::atomic::AtomicBool,
     /// The account chosen for the next connection; `None` follows the default account.
     account: Mutex<Option<String>>,
     started_by: Mutex<Option<u64>>,
     external: Mutex<Option<External>>,
-    portal: Mutex<Option<PortalBook>>,
+    portal: Arc<Mutex<Option<PortalBook>>>,
     session_lock: Mutex<Hold>,
     #[cfg(test)]
     start_gate: tokio::sync::Mutex<()>,
     #[cfg(test)]
     stop_gate: tokio::sync::Mutex<()>,
-    /// Holding it parks every forwarder before it handles its next event, as a forwarder far behind would be.
+    /// Holding it parks forwarders at event handling and publication.
     #[cfg(test)]
     forward_gate: tokio::sync::Mutex<()>,
     #[cfg(test)]
@@ -476,10 +504,33 @@ impl Hold {
 pub type VideoSize = (u32, u32, u32);
 
 struct External {
+    engine: Weak<Engine>,
     handle: ExternalHandle,
     announced: watch::Receiver<VideoSize>,
     watcher: JoinHandle<()>,
     announcer: JoinHandle<()>,
+    /// Held by the watcher around each publish, so the final `Detached` follows one in flight.
+    publishing: Arc<Mutex<()>>,
+    /// Source-wide interruptions taint the audio interval until its next health sample.
+    interrupted: Arc<AtomicBool>,
+}
+
+impl External {
+    fn take_interrupted(&self) -> bool {
+        let now = audio_interrupted(*self.handle.state().borrow());
+        self.interrupted.swap(false, Ordering::AcqRel) || now
+    }
+}
+
+fn audio_interrupted(state: SourceState) -> bool {
+    matches!(
+        state,
+        SourceState::Detached
+            | SourceState::Interrupted {
+                reason: InterruptReason::Detached | InterruptReason::Stalled,
+                ..
+            }
+    )
 }
 
 impl Drop for External {
@@ -488,11 +539,19 @@ impl Drop for External {
         self.announcer.abort();
         // A stopped session keeps its source for a restart; no producer may feed it meanwhile.
         self.handle.end();
+        if let Some(engine) = self.engine.upgrade() {
+            let _after_watcher = lock(&self.publishing);
+            engine.publish(EngineEvent::Source(SourceState::Detached));
+        }
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
+async fn disk<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, CliError> + Send + 'static,
+) -> Result<T, CliError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| CliError::Session(format!("account/config disk operation failed: {e}")))?
 }
 
 impl Engine {
@@ -504,19 +563,20 @@ impl Engine {
             events: broadcast::channel(opts.event_capacity).0,
             lossless: Mutex::new(Vec::new()),
             conn: Mutex::new(None),
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             updating: tokio::sync::Mutex::new(()),
-            last_stats: Mutex::new(None),
+            last_stats: Mutex::new(StatsCache::default()),
             viewers: watch::Sender::new(None),
             health: watch::Sender::new(None),
             running: Mutex::new(None),
             place: Mutex::new(None),
             conn_seq: std::sync::atomic::AtomicU64::new(0),
+            published_session_events: AtomicU64::new(0),
             stale_token: std::sync::atomic::AtomicBool::new(false),
             account: Mutex::new(ctx.account.clone()),
             started_by: Mutex::new(None),
             external: Mutex::new(None),
-            portal: Mutex::new(None),
+            portal: Arc::new(Mutex::new(None)),
             session_lock: Mutex::new(Hold::default()),
             #[cfg(test)]
             start_gate: tokio::sync::Mutex::new(()),
@@ -540,9 +600,9 @@ impl Engine {
         self.events.subscribe()
     }
 
-    /// Every event in order; closes once the engine and its event forwarder are gone.
-    pub fn subscribe_lossless(&self) -> mpsc::UnboundedReceiver<EngineEvent> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    /// Every event in order; disconnects on overflow so callers must reconnect or shut down.
+    pub fn subscribe_lossless(&self) -> mpsc::Receiver<EngineEvent> {
+        let (tx, rx) = mpsc::channel(self.opts.event_capacity);
         lock(&self.lossless).push(tx);
         rx
     }
@@ -561,7 +621,8 @@ impl Engine {
             })),
             Command::SetToken { token } => self.set_token(token).await,
             Command::LoggedIn => {
-                let logged_in = match crate::accounts::resolve(&self.selected_ctx()) {
+                let ctx = self.selected_ctx();
+                let logged_in = match disk(move || crate::accounts::resolve(&ctx)).await {
                     Ok(_) => true,
                     Err(
                         CliError::NotLoggedIn
@@ -601,7 +662,24 @@ impl Engine {
         }
     }
 
-    pub fn status(&self) -> Status {
+    pub async fn status(&self) -> Status {
+        let account = self.active_account().await;
+        let account = match account {
+            Some(name) => {
+                let ctx = self.ctx.clone();
+                disk(move || {
+                    let user = ctx.paths.accounts().user(&name);
+                    Ok(AccountView {
+                        name,
+                        username: user.as_ref().map(|u| u.username.clone()),
+                        global_name: user.and_then(|u| u.global_name),
+                    })
+                })
+                .await
+                .ok()
+            }
+            None => None,
+        };
         let session = self.current().map(|c| {
             let state = c.session.state().borrow().clone();
             let place = lock(&self.place)
@@ -618,41 +696,31 @@ impl Engine {
             started_by: session.as_ref().and(*lock(&self.started_by)),
             session,
             source,
-            stats: lock(&self.last_stats).clone(),
-            account: self.active_account().map(|name| self.account_view(name)),
+            stats: lock(&self.last_stats).stats.clone(),
+            account,
         }
     }
 
     /// The context with the account the next connection uses.
     fn selected_ctx(&self) -> Ctx {
-        Ctx {
-            account: lock(&self.account).clone(),
-            ..self.ctx.clone()
-        }
+        self.ctx.with_account(lock(&self.account).clone())
     }
 
-    fn selected_source(&self) -> Option<TokenSource> {
-        crate::accounts::resolve(&self.selected_ctx())
+    async fn selected_source(&self) -> Option<TokenSource> {
+        let ctx = self.selected_ctx();
+        disk(move || crate::accounts::resolve(&ctx))
+            .await
             .ok()
             .map(|r| r.source)
     }
 
     /// The live session's account, else the account the next connection uses.
-    pub fn active_account(&self) -> Option<String> {
+    pub async fn active_account(&self) -> Option<String> {
         let source = match self.current().filter(|c| c.live()) {
             Some(conn) => Some(conn.source.clone()),
-            None => self.selected_source(),
+            None => self.selected_source().await,
         };
         source.and_then(|s| s.account().map(str::to_owned))
-    }
-
-    fn account_view(&self, name: String) -> AccountView {
-        let user = self.ctx.paths.accounts().user(&name);
-        AccountView {
-            name,
-            username: user.as_ref().map(|u| u.username.clone()),
-            global_name: user.and_then(|u| u.global_name),
-        }
     }
 
     /// Whether the token comes from `DSTREAMY_TOKEN`, which leaves no accounts to manage.
@@ -665,7 +733,7 @@ impl Engine {
             return Err(Failure::new(
                 "accounts_unavailable",
                 format!(
-                    "the service takes its token from {TOKEN_ENV}, so it has no accounts: unset it for the service and restart it"
+                    "`dstreamy serve` takes its token from {TOKEN_ENV}, so it has no accounts: unset it where serve starts, then restart serve"
                 ),
             ));
         }
@@ -673,20 +741,25 @@ impl Engine {
     }
 
     /// The saved accounts and the active one.
-    pub fn accounts(&self) -> Result<Value, Failure> {
+    pub async fn accounts(&self) -> Result<Value, Failure> {
         Self::accounts_available()?;
-        let active = self.active_account();
-        let list = self.ctx.paths.accounts().list().map_err(CliError::from)?;
+        let active = self.active_account().await;
+        let ctx = self.ctx.clone();
+        let list = disk(move || ctx.paths.accounts().list().map_err(CliError::from)).await?;
         let rows: Vec<Value> = list
             .into_iter()
             .map(|a| {
-                json!({
+                let mut row = json!({
                     "active": active.as_deref() == Some(a.name.as_str()),
                     "username": a.user.as_ref().map(|u| &u.username),
                     "global_name": a.user.as_ref().and_then(|u| u.global_name.as_ref()),
                     "has_token": a.has_token,
                     "name": a.name,
-                })
+                });
+                if let Some(error) = a.token_error {
+                    row["token_error"] = Value::String(error);
+                }
+                row
             })
             .collect();
         Ok(json!({ "active": active, "accounts": rows }))
@@ -694,36 +767,49 @@ impl Engine {
 
     /// Makes `name` the default account and the next connection's; refused while a session is live.
     pub async fn select_account(&self, name: &str) -> Result<Value, Failure> {
+        let name = name.to_owned();
+        let engine = self.me.upgrade().expect("engine owner");
+        // Once admitted, cancellation cannot release lifecycle before the disk commit and connection update.
+        let lifecycle = self.lifecycle.clone().lock_owned().await;
+        tokio::spawn(async move { engine.select_account_owned(&name, lifecycle).await })
+            .await
+            .map_err(|e| Failure::new("internal", format!("account transaction failed: {e}")))?
+    }
+
+    async fn select_account_owned(
+        &self,
+        name: &str,
+        _lifecycle: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<Value, Failure> {
         Self::accounts_available()?;
-        let _lifecycle = self.lifecycle.lock().await;
-        self.ctx
-            .paths
-            .accounts()
-            .require(name)
-            .map_err(CliError::from)?;
         if self.is_live() {
             return Err(Failure::new(
                 "streaming",
                 "stop the stream before switching accounts",
             ));
         }
-        let has_token = self
-            .ctx
-            .paths
-            .accounts()
-            .load_token(name)
-            .ok()
-            .flatten()
-            .is_some();
+        let ctx = self.ctx.clone();
+        let selected = name.to_owned();
+        let has_token = disk(move || {
+            let accounts = ctx.paths.accounts();
+            let _store = crate::accounts::store_lock(&ctx)?;
+            accounts.require(&selected)?;
+            if accounts.load_token(&selected)?.is_none() {
+                return Ok(false);
+            }
+            accounts.set_default(&selected)?;
+            Ok(true)
+        })
+        .await?;
         if !has_token {
             return Err(Failure::new(
                 "not_logged_in",
                 format!(
-                    "account {name} has no saved login: log in to {name} first (`dstreamy login --account {name}`), or log it out"
+                    "account {name} has no saved login: log in to {name} first (`dstreamy login --account {name}`), or remove it"
                 ),
             ));
         }
-        self.make_default(name)?;
+        *lock(&self.account) = self.ctx.account.is_some().then(|| name.to_owned());
         if self
             .current()
             .is_some_and(|c| c.source.account() != Some(name))
@@ -731,26 +817,40 @@ impl Engine {
             self.disconnect_locked().await;
         }
         drop(_lifecycle);
-        self.accounts()
+        self.accounts().await
     }
 
     /// Saves `name` as the default; serve then follows it, unless it was started with `--account`.
-    fn make_default(&self, name: &str) -> Result<(), Failure> {
-        self.ctx
-            .paths
-            .accounts()
-            .set_default_locked(name, crate::accounts::STORE_LOCK_WAIT)
-            .map_err(CliError::from)?;
+    async fn make_default(&self, name: &str) -> Result<(), Failure> {
+        let ctx = self.ctx.clone();
+        let selected = name.to_owned();
+        disk(move || {
+            ctx.paths
+                .accounts()
+                .set_default_locked(&selected, crate::accounts::STORE_LOCK_WAIT)
+                .map_err(CliError::from)
+        })
+        .await?;
         *lock(&self.account) = self.ctx.account.is_some().then(|| name.to_owned());
         Ok(())
     }
 
     /// Deletes a saved account; refused while it streams here or in another process.
     pub async fn logout_account(&self, name: &str) -> Result<Value, Failure> {
+        let name = name.to_owned();
+        let engine = self.me.upgrade().expect("engine owner");
+        let lifecycle = self.lifecycle.clone().lock_owned().await;
+        tokio::spawn(async move { engine.logout_account_owned(&name, lifecycle).await })
+            .await
+            .map_err(|e| Failure::new("internal", format!("account transaction failed: {e}")))?
+    }
+
+    async fn logout_account_owned(
+        &self,
+        name: &str,
+        _lifecycle: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<Value, Failure> {
         Self::accounts_available()?;
-        let _lifecycle = self.lifecycle.lock().await;
-        let accounts = self.ctx.paths.accounts();
-        accounts.require(name).map_err(CliError::from)?;
         let source = TokenSource::Account(name.to_owned());
         let conn = self.current();
         if conn
@@ -762,11 +862,17 @@ impl Engine {
                 "stop the stream before logging this account out",
             ));
         }
-        let store = crate::accounts::store_lock(&self.ctx)?;
-        let held = crate::accounts::removal_lock(&self.ctx, name).map_err(CliError::from)?;
-        accounts.remove(name).map_err(CliError::from)?;
-        drop(store);
-        drop(held);
+        let ctx = self.ctx.clone();
+        let removed = name.to_owned();
+        disk(move || {
+            let accounts = ctx.paths.accounts();
+            let _store = crate::accounts::store_lock(&ctx)?;
+            accounts.require(&removed)?;
+            let _held = crate::accounts::removal_lock(&ctx, &removed)?;
+            accounts.remove(&removed)?;
+            Ok(())
+        })
+        .await?;
         {
             let mut selected = lock(&self.account);
             if selected.as_deref() == Some(name) {
@@ -778,18 +884,29 @@ impl Engine {
         }
         drop(_lifecycle);
         tracing::info!("logged out account {name}");
-        self.accounts()
+        self.accounts().await
     }
 
     /// A login saved into `account` makes it the default; an older connection goes once idle.
     pub async fn logged_in_as(&self, account: Option<String>) {
-        if let Some(name) = account
-            && let Err(e) = self.make_default(&name)
-        {
-            tracing::warn!("making account {name} the default: {}", e.message);
-            *lock(&self.account) = Some(name);
-        }
-        self.token_changed().await;
+        let engine = self.me.upgrade().expect("engine owner");
+        let lifecycle = self.lifecycle.clone().lock_owned().await;
+        let _ = tokio::spawn(async move {
+            let _lifecycle = lifecycle;
+            if let Some(name) = account
+                && let Err(e) = engine.make_default(&name).await
+            {
+                tracing::warn!("making account {name} the default: {}", e.message);
+                *lock(&engine.account) = Some(name);
+            }
+            if engine.is_live() {
+                engine.stale_token.store(true, Ordering::Release);
+            } else {
+                engine.stale_token.store(false, Ordering::Release);
+                engine.disconnect_locked().await;
+            }
+        })
+        .await;
     }
 
     /// The live session's viewer count, `None` while unknown.
@@ -804,7 +921,7 @@ impl Engine {
 
     /// Health stops while not streaming, so the last count would go stale.
     fn forget_viewers(&self) {
-        if let Some(stats) = lock(&self.last_stats).as_mut() {
+        if let Some(stats) = lock(&self.last_stats).stats.as_mut() {
             stats.viewers = None;
         }
         self.viewers.send_if_modified(|v| v.take().is_some());
@@ -857,7 +974,7 @@ impl Engine {
     }
 
     fn publish(&self, event: EngineEvent) {
-        lock(&self.lossless).retain(|tx| tx.send(event.clone()).is_ok());
+        lock(&self.lossless).retain(|tx| tx.try_send(event.clone()).is_ok());
         let _ = self.events.send(event);
     }
 
@@ -880,15 +997,15 @@ impl Engine {
         }
     }
 
-    fn reusable(&self, conn: &Conn) -> bool {
+    async fn reusable(&self, conn: &Conn) -> bool {
         conn.live()
             || (!self.stale_token.load(Ordering::Acquire)
-                && self.selected_source().as_ref() == Some(&conn.source))
+                && self.selected_source().await.as_ref() == Some(&conn.source))
     }
 
     async fn conn(&self) -> Result<Arc<Conn>, CliError> {
         if let Some(conn) = self.current()
-            && self.reusable(&conn)
+            && self.reusable(&conn).await
         {
             return Ok(conn);
         }
@@ -899,7 +1016,7 @@ impl Engine {
     /// Needs `lifecycle` held.
     async fn ensure_conn(&self) -> Result<Arc<Conn>, CliError> {
         if let Some(conn) = self.current() {
-            if self.reusable(&conn) {
+            if self.reusable(&conn).await {
                 return Ok(conn);
             }
             drop(conn);
@@ -910,7 +1027,8 @@ impl Engine {
             .upgrade()
             .expect("an engine is only reachable through its Arc");
         let ctx = self.selected_ctx();
-        let resolved = crate::accounts::resolve(&ctx)?;
+        let resolve_ctx = ctx.clone();
+        let resolved = disk(move || crate::accounts::resolve(&resolve_ctx)).await?;
         let source = resolved.source.clone();
         let client = Arc::new(discord::connect_resolved(&ctx, resolved, Persistence::Long).await?);
         let session = Session::new(client.clone());
@@ -918,6 +1036,7 @@ impl Engine {
             .conn_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
+        // One request per `start` or `stop`, each awaited before the next; never more than a few queued.
         let (catch_up, catch_ups) = mpsc::unbounded_channel();
         let forwarder = tokio::spawn(engine.forward(session.subscribe(), catch_ups, seq));
         let conn = Arc::new(Conn {
@@ -959,27 +1078,73 @@ impl Engine {
             drop(self.forward_gate.lock().await);
             match received {
                 Ok(event) => {
+                    if self.current().is_some_and(|current| current.seq != conn) {
+                        continue;
+                    }
                     match &event {
                         SessionEvent::Health(h) => {
-                            *lock(&self.last_stats) = Some(h.stats.clone());
-                            self.viewers.send_if_modified(|v| {
-                                std::mem::replace(v, h.stats.viewers) != h.stats.viewers
-                            });
+                            let current = lock(&self.conn);
+                            let mut cache = lock(&self.last_stats);
+                            if !cache.terminal_consumed
+                                && current.as_ref().is_some_and(|c| c.seq == conn)
+                            {
+                                cache.stats = Some(h.stats.clone());
+                                self.viewers.send_if_modified(|v| {
+                                    std::mem::replace(v, h.stats.viewers) != h.stats.viewers
+                                });
+                                let interrupted = self.source_interrupted();
+                                self.health.send_if_modified(|v| {
+                                    let next = LiveHealth::on_health(*v, h, interrupted);
+                                    std::mem::replace(v, next) != next
+                                });
+                            }
+                        }
+                        SessionEvent::E2ee {
+                            state,
+                            dave_protocol_version,
+                        } => {
+                            let current = lock(&self.conn);
+                            if current.as_ref().is_some_and(|current| current.seq != conn) {
+                                continue;
+                            }
                             self.health.send_if_modified(|v| {
-                                let next = LiveHealth::on_health(*v, h);
+                                let next = Some(LiveHealth {
+                                    e2ee: *state,
+                                    dave_protocol_version: (*state != E2ee::Unknown)
+                                        .then_some(*dave_protocol_version),
+                                    ..v.unwrap_or_default()
+                                });
                                 std::mem::replace(v, next) != next
                             });
                         }
                         SessionEvent::State { state } => {
-                            self.health.send_if_modified(|v| {
-                                let next = LiveHealth::on_state(*v, state);
-                                std::mem::replace(v, next) != next
-                            });
-                            if *state != SessionState::Streaming {
-                                self.forget_viewers();
+                            {
+                                let current = lock(&self.conn);
+                                if current.as_ref().is_some_and(|current| current.seq != conn) {
+                                    continue;
+                                }
+                                {
+                                    let mut cache = lock(&self.last_stats);
+                                    if !cache.terminal_consumed
+                                        && let Some(stats) = current
+                                            .as_ref()
+                                            .and_then(|c| c.session.terminal_stats())
+                                    {
+                                        cache.stats = Some(stats);
+                                    }
+                                }
+                                self.health.send_if_modified(|v| {
+                                    let next = LiveHealth::on_state(*v, state);
+                                    std::mem::replace(v, next) != next
+                                });
+                                if *state != SessionState::Streaming {
+                                    self.forget_viewers();
+                                }
                             }
-                            self.remember_portal_token();
-                            self.release_if_stopped();
+                            self.remember_portal_token().await;
+                            if self.current().is_none_or(|current| current.seq == conn) {
+                                self.release_if_stopped();
+                            }
                         }
                         SessionEvent::ChannelMoved {
                             guild_id,
@@ -987,7 +1152,14 @@ impl Engine {
                         } => self.moved(conn, guild_id.as_deref(), channel_id),
                         _ => {}
                     }
-                    self.publish(EngineEvent::Session(event));
+                    #[cfg(test)]
+                    drop(self.forward_gate.lock().await);
+                    let current = lock(&self.conn);
+                    if current.as_ref().is_none_or(|current| current.seq == conn) {
+                        self.publish(EngineEvent::Session(event));
+                        self.published_session_events
+                            .fetch_add(1, Ordering::Release);
+                    }
                 }
                 Err(RecvError::Lagged(n)) => {
                     tracing::warn!(skipped = n, "session events lagged");
@@ -999,7 +1171,9 @@ impl Engine {
     }
 
     fn moved(&self, from: u64, guild_id: Option<&str>, channel_id: &str) {
-        let Some(conn) = self.current() else { return };
+        let Some(conn) = self.current().filter(|current| current.seq == from) else {
+            return;
+        };
         let mut placed = lock(&self.place);
         let Some(Placed { place, .. }) = placed.as_mut().filter(|p| p.conn == from) else {
             return;
@@ -1048,20 +1222,38 @@ impl Engine {
         }
     }
 
-    fn remember_portal_token(&self) {
-        if let Some(book) = lock(&self.portal).as_mut()
-            && let Err(e) = book.save(&self.ctx.paths)
+    async fn remember_portal_token(&self) {
+        let portal = self.portal.clone();
+        let paths = self.ctx.paths.clone();
+        if let Err(e) = disk(move || {
+            if let Some(book) = lock(&portal).as_mut() {
+                book.save(&paths)?;
+            }
+            Ok(())
+        })
+        .await
         {
             tracing::warn!("saving the portal restore token: {e}");
         }
     }
 
     async fn set_token(&self, token: String) -> Result<Value, Failure> {
+        let engine = self.me.upgrade().expect("engine owner");
+        let lifecycle = self.lifecycle.clone().lock_owned().await;
+        tokio::spawn(async move { engine.set_token_owned(token, lifecycle).await })
+            .await
+            .map_err(|e| Failure::new("internal", format!("account transaction failed: {e}")))?
+    }
+
+    async fn set_token_owned(
+        &self,
+        token: String,
+        _lifecycle: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<Value, Failure> {
         let token = token.trim().to_owned();
         if token.is_empty() {
             return Err(CliError::EmptyToken.into());
         }
-        let _lifecycle = self.lifecycle.lock().await;
         if self.current().is_some_and(|c| c.live()) {
             return Err(Failure::new(
                 "streaming",
@@ -1071,26 +1263,48 @@ impl Engine {
         let client = discord::connect_with(&self.ctx, token.clone(), Persistence::Brief).await?;
         let user = crate::accounts::account_user(client.user());
         client.close().await;
-        let accounts = self.ctx.paths.accounts();
+        let ctx = self.ctx.clone();
         let selected = lock(&self.account).clone();
-        let name = match selected {
-            Some(name) => name,
-            None => match accounts.default_name().map_err(CliError::from)? {
+        disk(move || {
+            let accounts = ctx.paths.accounts();
+            let _store = crate::accounts::store_lock(&ctx)?;
+            let name = match selected {
                 Some(name) => name,
-                None => accounts.name_for(&user).map_err(CliError::from)?,
-            },
-        };
-        accounts
-            .save(&name, &token, Some(&user))
-            .map_err(CliError::from)?;
+                None => match accounts.default_name()? {
+                    Some(name) => name,
+                    None => accounts.name_for(&user)?,
+                },
+            };
+            if let Some(owner) = accounts.user(&name).filter(|u| u.id != user.id) {
+                return Err(CliError::AccountOfAnotherUser {
+                    account: name,
+                    signed_in: user.username,
+                    owner: owner.username,
+                });
+            }
+            accounts.save(&name, &token, Some(&user))?;
+            Ok(())
+        })
+        .await?;
         self.disconnect_locked().await;
         Ok(Value::Null)
     }
 
     async fn start(&self, p: StartParams, caller: Option<u64>) -> Result<Value, Failure> {
+        let published_before = self.published_session_events.load(Ordering::Acquire);
+        let config_file = self.ctx.paths.config_file.clone();
         let config =
-            dstreamy_core::Config::load(&self.ctx.paths.config_file).map_err(CliError::from)?;
+            disk(move || dstreamy_core::Config::load(&config_file).map_err(CliError::from)).await?;
         let external = self.opts.allow_external && p.target == EXTERNAL_TARGET_ID;
+        if external
+            && (p.crop.is_some()
+                || p.gain.is_some_and(|gain| gain != 1.0)
+                || p.audio_source.is_some())
+        {
+            return Err(invalid_params(
+                "external producers supply encoded media; crop, non-unity gain and audio_source are unsupported",
+            ));
+        }
         let codec = match &p.codec {
             Some(codec) => parse_codec(codec)
                 .map_err(|e| invalid_params(format!("invalid codec {codec:?}: {e}")))?,
@@ -1128,7 +1342,12 @@ impl Engine {
             fps: p.fps.unwrap_or(config.stream.fps),
             bitrate_kbps: p.bitrate_kbps.unwrap_or(config.stream.bitrate_kbps),
             codec,
-            audio_gain: p.gain.unwrap_or(config.stream.audio_gain),
+            audio_gain: if external {
+                1.0
+            } else {
+                p.gain.unwrap_or(config.stream.audio_gain)
+            },
+            require_e2ee: config.stream.require_e2ee || p.require_e2ee.unwrap_or(false),
         };
         settings.validate().map_err(invalid_params)?;
         if let Some(crop) = p.crop {
@@ -1139,8 +1358,15 @@ impl Engine {
         if conn.live() {
             return Err(CliError::AlreadyStreaming.into());
         }
-        // The last run may have stopped itself; its queued events must not touch this start's place.
-        let caught_up = self.catch_up(&conn).await;
+        // A prior terminal event delivered during this request can cancel its waiting frontend.
+        if !self.catch_up(&conn).await
+            || self.published_session_events.load(Ordering::Acquire) != published_before
+        {
+            return Err(Failure::new(
+                "busy",
+                "previous stream events are still being delivered; wait for the stopped event and retry Start",
+            ));
+        }
         let channels = discord::voice_channels(&conn.client, &p.guild_id).await?;
         let Some(channel) = channels.into_iter().find(|c| c.id == p.channel_id) else {
             return Err(CliError::UnknownChannel {
@@ -1168,7 +1394,11 @@ impl Engine {
                 (picked.source, picked.portal_token, None)
             }
         };
-        let audio_source = p.audio_source.or(config.audio_source);
+        let audio_source = if external {
+            None
+        } else {
+            p.audio_source.or(config.audio_source)
+        };
         if let Some(id) = &audio_source
             && handle.is_none()
             && let Some(warning) = capture::verify_audio_source(&p.target, id, &*source).await?
@@ -1176,23 +1406,31 @@ impl Engine {
             tracing::warn!("{warning}");
         }
         let capture = stream::capture_config(&p.target, &settings, p.crop, audio_source.clone());
-        {
-            let mut hold = lock(&self.session_lock);
-            if hold.lock.is_none() {
-                hold.lock = Some(
-                    crate::accounts::session_lock(&self.ctx, &conn.source)
-                        .map_err(CliError::from)?,
-                );
-            }
-            hold.starting = true;
+        let needs_lock = lock(&self.session_lock).lock.is_none();
+        if needs_lock {
+            let ctx = self.ctx.clone();
+            let source = conn.source.clone();
+            let held =
+                disk(move || crate::accounts::session_lock(&ctx, &source).map_err(CliError::from))
+                    .await?;
+            lock(&self.session_lock).lock = Some(held);
         }
-        *lock(&self.place) = caught_up.then(|| Placed {
+        lock(&self.session_lock).starting = true;
+        *lock(&self.place) = Some(Placed {
             place,
             conn: conn.seq,
         });
         #[cfg(test)]
         drop(self.start_gate.lock().await);
-        let started = stream::start(&conn.session, p.guild_id, p.channel_id, source, capture).await;
+        let started = stream::start(
+            &conn.session,
+            p.guild_id,
+            p.channel_id,
+            source,
+            capture,
+            settings.require_e2ee,
+        )
+        .await;
         {
             let mut hold = lock(&self.session_lock);
             hold.starting = false;
@@ -1202,9 +1440,20 @@ impl Engine {
             *lock(&self.place) = None;
         }
         started?;
-        *lock(&self.last_stats) = None;
+        {
+            let mut cache = lock(&self.last_stats);
+            *cache = StatsCache {
+                stats: conn.session.terminal_stats(),
+                terminal_consumed: false,
+            };
+        }
         self.viewers.send_replace(None);
-        *lock(&self.portal) = Some(PortalBook::new(restore_token, portal_token));
+        let portal = self.portal.clone();
+        disk(move || {
+            *lock(&portal) = Some(PortalBook::new(restore_token, portal_token));
+            Ok(())
+        })
+        .await?;
         *lock(&self.started_by) = caller;
         let announced = (
             settings.resolution.width(),
@@ -1228,25 +1477,46 @@ impl Engine {
         let announcer = tokio::spawn(announce(self.me.clone(), handle.producer(), announced_tx));
         let engine = self.me.clone();
         let mut states = handle.state();
+        let publishing = Arc::new(Mutex::new(()));
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let (gate, flag) = (publishing.clone(), interrupted.clone());
         let watcher = tokio::spawn(async move {
+            let mut was_interrupted = false;
             loop {
-                let state = *states.borrow_and_update();
-                let Some(engine) = engine.upgrade() else {
-                    return;
-                };
-                engine.publish(EngineEvent::Source(state));
-                drop(engine);
+                {
+                    let _ordered = lock(&gate);
+                    let state = *states.borrow_and_update();
+                    let interrupted = audio_interrupted(state);
+                    // Entering and leaving both taint the interval, as it is partly without media.
+                    if interrupted || was_interrupted {
+                        flag.store(true, Ordering::Release);
+                    }
+                    was_interrupted = interrupted;
+                    let Some(engine) = engine.upgrade() else {
+                        return;
+                    };
+                    engine.publish(EngineEvent::Source(state));
+                }
                 if states.changed().await.is_err() {
                     return;
                 }
             }
         });
         External {
+            engine: self.me.clone(),
             handle,
             announced: announced_rx,
             watcher,
             announcer,
+            publishing,
+            interrupted,
         }
+    }
+
+    fn source_interrupted(&self) -> bool {
+        lock(&self.external)
+            .as_ref()
+            .is_some_and(External::take_interrupted)
     }
 
     async fn update(&self, p: UpdateParams) -> Result<Value, Failure> {
@@ -1288,8 +1558,14 @@ impl Engine {
         #[cfg(test)]
         drop(self.stop_gate.lock().await);
         let stopped = conn.session.stop().await.map_err(session_failure)?;
-        self.catch_up(&conn).await;
+        let caught_up = self.catch_up(&conn).await;
         self.release_if_stopped();
+        if !caught_up {
+            return Err(Failure::new(
+                "busy",
+                "the stream has stopped but its terminal events are still being delivered; wait for the stopped event before starting again",
+            ));
+        }
         if stopped.is_none() {
             return Err(not_running());
         }
@@ -1298,7 +1574,12 @@ impl Engine {
         *lock(&self.started_by) = None;
         *lock(&self.external) = None;
         self.release_if_stopped();
-        let stats = lock(&self.last_stats).take().unwrap_or_default();
+        let cached = {
+            let mut cache = lock(&self.last_stats);
+            cache.terminal_consumed = true;
+            cache.stats.take()
+        };
+        let stats = conn.session.terminal_stats().or(cached).unwrap_or_default();
         self.viewers.send_replace(None);
         self.health.send_replace(None);
         serde_json::to_value(stats).map_err(|e| Failure::new("internal", e.to_string()))
@@ -1343,7 +1624,7 @@ impl Engine {
         *lock(&self.started_by) = None;
         *lock(&self.external) = None;
         *lock(&self.session_lock) = Hold::default();
-        self.remember_portal_token();
+        self.remember_portal_token().await;
     }
 }
 
@@ -1418,12 +1699,44 @@ mod tests {
     }
 
     #[test]
+    fn live_health_encryption_is_unknown_until_negotiated_and_during_reconnect() {
+        let h = LiveHealth::on_state(None, &SessionState::Streaming).unwrap();
+        assert_eq!(h.e2ee, E2ee::Unknown);
+        assert_eq!(h.dave_protocol_version, None);
+        let mut s = snapshot(0, 0, 50);
+        for (state, version) in [(E2ee::Encrypted, 1), (E2ee::Unencrypted, 0)] {
+            s.stats.e2ee = state;
+            s.stats.dave_protocol_version = version;
+            let live = LiveHealth::on_health(Some(h), &s, false).unwrap();
+            assert_eq!(live.e2ee, state);
+            assert_eq!(live.dave_protocol_version, Some(version));
+            let reconnecting =
+                LiveHealth::on_state(Some(live), &SessionState::Reconnecting { attempt: 1 })
+                    .unwrap();
+            assert_eq!(reconnecting.e2ee, E2ee::Unknown);
+            assert_eq!(reconnecting.dave_protocol_version, None);
+        }
+    }
+
+    #[test]
+    fn live_health_keeps_source_losses_separate_from_transport_losses() {
+        let mut snapshot = snapshot(0, 7, 50);
+        snapshot.stats.source_video_frames_dropped = 3;
+        snapshot.stats.source_audio_frames_dropped = 5;
+        let health = LiveHealth::on_health(None, &snapshot, false).unwrap();
+        assert_eq!(health.dropped_video, 7);
+        assert_eq!(health.source_dropped_video, 3);
+        assert_eq!(health.source_dropped_audio, 5);
+    }
+
+    #[test]
     fn live_health_counts_reconnects_and_resumes_per_stream() {
         let reconnecting = SessionState::Reconnecting { attempt: 1 };
         let mut h = LiveHealth::on_state(None, &SessionState::Connecting);
-        assert_eq!(h, Some(LiveHealth::default()));
+        assert_eq!(h, None, "no stream runs while connecting");
         h = LiveHealth::on_state(h, &SessionState::Streaming);
-        h = LiveHealth::on_health(h, &snapshot(1, 4, 50));
+        assert_eq!(h, Some(LiveHealth::default()));
+        h = LiveHealth::on_health(h, &snapshot(1, 4, 50), false);
         let got = h.unwrap();
         assert_eq!((got.reconnects(), got.dropped_video), (1, 4));
         assert_eq!(got.metrics.map(|m| m.a_sent), Some(50));
@@ -1447,8 +1760,9 @@ mod tests {
             reason: dstreamy_discord::StopReason::Requested,
         };
         assert_eq!(LiveHealth::on_state(h, &stopped), None);
+        assert_eq!(LiveHealth::on_state(h, &SessionState::Connecting), None);
         assert_eq!(
-            LiveHealth::on_state(h, &SessionState::Connecting),
+            LiveHealth::on_state(None, &SessionState::Streaming),
             Some(LiveHealth::default()),
             "a new stream counts from zero"
         );
@@ -1457,27 +1771,104 @@ mod tests {
 
     #[test]
     fn live_health_counts_intervals_with_too_little_audio_per_stream() {
-        let mut h = LiveHealth::on_state(None, &SessionState::Connecting);
-        h = LiveHealth::on_state(h, &SessionState::Streaming);
-        h = LiveHealth::on_health(h, &snapshot(0, 0, 50));
+        let mut h = LiveHealth::on_state(None, &SessionState::Streaming);
+        h = LiveHealth::on_health(h, &snapshot(0, 0, 50), false);
         assert_eq!(h.unwrap().audio_dropouts, 0);
-        h = LiveHealth::on_health(h, &snapshot(0, 0, AUDIO_DROPOUT_BELOW));
+        h = LiveHealth::on_health(h, &snapshot(0, 0, AUDIO_DROPOUT_BELOW), false);
         assert_eq!(
             h.unwrap().audio_dropouts,
             0,
             "half the frames still count as flowing"
         );
-        h = LiveHealth::on_health(h, &snapshot(0, 0, AUDIO_DROPOUT_BELOW - 1));
-        h = LiveHealth::on_health(h, &snapshot(0, 0, 0));
+        h = LiveHealth::on_health(h, &snapshot(0, 0, AUDIO_DROPOUT_BELOW - 1), false);
+        h = LiveHealth::on_health(h, &snapshot(0, 0, 0), false);
         assert_eq!(h.unwrap().audio_dropouts, 2);
+        h = LiveHealth::on_health(h, &snapshot(0, 0, 0), true);
+        h = LiveHealth::on_health(h, &snapshot(0, 0, 5), true);
+        assert_eq!(
+            h.unwrap().audio_dropouts,
+            2,
+            "silence while the source is interrupted is not a dropout"
+        );
         h = LiveHealth::on_state(h, &SessionState::Reconnecting { attempt: 1 });
         h = LiveHealth::on_state(h, &SessionState::Streaming);
         assert_eq!(h.unwrap().audio_dropouts, 2, "kept across a reconnect");
+        let stopped = SessionState::Stopped {
+            reason: dstreamy_discord::StopReason::Requested,
+        };
+        let next = LiveHealth::on_state(h, &stopped);
         assert_eq!(
-            LiveHealth::on_state(h, &SessionState::Connecting).map(|h| h.audio_dropouts),
+            LiveHealth::on_state(next, &SessionState::Streaming).map(|h| h.audio_dropouts),
             Some(0),
             "a new stream counts from zero"
         );
+    }
+
+    #[tokio::test]
+    async fn video_only_stalls_do_not_hide_audio_dropouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Ctx::new(
+            dstreamy_core::ConfigPaths::in_dir(dir.path()),
+            "ws://127.0.0.1:1".into(),
+            None,
+        );
+        let engine = Engine::new(&ctx, Options::default());
+        let mut source = ExternalSource::new(ExternalOptions {
+            stall: Duration::from_millis(500),
+            ..ExternalOptions::default()
+        })
+        .unwrap();
+        let handle = source.handle();
+        let attachment = handle
+            .attach(ProducerInfo {
+                codec: dstreamy_media::VideoCodec::H264,
+                width: 1280,
+                height: 720,
+                fps: 30,
+            })
+            .unwrap();
+        let _frames = source.start(CaptureConfig::default()).await.unwrap();
+        let external = engine.watch_source(handle.clone(), (1280, 720, 30));
+        attachment
+            .send(dstreamy_media::ProducerFrame::Video {
+                data: vec![0, 0, 1, 0x65, 1],
+                pts_us: 0,
+                keyframe: true,
+            })
+            .unwrap();
+        for i in 0..6 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            attachment
+                .send(dstreamy_media::ProducerFrame::Audio {
+                    data: vec![0xf8, 0xff, 0xfe],
+                    pts_us: i * 100_000,
+                })
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            *handle.state().borrow(),
+            SourceState::Interrupted {
+                reason: InterruptReason::VideoStalled,
+                ..
+            }
+        ));
+        let health =
+            LiveHealth::on_health(None, &snapshot(0, 0, 5), external.take_interrupted()).unwrap();
+        assert_eq!(health.audio_dropouts, 1);
+        drop(attachment);
+        tokio::task::yield_now().await;
+        assert!(external.take_interrupted());
+        let health = LiveHealth::on_health(
+            Some(health),
+            &snapshot(0, 0, 0),
+            external.take_interrupted(),
+        )
+        .unwrap();
+        assert_eq!(health.audio_dropouts, 1);
+        source.stop().await.unwrap();
+        drop(external);
+        engine.shutdown().await;
     }
 
     #[test]
@@ -1653,6 +2044,7 @@ mod tests {
                 gain: None,
                 audio_source: None,
                 grace_secs: None,
+                require_e2ee: None,
             }
         }
 
@@ -1672,6 +2064,397 @@ mod tests {
             f.wait_state(|s| matches!(s, SessionState::Stopped { .. }))
                 .await;
             streaming.elapsed()
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stop_and_status_include_source_losses_accrued_during_shutdown() {
+            #[derive(Default)]
+            struct Source {
+                frames: Option<tokio::sync::mpsc::Sender<dstreamy_media::MediaFrame>>,
+                drops: dstreamy_media::CaptureDrops,
+                self_stops: bool,
+            }
+            #[async_trait::async_trait]
+            impl CaptureSource for Source {
+                async fn list_targets(
+                    &self,
+                ) -> Result<Vec<dstreamy_media::CaptureTarget>, dstreamy_media::MediaError>
+                {
+                    Ok(Vec::new())
+                }
+                async fn start(
+                    &mut self,
+                    _: CaptureConfig,
+                ) -> Result<dstreamy_media::FrameReceiver, dstreamy_media::MediaError>
+                {
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    self.frames = (!self.self_stops).then_some(tx);
+                    self.drops = dstreamy_media::CaptureDrops::default();
+                    Ok(rx)
+                }
+                async fn stop(&mut self) -> Result<(), dstreamy_media::MediaError> {
+                    self.frames = None;
+                    self.drops = dstreamy_media::CaptureDrops {
+                        video_frames: 17,
+                        audio_frames: 19,
+                    };
+                    Ok(())
+                }
+                fn capture_drops(&self) -> dstreamy_media::CaptureDrops {
+                    self.drops
+                }
+                fn request_keyframe(&self) {}
+            }
+            for (self_stops, delayed_health) in [
+                (false, None),
+                (false, Some(false)),
+                (false, Some(true)),
+                (true, None),
+            ] {
+                let f = Fixture::new().await;
+                let conn = f.engine.conn().await.unwrap();
+                let mut options = dstreamy_discord::SessionOptions::new(
+                    dstreamy_discord::StreamOptions::new(CaptureConfig::default()),
+                );
+                if !self_stops {
+                    options.health_interval = if delayed_health == Some(true) {
+                        Duration::from_millis(20)
+                    } else {
+                        Duration::from_secs(3600)
+                    };
+                }
+                conn.session
+                    .start(
+                        Some(MOCK_GUILD_ID.into()),
+                        MOCK_VOICE_CHANNEL_ID.into(),
+                        Box::new(Source {
+                            self_stops,
+                            ..Source::default()
+                        }),
+                        options,
+                    )
+                    .await
+                    .unwrap();
+                let stats = if self_stops {
+                    f.wait_state(|s| matches!(s, SessionState::Stopped { .. }))
+                        .await;
+                    assert!(f.engine.catch_up(&conn).await);
+                    serde_json::to_value(f.engine.status().await).unwrap()["stats"].clone()
+                } else {
+                    f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+                    assert!(f.engine.catch_up(&conn).await);
+                    let mut events = conn.session.subscribe();
+                    let gate = if delayed_health.is_some() {
+                        Some(f.engine.forward_gate.lock().await)
+                    } else {
+                        None
+                    };
+                    if delayed_health == Some(true) {
+                        timeout(T, async {
+                            while !matches!(events.recv().await.unwrap(), SessionEvent::Health(_)) {
+                            }
+                        })
+                        .await
+                        .unwrap();
+                    }
+                    let stopped = f.engine.stop().await;
+                    if delayed_health.is_some() {
+                        assert_eq!(stopped.unwrap_err().code, "busy");
+                        assert!(!lock(&f.engine.last_stats).terminal_consumed);
+                        drop(gate);
+                        assert!(f.engine.catch_up(&conn).await);
+                        assert!(!lock(&f.engine.last_stats).terminal_consumed);
+                        serde_json::to_value(f.engine.status().await).unwrap()["stats"].clone()
+                    } else {
+                        let reply = stopped.unwrap();
+                        assert_eq!(
+                            serde_json::to_value(f.engine.status().await).unwrap()["stats"],
+                            Value::Null
+                        );
+                        drop(gate);
+                        assert!(f.engine.catch_up(&conn).await);
+                        assert_eq!(
+                            serde_json::to_value(f.engine.status().await).unwrap()["stats"],
+                            Value::Null
+                        );
+                        reply
+                    }
+                };
+                assert_eq!(stats["source_video_frames_dropped"], 17);
+                assert_eq!(stats["source_audio_frames_dropped"], 19);
+                if delayed_health.is_none() && !self_stops {
+                    f.engine.start(external(Some(0)), None).await.unwrap();
+                    timeout(T, async {
+                        while conn.session.terminal_stats().is_none() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert!(f.engine.catch_up(&conn).await);
+                    assert!(
+                        serde_json::to_value(f.engine.status().await).unwrap()["stats"].is_object(),
+                        "admitted start did not reset terminal consumption"
+                    );
+                }
+                f.engine.shutdown().await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stop_is_not_acknowledged_before_its_terminal_event_is_published() {
+            let f = Fixture::new().await;
+            f.engine.start(params(), None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            let conn = f.engine.current().unwrap();
+            assert!(f.engine.catch_up(&conn).await);
+            let gate = f.engine.forward_gate.lock().await;
+            let mut published = f.engine.subscribe_lossless();
+            let stopped = f.engine.stop().await;
+            assert!(
+                stopped.is_err(),
+                "successful Stop acknowledgement preceded its terminal event"
+            );
+            assert!(!conn.live());
+            assert!(!lock(&f.engine.last_stats).terminal_consumed);
+            assert!(
+                !std::iter::from_fn(|| published.try_recv().ok()).any(|event| matches!(
+                    event,
+                    EngineEvent::Session(SessionEvent::State {
+                        state: SessionState::Stopped { .. }
+                    })
+                ))
+            );
+            drop(gate);
+            assert!(f.engine.catch_up(&conn).await);
+            let terminal: Vec<_> = std::iter::from_fn(|| published.try_recv().ok()).collect();
+            assert!(terminal.iter().any(|event| matches!(
+                event,
+                EngineEvent::Session(SessionEvent::State {
+                    state: SessionState::Stopped { .. }
+                })
+            )));
+            assert_eq!(f.engine.stop().await.unwrap_err().code, "not_running");
+            f.engine.start(params(), None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            assert!(f.engine.catch_up(&conn).await);
+            let next: Vec<_> = std::iter::from_fn(|| published.try_recv().ok()).collect();
+            assert!(!next.iter().any(|event| matches!(
+                event,
+                EngineEvent::Session(SessionEvent::State {
+                    state: SessionState::Stopped { .. }
+                })
+            )));
+            f.engine.stop().await.unwrap();
+            f.engine.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn start_rejects_prior_terminal_delivery_instead_of_starting_a_cancelled_consumer() {
+            use dstreamy_mock_discord::opcodes::gateway::OP_STREAM_CREATE;
+            for (release_during_start, self_stops) in [(true, false), (false, false), (true, true)]
+            {
+                let f = Fixture::new().await;
+                f.engine
+                    .start(
+                        if self_stops {
+                            external(Some(1))
+                        } else {
+                            params()
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+                let conn = f.engine.current().unwrap();
+                assert!(f.engine.catch_up(&conn).await);
+                let gate = f.engine.forward_gate.lock().await;
+                let mut published = f.engine.subscribe_lossless();
+                if self_stops {
+                    f.wait_state(|s| matches!(s, SessionState::Stopped { .. }))
+                        .await;
+                } else {
+                    assert!(conn.session.stop().await.unwrap().is_some());
+                }
+                let before = f
+                    .mock
+                    .received_ops()
+                    .iter()
+                    .filter(|op| op.is(None, OP_STREAM_CREATE))
+                    .count();
+                let requested = f.engine.catch_ups_requested.load(Ordering::SeqCst);
+                let engine = f.engine.clone();
+                let attempted = tokio::spawn(async move { engine.start(params(), None).await });
+                timeout(T, async {
+                    while f.engine.catch_ups_requested.load(Ordering::SeqCst) == requested {
+                        assert!(!attempted.is_finished());
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let gate = if release_during_start {
+                    drop(gate);
+                    None
+                } else {
+                    Some(gate)
+                };
+                let result = timeout(T, attempted).await.unwrap().unwrap();
+                if result.is_ok() {
+                    f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+                }
+                let after = f
+                    .mock
+                    .received_ops()
+                    .iter()
+                    .filter(|op| op.is(None, OP_STREAM_CREATE))
+                    .count();
+                assert!(
+                    result.is_err(),
+                    "accepted a new remote stream while old terminal delivery was pending; released={release_during_start}, creates={before}->{after}"
+                );
+                assert_eq!(after, before, "rejected Start created a remote stream");
+                assert!(!conn.live());
+                drop(gate);
+                assert!(f.engine.catch_up(&conn).await);
+                let terminal: Vec<_> = std::iter::from_fn(|| published.try_recv().ok()).collect();
+                assert!(terminal.iter().any(|event| matches!(
+                    event,
+                    EngineEvent::Session(SessionEvent::State {
+                        state: SessionState::Stopped { .. }
+                    })
+                )));
+                assert!(!terminal.iter().any(|event| matches!(
+                    event,
+                    EngineEvent::Session(SessionEvent::State {
+                        state: SessionState::Connecting | SessionState::Streaming
+                    })
+                )));
+                f.engine.start(params(), None).await.unwrap();
+                f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+                assert!(f.engine.catch_up(&conn).await);
+                let next: Vec<_> = std::iter::from_fn(|| published.try_recv().ok()).collect();
+                assert!(next.iter().any(|event| matches!(
+                    event,
+                    EngineEvent::Session(SessionEvent::State {
+                        state: SessionState::Streaming
+                    })
+                )));
+                assert!(!next.iter().any(|event| matches!(
+                    event,
+                    EngineEvent::Session(SessionEvent::State {
+                        state: SessionState::Stopped { .. }
+                    })
+                )));
+                f.engine.stop().await.unwrap();
+                f.engine.shutdown().await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn start_observes_terminal_delivery_before_it_acquires_lifecycle() {
+            use dstreamy_mock_discord::opcodes::gateway::OP_STREAM_CREATE;
+            let f = Fixture::new().await;
+            f.engine.start(params(), None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            let conn = f.engine.current().unwrap();
+            assert!(f.engine.catch_up(&conn).await);
+            let forward = f.engine.forward_gate.lock().await;
+            let lifecycle = f.engine.lifecycle.lock().await;
+            let mut published = f.engine.subscribe_lossless();
+            conn.session.stop().await.unwrap();
+            let attempted = f.engine.start(params(), None);
+            tokio::pin!(attempted);
+            assert!(futures_util::poll!(&mut attempted).is_pending());
+            drop(forward);
+            assert!(f.engine.catch_up(&conn).await);
+            assert!(
+                std::iter::from_fn(|| published.try_recv().ok()).any(|event| matches!(
+                    event,
+                    EngineEvent::Session(SessionEvent::State {
+                        state: SessionState::Stopped { .. }
+                    })
+                ))
+            );
+            drop(lifecycle);
+            assert_eq!(attempted.await.unwrap_err().code, "busy");
+            assert!(!conn.live());
+            assert_eq!(
+                f.mock
+                    .received_ops()
+                    .iter()
+                    .filter(|op| op.is(None, OP_STREAM_CREATE))
+                    .count(),
+                1
+            );
+            f.engine.start(params(), None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            f.engine.stop().await.unwrap();
+            f.engine.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_forwarder_held_across_connection_replacement_cannot_publish_old_terminal_state()
+        {
+            let f = Fixture::new().await;
+            f.engine.start(params(), None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            let old = f.engine.current().unwrap();
+            assert!(f.engine.catch_up(&old).await);
+            old.forwarder.abort();
+            let portal = f.engine.portal.clone();
+            let (locked, is_locked) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let holding = std::thread::spawn(move || {
+                let _portal = lock(&portal);
+                locked.send(()).unwrap();
+                let _ = released.recv_timeout(T);
+            });
+            is_locked.recv_timeout(T).unwrap();
+            let receiver = old.session.subscribe();
+            let (catch_up, catch_ups) = mpsc::unbounded_channel();
+            let forwarding = tokio::spawn(f.engine.clone().forward(receiver, catch_ups, old.seq));
+            assert!(old.session.stop().await.unwrap().is_some());
+            timeout(T, async {
+                while f.engine.health.borrow().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let gate = f.engine.forward_gate.lock().await;
+            release.send(()).unwrap();
+            holding.join().unwrap();
+            f.engine.stale_token.store(true, Ordering::Release);
+            let current = f.engine.conn().await.unwrap();
+            assert_ne!(current.seq, old.seq);
+            let mut published = f.engine.subscribe_lossless();
+            f.engine.start(params(), None).await.unwrap();
+            f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            drop(gate);
+            let (done, processed) = oneshot::channel();
+            catch_up.send(done).unwrap();
+            timeout(T, processed).await.unwrap().unwrap();
+            forwarding.abort();
+            let _ = forwarding.await;
+            assert!(f.engine.catch_up(&current).await);
+            let states: Vec<_> = std::iter::from_fn(|| published.try_recv().ok())
+                .filter_map(|event| match event {
+                    EngineEvent::Session(SessionEvent::State { state }) => Some(state),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !states
+                    .iter()
+                    .any(|state| matches!(state, SessionState::Stopped { .. })),
+                "superseded terminal reached current consumer: {states:?}"
+            );
+            assert!(states.contains(&SessionState::Streaming));
+            assert!(f.engine.health.borrow().is_some());
+            f.engine.stop().await.unwrap();
+            f.engine.shutdown().await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1723,10 +2506,75 @@ mod tests {
             f.engine.shutdown().await;
         }
 
-        fn status_place(f: &Fixture) -> [Value; 4] {
-            let status = serde_json::to_value(f.engine.status()).unwrap();
+        async fn status_place(f: &Fixture) -> [Value; 4] {
+            let status = serde_json::to_value(f.engine.status().await).unwrap();
             ["guild_id", "channel_id", "channel_name", "target"]
                 .map(|k| status["session"][k].clone())
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn external_start_rejects_explicit_unsupported_transforms_before_connecting() {
+            let f = Fixture::new().await;
+            let crop =
+                serde_json::from_value(json!({"x": 0, "y": 0, "width": 16, "height": 16})).unwrap();
+            for p in [
+                StartParams {
+                    crop: Some(crop),
+                    ..external(None)
+                },
+                StartParams {
+                    gain: Some(0.5),
+                    ..external(None)
+                },
+                StartParams {
+                    audio_source: Some("device".into()),
+                    ..external(None)
+                },
+            ] {
+                let result = f.engine.start(p, None).await;
+                assert!(
+                    matches!(
+                        result,
+                        Err(Failure {
+                            code: "invalid_params",
+                            ..
+                        })
+                    ),
+                    "{result:?}"
+                );
+                assert!(
+                    f.mock.received_ops().is_empty(),
+                    "validation connected to Discord"
+                );
+            }
+            f.engine.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn external_start_ignores_native_capture_defaults() {
+            let f = Fixture::new().await;
+            std::fs::write(
+                f.dir.path().join("config.toml"),
+                "audio_source = 'native-device'\n[stream]\naudio_gain = 0.5\n",
+            )
+            .unwrap();
+            f.engine
+                .start(
+                    StartParams {
+                        gain: Some(1.0),
+                        ..external(None)
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            {
+                let running = lock(&f.engine.running);
+                let applied = running.as_ref().unwrap();
+                assert_eq!(applied.stream.audio_gain, 1.0);
+                assert_eq!(applied.audio_source, None);
+            }
+            f.engine.shutdown().await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1757,14 +2605,14 @@ mod tests {
                     .move_to_channel(MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID)
             );
             timeout(T, async {
-                while status_place(&f)[1] != json!(MOCK_OTHER_VOICE_CHANNEL_ID) {
+                while status_place(&f).await[1] != json!(MOCK_OTHER_VOICE_CHANNEL_ID) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
-            .unwrap_or_else(|_| panic!("status still names {:?}", status_place(&f)));
+            .expect("status did not update after the channel move");
             assert_eq!(
-                status_place(&f),
+                status_place(&f).await,
                 [
                     json!(MOCK_GUILD_ID),
                     json!(MOCK_OTHER_VOICE_CHANNEL_ID),
@@ -1782,8 +2630,8 @@ mod tests {
             assert_eq!(waited, Ok(true), "viewers stuck at {:?}", *rx.borrow());
         }
 
-        fn status_viewers(f: &Fixture) -> Value {
-            serde_json::to_value(f.engine.status()).unwrap()["stats"]["viewers"].clone()
+        async fn status_viewers(f: &Fixture) -> Value {
+            serde_json::to_value(f.engine.status().await).unwrap()["stats"]["viewers"].clone()
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1804,14 +2652,14 @@ mod tests {
                         .set_viewers(&["400000000000000001", "400000000000000002"])
                 );
                 wait_viewers(&mut producer, Some(2)).await;
-                assert_eq!(status_viewers(&f), json!(2));
+                assert_eq!(status_viewers(&f).await, json!(2));
 
                 f.mock.ignore_stream_creates(usize::MAX);
                 assert!(trigger(&f.mock));
                 f.wait_state(|s| !matches!(s, SessionState::Streaming))
                     .await;
                 wait_viewers(&mut producer, None).await;
-                assert_eq!(status_viewers(&f), Value::Null);
+                assert_eq!(status_viewers(&f).await, Value::Null);
                 f.engine.shutdown().await;
             }
         }
@@ -1864,12 +2712,15 @@ mod tests {
             f.engine.current().unwrap().forwarder.abort();
             forward_events(&f, conn + 1, &[moved_to_gaming()]).await;
             assert_eq!(
-                status_place(&f)[1],
+                status_place(&f).await[1],
                 json!(MOCK_VOICE_CHANNEL_ID),
                 "another connection's move"
             );
             forward_events(&f, conn, &[moved_to_gaming()]).await;
-            assert_eq!(status_place(&f)[1], json!(MOCK_OTHER_VOICE_CHANNEL_ID));
+            assert_eq!(
+                status_place(&f).await[1],
+                json!(MOCK_OTHER_VOICE_CHANNEL_ID)
+            );
             f.engine.shutdown().await;
         }
 
@@ -1935,7 +2786,18 @@ mod tests {
                 if !self_stops {
                     engine.stop().await.unwrap();
                 }
-                engine.start(second, None).await.unwrap();
+                let retry = if second.target == EXTERNAL_TARGET_ID {
+                    gaming(external(None))
+                } else {
+                    gaming(params())
+                };
+                let attempted = engine.start(second, None).await;
+                if self_stops {
+                    assert_eq!(attempted.unwrap_err().code, "busy");
+                    engine.start(retry, None).await.unwrap();
+                } else {
+                    attempted.unwrap();
+                }
             });
             timeout(T, async {
                 while requested() == before && !restart.is_finished() {
@@ -1952,7 +2814,7 @@ mod tests {
                 "the restart went ahead of the first run's queued events"
             );
             assert!(f.engine.catch_up(&f.engine.current().unwrap()).await);
-            assert_eq!(status_place(f)[1], json!(MOCK_OTHER_VOICE_CHANNEL_ID));
+            assert_eq!(status_place(f).await[1], json!(MOCK_OTHER_VOICE_CHANNEL_ID));
             lock(&f.engine.moves_applied)
                 .iter()
                 .filter(|p| p.target == second_target)
@@ -1992,7 +2854,7 @@ mod tests {
             .await
             .expect("the stopped session kept the lock");
             assert!(lock(&f.engine.place).is_none());
-            assert!(status_place(&f).iter().all(Value::is_null));
+            assert!(status_place(&f).await.iter().all(Value::is_null));
             f.engine.shutdown().await;
         }
 
@@ -2006,9 +2868,9 @@ mod tests {
                 .await;
             assert!(lock(&f.engine.place).is_some());
             assert!(
-                status_place(&f).iter().all(Value::is_null),
+                status_place(&f).await.iter().all(Value::is_null),
                 "{:?}",
-                status_place(&f)
+                status_place(&f).await
             );
             f.engine.shutdown().await;
         }
@@ -2016,15 +2878,10 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn status_names_the_guild_channel_and_target_of_the_live_session() {
             let f = Fixture::new().await;
-            let place = |f: &Fixture| {
-                let status = serde_json::to_value(f.engine.status()).unwrap();
-                ["guild_id", "channel_id", "channel_name", "target"]
-                    .map(|k| status["session"][k].clone())
-            };
             f.engine.start(params(), None).await.unwrap();
             f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
             assert_eq!(
-                place(&f),
+                status_place(&f).await,
                 [
                     json!(MOCK_GUILD_ID),
                     json!(MOCK_VOICE_CHANNEL_ID),
@@ -2033,13 +2890,13 @@ mod tests {
                 ]
             );
             assert_eq!(
-                serde_json::to_value(f.engine.status()).unwrap()["session"]["state"],
+                serde_json::to_value(f.engine.status().await).unwrap()["session"]["state"],
                 "streaming"
             );
             f.engine.stop().await.unwrap();
-            let gone = serde_json::to_value(f.engine.status()).unwrap();
+            let gone = serde_json::to_value(f.engine.status().await).unwrap();
             assert!(
-                place(&f).iter().all(Value::is_null),
+                status_place(&f).await.iter().all(Value::is_null),
                 "a stopped session still names its place: {gone}"
             );
             f.engine.shutdown().await;
@@ -2306,6 +3163,98 @@ mod tests {
             f.engine.shutdown().await;
         }
 
+        #[tokio::test(flavor = "current_thread")]
+        async fn held_store_lock_does_not_block_timers_or_other_engine_clients() {
+            let f = Fixture::new().await;
+            let accounts = f.engine.ctx.paths.accounts();
+            let held = accounts.store_lock(Duration::ZERO).unwrap().unwrap();
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                drop(held);
+            });
+            let started = std::time::Instant::now();
+            let (_, progress) = tokio::join!(f.engine.logout_account("default"), async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                f.engine.handle(Command::Hello).await.unwrap();
+                started.elapsed()
+            });
+            release.join().unwrap();
+            assert!(
+                progress < Duration::from_millis(150),
+                "runtime worker blocked for {progress:?}"
+            );
+            assert!(!accounts.exists("default"));
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn canceled_account_transaction_finishes_before_the_next_selection() {
+            let f = Fixture::new().await;
+            let accounts = f.engine.ctx.paths.accounts();
+            accounts.save("other", "other-token", None).unwrap();
+            let held = accounts.store_lock(Duration::ZERO).unwrap().unwrap();
+            let engine = f.engine.clone();
+            let first = tokio::spawn(async move { engine.select_account("other").await });
+            timeout(T, async {
+                while f.engine.lifecycle.try_lock().is_ok() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            first.abort();
+            let _ = first.await;
+            assert!(
+                f.engine.lifecycle.try_lock().is_err(),
+                "cancellation released the transaction's lifecycle lock"
+            );
+            let engine = f.engine.clone();
+            let second = tokio::spawn(async move { engine.select_account("default").await });
+            tokio::task::yield_now().await;
+            assert!(!second.is_finished());
+            drop(held);
+            second.await.unwrap().unwrap();
+            assert_eq!(accounts.default_name().unwrap().as_deref(), Some("default"));
+            assert_eq!(
+                accounts.load_token("other").unwrap().as_deref(),
+                Some("other-token")
+            );
+        }
+
+        #[tokio::test]
+        async fn account_changes_report_a_busy_store_and_keep_the_account() {
+            let f = Fixture::new().await;
+            let accounts = f.engine.ctx.paths.accounts();
+            let _held = accounts.store_lock(Duration::ZERO).unwrap().unwrap();
+            for result in [
+                f.engine.select_account("default").await,
+                f.engine.logout_account("default").await,
+            ] {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "config", "{}", error.message);
+                assert!(error.message.contains("changing the saved accounts"));
+            }
+            assert!(accounts.exists("default"));
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn selecting_an_insecure_account_returns_the_token_file_error() {
+            use std::os::unix::fs::PermissionsExt;
+            let f = Fixture::new().await;
+            let token_file = f.engine.ctx.paths.accounts().token_file("default");
+            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let error = f.engine.select_account("default").await.unwrap_err();
+            assert_eq!(error.code, "config");
+            assert!(error.message.contains("chmod 600"), "{}", error.message);
+            let rows = f.engine.accounts().await.unwrap();
+            assert!(
+                rows["accounts"][0]["token_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("chmod 600")
+            );
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn every_receiver_gets_every_event() {
             let f = Fixture::new().await;
@@ -2337,35 +3286,60 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_lossless_subscriber_gets_every_event_the_broadcast_drops() {
+    #[tokio::test]
+    async fn a_stalled_lossless_subscriber_is_disconnected_at_its_bound() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = Ctx {
             paths: dstreamy_core::ConfigPaths::in_dir(dir.path()),
             gateway_url: String::new(),
             account: None,
         };
-        let opts = Options {
-            event_capacity: 4,
-            ..Options::default()
+        let engine = Engine::new(
+            &ctx,
+            Options {
+                event_capacity: 4,
+                ..Options::default()
+            },
+        );
+        let receiver = engine.subscribe_lossless();
+        for _ in 0..5 {
+            engine.publish(EngineEvent::Session(SessionEvent::Resumed));
+        }
+        assert_eq!(
+            receiver.len(),
+            4,
+            "subscriber backlog exceeded its capacity"
+        );
+        assert!(
+            receiver.is_closed(),
+            "overflow must disconnect, not silently skip an event"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_drained_lossless_subscriber_gets_every_event_the_broadcast_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Ctx {
+            paths: dstreamy_core::ConfigPaths::in_dir(dir.path()),
+            gateway_url: String::new(),
+            account: None,
         };
-        let engine = Engine::new(&ctx, opts);
+        let engine = Engine::new(
+            &ctx,
+            Options {
+                event_capacity: 4,
+                ..Options::default()
+            },
+        );
         let mut lossless = engine.subscribe_lossless();
         let mut lossy = engine.events();
-        let (tx, rx) = broadcast::channel(128);
         for _ in 0..100 {
-            tx.send(SessionEvent::Resumed).unwrap();
+            engine.publish(EngineEvent::Session(SessionEvent::Resumed));
+            assert!(matches!(
+                lossless.recv().await,
+                Some(EngineEvent::Session(SessionEvent::Resumed))
+            ));
         }
-        drop(tx);
-        engine
-            .clone()
-            .forward(rx, mpsc::unbounded_channel().1, 0)
-            .await;
-        let mut n = 0;
-        while let Ok(EngineEvent::Session(SessionEvent::Resumed)) = lossless.try_recv() {
-            n += 1;
-        }
-        assert_eq!(n, 100);
         assert!(matches!(
             lossy.try_recv(),
             Err(broadcast::error::TryRecvError::Lagged(96))

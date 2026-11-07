@@ -29,6 +29,7 @@ webpki-roots = "0.26"
 
 [dev-dependencies]
 async-trait = "0.1"
+dstreamy-media = { path = "../dstreamy-media", features = ["openh264"] }
 openh264 = "0.9"
 unsafe-libopus = "0.2"
 dstreamy-mock-discord = { path = "../dstreamy-mock-discord" }
@@ -37,7 +38,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync",
 
 [features]
 test-rtp-start = ["discord-stream-rs/test-rtp-start"]
-test-hooks = []
+test-hooks = ["discord-stream-rs/test-hooks"]
 
 [lints]
 workspace = true

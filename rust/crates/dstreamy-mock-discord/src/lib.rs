@@ -41,8 +41,9 @@ pub mod opcodes {
         pub use crate::voice::{
             CLOSE_AUTHENTICATION_FAILED, CLOSE_BAD_REQUEST, CLOSE_DISCONNECTED,
             CLOSE_NOT_AUTHENTICATED, CLOSE_SERVER_CRASHED, CLOSE_SESSION_NO_LONGER_VALID,
-            CLOSE_SESSION_TIMEOUT, CLOSE_UNKNOWN_PROTOCOL, OP_CLIENTS_CONNECT,
-            OP_DAVE_EXECUTE_TRANSITION, OP_DAVE_TRANSITION_READY, OP_HEARTBEAT, OP_HEARTBEAT_ACK,
+            CLOSE_SESSION_TIMEOUT, CLOSE_UNKNOWN_PROTOCOL, OP_CLIENT_DISCONNECT,
+            OP_CLIENTS_CONNECT, OP_DAVE_EXECUTE_TRANSITION, OP_DAVE_PREPARE_EPOCH,
+            OP_DAVE_PREPARE_TRANSITION, OP_DAVE_TRANSITION_READY, OP_HEARTBEAT, OP_HEARTBEAT_ACK,
             OP_HELLO, OP_IDENTIFY, OP_MLS_ANNOUNCE_COMMIT_TRANSITION, OP_MLS_COMMIT_WELCOME,
             OP_MLS_EXTERNAL_SENDER, OP_MLS_INVALID_COMMIT_WELCOME, OP_MLS_KEY_PACKAGE,
             OP_MLS_PROPOSALS, OP_READY, OP_RESUME, OP_RESUMED, OP_SELECT_PROTOCOL,
@@ -51,7 +52,11 @@ pub mod opcodes {
     }
 }
 
+use dave::DaveServer;
+use serde_json::json;
+use sink::lock_dave;
 use state::{Control, Shared};
+use tokio::sync::mpsc;
 
 /// A running mock; all listeners are on 127.0.0.1 and stop when it is dropped.
 pub struct MockDiscord {
@@ -140,6 +145,16 @@ impl MockDiscord {
         self.shared.state().session.clone()
     }
 
+    /// The voice WebSockets currently open, by kind.
+    pub fn open_voice_sockets(&self) -> Vec<VoiceKind> {
+        let state = self.shared.state();
+        state
+            .voice_sockets
+            .values()
+            .map(|(kind, _)| *kind)
+            .collect()
+    }
+
     pub fn voice_state(&self) -> Option<VoiceStateSnapshot> {
         self.shared.state().voice.clone()
     }
@@ -172,6 +187,106 @@ impl MockDiscord {
             }
         }
         None
+    }
+
+    /// Whether the simulated second member is in the MLS group on a connection of `kind`.
+    pub async fn dave_has_guest(&self, kind: VoiceKind) -> bool {
+        let conns: Vec<_> = self.shared.state().voice_conns.values().cloned().collect();
+        for conn in conns {
+            let c = conn.lock().await;
+            if c.kind == kind
+                && lock_dave(&c.dave)
+                    .as_ref()
+                    .is_some_and(DaveServer::has_guest)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A second member (`user_id`) joins the call on connections of `kind`: CLIENTS_CONNECT, then the MLS Add the client commits, which re-keys the group.
+    pub async fn join_dave_guest(&self, kind: VoiceKind, user_id: u64) -> bool {
+        self.dave_hook(kind, |c, tx| {
+            let proposals = lock_dave(&c.dave)
+                .as_mut()
+                .and_then(|s| s.add_guest_proposal(user_id).ok())?;
+            let connect = json!({ "user_ids": [user_id.to_string()] });
+            let _ = tx.send(Control::VoiceJson(voice::OP_CLIENTS_CONNECT, connect));
+            let _ = tx.send(Control::VoiceBinary(voice::OP_MLS_PROPOSALS, proposals));
+            Some(())
+        })
+        .await
+    }
+
+    /// The second member leaves: CLIENT_DISCONNECT, then the MLS Remove the client commits, which re-keys the group.
+    pub async fn leave_dave_guest(&self, kind: VoiceKind, user_id: u64) -> bool {
+        self.dave_hook(kind, |c, tx| {
+            let proposals = lock_dave(&c.dave)
+                .as_mut()
+                .and_then(|s| s.remove_guest_proposal().ok())?;
+            let disconnect = json!({ "user_id": user_id.to_string() });
+            let _ = tx.send(Control::VoiceJson(voice::OP_CLIENT_DISCONNECT, disconnect));
+            let _ = tx.send(Control::VoiceBinary(voice::OP_MLS_PROPOSALS, proposals));
+            Some(())
+        })
+        .await
+    }
+
+    /// DAVE_PREPARE_TRANSITION to protocol 0 on connections of `kind`; once the client is ready, the transition executes and plaintext is accepted for good.
+    pub async fn downgrade_dave(&self, kind: VoiceKind) -> bool {
+        self.dave_hook(kind, |c, tx| {
+            let id = lock_dave(&c.dave).as_mut()?.next_transition_id();
+            c.pending_downgrade = Some(id);
+            let prepare = json!({ "transition_id": id, "protocol_version": 0 });
+            let _ = tx.send(Control::VoiceJson(
+                voice::OP_DAVE_PREPARE_TRANSITION,
+                prepare,
+            ));
+            Some(())
+        })
+        .await
+    }
+
+    /// DAVE_PREPARE_EPOCH for epoch 1 at the configured protocol version: the client re-keys from a fresh key package.
+    pub async fn upgrade_dave(&self, kind: VoiceKind) -> bool {
+        let version = self.shared.config.dave_protocol_version;
+        self.dave_hook(kind, |c, tx| {
+            lock_dave(&c.dave).as_mut()?.reset_group();
+            c.pending_downgrade = None;
+            c.dave_version = version;
+            let prepare = json!({ "epoch": 1, "protocol_version": version });
+            let _ = tx.send(Control::VoiceJson(voice::OP_DAVE_PREPARE_EPOCH, prepare));
+            Some(())
+        })
+        .await
+    }
+
+    /// Runs `f` on every DAVE-capable connection of `kind` with its socket; true when it applied to one.
+    async fn dave_hook(
+        &self,
+        kind: VoiceKind,
+        mut f: impl FnMut(&mut voice::VoiceConn, &mpsc::UnboundedSender<Control>) -> Option<()>,
+    ) -> bool {
+        let targets: Vec<_> = {
+            let state = self.shared.state();
+            state
+                .voice_conns
+                .iter()
+                .filter_map(|(server_id, conn)| {
+                    let (_, socket) = state.voice_sockets.get(server_id)?;
+                    Some((conn.clone(), socket.tx.clone()))
+                })
+                .collect()
+        };
+        let mut applied = false;
+        for (conn, tx) in targets {
+            let mut c = conn.lock().await;
+            if c.kind == kind && f(&mut c, &tx).is_some() {
+                applied = true;
+            }
+        }
+        applied
     }
 
     /// Send a viewer PLI for the video SSRC of every peer connection of `kind`.
@@ -240,6 +355,36 @@ impl MockDiscord {
         state.before_join_answer.push(payload);
     }
 
+    /// VOICE_STATE_UPDATE of another member (`user_id`) joining `channel_id`, or leaving voice for `None`.
+    pub fn voice_state_of_other_user(
+        &self,
+        user_id: &str,
+        guild_id: &str,
+        channel_id: Option<&str>,
+    ) -> bool {
+        let payload = state::other_user_voice_state(user_id, guild_id, channel_id);
+        let mut state = self.shared.state();
+        if state.session.is_none() {
+            return false;
+        }
+        self.shared
+            .dispatch(&mut state, "VOICE_STATE_UPDATE", payload);
+        drop(state);
+        self.shared.notify();
+        true
+    }
+
+    /// Another member's voice state sent during the next join, after any `move_during_next_join` and before the VOICE_SERVER_UPDATE.
+    pub fn other_user_voice_state_during_next_join(
+        &self,
+        user_id: &str,
+        guild_id: &str,
+        channel_id: Option<&str>,
+    ) {
+        let payload = state::other_user_voice_state(user_id, guild_id, channel_id);
+        self.shared.state().others_during_join.push(payload);
+    }
+
     /// Moves the user to `channel_id` after the next join's VOICE_STATE_UPDATE and before its VOICE_SERVER_UPDATE.
     pub fn move_during_next_join(&self, guild_id: &str, channel_id: &str) {
         self.shared.state().move_during_join = Some((guild_id.to_owned(), channel_id.to_owned()));
@@ -306,6 +451,24 @@ impl MockDiscord {
         drop(state);
         self.shared.notify();
         true
+    }
+
+    /// Closes the media peer connections of `kind` while their voice WebSockets stay up, as a dead UDP path looks.
+    pub async fn drop_media(&self, kind: VoiceKind) -> bool {
+        let conns: Vec<_> = self.shared.state().voice_conns.values().cloned().collect();
+        let mut dropped = false;
+        for conn in conns {
+            let mut c = conn.lock().await;
+            if c.kind == kind {
+                dropped |= c.close_peer().await;
+            }
+        }
+        dropped
+    }
+
+    /// Answers a second SELECT_PROTOCOL on a live voice session with a fresh peer connection; by default it is left unanswered.
+    pub fn accept_repeated_select_protocol(&self) {
+        self.shared.state().accept_repeated_select_protocol = true;
     }
 
     /// Close the voice WebSocket of `kind`; `None` drops TCP without a close frame. The connection stays resumable.

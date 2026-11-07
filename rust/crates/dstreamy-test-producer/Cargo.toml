@@ -8,7 +8,7 @@ publish.workspace = true
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 dstreamy-ipc = { path = "../dstreamy-ipc" }
-dstreamy-media = { path = "../dstreamy-media" }
+dstreamy-media = { path = "../dstreamy-media", features = ["openh264"] }
 dstreamy-obs-packet = { path = "../dstreamy-obs-packet" }
 futures-util = { version = "0.3", features = ["sink"] }
 openh264 = "0.9"

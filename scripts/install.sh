@@ -19,7 +19,7 @@ fi
 NEEDS_BUILD=false
 if [ ! -d "$SRC" ]; then
     NEEDS_BUILD=true
-elif [ -n "$(find "$ROOT/App" "$ROOT/src" "$ROOT/capture" -newer "$SRC" -type f 2>/dev/null | head -1)" ]; then
+elif [ -n "$(find "$ROOT/App" "$ROOT/Package.swift" "$ROOT/rust/crates" "$ROOT/rust/Cargo.lock" -newer "$SRC" -type f 2>/dev/null | head -1)" ]; then
     NEEDS_BUILD=true
 fi
 

@@ -1,11 +1,13 @@
 //! `serve` + mock Discord + `mock-producer` harness shared by the producer integration tests.
 #![allow(dead_code)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use dstreamy_core::ConfigPaths;
@@ -229,17 +231,52 @@ pub fn stream_audio(r: &Recorded) -> Vec<&RecordedAudioFrame> {
         .collect()
 }
 
-/// A process whose stdout lines (JSON from `mock-producer`) and stderr are collected.
+fn read_pipe(mut pipe: impl Read + AsRawFd, done: &AtomicBool, mut received: impl FnMut(&[u8])) {
+    let fd = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0);
+    let mut bytes = [0; 4096];
+    let mut deadline = None;
+    loop {
+        if done.load(Ordering::Acquire) {
+            let until = deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
+            if Instant::now() >= *until {
+                break;
+            }
+        }
+        match pipe.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(n) => received(&bytes[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Descendants can retain a reaped child's pipe writers.
+                if done.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::park_timeout(Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// A process whose stdout lines (JSON from `mock-producer`, anything else kept as text) and stderr are collected.
 pub struct Proc {
-    pub child: Child,
+    child: Mutex<Child>,
     pub lines: Arc<Mutex<Vec<Value>>>,
+    pub text: Arc<Mutex<Vec<String>>>,
     pub err: Arc<Mutex<String>>,
-    pub stderr: Option<std::thread::JoinHandle<String>>,
-    stdout: Option<std::thread::JoinHandle<()>>,
+    stderr: Mutex<Option<std::thread::JoinHandle<String>>>,
+    readers_done: Arc<AtomicBool>,
+    stdout: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Proc {
     pub fn spawn(cmd: &mut Command) -> Self {
+        Self::spawn_with_stderr_gate(cmd, None)
+    }
+
+    pub fn spawn_with_stderr_gate(cmd: &mut Command, gate: Option<mpsc::Receiver<()>>) -> Self {
         let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -247,55 +284,98 @@ impl Proc {
             .spawn()
             .unwrap();
         let lines = Arc::new(Mutex::new(Vec::new()));
+        let text = Arc::new(Mutex::new(Vec::new()));
+        let readers_done = Arc::new(AtomicBool::new(false));
         let stdout = child.stdout.take().unwrap();
-        let sink = lines.clone();
+        let (sink, other, done) = (lines.clone(), text.clone(), readers_done.clone());
         let stdout = std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Ok(v) = serde_json::from_str(&line) {
-                    sink.lock().unwrap().push(v);
+            let mut pending = Vec::new();
+            let record = |line: &[u8]| match serde_json::from_slice(line) {
+                Ok(v) => sink.lock().unwrap().push(v),
+                Err(_) => other
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(line).into_owned()),
+            };
+            read_pipe(stdout, &done, |bytes| {
+                pending.extend_from_slice(bytes);
+                while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+                    let line = &pending[..end];
+                    record(line.strip_suffix(b"\r").unwrap_or(line));
+                    pending.drain(..=end);
                 }
+            });
+            if !pending.is_empty() {
+                record(&pending);
             }
         });
         let stderr = child.stderr.take().unwrap();
         let err = Arc::new(Mutex::new(String::new()));
-        let copy = err.clone();
+        let (copy, done) = (err.clone(), readers_done.clone());
         let stderr = std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let mut text = copy.lock().unwrap();
-                text.push_str(&line);
-                text.push('\n');
+            if let Some(gate) = gate {
+                let _ = gate.recv();
             }
+            let mut captured = Vec::new();
+            read_pipe(stderr, &done, |bytes| {
+                captured.extend_from_slice(bytes);
+                *copy.lock().unwrap() = String::from_utf8_lossy(&captured).into_owned();
+            });
             copy.lock().unwrap().clone()
         });
         Self {
-            child,
+            child: Mutex::new(child),
             lines,
+            text,
             err,
-            stderr: Some(stderr),
-            stdout: Some(stdout),
+            stderr: Mutex::new(Some(stderr)),
+            readers_done,
+            stdout: Mutex::new(Some(stdout)),
         }
     }
 
+    fn child(&self) -> MutexGuard<'_, Child> {
+        self.child.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.child().id()
     }
 
     pub fn lines(&self) -> Vec<Value> {
         self.lines.lock().unwrap().clone()
     }
 
+    /// Everything the process wrote, for failure messages.
+    pub fn output_report(&self) -> String {
+        format!(
+            "stdout (JSON): {:#?}\nstdout (other): {:#?}\nstderr: {}",
+            self.lines(),
+            self.text.lock().unwrap(),
+            self.err.lock().unwrap()
+        )
+    }
+
+    /// The first line matching `f`, failing as soon as the process exits without one.
     pub fn wait_line(&self, what: &str, f: impl Fn(&Value) -> bool) -> Value {
         let deadline = Instant::now() + T;
         loop {
             if let Some(v) = self.lines().into_iter().find(&f) {
                 return v;
             }
-            if Instant::now() >= deadline {
+            let exited = self.child().try_wait().unwrap();
+            if let Some(status) = exited {
+                self.join_readers();
+                if let Some(v) = self.lines().into_iter().find(&f) {
+                    return v;
+                }
                 panic!(
-                    "{what} never came: {:#?}\nstderr: {}",
-                    self.lines(),
-                    self.err.lock().unwrap()
+                    "{what} never came: the process {status}\n{}",
+                    self.output_report()
                 );
+            }
+            if Instant::now() >= deadline {
+                panic!("{what} never came within {T:?}\n{}", self.output_report());
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -308,13 +388,13 @@ impl Proc {
             .unwrap_or_else(|| panic!("not attached: {hello}"))
     }
 
-    pub fn exited(&mut self) -> bool {
-        self.child.try_wait().unwrap().is_some()
+    pub fn exited(&self) -> bool {
+        self.child().try_wait().unwrap().is_some()
     }
 
     /// `exited`, saying how, for failure messages.
-    pub fn exit_report(&mut self) -> String {
-        match self.child.try_wait() {
+    pub fn exit_report(&self) -> String {
+        match self.child().try_wait() {
             Ok(Some(status)) => format!("exited with {status}"),
             Ok(None) => "still running".to_owned(),
             Err(e) => format!("unknown: {e}"),
@@ -322,32 +402,51 @@ impl Proc {
     }
 
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.join_stdout();
+        let mut child = self.child();
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(child);
+        self.join_readers();
     }
 
-    fn join_stdout(&mut self) {
-        if let Some(stdout) = self.stdout.take() {
-            let _ = stdout.join();
+    fn join_readers(&self) {
+        self.readers_done.store(true, Ordering::Release);
+        let stdout = self
+            .stdout
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(stdout) = stdout {
+            stdout.join().expect("stdout reader panicked");
+        }
+        let stderr = self
+            .stderr
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(stderr) = stderr {
+            stderr.join().expect("stderr reader panicked");
         }
     }
 
     /// Exit status and stderr, killing it after `T`.
-    pub fn finish(mut self) -> (std::process::ExitStatus, String) {
+    pub fn finish(self) -> (std::process::ExitStatus, String) {
         let deadline = Instant::now() + T;
         let status = loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
+            if let Some(status) = self.child().try_wait().unwrap() {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                panic!("process did not exit; stdout {:#?}", self.lines());
+                let _ = self.child().kill();
+                panic!(
+                    "process did not exit within {T:?}\n{}",
+                    self.output_report()
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        self.join_stdout();
-        (status, self.stderr.take().unwrap().join().unwrap())
+        self.join_readers();
+        (status, self.err.lock().unwrap().clone())
     }
 }
 

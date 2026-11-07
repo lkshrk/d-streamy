@@ -44,3 +44,7 @@ if(OS_LINUX)
     PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:OBS::libobs>" TIMEOUT 120
   )
 endif()
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME encoder-settings-checker COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_SOURCE_DIR}/tests/test-encoder-settings.py")
+add_test(NAME trace-drift-checker COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_SOURCE_DIR}/tests/test-trace-drift.py")

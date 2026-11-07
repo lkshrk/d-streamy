@@ -15,9 +15,13 @@ pub use service::{LOGIN_TIMEOUT, ObsControl, STOP_TIMEOUT};
 
 /// What a serve must offer beyond protocol 2 as first released.
 pub const STATUS_PLACE: &str = "status_place";
+/// Feature name: `start` accepts `grace_secs` (ADR 0004).
 pub const START_GRACE_SECS: &str = "start_grace_secs";
+/// Feature name: the service can open the login window (ADR 0004).
 pub const BROWSER_LOGIN: &str = "browser_login";
+/// Feature name: the account commands of ADR 0005 are available.
 pub const ACCOUNTS: &str = "accounts";
+/// Last entry of the account picker; opens a login for a new account.
 pub const ADD_ACCOUNT: &str = "Add account…";
 
 /// A saved Discord account as serve's `accounts` reply lists it.
@@ -62,6 +66,7 @@ impl Accounts {
     }
 }
 
+/// A server or channel as the service lists it: id and name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Named {
     pub id: String,
@@ -235,6 +240,7 @@ pub fn owns(
     ))
 }
 
+/// The control `start` the panel sends: place, encoder facts and grace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartRequest {
     pub guild_id: String,
@@ -322,6 +328,7 @@ impl Started {
     }
 }
 
+/// How a session ended, as the panel reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stopped {
     Stopped,
@@ -330,6 +337,7 @@ pub enum Stopped {
     NotRunning,
 }
 
+/// What the panel does with a Start press once the service answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Start,
@@ -434,6 +442,7 @@ impl fmt::Display for StartFailed {
 
 impl std::error::Error for StartFailed {}
 
+/// Everything that can go wrong talking to the service, with a headline, a fix and a full message for the panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlError {
     NotRunning(String),
@@ -633,7 +642,10 @@ impl ControlError {
             }
             Self::NoPlace => "Stop it, then press Start",
             Self::Refused { .. } | Self::Protocol(_) => "See the OBS log",
-            Self::Timeout { .. } => "Check the service, then retry",
+            #[cfg(target_os = "linux")]
+            Self::Timeout { .. } => "Run `dstreamy service status`",
+            #[cfg(not(target_os = "linux"))]
+            Self::Timeout { .. } => "Check that `dstreamy serve` runs",
         }
     }
 }

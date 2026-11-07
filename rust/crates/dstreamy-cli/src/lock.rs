@@ -10,7 +10,7 @@ pub enum LockError {
     Held { pid: Option<u32> },
     #[error("session lock {}: {source}", path.display())]
     Io { path: PathBuf, source: io::Error },
-    #[error("account {0} was removed meanwhile; see `dstreamy account list`")]
+    #[error("account {0} was removed by another command; see `dstreamy account list`")]
     AccountGone(String),
 }
 

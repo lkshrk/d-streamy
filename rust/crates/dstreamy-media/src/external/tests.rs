@@ -774,7 +774,7 @@ async fn a_paused_attachment_stalls_only_after_its_stall_timer_starts() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_silent_producer_is_stalled_then_producing_again_from_a_keyframe() {
+async fn a_silent_producer_is_stalled_then_producing_again_without_a_resync() {
     let rig = Rig::started(IdleMode::Documented).await;
     let mut state = rig.handle.state();
     let mut p = rig.producer(1, 0);
@@ -793,8 +793,38 @@ async fn a_silent_producer_is_stalled_then_producing_again_from_a_keyframe() {
     );
     let requests = *p.attachment.keyframe_requests().borrow();
     let resumed = rig.now_us();
-    p.run(Duration::from_secs(3)).await;
+    p.run(Duration::from_secs(1)).await;
     assert_eq!(*state.borrow(), SourceState::Producing { attachment: 1 });
+    assert_eq!(
+        *p.attachment.keyframe_requests().borrow(),
+        requests,
+        "nothing was lost, so no keyframe is needed"
+    );
+    let frames = rig.collector.frames();
+    let first_video = frames
+        .iter()
+        .find(|f| f.track() == VIDEO && f.sent_us() >= resumed)
+        .unwrap();
+    assert!(
+        !first_video.keyframe(),
+        "the P-frames after the stall continue the picture"
+    );
+    assert_eq!(p.attachment.stats().skipped, 0);
+    strictly_increasing(&frames);
+    on_wall_clock(&frames, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stall_after_an_overflow_resumes_at_a_keyframe() {
+    let rig = Rig::started(IdleMode::None).await;
+    let mut p = rig.producer(1, 0);
+    p.run(Duration::from_millis(500)).await;
+    rig.source.inner.lock().current.as_mut().unwrap().gate = Gate::Overflow;
+    sleep(STALL + MS).await;
+    settle().await;
+    let requests = *p.attachment.keyframe_requests().borrow();
+    let resumed = rig.now_us();
+    p.run(Duration::from_secs(3)).await;
     assert!(*p.attachment.keyframe_requests().borrow() > requests);
     let frames = rig.collector.frames();
     let first_video = frames
@@ -802,8 +832,284 @@ async fn a_silent_producer_is_stalled_then_producing_again_from_a_keyframe() {
         .find(|f| f.track() == VIDEO && f.sent_us() >= resumed)
         .unwrap();
     assert!(first_video.keyframe());
+    assert!(p.attachment.stats().dropped_video > 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_gate_closed_by_a_loss_detaches_at_the_resync_bound_without_forwarding_delta_frames() {
+    let rig = Rig::started(IdleMode::None).await;
+    let a = rig.handle.attach(info()).unwrap();
+    a.send(video(0, true)).unwrap();
+    a.send(audio(0)).unwrap();
+    settle().await;
+    rig.source
+        .inner
+        .lock()
+        .current
+        .as_mut()
+        .unwrap()
+        .close_gate_after_loss(Gate::Overflow, Instant::now());
+    a.send(video(FRAME_US, false)).unwrap();
+    sleep(RESYNC_BOUND - 2 * MS).await;
+    a.send(video(2 * FRAME_US, false)).unwrap();
+    assert_eq!(a.stats().dropped_video, 2);
+    sleep(3 * MS).await;
+    settle().await;
+    assert!(
+        matches!(a.close_reason(), Some(CloseReason::Incompatible(message))
+        if message.contains("restart the producer") && message.contains("2 s"))
+    );
+    assert!(a.send(video(3 * FRAME_US, false)).is_err());
+    let video_out = rig
+        .collector
+        .frames()
+        .iter()
+        .filter(|f| f.track() == VIDEO)
+        .count();
+    assert_eq!(video_out, 1, "only the reference keyframe was forwarded");
+    assert!(rig.closed().is_none(), "the session stays alive in grace");
+    assert!(
+        rig.handle.attach(info()).is_ok(),
+        "a replacement can attach"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_gate_an_attach_closes_waits_for_a_keyframe_however_long() {
+    let rig = Rig::started(IdleMode::None).await;
+    let a = rig.handle.attach(info()).unwrap();
+    a.send(audio(0)).unwrap();
+    a.send(video(0, false)).unwrap();
+    sleep(RESYNC_BOUND * 2).await;
+    settle().await;
+    a.send(video(FRAME_US, false)).unwrap();
+    assert_eq!(
+        a.stats().skipped,
+        2,
+        "no reference frame exists before the first keyframe"
+    );
+    a.send(video(2 * FRAME_US, true)).unwrap();
+    assert_eq!(a.stats().skipped, 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_producer_replaces_a_stalled_one_and_is_refused_by_a_live_one() {
+    let rig = Rig::started(IdleMode::Documented).await;
+    let mut state = rig.handle.state();
+    let mut first = rig.producer(1, 0);
+    first.run(Duration::from_millis(500)).await;
+    assert_eq!(rig.handle.attach(info()).err(), Some(AttachError::Busy));
+    sleep(STALL + MS).await;
+    settle().await;
+    assert!(matches!(
+        *state.borrow_and_update(),
+        SourceState::Interrupted {
+            reason: InterruptReason::Stalled,
+            ..
+        }
+    ));
+    let mut second = rig.producer(2, 0);
+    assert_eq!(first.attachment.close_reason(), Some(CloseReason::Replaced));
+    assert_eq!(
+        first.attachment.send(audio(0)),
+        Err(SendError::Closed(CloseReason::Replaced))
+    );
+    assert_eq!(*state.borrow(), SourceState::Producing { attachment: 2 });
+    second.run(Duration::from_secs(1)).await;
+    let frames = rig.collector.frames();
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.marker().is_some_and(|m| m.attachment == 2))
+    );
     strictly_increasing(&frames);
     on_wall_clock(&frames, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stall_clock_skips_the_time_the_source_is_stopped() {
+    let mut rig = Rig::started(IdleMode::None).await;
+    let state = rig.handle.state();
+    let mut p = rig.producer(1, 0);
+    p.run(Duration::from_millis(500)).await;
+    rig.source.stop().await.unwrap();
+    sleep(STALL * 2).await;
+    rig.start().await;
+    sleep(STALL / 2).await;
+    settle().await;
+    assert_eq!(*state.borrow(), SourceState::Producing { attachment: 1 });
+    sleep(STALL / 2 + MS).await;
+    settle().await;
+    assert!(matches!(
+        *state.borrow(),
+        SourceState::Interrupted {
+            reason: InterruptReason::Stalled,
+            ..
+        }
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn restarting_a_stalled_attachment_grants_a_fresh_stall_window() {
+    let mut rig = Rig::started(IdleMode::None).await;
+    let original = rig.handle.attach(info()).unwrap();
+    sleep(STALL + MS).await;
+    settle().await;
+    rig.restart().await;
+    settle().await;
+    assert!(matches!(rig.handle.attach(info()), Err(AttachError::Busy)));
+    assert_eq!(original.close_reason(), None);
+    assert_eq!(
+        *rig.handle.state().borrow(),
+        SourceState::Producing { attachment: 1 }
+    );
+    sleep(STALL - 2 * MS).await;
+    assert!(matches!(rig.handle.attach(info()), Err(AttachError::Busy)));
+    sleep(3 * MS).await;
+    settle().await;
+    let replacement = rig.handle.attach(info()).unwrap();
+    assert_eq!(original.close_reason(), Some(CloseReason::Replaced));
+    assert_eq!(replacement.close_reason(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn restarting_a_healthy_attachment_keeps_it_busy() {
+    let mut rig = Rig::started(IdleMode::None).await;
+    let original = rig.handle.attach(info()).unwrap();
+    rig.restart().await;
+    settle().await;
+    assert!(matches!(rig.handle.attach(info()), Err(AttachError::Busy)));
+    assert_eq!(original.close_reason(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_detach_while_stopped_gets_the_full_grace_from_the_restart() {
+    let mut rig = Rig::started(IdleMode::None).await;
+    let mut p = rig.producer(1, 0);
+    p.run(Duration::from_secs(1)).await;
+    rig.source.stop().await.unwrap();
+    sleep(GRACE).await;
+    drop(p);
+    sleep(GRACE).await;
+    rig.start().await;
+    let restarted = rig.now_us();
+    sleep(GRACE - MS).await;
+    assert_eq!(rig.closed(), None);
+    sleep(2 * MS).await;
+    settle().await;
+    assert_eq!(rig.closed(), Some(restarted + us(GRACE)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_video_track_is_reported_while_audio_flows() {
+    let rig = Rig::started(IdleMode::None).await;
+    let mut state = rig.handle.state();
+    let a = rig.handle.attach(info()).unwrap();
+    a.send(video(0, true)).unwrap();
+    a.send(audio(0)).unwrap();
+    let video_at = Instant::now();
+    let mut pts = 0;
+    while video_at.elapsed() < STALL {
+        sleep(SILENCE_SPACING).await;
+        pts += AUDIO_US;
+        a.send(audio(pts)).unwrap();
+    }
+    assert_eq!(
+        *state.borrow_and_update(),
+        SourceState::Interrupted {
+            since: video_at,
+            reason: InterruptReason::VideoStalled
+        }
+    );
+    sleep(STALL / 2).await;
+    settle().await;
+    assert!(
+        !state.has_changed().unwrap(),
+        "audio keeps the whole producer alive"
+    );
+    a.send(video(pts, false)).unwrap();
+    assert_eq!(*state.borrow(), SourceState::Producing { attachment: 1 });
+    assert_eq!(
+        a.stats().skipped,
+        0,
+        "nothing was lost, so the P-frame goes through"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn grace_restarts_in_full_when_the_source_starts_again() {
+    let mut rig = Rig::started(IdleMode::None).await;
+    let mut p = rig.producer(1, 0);
+    p.run(Duration::from_secs(1)).await;
+    drop(p);
+    sleep(GRACE / 2).await;
+    rig.source.stop().await.unwrap();
+    sleep(GRACE * 2).await;
+    rig.start().await;
+    let restarted = rig.now_us();
+    sleep(GRACE - MS).await;
+    assert_eq!(rig.closed(), None, "a restart grants a full grace period");
+    sleep(2 * MS).await;
+    settle().await;
+    assert_eq!(rig.closed(), Some(restarted + us(GRACE)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn grace_zero_ends_the_capture_on_any_absence_of_a_producer() {
+    let options = ExternalOptions {
+        grace: Duration::ZERO,
+        ..options(IdleMode::None)
+    };
+    let mut source = ExternalSource::new(options.clone()).unwrap();
+    let handle = source.handle();
+    let a = handle.attach(info()).unwrap();
+    let mut rx = source.start(CaptureConfig::default()).await.unwrap();
+    sleep(Duration::from_secs(1)).await;
+    a.send(video(0, true)).unwrap();
+    a.send(audio(0)).unwrap();
+    assert!(
+        rx.recv().await.is_some(),
+        "attached before start, the session runs"
+    );
+    a.close(CloseReason::Ended);
+    let drained = async { while rx.recv().await.is_some() {} };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), drained)
+            .await
+            .is_ok(),
+        "a detach ends it at once"
+    );
+
+    let mut source = ExternalSource::new(options).unwrap();
+    let mut rx = source.start(CaptureConfig::default()).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .is_ok_and(|frame| frame.is_none()),
+        "nothing attached at start ends it on the first tick"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn continuous_idle_catches_up_only_half_a_second_after_a_long_sleep() {
+    let rig = Rig::started(IdleMode::Continuous).await;
+    let mut p = rig.producer(1, 0);
+    p.run(Duration::from_millis(500)).await;
+    drop(p);
+    {
+        let mut state = rig.source.inner.lock();
+        let idle = state.idle.as_mut().unwrap();
+        idle.next = idle.next.checked_sub(Duration::from_secs(20)).unwrap();
+    }
+    let before = rig.collector.frames().len();
+    sleep(MS).await;
+    settle().await;
+    let silence = rig.collector.frames().len() + rig.source.queued() - before;
+    let per_half_second = (IDLE_CATCH_UP.as_micros() / u128::from(OPUS_FRAME_DURATION_US)) as usize;
+    assert!(
+        (1..=per_half_second + 2).contains(&silence),
+        "{silence} silence frames for a 20 s gap"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -918,6 +1224,33 @@ async fn an_undrained_source_fed_8_mib_keyframes_holds_at_most_its_byte_budget()
     feed_8_mib_keyframes(true).await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn unequal_frames_release_the_hold_before_the_next_frame_exceeds_the_byte_budget() {
+    let mut source = ExternalSource::new(options(IdleMode::None)).unwrap();
+    let handle = source.handle();
+    let _rx = source.start(CaptureConfig::default()).await.unwrap();
+    let a = handle.attach(info()).unwrap();
+    for i in 0..9 {
+        a.send(ProducerFrame::Video {
+            data: vec![0; 7 << 20],
+            pts_us: i * FRAME_US,
+            keyframe: true,
+        })
+        .unwrap();
+    }
+    a.send(ProducerFrame::Video {
+        data: vec![0; 2 << 20],
+        pts_us: 9 * FRAME_US,
+        keyframe: true,
+    })
+    .unwrap();
+    let state = source.inner.lock();
+    let cur = state.current.as_ref().unwrap();
+    assert!(cur.held.is_empty());
+    assert!(cur.offset.is_some());
+    assert!(state.queue.iter().map(Queued::len).sum::<usize>() <= QUEUE_MAX_BYTES);
+}
+
 #[tokio::test]
 async fn a_video_only_producer_waiting_for_audio_holds_at_most_the_byte_budget() {
     feed_8_mib_keyframes(false).await;
@@ -966,6 +1299,7 @@ async fn frames_cleared_when_grace_expires_are_counted() {
     let mut rx = source.start(CaptureConfig::default()).await.unwrap();
     let a = handle.attach(info()).unwrap();
     let sent = burst(&a, 0, 100);
+    source.inner.lock().current.as_mut().unwrap().open_gate();
     sleep(GRACE + MS).await;
     let mut got = 0;
     while let Some(frame) = rx.recv().await {
@@ -1276,16 +1610,12 @@ async fn held_frames_are_dropped_and_counted_on_a_stall() {
             ..
         }
     ));
-    assert!(
-        rig.source
-            .inner
-            .lock()
-            .current
-            .as_ref()
-            .unwrap()
-            .held
-            .is_empty()
-    );
+    {
+        let state = rig.source.inner.lock();
+        let cur = state.current.as_ref().unwrap();
+        assert!(cur.held.is_empty());
+        assert_eq!(cur.gate, Gate::Resync, "lost video needs a keyframe");
+    }
     assert_eq!(a.stats().dropped_video, 2);
     assert!(rig.collector.frames().is_empty());
 }
@@ -1509,13 +1839,24 @@ async fn run_ops(ops: Vec<Op>) {
                 mid_gop,
             } => match rig.handle.attach(info()) {
                 Ok(attachment) => {
-                    assert!(!model.expired && producer.is_none());
+                    assert!(!model.expired);
+                    let now = Instant::now();
+                    if let Some(old) = producer.take() {
+                        assert!(model.stalled(now), "only a stalled producer is replaced");
+                        assert_eq!(old.attachment.close_reason(), Some(CloseReason::Replaced));
+                    }
                     tag += 1;
                     let p = Producer::new(attachment, tag, rig.epoch, start).with_audio_skew(skew);
                     producer = Some(if mid_gop { p.starting_mid_gop() } else { p });
-                    model.last_activity = Some(Instant::now());
+                    model.last_activity = Some(now);
                 }
-                Err(AttachError::Busy) => assert!(!model.expired && producer.is_some()),
+                Err(AttachError::Busy) => {
+                    assert!(!model.expired && producer.is_some());
+                    assert!(
+                        !model.stalled(Instant::now()),
+                        "a stalled producer gives way"
+                    );
+                }
                 Err(AttachError::NoSession) => {
                     assert!(model.expired);
                     producer = None;
@@ -1556,6 +1897,7 @@ async fn run_ops(ops: Vec<Op>) {
             Op::Restart => {
                 if !model.expired {
                     rig.restart().await;
+                    model.started = Instant::now();
                     restarts.push(rig.now_us());
                 }
             }
@@ -1600,10 +1942,8 @@ async fn run_ops(ops: Vec<Op>) {
         let Some(m) = f.marker() else { continue };
         let restarted =
             previous.is_some_and(|p| restarts.iter().any(|&r| p.sent_us < r && r <= m.sent_us));
-        if restarted
-            || previous
-                .is_none_or(|p| p.attachment != m.attachment || m.sent_us - p.sent_us >= us(STALL))
-        {
+        // A stall with nothing lost continues the picture; only a new attachment or a restart needs a keyframe.
+        if restarted || previous.is_none_or(|p| p.attachment != m.attachment) {
             rearmed = true;
         }
         previous = Some(m);

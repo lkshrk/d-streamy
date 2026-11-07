@@ -21,6 +21,8 @@ pub use options::{DEFAULT_GATEWAY_URL, GATEWAY_VERSION, GatewayOptions, Identify
 
 const EVENT_CAPACITY: usize = 256;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Earlier session ids remembered for late voice states of this client; one READY adds one.
+const MAX_PAST_SESSIONS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GatewayError {
@@ -59,10 +61,13 @@ impl Shared {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(old) = current.replace(id) {
-            self.past_sessions
+            let mut past = self
+                .past_sessions
                 .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(old);
+                .unwrap_or_else(PoisonError::into_inner);
+            past.push(old);
+            let excess = past.len().saturating_sub(MAX_PAST_SESSIONS);
+            past.drain(..excess);
         }
     }
 

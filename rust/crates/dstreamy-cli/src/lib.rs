@@ -33,6 +33,21 @@ pub struct Ctx {
     pub account: Option<String>,
 }
 
+impl Ctx {
+    pub fn new(paths: ConfigPaths, gateway_url: String, account: Option<String>) -> Self {
+        Self {
+            paths,
+            gateway_url,
+            account,
+        }
+    }
+
+    /// The same directory and gateway with another account choice, as serve switches accounts.
+    pub fn with_account(&self, account: Option<String>) -> Self {
+        Self::new(self.paths.clone(), self.gateway_url.clone(), account)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     #[error(transparent)]
@@ -63,7 +78,9 @@ pub enum CliError {
     GuildUnavailable(String),
     #[error("no voice channel {channel} in guild {guild}; see `dstreamy channels {guild}`")]
     UnknownChannel { guild: String, channel: String },
-    #[error("screen capture is not supported on this platform; use --target test-pattern")]
+    #[error(
+        "screen capture is not supported on this platform; stream from OBS with the D-Streamy plugin instead"
+    )]
     NoPlatformCapture,
     #[error("unknown audio source {0:?}; see `dstreamy audio-sources`")]
     UnknownAudioSource(String),

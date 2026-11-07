@@ -69,7 +69,7 @@ fn main() {
         .header("wrapper.h")
         .rust_edition(bindgen::RustEdition::Edition2024)
         .allowlist_function(
-            "obs_.*|blog|bfree|calldata_set_data|calldata_get_data|signal_handler_connect|signal_handler_disconnect|proc_handler_add|video_output_get_info|audio_output_get_channels",
+            "obs_.*|blog|bfree|calldata_set_data|calldata_get_data|signal_handler_add|signal_handler_signal|signal_handler_connect|signal_handler_disconnect|proc_handler_add|proc_handler_call|video_output_get_info|audio_output_get_channels",
         )
         .allowlist_type(
             "obs_.*|encoder_packet|calldata_t|proc_handler_t|signal_handler_t|signal_callback_t|video_output_info|dstreamy_frontend_.*|dstreamy_ui_host",

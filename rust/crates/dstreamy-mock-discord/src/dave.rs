@@ -3,7 +3,7 @@
 use std::num::NonZeroU16;
 use std::time::{Duration, Instant};
 
-use davey::{DaveSession, MediaType};
+use davey::{DaveSession, MediaType, ProposalsOperationType};
 use openmls::prelude::tls_codec::{
     Deserialize as TlsDeserialize, DeserializeBytes, Serialize as TlsSerialize,
 };
@@ -48,9 +48,13 @@ pub struct DaveServer {
     signer: SignatureKeyPair,
     external_sender: Vec<u8>,
     participant: Option<DaveSession>,
+    /// A second simulated member, added and removed by the re-key hooks.
+    guest: Option<DaveSession>,
     next_transition: u16,
     /// `None` until a transition executes: plaintext is accepted without limit.
     pub(crate) plaintext_until: Option<Instant>,
+    /// After a transition to protocol 0 the client sends plaintext for good.
+    pub(crate) downgraded: bool,
 }
 
 impl DaveServer {
@@ -75,8 +79,10 @@ impl DaveServer {
             signer,
             external_sender,
             participant: None,
+            guest: None,
             next_transition: 0,
             plaintext_until: None,
+            downgraded: false,
         })
     }
 
@@ -94,53 +100,137 @@ impl DaveServer {
         if owner != self.client_user_id {
             return Err(DaveServerError::WrongUser(owner, self.client_user_id));
         }
-
-        let mut participant = DaveSession::new(
-            self.protocol_version,
-            self.participant_id,
-            self.channel_id,
-            None,
-        )
-        .map_err(davey)?;
-        participant
-            .set_external_sender(&self.external_sender)
-            .map_err(davey)?;
-        let participant_kp = participant.create_key_package().map_err(davey)?;
-        let participant_kp = parse_key_package(&self.provider, &participant_kp)?;
+        // The client starts a fresh group with every key package, so the member and the epoch start over.
+        self.guest = None;
+        let (participant, proposal) =
+            self.member_add_proposal(self.participant_id, GroupEpoch::from(0))?;
         self.participant = Some(participant);
+        Ok(proposal)
+    }
 
-        let proposal = ExternalProposal::new_add::<OpenMlsRustCrypto>(
-            participant_kp,
+    /// An external Add proposal for a second member (`user_id`), as when someone else joins the call.
+    pub fn add_guest_proposal(&mut self, user_id: u64) -> Result<Vec<u8>, DaveServerError> {
+        if !self.is_active() {
+            return Err(DaveServerError::NoParticipant);
+        }
+        let (guest, proposal) = self.member_add_proposal(user_id, self.epoch())?;
+        self.queue_in_members(ProposalsOperationType::APPEND, &proposal[1..])?;
+        self.guest = Some(guest);
+        Ok(proposal)
+    }
+
+    /// Every member sees the proposals and keeps its own pending commit until the announced one lands, as on Discord.
+    fn queue_in_members(
+        &mut self,
+        operation: ProposalsOperationType,
+        proposals: &[u8],
+    ) -> Result<(), DaveServerError> {
+        for member in [&mut self.participant, &mut self.guest]
+            .into_iter()
+            .flatten()
+            .filter(|m| m.is_ready())
+        {
+            member
+                .process_proposals(operation, proposals, None)
+                .map_err(davey)?;
+        }
+        Ok(())
+    }
+
+    /// An external Remove proposal for the guest, as when that member leaves the call.
+    pub fn remove_guest_proposal(&mut self) -> Result<Vec<u8>, DaveServerError> {
+        let leaf = self
+            .guest
+            .as_ref()
+            .filter(|g| g.is_ready())
+            .and_then(DaveSession::own_leaf_index)
+            .ok_or(DaveServerError::NoParticipant)?;
+        let proposal = ExternalProposal::new_remove::<OpenMlsRustCrypto>(
+            leaf,
             GroupId::from_slice(&self.channel_id.to_be_bytes()),
-            GroupEpoch::from(0),
+            self.epoch(),
             &self.signer,
             SenderExtensionIndex::new(0),
         )
         .map_err(mls)?
         .tls_serialize_detached()
         .map_err(mls)?;
-        let mut payload = vec![0u8];
-        payload.extend(
-            VLBytes::new(proposal)
-                .tls_serialize_detached()
-                .map_err(mls)?,
-        );
+        // DAVE's REVOKE withdraws earlier proposals; a member leaving is an appended MLS Remove.
+        let payload = proposals_payload(0, proposal)?;
+        self.guest = None;
+        self.queue_in_members(ProposalsOperationType::APPEND, &payload[1..])?;
         Ok(payload)
     }
 
+    fn member_add_proposal(
+        &self,
+        user_id: u64,
+        epoch: GroupEpoch,
+    ) -> Result<(DaveSession, Vec<u8>), DaveServerError> {
+        let mut member = DaveSession::new(self.protocol_version, user_id, self.channel_id, None)
+            .map_err(davey)?;
+        member
+            .set_external_sender(&self.external_sender)
+            .map_err(davey)?;
+        let member_kp = member.create_key_package().map_err(davey)?;
+        let member_kp = parse_key_package(&self.provider, &member_kp)?;
+        let proposal = ExternalProposal::new_add::<OpenMlsRustCrypto>(
+            member_kp,
+            GroupId::from_slice(&self.channel_id.to_be_bytes()),
+            epoch,
+            &self.signer,
+            SenderExtensionIndex::new(0),
+        )
+        .map_err(mls)?
+        .tls_serialize_detached()
+        .map_err(mls)?;
+        Ok((member, proposals_payload(0, proposal)?))
+    }
+
+    fn epoch(&self) -> GroupEpoch {
+        self.participant
+            .as_ref()
+            .and_then(DaveSession::epoch)
+            .unwrap_or_else(|| GroupEpoch::from(0))
+    }
+
+    /// Members in the group apply the commit; a member still joining takes the welcome.
     pub fn on_commit_welcome(&mut self, payload: &[u8]) -> Result<(u16, Vec<u8>), DaveServerError> {
-        let (_, welcome) = MlsMessageIn::tls_deserialize_bytes(payload).map_err(mls)?;
-        let commit = &payload[..payload.len() - welcome.len()];
-        let participant = self
-            .participant
-            .as_mut()
-            .ok_or(DaveServerError::NoParticipant)?;
-        participant.process_welcome(welcome).map_err(davey)?;
+        let (_, rest) = MlsMessageIn::tls_deserialize_bytes(payload).map_err(mls)?;
+        let commit = &payload[..payload.len() - rest.len()];
+        let welcome = (!rest.is_empty()).then_some(rest);
+        if self.participant.is_none() {
+            return Err(DaveServerError::NoParticipant);
+        }
+        for member in [&mut self.participant, &mut self.guest]
+            .into_iter()
+            .flatten()
+        {
+            if member.is_ready() {
+                member.process_commit(commit).map_err(davey)?;
+            } else if let Some(welcome) = welcome {
+                member.process_welcome(welcome).map_err(davey)?;
+            }
+        }
         self.next_transition = self.next_transition.wrapping_add(1).max(1);
         let transition_id = self.next_transition;
         let mut out = transition_id.to_be_bytes().to_vec();
         out.extend_from_slice(commit);
         Ok((transition_id, out))
+    }
+
+    /// The id the next PREPARE_TRANSITION announces.
+    pub fn next_transition_id(&mut self) -> u16 {
+        self.next_transition = self.next_transition.wrapping_add(1).max(1);
+        self.next_transition
+    }
+
+    /// Forgets the group ahead of a new epoch; the client's next key package starts it over.
+    pub fn reset_group(&mut self) {
+        self.participant = None;
+        self.guest = None;
+        self.plaintext_until = None;
+        self.downgraded = false;
     }
 
     pub fn execute_transition(&mut self) {
@@ -149,7 +239,11 @@ impl DaveServer {
     }
 
     pub fn accepts_plaintext(&self) -> bool {
-        self.plaintext_until.is_none_or(|t| Instant::now() < t)
+        self.downgraded || self.plaintext_until.is_none_or(|t| Instant::now() < t)
+    }
+
+    pub fn has_guest(&self) -> bool {
+        self.guest.as_ref().is_some_and(DaveSession::is_ready)
     }
 
     pub fn is_active(&self) -> bool {
@@ -173,6 +267,16 @@ impl DaveServer {
             .ok_or(DaveServerError::NoParticipant)?;
         Ok(participant.decrypt(self.client_user_id, media_type, frame)?)
     }
+}
+
+fn proposals_payload(op_type: u8, proposal: Vec<u8>) -> Result<Vec<u8>, DaveServerError> {
+    let mut payload = vec![op_type];
+    payload.extend(
+        VLBytes::new(proposal)
+            .tls_serialize_detached()
+            .map_err(mls)?,
+    );
+    Ok(payload)
 }
 
 pub fn is_dave_frame(frame: &[u8]) -> bool {
@@ -239,6 +343,45 @@ mod tests {
             .unwrap()
             .into_owned();
         assert!(is_dave_frame(&enc));
+        assert_eq!(server.decrypt(MediaType::VIDEO, &enc).unwrap(), frame);
+
+        let commit_proposals = |client: &mut DaveSession, proposals: Vec<u8>| {
+            let ops = match proposals[0] {
+                0 => davey::ProposalsOperationType::APPEND,
+                _ => davey::ProposalsOperationType::REVOKE,
+            };
+            let cw = client
+                .process_proposals(ops, &proposals[1..], Some(&[9999, 8888]))
+                .unwrap()
+                .unwrap();
+            let mut payload = cw.commit.clone();
+            if let Some(w) = cw.welcome {
+                payload.extend(w);
+            }
+            payload
+        };
+        let epoch_before = client.epoch().unwrap();
+        let joined = commit_proposals(&mut client, server.add_guest_proposal(8888).unwrap());
+        let (tid, announce) = server.on_commit_welcome(&joined).unwrap();
+        assert_eq!(tid, 2);
+        client.process_commit(&announce[2..]).unwrap();
+        assert!(server.has_guest());
+        assert!(client.epoch().unwrap() > epoch_before);
+        let enc = client
+            .encrypt(MediaType::VIDEO, Codec::H264, &frame)
+            .unwrap()
+            .into_owned();
+        assert_eq!(server.decrypt(MediaType::VIDEO, &enc).unwrap(), frame);
+
+        let left = commit_proposals(&mut client, server.remove_guest_proposal().unwrap());
+        let (tid, announce) = server.on_commit_welcome(&left).unwrap();
+        assert_eq!(tid, 3);
+        client.process_commit(&announce[2..]).unwrap();
+        assert!(!server.has_guest());
+        let enc = client
+            .encrypt(MediaType::VIDEO, Codec::H264, &frame)
+            .unwrap()
+            .into_owned();
         assert_eq!(server.decrypt(MediaType::VIDEO, &enc).unwrap(), frame);
     }
 }

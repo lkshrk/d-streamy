@@ -1,7 +1,10 @@
 //! Real OBS through the plugin: `obs-harness` loads `obs-dstreamy` and streams to `serve` + mock Discord; obs-ci only.
 #![cfg(target_os = "linux")]
 
+#[path = "support/obs_events.rs"]
+mod obs_events;
 mod support;
+use obs_events::{event, event_matches, field, has_event, line_starts};
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -114,7 +117,9 @@ impl HarnessRun {
             readers.push(std::thread::spawn(move || {
                 for line in BufReader::new(pipe).lines().map_while(Result::ok) {
                     eprintln!("obs-harness: {line}");
-                    sink.lock().unwrap().push(line);
+                    if !line.starts_with("HARNESS ") {
+                        sink.lock().unwrap().push(line);
+                    }
                 }
             }));
         }
@@ -172,39 +177,89 @@ fn runtime_dir(h: &Harness) -> PathBuf {
 
 fn passed(status: ExitStatus, lines: &[String]) {
     assert!(
-        status.success() && lines.iter().any(|l| l == "HARNESS result=PASS"),
+        status.success()
+            && lines
+                .iter()
+                .any(|l| event_matches(l, "HARNESS result=PASS", false)),
         "obs-harness failed ({status}): {lines:#?}"
     );
 }
 
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn concurrent_c_and_rust_observations_preserve_complete_records() {
+    let h = Harness::new("");
+    let (status, lines) = HarnessRun::start(&h, json!({}), &["--observation-framing"]).finish();
+    passed(status, &lines);
+    let payload = "Grüße 🧃".repeat(1024);
+    assert!(payload.len() > 4096);
+    for name in ["c_framing_probe", "plugin_framing_probe"] {
+        let rows: Vec<_> = lines
+            .iter()
+            .filter_map(|line| event(line))
+            .filter(|row| row["event"] == name)
+            .collect();
+        assert_eq!(rows.len(), 64, "every {name} record must survive");
+        let mut sequences = std::collections::BTreeSet::new();
+        for row in rows {
+            sequences.insert(row["sequence"].as_u64().unwrap());
+            assert_eq!(row["payload"].as_str(), Some(payload.as_str()));
+            assert_eq!(row["note"], "first\nsecond");
+            if name == "plugin_framing_probe" {
+                assert_eq!(row["nul"], "\0");
+            }
+        }
+        assert_eq!(sequences, (0..64).collect());
+    }
+    assert!(has_event(&lines, "HARNESS framing_complete records=64"));
+}
+
 /// The dialog's `name` (start or stop) asked a question starting with `question` and changed nothing itself.
 fn asked_first(lines: &[String], name: &str, output_active: u8, question: &str) {
-    let prefix = format!(
-        "HARNESS settings_asked name={name} output_active={output_active} question={question}"
-    );
     assert!(
-        lines.iter().any(|l| l.starts_with(&prefix)),
-        "{prefix}: {lines:#?}"
+        lines.iter().filter_map(|line| event(line)).any(|row| {
+            row["event"] == "settings_asked"
+                && row["name"] == name
+                && row["output_active"].as_u64() == Some(u64::from(output_active))
+                && row["question"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(question))
+        }),
+        "no matching confirm question: {lines:#?}"
     );
     let clicked = lines
         .iter()
-        .find(|l| l.starts_with(&format!("HARNESS settings_clicked name={name} enabled=1 ")))
+        .find(|l| {
+            line_starts(
+                l,
+                &format!("HARNESS settings_clicked name={name} enabled=1 "),
+            )
+        })
         .unwrap_or_else(|| panic!("no {name} click: {lines:#?}"));
     assert!(
-        !clicked.contains(" status=Starting") && !clicked.contains(" status=Stopping"),
+        field(clicked, "status").is_none_or(|status| !status.starts_with("Starting") && !status.starts_with("Stopping")),
         "{name} alone acts on nothing: {clicked}"
     );
 }
 
 fn has_line(lines: &[String], prefix: &str) -> bool {
-    lines.iter().any(|l| l.starts_with(prefix))
+    lines.iter().any(|l| line_starts(l, prefix))
 }
 
 fn number_after(lines: &[String], key: &str) -> u64 {
+    let (name, key) = match key {
+        "base_ns=" => ("markers", "base_ns"),
+        "period_ns=" => ("markers", "period_ns"),
+        "capture_start_ns=" => ("capture_start", "ns"),
+        "released the output during its start in " => ("release_during_start", "ms"),
+        "HARNESS obs_shutdown ms=" => ("obs_shutdown", "ms"),
+        _ => panic!("unknown event counter {key}"),
+    };
     lines
         .iter()
-        .find_map(|l| l.split(key).nth(1)?.split_whitespace().next()?.parse().ok())
-        .unwrap_or_else(|| panic!("no {key} in the harness output"))
+        .filter_map(|line| event(line))
+        .find_map(|row| (row["event"] == name).then(|| row[key].as_u64()).flatten())
+        .unwrap_or_else(|| panic!("no {name}.{key} in the harness output"))
 }
 
 /// An external session at the harness's canvas, streaming at the mock.
@@ -298,7 +353,7 @@ fn obs_streams_through_the_plugin_in_sync_and_within_a_second() {
     let (status, lines) = run.finish();
     passed(status, &lines);
     assert!(
-        has_plugin_line(&lines, "from the canvas's video"),
+        plugin_observed(&lines, "own_video_encoder", json!({"gpu_mix": false})),
         "an NV12 canvas needs no extra GPU mix: {lines:#?}"
     );
     c.source("the attachment ending at end of stream", |e| {
@@ -338,9 +393,9 @@ fn obs_streams_through_the_plugin_in_sync_and_within_a_second() {
     let keyframes: Vec<(i64, i64)> = lines
         .iter()
         .filter_map(|l| {
-            let rest = l.split("[obs-dstreamy] sent keyframe pts_us=").nth(1)?;
-            let (pts, arrived) = rest.split_once(" arrived_ns=")?;
-            Some((pts.parse().ok()?, arrived.trim().parse().ok()?))
+            let row = event(l)?;
+            (row["event"] == "plugin_keyframe_sent").then_some(())?;
+            Some((row["pts_us"].as_i64()?, row["arrived_ns"].as_i64()?))
         })
         .collect();
     assert!(!keyframes.is_empty(), "the plugin logged no keyframes");
@@ -528,9 +583,7 @@ fn a_stalled_service_cannot_hold_up_the_stop() {
     unsafe { libc::kill(pid, libc::SIGCONT) };
     passed(status, &lines);
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("[obs-dstreamy] the service read nothing for")),
+        plugin_observed(&lines, "stop_drain_timed_out", json!({"deadline_ms":1500})),
         "the writer never blocked on the stopped service: {lines:#?}"
     );
 }
@@ -568,74 +621,267 @@ fn releasing_the_output_while_it_connects_returns_promptly() {
     drop(held);
 }
 
+struct LateService {
+    complete: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for LateService {
+    fn drop(&mut self) {
+        self.complete.take();
+        let joined = self.thread.take().unwrap().join();
+        if !std::thread::panicking() {
+            joined.unwrap();
+        }
+    }
+}
+
 /// A service that replies `attached` after `reply_ms`, sends `detached` at `detached_ms` and never reads.
-fn late_service(
-    h: &Harness,
-    reply_ms: u64,
-    detached_ms: u64,
-) -> (PathBuf, std::thread::JoinHandle<()>) {
+fn late_service(h: &Harness, reply_ms: u64, detached_ms: u64) -> (PathBuf, LateService) {
     use std::io::{BufRead, Write};
     let dir = h.run.path().join("late");
     std::fs::create_dir(&dir).unwrap();
     std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     let path = dir.join("s.sock");
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (complete, completed) = std::sync::mpsc::channel();
     let service = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let accepted = Instant::now();
-        let mut hello = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut hello)
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if completed.recv_timeout(Duration::from_millis(20))
+                        != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    {
+                        return;
+                    }
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(reply_ms).saturating_sub(accepted.elapsed()));
+        let accepted = Instant::now();
+        let mut read = BufReader::new(stream.try_clone().unwrap());
+        let mut hello = String::new();
+        while !hello.ends_with('\n') {
+            if completed.try_recv() != Err(std::sync::mpsc::TryRecvError::Empty) {
+                return;
+            }
+            match read.read_line(&mut hello) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("hello: {e}"),
+            }
+        }
+        if completed
+            .recv_timeout(Duration::from_millis(reply_ms).saturating_sub(accepted.elapsed()))
+            != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
+            return;
+        }
         stream.write_all(b"{\"attached\":1}\n").unwrap();
-        std::thread::sleep(Duration::from_millis(detached_ms).saturating_sub(accepted.elapsed()));
+        if completed
+            .recv_timeout(Duration::from_millis(detached_ms).saturating_sub(accepted.elapsed()))
+            != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
+            return;
+        }
         let _ = stream.write_all(
-            b"{\"message\":\"late test\",\"reason\":\"stopped\",\"type\":\"detached\"}\n",
+            b"{\"message\":\"late test\",\"reason\":\"incompatible\",\"type\":\"detached\"}\n",
         );
-        std::thread::sleep(Duration::from_secs(10));
+        let _ = completed.recv();
     });
-    (path, service)
+    (
+        path,
+        LateService {
+            complete: Some(complete),
+            thread: Some(service),
+        },
+    )
+}
+
+#[test]
+fn late_service_teardown_cancels_without_a_connection_or_complete_hello() {
+    use std::io::Write;
+    for connect in [false, true] {
+        let h = Harness::new("");
+        let (path, service) = late_service(&h, 800, 2600);
+        let _peer = connect.then(|| {
+            let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+            stream.write_all(b"{partial").unwrap();
+            stream
+        });
+        let started = Instant::now();
+        drop(service);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation must join before hello too"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn a_native_capture_reattaches_with_decodable_video_and_audio() {
+    use std::io::{Read, Write};
+    let h = Harness::new("");
+    let directory = h.run.path().join("reattach");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(
+        &directory,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let path = directory.join("s.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let service = std::thread::spawn(move || {
+        let mut second_video = Vec::new();
+        let mut second_audio = 0;
+        let mut first_last_pts = 0;
+        for attempt in 0..2 {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    other => panic!("producer did not attach: {other:?}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            let mut read = BufReader::new(stream.try_clone().unwrap());
+            let mut hello = String::new();
+            read.read_line(&mut hello).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&hello).unwrap()["role"],
+                "producer"
+            );
+            stream
+                .write_all(format!("{{\"attached\":{attempt}}}\n").as_bytes())
+                .unwrap();
+            let mut video_count = 0;
+            loop {
+                let mut length = [0; 4];
+                read.read_exact(&mut length).unwrap();
+                let length = u32::from_be_bytes(length) as usize;
+                assert!((10..=(8 << 20)).contains(&length));
+                let mut frame = vec![0; length];
+                read.read_exact(&mut frame).unwrap();
+                let pts = i64::from_be_bytes(frame[1..9].try_into().unwrap());
+                match frame[0] {
+                    1 => {
+                        video_count += 1;
+                        if attempt == 0 {
+                            first_last_pts = pts;
+                        } else {
+                            second_video.push((pts, frame[9] & 1 != 0, frame[10..].to_vec()));
+                        }
+                    }
+                    2 if attempt == 1 => second_audio += 1,
+                    3 => break,
+                    _ => {}
+                }
+                if attempt == 0 && video_count == 30 {
+                    break;
+                }
+            }
+        }
+        (first_last_pts, second_video, second_audio)
+    });
+    let (status, lines) = HarnessRun::start(
+        &h,
+        json!({"endpoint":path}),
+        &["--seconds", "30", "--until-video", "180"],
+    )
+    .finish();
+    passed(status, &lines);
+    let (before, video, audio) = service.join().unwrap();
+    assert!(
+        video.len() >= 60 && audio >= 60,
+        "capture must survive reattachment: {} video, {audio} audio",
+        video.len()
+    );
+    assert!(
+        video[0].1 && video[0].0 > before,
+        "reattach starts at a fresh IDR, never replaying the old one"
+    );
+    assert!(video.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    let mut decoder = openh264::decoder::Decoder::new().unwrap();
+    let pictures = video
+        .iter()
+        .filter(|(_, _, bytes)| decoder.decode(bytes).unwrap().is_some())
+        .count();
+    assert!(
+        pictures >= 60,
+        "post-reattach frames decode independently: {pictures}"
+    );
 }
 
 /// Capture begins after libobs's active check in destroy (the hook delays our flag by 1.5 s).
 fn release_during_a_late_capture(detached_ms: u64) -> Vec<String> {
     let h = Harness::new("");
     let (path, _service) = late_service(&h, 800, detached_ms);
+    let clean_stop = detached_ms > 2000;
+    let mut args = vec![
+        "--seconds",
+        "60",
+        "--until-video",
+        "100000",
+        "--bitrate",
+        "8000",
+        "--release-after-start",
+        "500",
+        "--verbose",
+    ];
+    if !clean_stop {
+        args.extend(["--expect-error", "late test"]);
+    }
     let run = HarnessRun::start(
         &h,
         json!({"endpoint": path, "test_destroy_delay_ms": 1500}),
-        &[
-            "--seconds",
-            "60",
-            "--until-video",
-            "100000",
-            "--bitrate",
-            "8000",
-            "--release-after-start",
-            "500",
-            "--expect-error",
-            "late test",
-            "--verbose",
-        ],
+        &args,
     );
     let (status, lines) = run.finish();
     passed(status, &lines);
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("[obs-dstreamy] attached to the D-Streamy service")),
+        plugin_observed(&lines, "attached", json!({"attachment":1})),
         "capture never began during destroy: {lines:#?}"
     );
     assert!(
         has_line(
             &lines,
-            "HARNESS output stopped with code -4: The D-Streamy service ended the stream (stopped): late test"
+            if clean_stop {
+                "HARNESS output stopped with code 0: "
+            } else {
+                "HARNESS output stopped with code -4: The D-Streamy service ended the stream (incompatible): late test"
+            }
         ),
         "{lines:#?}"
     );
     assert!(
-        has_line(&lines, "HARNESS stop_signals=1 error_stop_signals=1"),
+        has_line(
+            &lines,
+            if clean_stop {
+                "HARNESS stop_signals=1 error_stop_signals=0"
+            } else {
+                "HARNESS stop_signals=1 error_stop_signals=1"
+            }
+        ),
         "{lines:#?}"
     );
     lines
@@ -651,21 +897,33 @@ fn a_late_capture_that_ends_before_destroy_takes_the_join_path() {
 /// The writer takes destroy's Shutdown, then the reader's `detached` wins while the writer is blocked.
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
-fn a_late_capture_whose_shutdown_is_lost_still_lets_destroy_return() {
+fn a_late_capture_preserves_consumed_shutdown_when_the_peer_ends_during_drain() {
     let lines = release_during_a_late_capture(2_600);
-    let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
-    let stop = at("[obs-dstreamy] stop requested; sending").expect("the writer took the stop");
-    let detached = at("The D-Streamy service ended the stream").expect("the reader saw detached");
+    let stop = lines
+        .iter()
+        .position(|line| event(line).is_some_and(|row| row["event"] == "plugin_stop_drain_started"))
+        .expect("the writer took the stop");
+    let detached = lines
+        .iter()
+        .position(|line| {
+            event(line).is_some_and(|row| row["event"] == "output_stop" && row["code"] == 0)
+        })
+        .expect("the requested Shutdown ended cleanly");
     assert!(
         stop < detached,
         "the Shutdown was not taken before the detached: {lines:#?}"
     );
 }
 
-fn has_plugin_line(lines: &[String], text: &str) -> bool {
-    lines
-        .iter()
-        .any(|l| l.contains("[obs-dstreamy] ") && l.contains(text))
+fn plugin_observed(lines: &[String], name: &str, fields: Value) -> bool {
+    lines.iter().filter_map(|line| event(line)).any(|row| {
+        row["event"] == format!("plugin_{name}")
+            && fields
+                .as_object()
+                .unwrap()
+                .iter()
+                .all(|(key, value)| row.get(key) == Some(value))
+    })
 }
 
 fn first_picture_size(video: &[&RecordedVideoFrame]) -> (usize, usize) {
@@ -747,10 +1005,42 @@ fn share_mode_shares_a_stream_encoder_that_passes() {
         90,
     );
     assert!(
-        has_plugin_line(&lines, "] sharing the stream's video encoder obs_x264"),
+        plugin_observed(&lines, "shared_video_encoder", json!({"id": "obs_x264"})),
         "{lines:#?}"
     );
-    assert!(!has_plugin_line(&lines, "own video encoder"), "{lines:#?}");
+    assert!(
+        !plugin_observed(&lines, "own_video_encoder", json!({})),
+        "{lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn custom_x264_profile_override_uses_a_safe_own_encoder() {
+    let (lines, _) = stream(
+        json!({"mode":"share"}),
+        &[
+            "--preset",
+            "veryfast",
+            "--profile",
+            "baseline",
+            "--keyint-sec",
+            "2",
+            "--x264opts",
+            "profile=main",
+        ],
+        90,
+    );
+    assert!(plugin_observed(
+        &lines,
+        "share_refused",
+        json!({"custom_options":true})
+    ));
+    assert!(plugin_observed(
+        &lines,
+        "own_video_encoder",
+        json!({"id":"obs_x264"})
+    ));
 }
 
 #[test]
@@ -762,14 +1052,15 @@ fn share_mode_falls_back_to_the_own_encoder_when_b_frames_are_on() {
         90,
     );
     assert!(
-        has_plugin_line(
+        plugin_observed(
             &lines,
-            "not sharing the stream's video encoder obs_x264 (D-Streamy needs B-frames off"
+            "share_refused",
+            json!({"id": "obs_x264", "b_frames": true})
         ),
         "{lines:#?}"
     );
     assert!(
-        has_plugin_line(&lines, "own video encoder obs_x264"),
+        plugin_observed(&lines, "own_video_encoder", json!({"id": "obs_x264"})),
         "{lines:#?}"
     );
 }
@@ -780,8 +1071,15 @@ fn the_own_encoder_scales_a_1440p_canvas_to_1080p() {
     let (lines, recorded) =
         rescaled_stream(json!({}), &["--width", "2560", "--height", "1440"], 60);
     assert!(
-        has_plugin_line(&lines, "own video encoder obs_x264 at 1920×1080")
-            && has_plugin_line(&lines, "from a GPU mix in NV12"),
+        plugin_observed(
+            &lines,
+            "own_video_encoder",
+            json!({"id": "obs_x264", "width": 1920, "height": 1080})
+        ) && plugin_observed(
+            &lines,
+            "own_video_encoder",
+            json!({"gpu_mix": true, "format": "NV12"})
+        ),
         "{lines:#?}"
     );
     assert_eq!(first_picture_size(&stream_video(&recorded)), (1920, 1080));
@@ -796,7 +1094,11 @@ fn the_own_encoder_divides_a_90_fps_canvas_down_to_30() {
         90,
     );
     assert!(
-        has_plugin_line(&lines, "own video encoder obs_x264 at 640×360, 30 FPS"),
+        plugin_observed(
+            &lines,
+            "own_video_encoder",
+            json!({"width": 640, "height": 360, "fps": 30})
+        ),
         "{lines:#?}"
     );
     let steps = rtp_steps(&stream_video(&recorded));
@@ -816,7 +1118,11 @@ fn the_own_encoder_runs_at_60_fps_on_a_60_fps_canvas() {
         120,
     );
     assert!(
-        has_plugin_line(&lines, "own video encoder obs_x264 at 640×360, 60 FPS"),
+        plugin_observed(
+            &lines,
+            "own_video_encoder",
+            json!({"width": 640, "height": 360, "fps": 60})
+        ),
         "{lines:#?}"
     );
     let steps = rtp_steps(&stream_video(&recorded));
@@ -844,9 +1150,10 @@ fn share_mode_replaces_an_attached_aac_encoder_with_opus() {
         90,
     );
     assert!(
-        has_plugin_line(
+        plugin_observed(
             &lines,
-            "replacing the attached audio encoder ffmpeg_aac with D-Streamy's own Opus encoder"
+            "audio_encoder_replaced",
+            json!({"previous": "ffmpeg_aac", "current": "ffmpeg_opus"})
         ),
         "{lines:#?}"
     );
@@ -867,18 +1174,17 @@ fn share_mode_rechecks_the_stream_encoder_after_a_fallback() {
         ],
         60,
     );
-    let at = |text: &str| {
+    let at = |name: &str| {
         lines
             .iter()
-            .position(|l| l.contains("[obs-dstreamy] ") && l.contains(text))
+            .position(|line| event(line).is_some_and(|row| row["event"] == name))
     };
-    let fell_back =
-        at("not sharing the stream's video encoder obs_x264").expect("first start falls back");
+    let fell_back = at("plugin_share_refused").expect("first start falls back");
     let restarted = lines
         .iter()
-        .position(|l| l == "HARNESS restarting the output")
+        .position(|l| event_matches(l, "HARNESS restarting the output", false))
         .expect("a restart");
-    let shared = at("] sharing the stream's video encoder obs_x264").expect("the restart shares");
+    let shared = at("plugin_shared_video_encoder").expect("the restart shares");
     assert!(fell_back < restarted && restarted < shared, "{lines:#?}");
 }
 
@@ -891,11 +1197,11 @@ fn share_mode_uses_the_own_encoder_while_the_stream_is_idle() {
         60,
     );
     assert!(
-        has_plugin_line(&lines, "only while streaming"),
+        plugin_observed(&lines, "share_refused", json!({"inactive": true})),
         "{lines:#?}"
     );
     assert!(
-        has_plugin_line(&lines, "own video encoder obs_x264"),
+        plugin_observed(&lines, "own_video_encoder", json!({"id": "obs_x264"})),
         "{lines:#?}"
     );
 }
@@ -906,7 +1212,11 @@ fn the_own_encoder_restarts_on_the_same_output() {
     let (lines, _) = stream(json!({}), &["--restart-video-settings", "{}"], 60);
     let own = lines
         .iter()
-        .filter(|l| l.contains("[obs-dstreamy] own video encoder obs_x264"))
+        .filter(|line| {
+            event(line).is_some_and(|row| {
+                row["event"] == "plugin_own_video_encoder" && row["id"] == "obs_x264"
+            })
+        })
         .count();
     assert_eq!(own, 2, "{lines:#?}");
 }
@@ -914,19 +1224,15 @@ fn the_own_encoder_restarts_on_the_same_output() {
 fn mixer_reports(lines: &[String]) -> Vec<(String, Option<u64>, u64)> {
     lines
         .iter()
-        .filter_map(|l| {
-            let rest = l.strip_prefix("HARNESS audio_mixer when=")?;
-            let (when, rest) = rest.split_once(' ')?;
-            let idx = rest
-                .strip_prefix("idx=")
-                .and_then(|r| r.split_whitespace().next()?.parse().ok());
-            let count = rest
-                .split("dstreamy_audio_encoders=")
-                .nth(1)?
-                .trim()
-                .parse()
-                .ok()?;
-            Some((when.to_owned(), idx, count))
+        .filter_map(|line| {
+            let row = event(line)?;
+            (row["event"] == "audio_mixer").then(|| {
+                Some((
+                    row["when"].as_str()?.to_owned(),
+                    row["idx"].as_u64(),
+                    row["dstreamy_audio_encoders"].as_u64()?,
+                ))
+            })?
         })
         .collect()
 }
@@ -974,7 +1280,7 @@ fn an_invalid_audio_track_fails_before_any_audio_encoder_exists() {
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("HARNESS expected_error start: ")
+                .any(|l| line_starts(l, "HARNESS expected_error start: ")
                     && l.contains(&format!("not {track}"))),
             "{lines:#?}"
         );
@@ -1013,10 +1319,10 @@ fn an_unchanged_audio_track_keeps_the_cached_encoder_across_starts() {
         &["--restart-output-settings", "{}"],
         60,
     );
-    let ptrs: Vec<&str> = lines
+    let ptrs: Vec<String> = lines
         .iter()
-        .filter(|l| l.starts_with("HARNESS audio_mixer when="))
-        .filter_map(|l| l.split("encoder=").nth(1)?.split_whitespace().next())
+        .filter(|l| line_starts(l, "HARNESS audio_mixer when="))
+        .filter_map(|l| field(l, "encoder"))
         .collect();
     assert_eq!(ptrs.len(), 2, "{lines:#?}");
     assert_eq!(ptrs[0], ptrs[1], "{lines:#?}");
@@ -1061,17 +1367,23 @@ fn fake_frontend() -> String {
 fn without_a_frontend_the_plugin_loads_and_offers_no_tools_entry() {
     let lines = report_ui(&[]);
     assert!(
-        has_plugin_line(&lines, "no OBS frontend: Tools > D-Streamy is unavailable"),
+        plugin_observed(
+            &lines,
+            "frontend_unavailable",
+            json!({"reason": "frontend"})
+        ),
         "{lines:#?}"
     );
     assert!(
-        !has_plugin_line(&lines, "added Tools > D-Streamy"),
+        !plugin_observed(&lines, "tools_entry_added", json!({})),
         "{lines:#?}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "HARNESS settings_source registered=1 listed=0 flags=0x400"),
+        lines.iter().any(|l| event_matches(
+            l,
+            "HARNESS settings_source registered=1 listed=0 flags=0x400",
+            false
+        )),
         "{lines:#?}"
     );
 }
@@ -1080,11 +1392,15 @@ fn without_a_frontend_the_plugin_loads_and_offers_no_tools_entry() {
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn the_output_has_no_audio_track_property_but_keeps_track_1_as_its_default() {
     let lines = report_ui(&[]);
-    let props: Vec<&str> = lines
+    let props: Vec<String> = lines
         .iter()
-        .filter_map(|l| l.strip_prefix("HARNESS output_property name="))
+        .filter_map(|l| {
+            line_starts(l, "HARNESS output_property ")
+                .then(|| field(l, "name"))
+                .flatten()
+        })
         .collect();
-    assert!(props.contains(&"mode"), "{lines:#?}");
+    assert!(props.iter().any(|name| name == "mode"), "{lines:#?}");
     assert!(
         props
             .iter()
@@ -1094,7 +1410,7 @@ fn the_output_has_no_audio_track_property_but_keeps_track_1_as_its_default() {
     assert!(
         lines
             .iter()
-            .any(|l| l == "HARNESS output_setting audio_track=1"),
+            .any(|l| event_matches(l, "HARNESS output_setting audio_track=1", false)),
         "{lines:#?}"
     );
 }
@@ -1105,7 +1421,7 @@ fn tools_d_streamy_opens_the_private_settings_source_through_the_frontend() {
     let lib = fake_frontend();
     let lines = report_ui(&["--fake-frontend", lib.as_str()]);
     assert!(
-        has_plugin_line(&lines, "added Tools > D-Streamy"),
+        plugin_observed(&lines, "tools_entry_added", json!({})),
         "{lines:#?}"
     );
     for want in [
@@ -1115,7 +1431,10 @@ fn tools_d_streamy_opens_the_private_settings_source_through_the_frontend() {
         "HARNESS frontend closed expired=1",
         "HARNESS settings_source registered=1 listed=0 flags=0x400",
     ] {
-        assert!(lines.iter().any(|l| l == want), "{want}: {lines:#?}");
+        assert!(
+            lines.iter().any(|l| event_matches(l, want, false)),
+            "{want}: {lines:#?}"
+        );
     }
 }
 
@@ -1125,17 +1444,25 @@ fn a_frontend_without_a_properties_dialog_offers_no_tools_entry() {
     let lib = harness_lib("obs-harness-frontend-incomplete.so");
     let lines = report_ui(&["--fake-frontend", lib.as_str()]);
     assert!(
-        has_plugin_line(
+        plugin_observed(
             &lines,
-            "OBS frontend lacks obs_frontend_open_source_properties: Tools > D-Streamy is unavailable"
+            "frontend_unavailable",
+            json!({"reason": "symbol", "symbol": "obs_frontend_open_source_properties"})
         ),
         "{lines:#?}"
     );
-    assert!(!has_plugin_line(&lines, "no OBS frontend"), "{lines:#?}");
+    assert!(
+        !plugin_observed(
+            &lines,
+            "frontend_unavailable",
+            json!({"reason": "frontend"})
+        ),
+        "{lines:#?}"
+    );
     assert!(
         lines
             .iter()
-            .any(|l| l == "HARNESS frontend tools_items=0 name="),
+            .any(|l| event_matches(l, "HARNESS frontend tools_items=0 name=", false)),
         "{lines:#?}"
     );
 }
@@ -1167,10 +1494,16 @@ fn read_module_config(dir: &std::path::Path) -> Value {
 }
 
 fn settings_lines<'a>(lines: &'a [String], when: &str) -> Vec<&'a str> {
-    let prefix = format!(" when={when} ");
     lines
         .iter()
-        .filter(|l| l.starts_with("HARNESS settings_") && l.contains(&prefix))
+        .filter(|line| {
+            event(line).is_some_and(|row| {
+                row["event"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("settings_"))
+                    && row["when"] == when
+            })
+        })
         .map(String::as_str)
         .collect()
 }
@@ -1218,9 +1551,17 @@ fn the_settings_dialog_offers_a_server_a_channel_tracks_1_to_6_and_start_while_i
         "HARNESS settings_property when=open name=stop type=8 enabled=0 desc=Stop".to_owned(),
         "HARNESS settings_source when=open audio_track=6".to_owned(),
     ]);
-    assert_eq!(settings_lines(&lines, "open"), want, "{lines:#?}");
+    let actual = settings_lines(&lines, "open");
+    assert_eq!(actual.len(), want.len(), "{lines:#?}");
     assert!(
-        lines.contains(&"HARNESS check_settings when=close differ=0".to_owned()),
+        actual
+            .iter()
+            .zip(&want)
+            .all(|(line, want)| event_matches(line, want, false)),
+        "{lines:#?}"
+    );
+    assert!(
+        has_event(&lines, "HARNESS check_settings when=close differ=0"),
         "an unchanged close asks nothing: {lines:#?}"
     );
     assert!(
@@ -1249,7 +1590,10 @@ fn mixer_session(saved: Option<Value>) -> (Vec<String>, Value) {
 
 fn assert_lines(lines: &[String], want: &[String]) {
     for want in want {
-        assert!(lines.iter().any(|l| l == want), "{want}: {lines:#?}");
+        assert!(
+            lines.iter().any(|l| event_matches(l, want, false)),
+            "{want}: {lines:#?}"
+        );
     }
 }
 
@@ -1258,12 +1602,12 @@ fn mixer_step<'a>(lines: &'a [String], step: &str) -> &'a [String] {
     let marker = format!("HARNESS mixer_step name={step}");
     let start = lines
         .iter()
-        .position(|l| *l == marker)
+        .position(|l| event_matches(l, &marker, false))
         .unwrap_or_else(|| panic!("no {marker}: {lines:#?}"))
         + 1;
     let end = lines[start..]
         .iter()
-        .position(|l| l.starts_with("HARNESS mixer_step "))
+        .position(|l| line_starts(l, "HARNESS mixer_step "))
         .map_or(lines.len(), |n| start + n);
     &lines[start..end]
 }
@@ -1271,22 +1615,26 @@ fn mixer_step<'a>(lines: &'a [String], step: &str) -> &'a [String] {
 /// The dialog never rebuilds inside its own callbacks, and an outside mixer change shows once libobs stored it.
 fn assert_dialog_follows(lines: &[String]) {
     assert!(
-        lines.contains(&"HARNESS mixer_sync_reloads count=0".to_owned()),
+        has_event(lines, "HARNESS mixer_sync_reloads count=0"),
         "no rebuild inside a click or a pick: {lines:#?}"
     );
     assert!(
-        mixer_step(lines, "track5").contains(
-            &"HARNESS settings_property when=view name=take_over type=8 enabled=1 desc=Manage Track 5"
-                .to_owned()
+        has_event(
+            mixer_step(lines, "track5"),
+            "HARNESS settings_property when=view name=take_over type=8 enabled=1 desc=Manage Track 5"
         ),
         "a picked track shows its own takeover: {lines:#?}"
     );
     let voice = mixer_step(lines, "external")
         .iter()
-        .rfind(|l| l.starts_with("HARNESS settings_checkbox when=view desc=Voice "));
+        .rfind(|l| line_starts(l, "HARNESS settings_checkbox when=view desc=Voice "));
     assert_eq!(
-        voice.map(String::as_str),
-        Some("HARNESS settings_checkbox when=view desc=Voice on=1"),
+        voice.map(|line| event_matches(
+            line,
+            "HARNESS settings_checkbox when=view desc=Voice on=1",
+            false
+        )),
+        Some(true),
         "the last rebuild shows the stored flags: {lines:#?}"
     );
 }
@@ -1324,32 +1672,37 @@ fn taking_over_track_6_clears_it_on_every_source_and_a_tick_sets_only_that_bit()
         .map(str::to_owned),
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("HARNESS settings_clicked name=take_over enabled=1 refresh=0 ")),
+        lines.iter().any(|l| line_starts(
+            l,
+            "HARNESS settings_clicked name=take_over enabled=1 refresh=0 "
+        )),
         "{lines:#?}"
     );
     assert!(
-        lines.contains(&format!(
-            "HARNESS settings_property when=confirming name=take_over_effect type=4 enabled=1 desc={TAKE_OVER_EFFECT}"
-        )),
+        has_event(
+            &lines,
+            &format!(
+                "HARNESS settings_property when=confirming name=take_over_effect type=4 enabled=1 desc={TAKE_OVER_EFFECT}"
+            )
+        ),
         "the takeover waits for its confirm: {lines:#?}"
     );
     assert!(
-        !lines
-            .iter()
-            .any(|l| l.starts_with("HARNESS settings_property when=confirming name=take_over ")),
+        !lines.iter().any(|l| line_starts(
+            l,
+            "HARNESS settings_property when=confirming name=take_over "
+        )),
         "{lines:#?}"
     );
     assert!(
         !lines
             .iter()
-            .any(|l| l.starts_with("HARNESS settings_checkbox when=unmanaged")),
+            .any(|l| line_starts(l, "HARNESS settings_checkbox when=unmanaged")),
         "no checklist before the takeover: {lines:#?}"
     );
     assert_dialog_follows(&lines);
     assert!(
-        lines.contains(&"HARNESS mixers when=external name=Voice mixers=63".to_owned()),
+        has_event(&lines, "HARNESS mixers when=external name=Voice mixers=63"),
         "{lines:#?}"
     );
     assert_eq!(
@@ -1411,11 +1764,15 @@ fn dialog_session_with(mode: &str, saved: Option<Value>) -> (Vec<String>, Option
 }
 
 fn start_button(lines: &[String], when: &str) -> Option<bool> {
-    let prefix = format!("HARNESS settings_property when={when} name=start type=8 enabled=");
     lines
         .iter()
-        .rfind(|l| l.starts_with(&prefix))
-        .map(|l| l[prefix.len()..].starts_with('1'))
+        .rfind(|line| {
+            line_starts(
+                line,
+                &format!("HARNESS settings_property when={when} name=start "),
+            )
+        })
+        .and_then(|line| event(line)?["enabled"].as_u64().map(|enabled| enabled == 1))
 }
 
 #[test]
@@ -1470,7 +1827,7 @@ fn the_managed_track_belongs_to_its_scene_collection_and_loads_never_touch_mixer
         "HARNESS settings_property when=a_unmanaged name=status type=4 enabled=1 desc={MIC_GUARD}"
     );
     assert!(
-        lines.contains(&guard),
+        has_event(&lines, &guard),
         "the dialog says why Start waits: {lines:#?}"
     );
     for (when, enabled) in [
@@ -1488,11 +1845,13 @@ fn the_managed_track_belongs_to_its_scene_collection_and_loads_never_touch_mixer
     }
     for when in ["a_not_now", "b", "c"] {
         assert!(
-            !lines.iter().any(|l| l
-                .starts_with(&format!("HARNESS settings_checkbox when={when} "))
-                || l.starts_with(&format!(
-                    "HARNESS settings_property when={when} name=confirm_take_over "
-                ))),
+            !lines.iter().any(|l| line_starts(
+                l,
+                &format!("HARNESS settings_checkbox when={when} ")
+            ) || line_starts(
+                l,
+                &format!("HARNESS settings_property when={when} name=confirm_take_over ")
+            )),
             "{when} is unmanaged with no confirm open: {lines:#?}"
         );
     }
@@ -1545,22 +1904,19 @@ fn cancel_puts_back_the_discord_track_the_dialog_changed_on_every_source() {
         .map(str::to_owned),
     );
     assert!(
-        has_plugin_line(
-            &lines,
-            "D-Streamy put back the Discord tracks on 3 audio sources"
-        ),
+        plugin_observed(&lines, "tracks_restored", json!({"sources": 3})),
         "Music, Voice and Late: {lines:#?}"
     );
     assert!(
         mixer_step(&lines, "managed")
             .iter()
-            .any(|l| l.starts_with("HARNESS picked track=4 ")),
+            .any(|l| line_starts(l, "HARNESS picked track=4 ")),
         "Defaults has a pick to put back: {lines:#?}"
     );
     assert!(
         !lines
             .iter()
-            .any(|l| l.starts_with("HARNESS settings_checkbox when=cancelled ")),
+            .any(|l| line_starts(l, "HARNESS settings_checkbox when=cancelled ")),
         "unmanaged again: {lines:#?}"
     );
 }
@@ -1673,7 +2029,11 @@ fn a_legacy_managed_track_with_a_mic_on_it_stays_unmanaged_so_go_live_waits() {
     );
     assert_eq!(start_button(&lines, "adopted"), Some(false), "{lines:#?}");
     assert!(
-        has_plugin_line(&lines, "but Mic is on it here, so Track 3 stays unmanaged"),
+        plugin_observed(
+            &lines,
+            "track_adoption_refused",
+            json!({"track": 3, "microphones": ["Mic"]})
+        ),
         "{lines:#?}"
     );
     assert_eq!(
@@ -1711,7 +2071,7 @@ fn an_unsaved_adoption_is_not_repeated_in_the_next_collection() {
         let prefix = format!("HARNESS settings_property when={when} name=status ");
         lines
             .iter()
-            .any(|l| l.starts_with(&prefix) && l.contains("Couldn't read D-Streamy's settings"))
+            .any(|l| line_starts(l, &prefix) && l.contains("Couldn't read D-Streamy's settings"))
     };
     assert!(unreadable("corrupt"), "{lines:#?}");
     assert!(
@@ -1721,7 +2081,7 @@ fn an_unsaved_adoption_is_not_repeated_in_the_next_collection() {
     assert!(
         !lines
             .iter()
-            .any(|l| l.starts_with("HARNESS settings_checkbox when=b_adopt ")),
+            .any(|l| line_starts(l, "HARNESS settings_checkbox when=b_adopt ")),
         "B has no mic on Track 6, yet the reloaded file's managed_track is not adopted again: {lines:#?}"
     );
     assert_eq!(
@@ -1729,7 +2089,7 @@ fn an_unsaved_adoption_is_not_repeated_in_the_next_collection() {
         "the read-only file was never written: {saved}"
     );
     assert!(
-        has_plugin_line(&lines, "Couldn't save D-Streamy's settings"),
+        plugin_observed(&lines, "config_error", json!({"kind": "write"})),
         "{lines:#?}"
     );
 }
@@ -1748,7 +2108,7 @@ fn a_deliberate_track_1_takeover_stays_on_track_1_and_says_what_it_costs() {
         .map(str::to_owned),
     );
     assert!(
-        lines.iter().any(|l| l.starts_with(
+        lines.iter().any(|l| line_starts(l,
             "HARNESS settings_property when=adopted name=audio_note_0 type=4 enabled=1 desc=Track 1 is OBS's \
              streaming and recording track, and D-Streamy manages it for Discord"
         )),
@@ -1757,7 +2117,7 @@ fn a_deliberate_track_1_takeover_stays_on_track_1_and_says_what_it_costs() {
     assert!(
         !lines
             .iter()
-            .any(|l| l.starts_with("HARNESS settings_property when=adopted name=release_")),
+            .any(|l| line_starts(l, "HARNESS settings_property when=adopted name=release_")),
         "Discord gets Track 1, so it can't be let go here: {lines:#?}"
     );
     assert_eq!(saved["audio_track"], 1, "{saved}");
@@ -1794,23 +2154,23 @@ fn track_1_confirms_its_cost_and_another_managed_track_can_be_let_go() {
         .map(str::to_owned),
     );
     assert!(
-        lines.iter().any(|l| l.starts_with(
+        lines.iter().any(|l| line_starts(l,
             "HARNESS settings_property when=track1_confirming name=take_over_effect type=4 enabled=1 \
              desc=Track 1 is OBS's streaming and recording track: managing it turns it off on every audio source"
         )),
         "{lines:#?}"
     );
     assert!(
-        lines.contains(
-            &"HARNESS settings_property when=three name=release_6 type=8 enabled=1 desc=Stop managing Track 6"
-                .to_owned()
+        has_event(
+            &lines,
+            "HARNESS settings_property when=three name=release_6 type=8 enabled=1 desc=Stop managing Track 6"
         ),
         "a Cancel would manage the opened pick again, so letting it go is offered at once: {lines:#?}"
     );
     assert!(
         !lines
             .iter()
-            .any(|l| l.starts_with("HARNESS settings_property when=released name=release_")),
+            .any(|l| line_starts(l, "HARNESS settings_property when=released name=release_")),
         "nothing left to let go: {lines:#?}"
     );
 }
@@ -1849,7 +2209,6 @@ fn mixer_changes_obs_saves_before_closing_the_dialog_stay_and_only_picks_are_ask
         ]
         .map(str::to_owned),
     );
-    let leaving = "the Discord track changes made in the open D-Streamy dialog stay";
     for (step, closes) in [
         ("duplicate", "none"),
         ("rename", "none"),
@@ -1860,20 +2219,27 @@ fn mixer_changes_obs_saves_before_closing_the_dialog_stay_and_only_picks_are_ask
             "HARNESS close_dialog differ={} choice={closes}",
             u8::from(closes != "none")
         );
-        assert!(lines.contains(&close), "{step}: {lines:#?}");
+        assert!(has_event(lines, &close), "{step}: {lines:#?}");
     }
     assert!(
-        has_plugin_line(collection_step(&lines, "switch_discard"), leaving),
+        plugin_observed(
+            collection_step(&lines, "switch_discard"),
+            "dialog_mixer_changes_kept",
+            json!({})
+        ),
         "the switch's changing event keeps the dialog's changes before the Discard: {lines:#?}"
     );
     let exit = collection_step(&lines, "exit");
-    let at = |want: &str| exit.iter().position(|l| l == want);
+    let at = |want: &str| exit.iter().position(|l| event_matches(l, want, false));
     assert!(
         at("HARNESS close_dialog differ=0 choice=none")
             > at("HARNESS check_settings when=exit_before differ=1"),
         "OBS saved the takeover at exit, so closing asks nothing: {exit:#?}"
     );
-    assert!(has_plugin_line(exit, leaving), "{exit:#?}");
+    assert!(
+        plugin_observed(exit, "dialog_mixer_changes_kept", json!({})),
+        "{exit:#?}"
+    );
 }
 
 /// The lines between a collection run's `step` marker and the next marker.
@@ -1881,12 +2247,12 @@ fn collection_step<'a>(lines: &'a [String], step: &str) -> &'a [String] {
     let marker = format!("HARNESS collection_step name={step}");
     let start = lines
         .iter()
-        .position(|l| *l == marker)
+        .position(|l| event_matches(l, &marker, false))
         .unwrap_or_else(|| panic!("no {marker}: {lines:#?}"))
         + 1;
     let end = lines[start..]
         .iter()
-        .position(|l| l.starts_with("HARNESS collection_step "))
+        .position(|l| line_starts(l, "HARNESS collection_step "))
         .map_or(lines.len(), |n| start + n);
     &lines[start..end]
 }
@@ -1931,7 +2297,7 @@ fn a_config_saved_on_the_old_default_track_1_opens_on_track_6() {
         dir.as_str(),
     ]);
     assert!(
-        lines.contains(&"HARNESS settings_source when=open audio_track=6".to_owned()),
+        has_event(&lines, "HARNESS settings_source when=open audio_track=6"),
         "{lines:#?}"
     );
 }
@@ -1960,18 +2326,22 @@ fn a_track_chosen_in_the_dialog_is_saved_to_the_module_config_and_reopens() {
         "HARNESS settings_source when=updated audio_track=5",
         "HARNESS settings_source when=reopened audio_track=5",
     ] {
-        assert!(lines.iter().any(|l| l == want), "{want}: {lines:#?}");
+        assert!(
+            lines.iter().any(|l| event_matches(l, want, false)),
+            "{want}: {lines:#?}"
+        );
     }
     assert!(
-        lines.iter().any(|l| l
-            .strip_prefix("HARNESS settings_modified refresh=1 status=")
-            .is_some_and(|s| s.starts_with(NO_SERVICE))),
+        lines
+            .iter()
+            .any(|l| line_starts(l, "HARNESS settings_modified refresh=1 ")
+                && field(l, "status").is_some_and(|status| status.starts_with(NO_SERVICE))),
         "{lines:#?}"
     );
     assert_eq!(
         lines
             .iter()
-            .filter(|l| *l == "HARNESS frontend closed expired=1")
+            .filter(|l| event_matches(l, "HARNESS frontend closed expired=1", false))
             .count(),
         2,
         "{lines:#?}"
@@ -2000,27 +2370,32 @@ fn an_out_of_range_track_from_the_dialog_is_refused_and_not_saved() {
         r#"{"audio_track": 9}"#,
     ]);
     assert!(
-        has_plugin_line(
-            &lines,
-            "ignored Discord audio track 9: pick Track 1 to Track 6"
-        ),
+        plugin_observed(&lines, "audio_track_refused", json!({"track": 9})),
         "{lines:#?}"
     );
     for want in [
         "HARNESS settings_source when=updated audio_track=3",
         "HARNESS settings_source when=reopened audio_track=3",
     ] {
-        assert!(lines.iter().any(|l| l == want), "{want}: {lines:#?}");
+        assert!(
+            lines.iter().any(|l| event_matches(l, want, false)),
+            "{want}: {lines:#?}"
+        );
     }
     assert_eq!(read_module_config(config.path())["audio_track"], 3);
 }
 
-fn status_line<'a>(lines: &'a [String], when: &str) -> &'a str {
-    let prefix =
-        format!("HARNESS settings_property when={when} name=status type=4 enabled=1 desc=");
+fn status_line(lines: &[String], when: &str) -> String {
     lines
         .iter()
-        .find_map(|l| l.strip_prefix(&prefix))
+        .find_map(|line| {
+            line_starts(
+                line,
+                &format!("HARNESS settings_property when={when} name=status "),
+            )
+            .then(|| field(line, "desc"))
+            .flatten()
+        })
         .unwrap_or_else(|| panic!("no {when} status: {lines:#?}"))
 }
 
@@ -2072,9 +2447,11 @@ fn corrupt_module_config_is_kept(garbage: &[u8]) {
             "{when}: the session and config errors both show: {status}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|l| *l == format!("HARNESS settings_info when={when} name=status kind=2")),
+            lines.iter().any(|l| event_matches(
+                l,
+                &format!("HARNESS settings_info when={when} name=status kind=2"),
+                false
+            )),
             "{when}: {lines:#?}"
         );
     }
@@ -2085,12 +2462,17 @@ fn corrupt_module_config_is_kept(garbage: &[u8]) {
         "{lines:#?}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "HARNESS settings_source when=reopened audio_track=5"),
+        lines.iter().any(|l| event_matches(
+            l,
+            "HARNESS settings_source when=reopened audio_track=5",
+            false
+        )),
         "{lines:#?}"
     );
-    assert!(has_plugin_line(&lines, &read_error), "{lines:#?}");
+    assert!(
+        plugin_observed(&lines, "config_error", json!({"kind":"corrupt"})),
+        "{lines:#?}"
+    );
     assert_eq!(
         std::fs::read(&path).unwrap(),
         garbage,
@@ -2148,19 +2530,26 @@ fn a_track_that_could_not_be_saved_survives_reopening_with_its_error() {
         );
         for when in ["updated", "reopened"] {
             assert!(
-                lines
-                    .iter()
-                    .any(|l| *l == format!("HARNESS settings_info when={when} name=status kind=2")),
+                lines.iter().any(|l| event_matches(
+                    l,
+                    &format!("HARNESS settings_info when={when} name=status kind=2"),
+                    false
+                )),
                 "{when}: {lines:#?}"
             );
         }
         assert!(
-            lines
-                .iter()
-                .any(|l| l == "HARNESS settings_source when=reopened audio_track=4"),
+            lines.iter().any(|l| event_matches(
+                l,
+                "HARNESS settings_source when=reopened audio_track=4",
+                false
+            )),
             "{saved:?}: {lines:#?}"
         );
-        assert!(has_plugin_line(&lines, &save_error), "{lines:#?}");
+        assert!(
+            plugin_observed(&lines, "config_error", json!({"kind":"write"})),
+            "{lines:#?}"
+        );
         let moved = config.path().join("obs-dstreamy.saved");
         match &saved {
             Some(saved) => assert_eq!(
@@ -2193,16 +2582,27 @@ fn without_a_module_config_folder_the_dialog_says_the_track_is_not_saved() {
         "{status}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "HARNESS settings_info when=updated name=status kind=2"),
+        lines.iter().any(|l| event_matches(
+            l,
+            "HARNESS settings_info when=updated name=status kind=2",
+            false
+        )),
         "{lines:#?}"
     );
-    assert!(has_plugin_line(&lines, error), "{lines:#?}");
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "HARNESS settings_source when=reopened audio_track=2"),
+        plugin_observed(
+            &lines,
+            "config_error",
+            json!({"kind":"no_folder","track":2})
+        ),
+        "{lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| event_matches(
+            l,
+            "HARNESS settings_source when=reopened audio_track=2",
+            false
+        )),
         "{lines:#?}"
     );
     assert!(lines.iter().all(|l| !l.contains("relative")), "{lines:#?}");
@@ -2240,16 +2640,20 @@ fn a_folder_in_place_of_the_module_config_is_reported_and_never_replaced() {
             "{when}: {status}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|l| *l == format!("HARNESS settings_info when={when} name=status kind=2")),
+            lines.iter().any(|l| event_matches(
+                l,
+                &format!("HARNESS settings_info when={when} name=status kind=2"),
+                false
+            )),
             "{when}: {lines:#?}"
         );
     }
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "HARNESS settings_source when=reopened audio_track=5"),
+        lines.iter().any(|l| event_matches(
+            l,
+            "HARNESS settings_source when=reopened audio_track=5",
+            false
+        )),
         "{lines:#?}"
     );
     assert!(path.is_dir(), "the folder is kept");
@@ -2321,42 +2725,55 @@ fn tools_start_binds_the_chosen_track_and_stop_ends_the_session() {
     passed(status, &lines);
 
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "HARNESS settings_item when=open name=guild_id value=0 text=Mock Guild"),
+        lines.iter().any(|l| event_matches(
+            l,
+            "HARNESS settings_item when=open name=guild_id value=0 text=Mock Guild",
+            false
+        )),
         "the dialog lists the service's servers: {lines:#?}"
     );
     assert!(
-        lines.iter().any(|l| l == "HARNESS settings_item when=updated name=channel_id value=0 text=General"),
+        lines.iter().any(|l| event_matches(
+            l,
+            "HARNESS settings_item when=updated name=channel_id value=0 text=General",
+            false
+        )),
         "{lines:#?}"
     );
     asked_first(&lines, "start", 0, "Go live in General on Mock Guild");
     assert!(
-        lines.iter().any(|l| l
-            == "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status=Live on Track 3"
-            || l.starts_with(
+        lines.iter().any(|l| event_matches(l, "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status=Live on Track 3", false)
+            || line_starts(l,
                 "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status=Starting on Track 3"
             )),
         "the confirm starts: {lines:#?}"
     );
     asked_first(&lines, "stop", 1, "Stop the Discord stream?");
     assert!(
-        lines.iter().any(|l| l.starts_with(
+        lines.iter().any(|l| line_starts(
+            l,
             "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status=Stopping"
-        ) || l
-            == "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status=Idle"),
+        ) || event_matches(
+            l,
+            "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status=Idle",
+            false
+        )),
         "the second confirm stops: {lines:#?}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "HARNESS settings_status when=live status=Live on Track 3"),
+        lines.iter().any(|l| event_matches(
+            l,
+            "HARNESS settings_status when=live status=Live on Track 3",
+            false
+        )),
         "{lines:#?}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "HARNESS output_audio_track when=tools_live active=1 track=3"),
+        lines.iter().any(|l| event_matches(
+            l,
+            "HARNESS output_audio_track when=tools_live active=1 track=3",
+            false
+        )),
         "{lines:#?}"
     );
     assert_eq!(
@@ -2364,9 +2781,11 @@ fn tools_start_binds_the_chosen_track_and_stop_ends_the_session() {
         "Live on Track 3 \u{2014} Discord hears Track 5 from the next Go Live"
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "HARNESS output_audio_track when=after_settings_update active=1 track=3"),
+        lines.iter().any(|l| event_matches(
+            l,
+            "HARNESS output_audio_track when=after_settings_update active=1 track=3",
+            false
+        )),
         "a live change never touches the output: {lines:#?}"
     );
     assert_eq!(
@@ -2384,10 +2803,13 @@ fn tools_start_binds_the_chosen_track_and_stop_ends_the_session() {
         "HARNESS settings_property when=reopened name=start type=8 enabled=1 desc=Start",
         "HARNESS settings_property when=reopened name=stop type=8 enabled=0 desc=Stop",
     ] {
-        assert!(lines.iter().any(|l| l == want), "{want}: {lines:#?}");
+        assert!(
+            lines.iter().any(|l| event_matches(l, want, false)),
+            "{want}: {lines:#?}"
+        );
     }
     assert!(
-        has_plugin_line(&lines, "started from Tools > D-Streamy on Track 3"),
+        plugin_observed(&lines, "tools_output_started", json!({"track": 3})),
         "{lines:#?}"
     );
 
@@ -2451,19 +2873,23 @@ fn tools_start_without_the_service_says_so_and_stays_idle() {
     passed(status, &lines);
     asked_first(&lines, "start", 0, "Go live in ");
     assert!(
-        lines.contains(&format!(
-            "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status={not_running}"
-        )),
+        lines.iter().any(|line| {
+            event_matches(line, &format!("HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status={not_running}"), false)
+                || event_matches(line, "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status=Starting on Track 2…", false)
+        }),
         "{lines:#?}"
     );
     assert!(
-        lines.contains(&format!(
-            "HARNESS settings_status when=live status={not_running}"
-        )),
+        has_event(
+            &lines,
+            &format!("HARNESS settings_status when=live status={not_running}")
+        ),
         "{lines:#?}"
     );
     assert!(
-        lines.iter().any(|l| l == "HARNESS tools output=0 active=0"),
+        lines
+            .iter()
+            .any(|l| event_matches(l, "HARNESS tools output=0 active=0", false)),
         "no output is created without a session: {lines:#?}"
     );
     for when in ["after_stop", "reopened"] {
@@ -2475,7 +2901,7 @@ fn tools_start_without_the_service_says_so_and_stays_idle() {
             format!("HARNESS settings_property when={when} name=start type=8 enabled=1 desc=Start"),
             format!("HARNESS settings_property when={when} name=stop type=8 enabled=0 desc=Stop"),
         ] {
-            assert!(lines.contains(&want), "{want}: {lines:#?}");
+            assert!(has_event(&lines, &want), "{want}: {lines:#?}");
         }
     }
     assert!(lines.iter().all(|l| !l.contains("panicked")), "{lines:#?}");
@@ -2505,20 +2931,20 @@ fn tools_start_then_cancel_leaves_the_session_idle_and_the_service_untouched() {
     passed(status, &lines);
     asked_first(&lines, "start", 0, "Go live in ");
     assert!(
-        lines
-            .iter()
-            .any(|l| l
-                .starts_with("HARNESS settings_clicked name=cancel_stream enabled=1 refresh=1 ")),
+        lines.iter().any(|l| line_starts(
+            l,
+            "HARNESS settings_clicked name=cancel_stream enabled=1 refresh=1 "
+        )),
         "{lines:#?}"
     );
     assert!(
         !lines
             .iter()
-            .any(|l| l.starts_with("HARNESS settings_clicked name=confirm_stream ")),
+            .any(|l| line_starts(l, "HARNESS settings_clicked name=confirm_stream ")),
         "{lines:#?}"
     );
     assert!(
-        lines.contains(&"HARNESS tools output=0 active=0".to_owned()),
+        has_event(&lines, "HARNESS tools output=0 active=0"),
         "{lines:#?}"
     );
     for when in ["cancelled", "reopened"] {
@@ -2526,16 +2952,20 @@ fn tools_start_then_cancel_leaves_the_session_idle_and_the_service_untouched() {
             format!("HARNESS settings_property when={when} name=start type=8 enabled=1 desc=Start"),
             format!("HARNESS settings_property when={when} name=stop type=8 enabled=0 desc=Stop"),
         ] {
-            assert!(lines.contains(&want), "{want}: {lines:#?}");
+            assert!(has_event(&lines, &want), "{want}: {lines:#?}");
         }
         assert!(
-            !lines.iter().any(|l| l.starts_with(&format!(
-                "HARNESS settings_property when={when} name=stream_question "
-            ))),
+            !lines.iter().any(|l| line_starts(
+                l,
+                &format!("HARNESS settings_property when={when} name=stream_question ")
+            )),
             "the question is gone: {lines:#?}"
         );
     }
-    assert!(!has_plugin_line(&lines, "started from Tools"), "{lines:#?}");
+    assert!(
+        !plugin_observed(&lines, "tools_output_started", json!({})),
+        "{lines:#?}"
+    );
     assert!(h.mock.voice_state().is_none(), "nothing joined: {lines:#?}");
     assert!(
         stream_video(&h.mock.recorded()).is_empty(),
@@ -2578,24 +3008,28 @@ fn a_start_without_the_control_thread_says_so_without_rebuilding_inside_the_clic
     passed(status, &lines);
     asked_first(&lines, "start", 0, "Go live in ");
     assert!(
-        lines.contains(&format!(
-            "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status={gone}"
-        )),
+        has_event(
+            &lines,
+            &format!(
+                "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status={gone}"
+            )
+        ),
         "the click's own rebuild shows the error: {lines:#?}"
     );
     assert!(
-        lines.contains(
-            &"HARNESS settings_click_sync_refreshes name=confirm_stream count=0".to_owned()
+        has_event(
+            &lines,
+            "HARNESS settings_click_sync_refreshes name=confirm_stream count=0"
         ),
         "the click never asked OBS to rebuild the dialog it is running in: {lines:#?}"
     );
-    assert!(lines.contains(&"HARNESS tools output=0 active=0".to_owned()));
+    assert!(has_event(&lines, "HARNESS tools output=0 active=0"));
     for want in [
         "HARNESS settings_property when=after_stop name=start type=8 enabled=1 desc=Start",
         "HARNESS settings_property when=after_stop name=stop type=8 enabled=0 desc=Stop",
         "HARNESS settings_info when=after_stop name=status kind=2",
     ] {
-        assert!(lines.contains(&want.to_owned()), "{want}: {lines:#?}");
+        assert!(has_event(&lines, want), "{want}: {lines:#?}");
     }
     assert!(lines.iter().all(|l| !l.contains("panicked")), "{lines:#?}");
     assert!(h.mock.voice_state().is_none(), "nothing joined");
@@ -2708,26 +3142,32 @@ fn a_server_change_in_the_dialog_never_keeps_the_old_servers_channel() {
     .finish();
     passed(status, &lines);
     assert!(
-        lines.contains(&format!(
-            "HARNESS pick when=updated guild_id={MOCK_GUILD_ID} channel_id={MOCK_VOICE_CHANNEL_ID}"
-        )),
+        has_event(
+            &lines,
+            &format!(
+                "HARNESS pick when=updated guild_id={MOCK_GUILD_ID} channel_id={MOCK_VOICE_CHANNEL_ID}"
+            )
+        ),
         "{lines:#?}"
     );
     assert!(
-        lines.contains(&format!(
-            "HARNESS pick when=updated_again guild_id={OTHER_GUILD_ID} channel_id="
-        )),
+        has_event(
+            &lines,
+            &format!("HARNESS pick when=updated_again guild_id={OTHER_GUILD_ID} channel_id=")
+        ),
         "the view's old channel is cleared with the server: {lines:#?}"
     );
-    let channels: Vec<&str> = settings_lines(&lines, "updated_again")
+    let channels: Vec<String> = settings_lines(&lines, "updated_again")
         .into_iter()
-        .filter_map(|l| l.strip_prefix("HARNESS settings_item when=updated_again name=channel_id "))
+        .filter(|line| {
+            line_starts(
+                line,
+                "HARNESS settings_item when=updated_again name=channel_id ",
+            )
+        })
+        .filter_map(|line| field(line, "text"))
         .collect();
-    assert_eq!(
-        channels,
-        ["value=0 text=Pick a voice channel", "value=0 text=Lobby"],
-        "only the new server's channels: {lines:#?}"
-    );
+    assert_eq!(channels, ["Pick a voice channel", "Lobby"], "{lines:#?}");
     assert_lines(
         &lines,
         &[
@@ -2742,13 +3182,14 @@ fn a_server_change_in_the_dialog_never_keeps_the_old_servers_channel() {
     assert!(
         !lines
             .iter()
-            .any(|l| l.starts_with("HARNESS settings_clicked name=confirm_stream ")),
+            .any(|l| line_starts(l, "HARNESS settings_clicked name=confirm_stream ")),
         "Start never uses the old server's channel: {lines:#?}"
     );
     assert!(
-        lines.contains(&format!(
-            "HARNESS pick when=reopened guild_id={OTHER_GUILD_ID} channel_id="
-        )),
+        has_event(
+            &lines,
+            &format!("HARNESS pick when=reopened guild_id={OTHER_GUILD_ID} channel_id=")
+        ),
         "{lines:#?}"
     );
     assert!(h.mock.voice_state().is_none(), "nothing joined: {lines:#?}");
@@ -2801,7 +3242,8 @@ fn while_live_the_dialog_shows_the_heard_track_and_warns_about_a_mic_on_it() {
         ],
     );
     assert!(
-        lines.iter().any(|l| l.starts_with(
+        lines.iter().any(|l| line_starts(
+            l,
             "HARNESS settings_property when=live_mic name=audio_help type=4 enabled=1 \
              desc=Discord hears every source on Track 4 (live), including Mic."
         )),
@@ -2824,26 +3266,31 @@ fn a_start_slower_than_the_click_shows_live_or_its_error_without_reopening() {
         }
         let run = tools_run_gated(&h, config.path(), &extra, &gate);
         let clicked = wait_for_line(&run, "start confirm", |l| {
-            l.starts_with("HARNESS settings_clicked name=confirm_stream ")
+            line_starts(l, "HARNESS settings_clicked name=confirm_stream ")
         });
         assert_eq!(
-            clicked,
-            "HARNESS settings_clicked name=confirm_stream enabled=1 refresh=1 status=Starting on Track 4\u{2026}",
+            field(&clicked, "status"),
+            Some("Starting on Track 4…".to_owned()),
             "the click's wait ran out first"
         );
         asked_first(&run.lines(), "start", 0, "Go live in ");
         if !answered {
             serve.kill();
         }
-        std::thread::sleep(Duration::from_millis(500));
+        wait_for_line(&run, "refresh baseline", |line| {
+            event(line).is_some_and(|row| {
+                row["event"] == "refresh_baseline_ready" && row["when"] == "live"
+            })
+        });
         std::fs::write(&gate, "").unwrap();
         let (status, lines) = run.finish();
         passed(status, &lines);
         for name in ["start", "stop", "confirm_stream"] {
             assert!(
-                !lines.iter().any(|l| l.starts_with(&format!(
-                    "HARNESS settings_click_sync_refreshes name={name} count="
-                )) && !l.ends_with(" count=0")),
+                !lines.iter().any(|l| line_starts(
+                    l,
+                    &format!("HARNESS settings_click_sync_refreshes name={name} count=")
+                ) && field(l, "count").as_deref() != Some("0")),
                 "no refresh inside a click: {lines:#?}"
             );
         }
@@ -2853,32 +3300,35 @@ fn a_start_slower_than_the_click_shows_live_or_its_error_without_reopening() {
             late_error
         };
         assert!(
-            lines.iter().any(|l| l.starts_with(&format!(
-                "HARNESS settings_refreshed when=live status={want}"
-            ))),
+            lines.iter().any(|l| line_starts(
+                l,
+                &format!("HARNESS settings_refreshed when=live status={want}")
+            )),
             "{answered}: the dialog rebuilt itself on the control thread's change: {lines:#?}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|l| l.starts_with(&format!("HARNESS settings_status when=live status={want}"))),
+            lines.iter().any(|l| line_starts(
+                l,
+                &format!("HARNESS settings_status when=live status={want}")
+            )),
             "{lines:#?}"
         );
         if answered {
             assert!(
-                lines.contains(&"HARNESS settings_status when=stopped status=Idle".to_owned()),
+                has_event(&lines, "HARNESS settings_status when=stopped status=Idle"),
                 "{lines:#?}"
             );
-            assert!(has_plugin_line(
+            assert!(plugin_observed(
                 &lines,
-                "started from Tools > D-Streamy on Track 4"
+                "tools_output_started",
+                json!({"track": 4})
             ));
         } else {
-            assert!(lines.contains(&"HARNESS tools output=0 active=0".to_owned()));
+            assert!(has_event(&lines, "HARNESS tools output=0 active=0"));
             assert!(
-                lines.contains(
-                    &"HARNESS settings_property when=reopened name=start type=8 enabled=1 desc=Start"
-                        .to_owned()
+                has_event(
+                    &lines,
+                    "HARNESS settings_property when=reopened name=start type=8 enabled=1 desc=Start"
                 ),
                 "{lines:#?}"
             );
@@ -2914,26 +3364,33 @@ fn an_output_that_refuses_to_start_ends_the_service_session_it_started() {
     passed(status, &lines);
     let shown = lines
         .iter()
-        .find_map(|l| l.strip_prefix("HARNESS settings_status when=live status="))
+        .find_map(|l| {
+            line_starts(l, "HARNESS settings_status when=live ")
+                .then(|| field(l, "status"))
+                .flatten()
+        })
         .unwrap_or_else(|| panic!("{lines:#?}"));
     assert!(
         shown.contains("no_such_encoder") && shown.ends_with(fix),
         "{shown}"
     );
     assert!(
-        lines.contains(&"HARNESS tools output=1 active=0".to_owned()),
+        has_event(&lines, "HARNESS tools output=1 active=0"),
         "{lines:#?}"
     );
-    assert!(!has_plugin_line(&lines, "started from Tools"), "{lines:#?}");
+    assert!(
+        !plugin_observed(&lines, "tools_output_started", json!({})),
+        "{lines:#?}"
+    );
     let session = serve_session(&h);
     assert_eq!(session["state"], "stopped", "rolled back: {session}");
     assert_eq!(session["reason"]["reason"], "requested", "{session}");
     let saved = read_module_config(config.path());
     assert_eq!(saved["owned"], Value::Null, "{saved}");
     assert!(
-        lines.contains(
-            &"HARNESS settings_property when=reopened name=start type=8 enabled=1 desc=Start"
-                .to_owned()
+        has_event(
+            &lines,
+            "HARNESS settings_property when=reopened name=start type=8 enabled=1 desc=Start"
         ),
         "{lines:#?}"
     );
@@ -2951,7 +3408,7 @@ fn a_session_the_service_ends_shows_in_the_open_dialog() {
         &[
             "--tools-wait-end",
             "--tools-expect",
-            "Press Start to go live again",
+            "Idle",
             "--seconds",
             "60",
             "--until-video",
@@ -2959,7 +3416,7 @@ fn a_session_the_service_ends_shows_in_the_open_dialog() {
         ],
     );
     wait_for_line(&run, "the live wait", |l| {
-        l == "HARNESS tools waiting for the end"
+        event_matches(l, "HARNESS tools waiting for the end", false)
     });
     let mut control = Client::connect(&runtime_dir(&h).join("dstreamy").join("serve.sock"));
     control.send(&json!({"id": "h", "cmd": "hello", "role": "control", "protocol": 2}));
@@ -2971,21 +3428,21 @@ fn a_session_the_service_ends_shows_in_the_open_dialog() {
     passed(status, &lines);
     let ended = lines
         .iter()
-        .find_map(|l| l.strip_prefix("HARNESS settings_refreshed when=ended status="))
+        .find_map(|l| {
+            line_starts(l, "HARNESS settings_refreshed when=ended ")
+                .then(|| field(l, "status"))
+                .flatten()
+        })
         .unwrap_or_else(|| panic!("the dialog was never asked to rebuild: {lines:#?}"));
+    assert_eq!(ended, "Idle", "a clean service stop is not an output error");
     assert!(
-        ended.starts_with("D-Streamy stopped: ")
-            && ended.ends_with(". Press Start to go live again"),
-        "{ended}"
-    );
-    assert!(
-        lines.contains(&"HARNESS tools stopped active=0".to_owned()),
+        has_event(&lines, "HARNESS tools stopped active=0"),
         "{lines:#?}"
     );
     assert!(
-        lines.contains(
-            &"HARNESS settings_property when=after_stop name=start type=8 enabled=1 desc=Start"
-                .to_owned()
+        has_event(
+            &lines,
+            "HARNESS settings_property when=after_stop name=start type=8 enabled=1 desc=Start"
         ),
         "{lines:#?}"
     );
@@ -3016,7 +3473,7 @@ fn a_stop_the_service_cannot_answer_says_what_to_do_next() {
         ],
     );
     wait_for_line(&run, "live video", |l| {
-        l.starts_with("HARNESS tools video=")
+        line_starts(l, "HARNESS tools video=")
     });
     let pid = i32::try_from(serve.pid()).unwrap();
     // SAFETY: signals the serve child this test spawned.
@@ -3028,7 +3485,11 @@ fn a_stop_the_service_cannot_answer_says_what_to_do_next() {
     passed(status, &lines);
     let stopped = lines
         .iter()
-        .find_map(|l| l.strip_prefix("HARNESS settings_status when=stopped status="))
+        .find_map(|l| {
+            line_starts(l, "HARNESS settings_status when=stopped ")
+                .then(|| field(l, "status"))
+                .flatten()
+        })
         .unwrap_or_else(|| panic!("{lines:#?}"));
     assert_eq!(
         stopped,
@@ -3037,18 +3498,21 @@ fn a_stop_the_service_cannot_answer_says_what_to_do_next() {
         )
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l
-                .starts_with("HARNESS settings_refreshed when=stopped status=Stop didn't finish")),
+        lines.iter().any(|l| line_starts(
+            l,
+            "HARNESS settings_refreshed when=stopped status=Stop didn't finish"
+        )),
         "{lines:#?}"
     );
     assert!(
-        lines.contains(&"HARNESS tools stopped active=0".to_owned()),
+        has_event(&lines, "HARNESS tools stopped active=0"),
         "{lines:#?}"
     );
     assert!(
-        lines.contains(&"HARNESS settings_info when=after_stop name=status kind=2".to_owned()),
+        has_event(
+            &lines,
+            "HARNESS settings_info when=after_stop name=status kind=2"
+        ),
         "{lines:#?}"
     );
     assert!(
@@ -3061,37 +3525,98 @@ fn a_stop_the_service_cannot_answer_says_what_to_do_next() {
 fn closing_ms(lines: &[String]) -> u64 {
     let exit = lines
         .iter()
-        .find_map(|l| {
-            l.strip_prefix("HARNESS frontend_exit ")?
-                .split(" ms=")
-                .nth(1)?
-                .parse::<u64>()
-                .ok()
+        .filter_map(|line| event(line))
+        .find_map(|row| {
+            (row["event"] == "frontend_exit")
+                .then(|| row["ms"].as_u64())
+                .flatten()
         })
-        .unwrap_or_else(|| panic!("no frontend exit in the harness output: {lines:#?}"));
+        .unwrap_or_else(|| panic!("no frontend exit: {lines:#?}"));
     exit + number_after(lines, "HARNESS obs_shutdown ms=")
 }
 
 /// The plugin shut down once, on the frontend's exit event, and left no output for `obs_shutdown` to stop after audio.
 fn assert_closed_on_frontend_exit(lines: &[String]) {
-    let position = |text: &str| lines.iter().position(|l| l.contains(text));
-    let exiting =
-        position("OBS's frontend is exiting: D-Streamy stops before OBS stops audio and video");
-    let shutdown = position("HARNESS obs_shutdown begins dstreamy_output=0 active=0");
-    let closing = "OBS is closing: D-Streamy finishes its control steps";
-    let ended = position("the D-Streamy control thread ended in ");
+    let position = |name: &str| {
+        lines
+            .iter()
+            .position(|line| event(line).is_some_and(|row| row["event"] == name))
+    };
+    let exiting = position("plugin_frontend_exit");
+    let ended = position("plugin_control_closed");
+    let shutdown = lines.iter().position(|line| {
+        line_starts(
+            line,
+            "HARNESS obs_shutdown begins dstreamy_output=0 active=0",
+        )
+    });
     assert!(
         matches!((exiting, ended, shutdown), (Some(a), Some(b), Some(c)) if a < b && b < c),
-        "the control thread ended on the exit event, before obs_shutdown: {lines:#?}"
+        "the control thread ended on frontend exit, before obs_shutdown: {lines:#?}"
     );
     assert_eq!(
-        lines.iter().filter(|l| l.contains(closing)).count(),
+        lines
+            .iter()
+            .filter_map(|line| event(line))
+            .filter(|row| row["event"] == "plugin_control_closing")
+            .count(),
         1,
-        "unload after the exit event shuts down nothing again: {lines:#?}"
+        "unload after exit shuts down nothing again: {lines:#?}"
     );
     assert!(
         has_line(lines, "HARNESS frontend_exit callbacks=1 "),
         "the plugin watched the frontend's exit: {lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
+fn an_error_ended_output_retains_stop_and_ownership_when_service_cleanup_fails() {
+    let h = Harness::new("");
+    let serve = default_serve(&h);
+    let config = picked_config(1);
+    let fail = h.dir.path().join("fail-output");
+    let run = tools_run_env(
+        &h,
+        config.path(),
+        &[
+            "--tools-wait-end",
+            "--tools-expect",
+            "press Stop to end it",
+            "--seconds",
+            "60",
+            "--until-video",
+            "30",
+        ],
+        &[("DSTREAMY_TEST_OUTPUT_ERROR_GATE", &fail)],
+    );
+    wait_for_line(&run, "live video", |line| {
+        line_starts(line, "HARNESS tools video=")
+    });
+    let pid = i32::try_from(serve.pid()).unwrap();
+    // SAFETY: this unreaped serve child belongs to the test.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    std::fs::write(&fail, "").unwrap();
+    let (status, lines) = run.finish();
+    // SAFETY: the same test-owned child is still unreaped.
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    passed(status, &lines);
+    assert!(has_event(&lines, "HARNESS tools stopped active=0"));
+    assert!(
+        has_event(
+            &lines,
+            "HARNESS settings_property when=after_stop name=stop type=8 enabled=1 desc=Stop"
+        ),
+        "{lines:#?}"
+    );
+    let stopped = status_line(&lines, "after_stop");
+    assert!(
+        stopped.contains("test output failure") && stopped.contains("press Stop to end it"),
+        "{stopped}"
+    );
+    assert!(
+        read_module_config(config.path())["owned"].is_object(),
+        "cleanup failure keeps ownership for retry"
     );
 }
 
@@ -3116,7 +3641,7 @@ fn closing_obs_during_a_start_never_streams_and_unloads_promptly() {
             &gate,
         );
         wait_for_line(&run, "the closing log", |l| {
-            l.contains("OBS is closing: D-Streamy finishes its control steps")
+            event(l).is_some_and(|row| row["event"] == "plugin_control_closing")
         });
         if answered {
             std::fs::write(&gate, "").unwrap();
@@ -3125,11 +3650,14 @@ fn closing_obs_during_a_start_never_streams_and_unloads_promptly() {
         passed(status, &lines);
         asked_first(&lines, "start", 0, "Go live in ");
         assert!(
-            lines.contains(&"HARNESS tools exiting status=Starting on Track 1\u{2026}".to_owned()),
+            has_event(
+                &lines,
+                "HARNESS tools exiting status=Starting on Track 1\u{2026}"
+            ),
             "{lines:#?}"
         );
         assert!(
-            !has_plugin_line(&lines, "started from Tools"),
+            !plugin_observed(&lines, "tools_output_started", json!({})),
             "{answered}: {lines:#?}"
         );
         let closing_ms = closing_ms(&lines);
@@ -3140,10 +3668,7 @@ fn closing_obs_during_a_start_never_streams_and_unloads_promptly() {
         assert_closed_on_frontend_exit(&lines);
         if answered {
             assert!(
-                has_plugin_line(
-                    &lines,
-                    "D-Streamy stopped the Discord session it started, before streaming"
-                ),
+                plugin_observed(&lines, "closing_unstreamed_session", json!({"ended": true})),
                 "{lines:#?}"
             );
             let session = serve_session(&h);
@@ -3152,10 +3677,7 @@ fn closing_obs_during_a_start_never_streams_and_unloads_promptly() {
             assert_eq!(read_module_config(config.path())["owned"], Value::Null);
         } else {
             assert!(
-                has_plugin_line(
-                    &lines,
-                    "OBS is closing: D-Streamy stopped waiting for the Discord session it was starting"
-                ),
+                plugin_observed(&lines, "closing_start_abandoned", json!({})),
                 "{lines:#?}"
             );
         }
@@ -3185,7 +3707,7 @@ fn closing_obs_while_live_stops_the_output_then_the_session_promptly() {
             ],
         );
         wait_for_line(&run, "live video", |l| {
-            l.starts_with("HARNESS tools video=")
+            line_starts(l, "HARNESS tools video=")
         });
         let pid = i32::try_from(serve.pid()).unwrap();
         if !answered {
@@ -3202,14 +3724,11 @@ fn closing_obs_while_live_stops_the_output_then_the_session_promptly() {
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("HARNESS tools exiting status=Live on Track 1")),
+                .any(|l| line_starts(l, "HARNESS tools exiting status=Live on Track 1")),
             "{answered}: {lines:#?}"
         );
         assert!(
-            has_plugin_line(
-                &lines,
-                "OBS is closing while D-Streamy is live: it stops its output, then the Discord session"
-            ),
+            plugin_observed(&lines, "closing_live_session", json!({})),
             "{answered}: {lines:#?}"
         );
         let position = |pred: &dyn Fn(&str) -> bool| lines.iter().position(|l| pred(l));
@@ -3226,18 +3745,18 @@ fn closing_obs_while_live_stops_the_output_then_the_session_promptly() {
             );
         }
         assert_closed_on_frontend_exit(&lines);
-        let stopped = position(&|l| l.starts_with("HARNESS tools output_stopped code=0"));
-        let shutdown = position(&|l| l.starts_with("HARNESS obs_shutdown begins"));
+        let stopped = position(&|l| line_starts(l, "HARNESS tools output_stopped code=0"));
+        let shutdown = position(&|l| line_starts(l, "HARNESS obs_shutdown begins"));
         assert!(
             matches!((stopped, shutdown), (Some(a), Some(b)) if a < b),
             "{answered}: the output stopped before obs_shutdown stopped audio: {lines:#?}"
         );
-        let begins = position(&|l| l.contains("it stops its output, then the Discord session"));
-        let output_stopped = position(&|l| l.starts_with("HARNESS tools output_stopped code=0"));
-        let ended = position(&|l| {
-            l.contains("[obs-dstreamy] ")
-                && (l.contains("stopped its output and the Discord session")
-                    || l.contains("may keep running until the D-Streamy service's grace period"))
+        let begins = position(&|line| {
+            event(line).is_some_and(|row| row["event"] == "plugin_closing_live_session")
+        });
+        let output_stopped = position(&|l| line_starts(l, "HARNESS tools output_stopped code=0"));
+        let ended = position(&|line| {
+            event(line).is_some_and(|row| row["event"] == "plugin_closing_live_session_finished")
         });
         assert!(
             matches!((begins, output_stopped, ended), (Some(a), Some(b), Some(c)) if a < b && b < c),
@@ -3246,9 +3765,10 @@ fn closing_obs_while_live_stops_the_output_then_the_session_promptly() {
         let owned = read_module_config(config.path())["owned"].clone();
         if answered {
             assert!(
-                has_plugin_line(
+                plugin_observed(
                     &lines,
-                    "OBS is closing: D-Streamy stopped its output and the Discord session"
+                    "closing_live_session_finished",
+                    json!({"output_stopped": true, "session_ended": true})
                 ),
                 "{lines:#?}"
             );
@@ -3258,9 +3778,10 @@ fn closing_obs_while_live_stops_the_output_then_the_session_promptly() {
             assert_eq!(owned, Value::Null);
         } else {
             assert!(
-                has_plugin_line(
+                plugin_observed(
                     &lines,
-                    "the Discord session D-Streamy started may keep running until the D-Streamy service's grace period ends"
+                    "closing_live_session_finished",
+                    json!({"session_ended": false})
                 ),
                 "{lines:#?}"
             );
@@ -3288,21 +3809,20 @@ fn a_track_chosen_in_the_dialog_while_live_never_touches_the_active_output() {
         60,
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "HARNESS output_audio_track when=after_settings_update active=1 track=1"),
+        lines.iter().any(|l| event_matches(
+            l,
+            "HARNESS output_audio_track when=after_settings_update active=1 track=1",
+            false
+        )),
         "{lines:#?}"
     );
     let encoder = |when: &str| {
         lines
             .iter()
             .find_map(|l| {
-                l.strip_prefix(&format!("HARNESS audio_mixer when={when} "))?
-                    .split("encoder=")
-                    .nth(1)?
-                    .split_whitespace()
-                    .next()
-                    .map(str::to_owned)
+                line_starts(l, &format!("HARNESS audio_mixer when={when} "))
+                    .then(|| field(l, "encoder"))
+                    .flatten()
             })
             .unwrap_or_else(|| panic!("no {when} mixer report: {lines:#?}"))
     };
@@ -3332,24 +3852,20 @@ fn a_track_changed_on_an_active_output_is_kept_and_applies_on_the_next_start() {
         60,
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "HARNESS output_audio_track when=after_active_update active=1 track=4"),
+        lines.iter().any(|l| event_matches(
+            l,
+            "HARNESS output_audio_track when=after_active_update active=1 track=4",
+            false
+        )),
         "{lines:#?}"
     );
-    let ptrs: Vec<(&str, &str)> = lines
+    let ptrs: Vec<(String, String)> = lines
         .iter()
-        .filter(|l| l.starts_with("HARNESS audio_mixer when="))
-        .filter_map(|l| {
-            let when = l
-                .strip_prefix("HARNESS audio_mixer when=")?
-                .split(' ')
-                .next()?;
-            Some((when, l.split("encoder=").nth(1)?.split_whitespace().next()?))
-        })
+        .filter(|line| line_starts(line, "HARNESS audio_mixer "))
+        .filter_map(|line| Some((field(line, "when")?, field(line, "encoder")?)))
         .collect();
     assert_eq!(
-        ptrs.iter().map(|p| p.0).collect::<Vec<_>>(),
+        ptrs.iter().map(|p| p.0.as_str()).collect::<Vec<_>>(),
         ["start", "after_active_update", "restart"],
         "{lines:#?}"
     );
@@ -3387,7 +3903,11 @@ fn sps_profile(video: &[&RecordedVideoFrame]) -> u8 {
 fn the_own_encoder_sends_4_2_0_from_an_i444_canvas() {
     let (lines, recorded) = stream(json!({}), &["--format", "I444"], 90);
     assert!(
-        has_plugin_line(&lines, "from a GPU mix in NV12"),
+        plugin_observed(
+            &lines,
+            "own_video_encoder",
+            json!({"gpu_mix": true, "format": "NV12"})
+        ),
         "{lines:#?}"
     );
     let profile = sps_profile(&stream_video(&recorded));
@@ -3407,10 +3927,7 @@ fn share_mode_falls_back_from_an_i444_stream_encoder() {
         90,
     );
     assert!(
-        has_plugin_line(
-            &lines,
-            "not I444: Settings › Advanced › Color Format), so D-Streamy uses its own"
-        ),
+        plugin_observed(&lines, "share_refused", json!({"color_format": true})),
         "{lines:#?}"
     );
 }
@@ -3425,8 +3942,15 @@ fn the_own_encoder_resizes_an_i420_canvas_in_nv12() {
         60,
     );
     assert!(
-        has_plugin_line(&lines, "at 1920×1080")
-            && has_plugin_line(&lines, "from a GPU mix in NV12"),
+        plugin_observed(
+            &lines,
+            "own_video_encoder",
+            json!({"width": 1920, "height": 1080})
+        ) && plugin_observed(
+            &lines,
+            "own_video_encoder",
+            json!({"gpu_mix": true, "format": "NV12"})
+        ),
         "{lines:#?}"
     );
     assert_eq!(first_picture_size(&stream_video(&recorded)), (1920, 1080));
@@ -3440,7 +3964,7 @@ fn only_the_chosen_mixer_track_carries_a_source_routed_to_it() {
     let peak = |track: u8| {
         let (lines, recorded) = stream(json!({"audio_track": track}), &["--audio-mixers", "2"], 90);
         assert!(
-            lines.contains(&"HARNESS audio_source mixers=0x2".to_owned()),
+            has_event(&lines, "HARNESS audio_source mixers=0x2"),
             "{lines:#?}"
         );
         let video = stream_video(&recorded);
@@ -3490,7 +4014,7 @@ fn cancel_in_the_dialog_puts_back_and_saves_what_it_opened_with() {
         format!("HARNESS pick when=reopened {opened}"),
         "HARNESS settings_source when=reopened audio_track=2".to_owned(),
     ] {
-        assert!(lines.contains(&want), "{want}: {lines:#?}");
+        assert!(has_event(&lines, &want), "{want}: {lines:#?}");
     }
     let saved = read_module_config(config.path());
     assert_eq!(saved["guild_id"], MOCK_GUILD_ID, "{saved}");
@@ -3520,7 +4044,7 @@ fn pick_a_server_in_the_dialog_clears_the_server_and_its_channel() {
         "HARNESS pick when=reopened guild_id= channel_id=".to_owned(),
         "HARNESS settings_source when=reopened audio_track=3".to_owned(),
     ] {
-        assert!(lines.contains(&want), "{want}: {lines:#?}");
+        assert!(has_event(&lines, &want), "{want}: {lines:#?}");
     }
     let saved = read_module_config(config.path());
     assert_eq!(saved["guild_id"], Value::Null, "{saved}");
@@ -3557,7 +4081,11 @@ fn a_panic_after_the_output_started_stops_it_and_its_session() {
     passed(status, &lines);
     let shown = lines
         .iter()
-        .find_map(|l| l.strip_prefix("HARNESS settings_status when=live status="))
+        .find_map(|l| {
+            line_starts(l, "HARNESS settings_status when=live ")
+                .then(|| field(l, "status"))
+                .flatten()
+        })
         .unwrap_or_else(|| panic!("{lines:#?}"));
     assert_eq!(
         shown,
@@ -3566,7 +4094,7 @@ fn a_panic_after_the_output_started_stops_it_and_its_session() {
         )
     );
     assert!(
-        lines.contains(&"HARNESS tools output=1 active=0".to_owned()),
+        has_event(&lines, "HARNESS tools output=1 active=0"),
         "the output it started is stopped: {lines:#?}"
     );
     let session = serve_session(&h);
@@ -3577,7 +4105,7 @@ fn a_panic_after_the_output_started_stops_it_and_its_session() {
         let want = format!(
             "HARNESS settings_property when=after_stop name={name} type=8 enabled={enabled} desc={label}"
         );
-        assert!(lines.contains(&want), "{want}: {lines:#?}");
+        assert!(has_event(&lines, &want), "{want}: {lines:#?}");
     }
 }
 
@@ -3645,9 +4173,13 @@ fn real_obs_shows_tools_d_streamy_and_rebuilds_its_dialog_from_the_service() {
                 .filter_map(Result::ok)
                 .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
         });
-        newest
+        let mut text = newest
             .and_then(|e| std::fs::read_to_string(e.path()).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        text.push_str(
+            &std::fs::read_to_string(h.dir.path().join("obs-stdout.log")).unwrap_or_default(),
+        );
+        text
     };
     let wait = |what: &str, done: &dyn Fn(&str) -> bool| {
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -3664,16 +4196,24 @@ fn real_obs_shows_tools_d_streamy_and_rebuilds_its_dialog_from_the_service() {
         }
     };
     wait("its startup", &|l| {
-        l.contains("[obs-dstreamy] added Tools > D-Streamy") && l.contains("==== Startup complete")
+        l.lines()
+            .filter_map(event)
+            .any(|row| row["event"] == "plugin_tools_entry_added")
+            && l.contains("==== Startup complete")
     });
     std::fs::write(&open, "").unwrap();
-    let first = "[obs-dstreamy] test hook: dialog built servers=0 ";
-    wait("the dialog", &|l| l.contains(first));
+    let built = |text: &str, servers: u64| {
+        text.lines().position(|line| {
+            event(line).is_some_and(|row| {
+                row["event"] == "plugin_dialog_built" && row["servers"] == servers
+            })
+        })
+    };
+    wait("the dialog", &|text| built(text, 0).is_some());
     std::fs::write(&gate, "").unwrap();
-    let rebuilt = "[obs-dstreamy] test hook: dialog built servers=1 ";
-    let text = wait("the rebuilt dialog", &|l| l.contains(rebuilt));
+    let text = wait("the rebuilt dialog", &|text| built(text, 1).is_some());
     assert!(
-        text.find(first) < text.find(rebuilt),
+        built(&text, 0) < built(&text, 1),
         "OBS built the dialog with the servers only after they loaded:\n{text}"
     );
     // SAFETY: signals the OBS child this test spawned; OBS closes its window on SIGINT.
@@ -3688,7 +4228,12 @@ fn real_obs_shows_tools_d_streamy_and_rebuilds_its_dialog_from_the_service() {
     };
     let text = log();
     assert!(status.success(), "OBS exited with {status}:\n{text}");
-    assert!(text.contains("[obs-dstreamy] unloaded"), "{text}");
+    assert!(
+        text.lines()
+            .filter_map(event)
+            .any(|row| row["event"] == "plugin_unloaded"),
+        "{text}"
+    );
     assert!(!text.contains("[obs-dstreamy] panic caught"), "{text}");
 }
 

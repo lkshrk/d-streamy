@@ -1,7 +1,7 @@
 use std::ffi::{c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use dstreamy_media::{EncodedVideoFrame, MediaError, VideoCodec, VideoEncoder, annexb};
@@ -25,6 +25,8 @@ use objc2_video_toolbox::{
 };
 
 const MICROS: i32 = 1_000_000;
+/// A second at 30 fps: a session lost to a GPU reset or a sample the packager rejects fails every frame.
+const LOST_FRAME_LIMIT: u32 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VtEncoderConfig {
@@ -46,6 +48,9 @@ struct Shared {
     codec: VideoCodec,
     output: Mutex<Output>,
     lost_frame: AtomicBool,
+    /// Callbacks in a row that delivered no usable frame, and the status of the last one.
+    lost_streak: AtomicU32,
+    last_status: AtomicI32,
 }
 
 impl Shared {
@@ -117,6 +122,8 @@ impl VtEncoder {
             codec,
             output: Mutex::new(output),
             lost_frame: AtomicBool::new(false),
+            lost_streak: AtomicU32::new(0),
+            last_status: AtomicI32::new(0),
         })));
         let refcon = shared.as_ptr().cast::<c_void>();
         let mut raw: *mut VTCompressionSession = ptr::null_mut();
@@ -264,6 +271,13 @@ impl VideoEncoder for VtEncoder {
                 "VTCompressionSessionEncodeFrame failed: {status}"
             )));
         }
+        let lost = self.shared().lost_streak.load(Ordering::Relaxed);
+        if lost >= LOST_FRAME_LIMIT {
+            return Err(MediaError::Encoder(format!(
+                "VideoToolbox delivered no usable frame for {lost} frames in a row (last status {})",
+                self.shared().last_status.load(Ordering::Relaxed)
+            )));
+        }
         Ok(self.shared().drain())
     }
 
@@ -281,7 +295,7 @@ impl VideoEncoder for VtEncoder {
 
 impl Drop for VtEncoder {
     fn drop(&mut self) {
-        // SAFETY: after invalidation no callback can reach `shared`, which was leaked in `create`.
+        // SAFETY: CompleteFrames(kCMTimeInvalid) waits for every pending callback, Invalidate stops new ones and `&mut self` rules out a concurrent encode, so nothing reaches `shared` (leaked in `create`) after it is freed.
         unsafe {
             self.session.complete_frames(kCMTimeInvalid);
             self.session.invalidate();
@@ -316,8 +330,15 @@ unsafe extern "C-unwind" fn on_output(
             .then(|| annexb_frame(shared.codec, unsafe { &*sample }))
             .flatten();
         match frame {
-            Some(frame) => shared.deliver(frame),
-            None => shared.lost_frame.store(true, Ordering::Relaxed),
+            Some(frame) => {
+                shared.lost_streak.store(0, Ordering::Relaxed);
+                shared.deliver(frame);
+            }
+            None => {
+                shared.last_status.store(status, Ordering::Relaxed);
+                shared.lost_streak.fetch_add(1, Ordering::Relaxed);
+                shared.lost_frame.store(true, Ordering::Relaxed);
+            }
         }
     }));
 }

@@ -29,7 +29,7 @@ pub struct StreamArgs {
     /// Voice channel id, see `dstreamy channels <GUILD>`
     #[arg(long)]
     pub channel: String,
-    /// Capture target id from `dstreamy targets`, or `test-pattern`
+    /// Capture target id from `dstreamy targets`
     #[arg(long)]
     pub target: String,
     /// Crop rectangle in source pixels
@@ -53,6 +53,9 @@ pub struct StreamArgs {
     /// Audio device to capture, see `dstreamy audio-sources`; by default what plays on the default output
     #[arg(long, value_name = "ID")]
     pub audio_source: Option<String>,
+    /// Refuse to stream unless Discord provides end-to-end encryption
+    #[arg(long)]
+    pub require_e2ee: bool,
 }
 
 pub fn parse_crop(s: &str) -> Result<CropRect, String> {
@@ -88,6 +91,7 @@ impl StreamArgs {
             bitrate_kbps: self.bitrate.unwrap_or(base.bitrate_kbps),
             codec: self.codec.unwrap_or(base.codec),
             audio_gain: self.gain.unwrap_or(base.audio_gain),
+            require_e2ee: self.require_e2ee || base.require_e2ee,
         };
         config.validate()?;
         Ok(config)
@@ -275,7 +279,16 @@ pub async fn run_with(
 
     let session = Session::new(client.clone());
     let mut events = session.subscribe();
-    if let Err(e) = start(&session, args.guild, args.channel, source, capture).await {
+    if let Err(e) = start(
+        &session,
+        args.guild,
+        args.channel,
+        source,
+        capture,
+        stream.require_e2ee,
+    )
+    .await
+    {
         teardown(session, client).await;
         return Err(e);
     }
@@ -350,8 +363,12 @@ pub async fn start(
     channel: String,
     source: Box<dyn CaptureSource>,
     capture: CaptureConfig,
+    require_e2ee: bool,
 ) -> Result<(), CliError> {
-    let options = SessionOptions::new(StreamOptions::new(capture));
+    let options = SessionOptions::new(StreamOptions {
+        require_e2ee,
+        ..StreamOptions::new(capture)
+    });
     let mut state = session.state();
     state.borrow_and_update();
     session
@@ -391,7 +408,7 @@ pub fn stopped_cleanly(reason: &StopReason) -> bool {
 
 fn health_line(h: &HealthSnapshot) -> String {
     let mut line = format!(
-        "{} fps  {} kbps  video {} ({})  audio {} ({})  dropped {}  viewer keyframe requests {}",
+        "{} fps  {} kbps  video {} ({})  audio {} ({})  dropped {}  capture dropped {} video / {} audio  viewer keyframe requests {}",
         h.metrics.fps,
         h.metrics.bitrate_kbps,
         h.health.video_level.label(),
@@ -399,6 +416,8 @@ fn health_line(h: &HealthSnapshot) -> String {
         h.health.audio_level.label(),
         h.health.audio_score,
         h.stats.video_frames_dropped,
+        h.stats.source_video_frames_dropped,
+        h.stats.source_audio_frames_dropped,
         h.stats.viewer_keyframe_requests,
     );
     if let Some(n) = h.stats.viewers {
@@ -419,6 +438,18 @@ fn print_event(out: &Out, event: &SessionEvent) {
             out.line(format_args!("moved to channel {channel_id}"));
         }
         SessionEvent::Resumed => out.line("connection resumed"),
+        SessionEvent::E2ee {
+            state: dstreamy_discord::E2ee::Encrypted,
+            dave_protocol_version,
+        } => out.line(format_args!(
+            "end-to-end encryption on (DAVE protocol {dave_protocol_version})"
+        )),
+        SessionEvent::E2ee {
+            dave_protocol_version,
+            ..
+        } => out.warn(format_args!(
+            "end-to-end encryption off (DAVE protocol {dave_protocol_version}); Discord can read this stream"
+        )),
         SessionEvent::Error {
             message,
             fatal: true,
@@ -430,6 +461,23 @@ fn print_event(out: &Out, event: &SessionEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_line_distinguishes_capture_drops_from_transport_drops() {
+        let snapshot = HealthSnapshot {
+            metrics: dstreamy_core::StreamMetrics::default(),
+            health: dstreamy_core::StreamHealth::compute(&[], 30),
+            stats: dstreamy_discord::StreamStats {
+                video_frames_dropped: 7,
+                source_video_frames_dropped: 3,
+                source_audio_frames_dropped: 5,
+                ..Default::default()
+            },
+        };
+        let line = health_line(&snapshot);
+        assert!(line.contains("dropped 7"), "{line}");
+        assert!(line.contains("capture dropped 3 video / 5 audio"), "{line}");
+    }
 
     #[test]
     fn health_line_says_how_many_watch_once_known() {
@@ -483,6 +531,7 @@ mod tests {
             bitrate: None,
             gain: None,
             audio_source: None,
+            require_e2ee: false,
         }
     }
 
@@ -523,6 +572,30 @@ mod tests {
     }
 
     #[test]
+    fn encryption_can_be_required_by_a_flag_or_the_saved_config() {
+        let mut flags = args();
+        assert!(
+            !flags
+                .stream_config(StreamConfig::default())
+                .unwrap()
+                .require_e2ee
+        );
+        flags.require_e2ee = true;
+        assert!(
+            flags
+                .stream_config(StreamConfig::default())
+                .unwrap()
+                .require_e2ee
+        );
+        flags.require_e2ee = false;
+        let base = StreamConfig {
+            require_e2ee: true,
+            ..StreamConfig::default()
+        };
+        assert!(flags.stream_config(base).unwrap().require_e2ee);
+    }
+
+    #[test]
     fn capture_config_carries_every_setting() {
         let stream = StreamConfig {
             resolution: Resolution::P900,
@@ -530,6 +603,7 @@ mod tests {
             bitrate_kbps: 8_000,
             codec: Codec::H265,
             audio_gain: 1.5,
+            require_e2ee: true,
         };
         let config = Config {
             crop: Some(CropRect::new(1, 2, 30, 40)),

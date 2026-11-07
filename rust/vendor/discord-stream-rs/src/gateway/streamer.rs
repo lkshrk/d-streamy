@@ -2,7 +2,7 @@ use crate::gateway::events::GatewayEvent;
 use crate::gateway::opcodes::GatewayOpCode;
 use crate::utils::{StreamType, generate_stream_key, parse_stream_key};
 use crate::voice::connection::{
-    ConnectionError, MediaConnection, ReadyReceiver, VoiceConnection, VoiceEvent,
+    ConnectionError, MediaConnection, MediaTimeouts, ReadyReceiver, VoiceConnection, VoiceEvent,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -107,14 +107,24 @@ impl Slot {
     }
 }
 
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 #[derive(Clone, Default)]
 struct WebRtcConfig {
     ice_servers: Option<Vec<String>>,
     setting_engine: Option<SettingEngine>,
+    media_timeouts: Option<MediaTimeouts>,
 }
 
 impl WebRtcConfig {
     fn apply(&self, conn: &mut VoiceConnection) {
+        if let Some(timeouts) = self.media_timeouts {
+            conn.set_media_timeouts(timeouts);
+        }
         if let Some(w) = conn.webrtc_mut() {
             if let Some(urls) = &self.ice_servers {
                 w.set_ice_servers(urls.clone());
@@ -168,7 +178,7 @@ impl Streamer {
         &self.user_id
     }
 
-    /// ICE servers for connections started after this call (default: the JS reference's STUN server).
+    /// ICE servers for future connections; an empty list disables the reference client's STUN default.
     pub fn set_ice_servers(&mut self, urls: Vec<String>) {
         self.webrtc.ice_servers = Some(urls);
     }
@@ -176,6 +186,11 @@ impl Streamer {
     /// webrtc-rs setting engine for connections started after this call.
     pub fn set_setting_engine(&mut self, engine: SettingEngine) {
         self.webrtc.setting_engine = Some(engine);
+    }
+
+    /// How long a dead media path is tolerated before `VoiceEvent::MediaFailed`, for connections started after this call.
+    pub fn set_media_timeouts(&mut self, timeouts: MediaTimeouts) {
+        self.webrtc.media_timeouts = Some(timeouts);
     }
 
     /// Join a voice channel (`joinVoice`); `guild_id` is `None` for DM calls.
@@ -248,7 +263,7 @@ impl Streamer {
                 if d.user_id != self.user_id {
                     return;
                 }
-                debug!("Gateway: VOICE_STATE_UPDATE session={}", d.session_id);
+                debug!("Gateway: VOICE_STATE_UPDATE session={:?}", d.session_id);
                 if let Some(voice) = &mut self.voice {
                     voice.session_id = Some(d.session_id.clone());
                     voice.slot.set_session(d.session_id);
@@ -272,12 +287,12 @@ impl Streamer {
                     debug!("Gateway: VOICE_SERVER_UPDATE without endpoint ignored");
                     return;
                 };
-                debug!("Gateway: VOICE_SERVER_UPDATE endpoint={}", endpoint);
+                debug!("Gateway: VOICE_SERVER_UPDATE endpoint={endpoint:?}");
                 voice.slot.set_tokens(endpoint, d.token);
                 voice.slot.start_if_ready(&self.webrtc);
             }
             GatewayEvent::StreamCreate(d) => {
-                debug!("Gateway: STREAM_CREATE key={}", d.stream_key);
+                debug!("Gateway: STREAM_CREATE key={:?}", d.stream_key);
                 let user_id = self.user_id.clone();
                 let Some(stream) = &mut self.stream else {
                     return;
@@ -314,7 +329,7 @@ impl Streamer {
                 stream.slot = Some(slot);
             }
             GatewayEvent::StreamServerUpdate(d) => {
-                debug!("Gateway: STREAM_SERVER_UPDATE key={}", d.stream_key);
+                debug!("Gateway: STREAM_SERVER_UPDATE key={:?}", d.stream_key);
                 let user_id = self.user_id.clone();
                 let Some(stream) = &mut self.stream else {
                     return;
@@ -350,6 +365,11 @@ impl Streamer {
     pub fn leave_voice(&mut self) {
         self.leave_voice_connections();
         self.signal_leave_voice();
+    }
+
+    /// Ends the voice and stream connections without any gateway op, for a client that is closing.
+    pub fn stop_connections(&mut self) {
+        self.leave_voice_connections();
     }
 
     /// Retarget the next `create_stream()` after a channel move, without rejoining.

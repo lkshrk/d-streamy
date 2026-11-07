@@ -159,16 +159,18 @@ pub enum Field {
     Codec,
     Gain,
     Crop,
+    RequireE2ee,
 }
 
 impl Field {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Resolution,
         Self::Fps,
         Self::Bitrate,
         Self::Codec,
         Self::Gain,
         Self::Crop,
+        Self::RequireE2ee,
     ];
 
     pub fn label(self) -> &'static str {
@@ -179,6 +181,7 @@ impl Field {
             Self::Codec => "Codec",
             Self::Gain => "Audio gain",
             Self::Crop => "Crop X,Y,W,H",
+            Self::RequireE2ee => "Require E2EE",
         }
     }
 
@@ -219,6 +222,7 @@ impl Settings {
             Field::Gain => format!("{:.1}", s.audio_gain),
             Field::Crop if self.crop_text.is_empty() => "none".to_owned(),
             Field::Crop => self.crop_text.clone(),
+            Field::RequireE2ee => if s.require_e2ee { "yes" } else { "no" }.to_owned(),
         }
     }
 
@@ -256,6 +260,7 @@ impl Settings {
                 s.audio_gain = tenths as f32 / 10.0;
             }
             Field::Crop => {}
+            Field::RequireE2ee => s.require_e2ee = !s.require_e2ee,
         }
     }
 
@@ -372,15 +377,22 @@ impl HealthView {
                 (
                     "Drops",
                     format!(
-                        "{} this second, {} total",
-                        m.v_drop, stats.video_frames_dropped
+                        "{} this second, {} total ({} capture)",
+                        m.v_drop,
+                        stats
+                            .video_frames_dropped
+                            .saturating_add(stats.source_video_frames_dropped),
+                        stats.source_video_frames_dropped
                     ),
                 ),
                 (
                     "Audio",
                     format!(
-                        "{} / {audio_per_sec} frames/s, {} not ready, {} errors",
-                        m.a_sent, m.a_drop_not_ready, m.a_enc_err
+                        "{} / {audio_per_sec} frames/s, {} not ready, {} errors, {} capture dropped",
+                        m.a_sent,
+                        m.a_drop_not_ready,
+                        m.a_enc_err,
+                        stats.source_audio_frames_dropped
                     ),
                 ),
                 ("Bitrate", format!("{} kbps", m.bitrate_kbps)),
@@ -468,7 +480,7 @@ impl App {
             }
             Msg::Guilds(guilds) => {
                 if guilds.is_empty() {
-                    self.notify(Tone::Warn, "this account is in no guilds");
+                    self.notify(Tone::Warn, "this account is in no servers");
                 }
                 self.guilds.set(guilds);
             }
@@ -477,7 +489,7 @@ impl App {
                     match result {
                         Ok(channels) => {
                             if channels.is_empty() {
-                                self.notify(Tone::Warn, "this guild has no voice channels");
+                                self.notify(Tone::Warn, "this server has no voice channels");
                             }
                             self.channels.set(channels);
                         }
@@ -554,6 +566,19 @@ impl App {
                 live.log(Tone::Info, format!("moved to {}", live.channel));
             }
             SessionEvent::Resumed => live.log(Tone::Info, "connection resumed"),
+            SessionEvent::E2ee {
+                state,
+                dave_protocol_version,
+            } => {
+                let encrypted = state == dstreamy_discord::E2ee::Encrypted;
+                let tone = if encrypted { Tone::Info } else { Tone::Warn };
+                let text = if encrypted {
+                    format!("end-to-end encryption on (DAVE protocol {dave_protocol_version})")
+                } else {
+                    format!("end-to-end encryption off (DAVE protocol {dave_protocol_version})")
+                };
+                live.log(tone, text);
+            }
             SessionEvent::Error { message, fatal } => {
                 live.log(if fatal { Tone::Bad } else { Tone::Warn }, message);
             }
@@ -850,9 +875,17 @@ mod tests {
         s.step(1);
         assert_eq!(s.field, Field::Crop);
         s.step(1);
+        assert_eq!(s.field, Field::RequireE2ee);
+        assert!(!s.stream.require_e2ee);
+        s.adjust(1);
+        assert!(s.stream.require_e2ee);
+        assert_eq!(s.value(Field::RequireE2ee), "yes");
+        s.adjust(-1);
+        assert!(!s.stream.require_e2ee);
+        s.step(1);
         assert_eq!(s.field, Field::Resolution);
         s.step(-1);
-        assert_eq!(s.field, Field::Crop);
+        assert_eq!(s.field, Field::RequireE2ee);
     }
 
     #[test]
@@ -868,7 +901,10 @@ mod tests {
             guild_id: "g1".into(),
             result: Ok(vec![channel("c1", "General")]),
         });
-        keys(&mut app, &[Key::Enter, Key::Enter, Key::BackTab]);
+        keys(
+            &mut app,
+            &[Key::Enter, Key::Enter, Key::BackTab, Key::BackTab],
+        );
         assert_eq!(app.settings.field, Field::Crop);
         keys(&mut app, &[Key::Backspace, Key::Char('x'), Key::Char('0')]);
         assert_eq!(app.settings.crop_text, "1,2,3,0");
@@ -1022,6 +1058,8 @@ mod tests {
             health: StreamHealth::compute(&[metrics, StreamMetrics::default()], 30),
             stats: StreamStats {
                 video_frames_dropped: 4,
+                source_video_frames_dropped: 3,
+                source_audio_frames_dropped: 5,
                 viewer_keyframe_requests: 2,
                 ..StreamStats::default()
             },
@@ -1035,8 +1073,11 @@ mod tests {
         let row = |name| view.rows.iter().find(|r| r.0 == name).unwrap().1.clone();
         assert_eq!(row("FPS"), "29 / 30");
         assert_eq!(row("Jitter"), "p95 40 ms, max 90+ ms");
-        assert_eq!(row("Drops"), "1 this second, 4 total");
-        assert_eq!(row("Audio"), "49 / 50 frames/s, 0 not ready, 0 errors");
+        assert_eq!(row("Drops"), "1 this second, 7 total (3 capture)");
+        assert_eq!(
+            row("Audio"),
+            "49 / 50 frames/s, 0 not ready, 0 errors, 5 capture dropped"
+        );
     }
 
     #[test]

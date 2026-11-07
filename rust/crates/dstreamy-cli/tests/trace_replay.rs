@@ -1,4 +1,6 @@
 //! `serve` + mock Discord + `mock-producer --replay`: real OBS traces converted by `dstreamy-obs-packet`.
+//!
+//! `DSTREAMY_TRACE_REPLAY_STRICT=1` fails on the first inconclusive replay instead of retrying it.
 #![cfg(unix)]
 
 mod support;
@@ -31,17 +33,17 @@ const MIN_BASELINE_FRAMES: usize = 15;
 /// The fewest matched frames a median lag is taken from.
 const MIN_MEDIAN_FRAMES: usize = 10;
 const REPLAY_ATTEMPTS: usize = 3;
-// GitHub's macOS runners have too few cores to pace six replays, their serves and producers at once.
-const CONCURRENT_TRACES: usize = if cfg!(target_os = "macos") {
-    2
-} else {
-    usize::MAX
-};
+/// The most frames serve's source queue may hold while a producer sends at a trace's own pace; a quiet run peaks at 2.
+const SOURCE_QUEUE_BOUND: u64 = 8;
 
-/// On macOS, held for the whole of each pace-checked replay test, so those tests never overlap.
-fn exclusive_on_macos() -> Option<MutexGuard<'static, ()>> {
-    static PACED: Mutex<()> = Mutex::new(());
-    cfg!(target_os = "macos").then(|| PACED.lock().unwrap_or_else(PoisonError::into_inner))
+/// Held for the whole of each test that replays through serve, so replays never share the CPU.
+fn exclusive() -> MutexGuard<'static, ()> {
+    static ONE: Mutex<()> = Mutex::new(());
+    ONE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn strict() -> bool {
+    std::env::var_os("DSTREAMY_TRACE_REPLAY_STRICT").is_some_and(|v| v == "1")
 }
 
 fn traces_dir() -> PathBuf {
@@ -359,11 +361,9 @@ fn paced<F>(
         .max()
         .unwrap_or(0);
     eprintln!("{what}: largest deviation from the median lag {largest} µs, slack {slack} µs");
-    // Below 50 checked frames the 2% budget allows none, so one frame of scheduling noise past the slack would fail.
-    let one_jitter = off.len() == 1 && (off[0] - mid).abs() <= slack + JITTER_MARGIN_US;
     let deviations: Vec<i64> = off.iter().map(|l| l - mid).collect();
     assert!(
-        off.len() * 50 <= checked.len() || one_jitter,
+        off.is_empty(),
         "{what}: {} of {} checked frames off the trace's dts pace by more than {slack} µs from the median lag {mid} µs: lags {off:?}, deviations {deviations:?}",
         off.len(),
         checked.len()
@@ -556,7 +556,7 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
     let want = expected(trace);
     let h = Harness::new("");
     let canary = StallCanary::start(&h.rt);
-    let mut serve = h.serve();
+    let serve = h.serve();
     let mut c = h.external_session();
     let before_replay = Instant::now();
     let p = h.replay(dir, &[]);
@@ -594,16 +594,13 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
                 .filter(|&(from, to)| to > window.0 && from < window.1)
                 .collect();
             match c.try_status() {
-                Ok(s) => match serve_drops(&s, &stalls, window.0) {
-                    Some(drops) if overflow_explained(&s, &stalls, window, want.fps) => {
-                        return Err(Stalled(format!("{counts}; {drops}")));
-                    }
-                    Some(drops) => panic!("{counts}; {drops}"),
-                    None => panic!(
+                Ok(s) => {
+                    serve_kept_pace(&s, &stalls, window, want.fps, &counts)?;
+                    panic!(
                         "{counts}; session {}; source {}",
                         s["stats"], s["source"]["stats"]
-                    ),
-                },
+                    )
+                }
                 Err(e) => {
                     let connection = c.connection_report();
                     let exit = serve.exit_report();
@@ -638,6 +635,7 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
         );
     }
     monotonic(&recorded);
+    serve_kept_pace(&c.status(), &canary.stalls(), window, want.fps, name)?;
     check_replay(
         &stream_video(&recorded),
         &producer_audio(&recorded),
@@ -668,6 +666,15 @@ fn overflow_explained(
 ) -> bool {
     let stats = &status["stats"];
     stats["last_error"].is_null()
+        && status["source"]["stats"]["dropped_video"]
+            .as_u64()
+            .unwrap_or(0)
+            == 0
+        && status["source"]["stats"]["dropped_audio"]
+            .as_u64()
+            .unwrap_or(0)
+            == 0
+        && stats["audio_frames_dropped"].as_u64().unwrap_or(0) == 0
         && stats["video_queue_overflows"]
             .as_u64()
             .is_some_and(|n| n > 0)
@@ -723,57 +730,48 @@ fn report(line: &str, annotate: bool) {
     }
 }
 
-/// Replays `batch` concurrently until each trace has passed once, rerunning the whole batch so retries see the same load.
-fn replay_until_conclusive(batch: &[(String, PathBuf, Trace)], plis: bool) {
-    let mut reasons: Vec<Vec<String>> = vec![Vec::new(); batch.len()];
-    let mut passed = vec![false; batch.len()];
-    let mut annotated = vec![false; batch.len()];
-    for attempt in 1..=REPLAY_ATTEMPTS {
-        let results: Vec<Result<(), Stalled>> = std::thread::scope(|s| {
-            let runs: Vec<_> = batch
-                .iter()
-                .map(|(name, dir, trace)| {
-                    s.spawn(move || replay_through_serve(name, dir, trace, plis))
-                })
-                .collect();
-            runs.into_iter()
-                .map(|run| run.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-                .collect()
-        });
-        for (i, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(()) => passed[i] = true,
-                Err(Stalled(why)) if !passed[i] => {
+/// Replays each trace in turn until it passes once; an inconclusive replay is retried unless `strict`.
+fn replay_until_conclusive(traces: &[(String, PathBuf, Trace)], plis: bool) {
+    let attempts = if strict() { 1 } else { REPLAY_ATTEMPTS };
+    let mut failed = Vec::new();
+    for (name, dir, trace) in traces {
+        let mut reasons = Vec::new();
+        for attempt in 1..=attempts {
+            match replay_through_serve(name, dir, trace, plis) {
+                Ok(()) => {
                     report(
-                        &format!(
-                            "{}: attempt {attempt} of {REPLAY_ATTEMPTS} inconclusive: {why}",
-                            batch[i].0
-                        ),
-                        !annotated[i],
+                        &format!("{name}: replay_retries_total={}", reasons.len()),
+                        false,
                     );
-                    annotated[i] = true;
-                    reasons[i].push(why);
+                    break;
                 }
-                Err(_) => {}
+                Err(Stalled(why)) => {
+                    if attempt < attempts {
+                        report(
+                            &format!("{name}: attempt {attempt} of {attempts} inconclusive: {why}"),
+                            attempt == 1,
+                        );
+                    }
+                    reasons.push(why);
+                }
             }
         }
-        if passed.iter().all(|&p| p) {
-            return;
+        if reasons.len() == attempts {
+            failed.push(format!("{name}:\n  {}", reasons.join("\n  ")));
         }
     }
-    let failed: Vec<String> = batch
-        .iter()
-        .zip(&reasons)
-        .zip(&passed)
-        .filter(|(_, p)| !**p)
-        .map(|(((name, _, _), why), _)| format!("{name}:\n  {}", why.join("\n  ")))
-        .collect();
-    panic!(
-        "{}\nno attempt of these traces was conclusive in {REPLAY_ATTEMPTS} tries. An attempt is \
-         inconclusive when stalls of the mock's runtime excuse too much of a trace or leave too few \
-         frames outside them for a baseline, or when serve drops video after stalls that fill its \
-         queue. The runner, serve or the producer using the CPU, or frames arriving late, all cause this.",
-        failed.join("\n")
+    assert!(
+        failed.is_empty(),
+        "{}\nno attempt of these traces was conclusive in {attempts}{}. An attempt is inconclusive when \
+         stalls of the mock's runtime excuse too much of a trace or leave too few frames outside them \
+         for a baseline, or when serve drops video after stalls that fill its queue. The runner, serve \
+         or the producer using the CPU, or frames arriving late, all cause this.",
+        failed.join("\n"),
+        if strict() {
+            " (DSTREAMY_TRACE_REPLAY_STRICT=1 allows no retry)"
+        } else {
+            " tries"
+        }
     );
 }
 
@@ -784,10 +782,8 @@ fn every_positive_trace_replays_through_serve() {
         .filter(|(n, _, t)| positive(n, t))
         .collect();
     assert!(positives.len() >= 6, "{} positive traces", positives.len());
-    let _paced = exclusive_on_macos();
-    for batch in positives.chunks(CONCURRENT_TRACES) {
-        replay_until_conclusive(batch, false);
-    }
+    let _one = exclusive();
+    replay_until_conclusive(&positives, false);
 }
 
 #[test]
@@ -796,7 +792,7 @@ fn control_events_during_a_replay_lose_no_packet() {
         .into_iter()
         .find(|(n, _, _)| n == "linux-x264-main-bf0-keyint2-30fps")
         .unwrap();
-    let _paced = exclusive_on_macos();
+    let _one = exclusive();
     replay_until_conclusive(&[(name, dir, trace)], true);
 }
 
@@ -982,7 +978,8 @@ fn late_frames_without_a_stall_still_fail() {
 }
 
 #[test]
-fn one_frame_of_jitter_past_the_slack_passes_a_short_trace() {
+#[should_panic(expected = "checked frames off")]
+fn one_frame_of_jitter_past_the_slack_fails_a_short_trace() {
     check_sixty_fps(&[(20, Duration::from_millis(29))]);
 }
 
@@ -1052,7 +1049,7 @@ fn a_stall_that_ends_before_the_first_frame_still_excuses_the_frames_behind_it()
 
 #[test]
 fn b_frame_traces_are_refused_at_conversion() {
-    let _paced = exclusive_on_macos();
+    let _one = exclusive();
     let negatives: Vec<_> = traces()
         .into_iter()
         .filter(|(n, _, _)| uses_b_frames(n))
@@ -1087,7 +1084,7 @@ fn b_frame_traces_are_refused_at_conversion() {
 
 #[test]
 fn non_opus_traces_are_refused_at_hello() {
-    let _paced = exclusive_on_macos();
+    let _one = exclusive();
     let refused: Vec<_> = traces()
         .into_iter()
         .filter(|(_, _, t)| t.audio_codec() != "opus")
@@ -1145,18 +1142,68 @@ fn stall_summary(stalls: &[Stall], origin: Instant) -> String {
     )
 }
 
-/// Serve's own drops to a keyframe, which a stall that overfills its video queue causes by design.
+/// What serve dropped, by counter; its video queue overflowing after a stall drops to a keyframe by design.
 fn serve_drops(status: &Value, stalls: &[Stall], origin: Instant) -> Option<String> {
-    let dropped = status["stats"]["video_frames_dropped"]
-        .as_u64()
-        .filter(|&n| n > 0)?;
+    let (session, source) = (&status["stats"], &status["source"]["stats"]);
+    let dropped: Vec<String> = [
+        ("video_frames_dropped", session),
+        ("audio_frames_dropped", session),
+        ("dropped_video", source),
+        ("dropped_audio", source),
+    ]
+    .into_iter()
+    .filter_map(|(key, stats)| {
+        let n = stats[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no {key} in {status}"));
+        (n > 0).then(|| format!("{key} {n}"))
+    })
+    .collect();
+    if dropped.is_empty() {
+        return None;
+    }
     Some(format!(
-        "serve dropped {dropped} video frames ({} queue overflows, {} keyframe requests, last error {}); {}",
-        status["stats"]["video_queue_overflows"],
-        status["stats"]["keyframe_requests"],
-        status["stats"]["last_error"],
+        "serve dropped {} ({} queue overflows, {} keyframe requests, last error {}); {}",
+        dropped.join(", "),
+        session["video_queue_overflows"],
+        session["keyframe_requests"],
+        session["last_error"],
         stall_summary(stalls, origin)
     ))
+}
+
+// The mock's stall canary cannot excuse source loss, audio loss or a deep source queue.
+fn serve_kept_pace(
+    status: &Value,
+    stalls: &[Stall],
+    window: (Instant, Instant),
+    fps: i64,
+    what: &str,
+) -> Result<(), Stalled> {
+    if let Some(drops) = serve_drops(status, stalls, window.0) {
+        if overflow_explained(status, stalls, window, fps) {
+            return Err(Stalled(format!("{what}: {drops}")));
+        }
+        panic!("{what}: {drops}");
+    }
+    let queued = source_queue_peak(status, what);
+    eprintln!("{what}: serve dropped nothing; its source queue peaked at {queued} frames");
+    Ok(())
+}
+
+/// `max_queued` of serve's source, which stays under `SOURCE_QUEUE_BOUND` while serve keeps up with the producer.
+fn source_queue_peak(status: &Value, what: &str) -> u64 {
+    let now = status["source"]["stats"]["queued"].as_u64().unwrap();
+    let queued = status["source"]["stats"]["max_queued"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{what}: no source stats in {status}"));
+    assert!(
+        now <= queued && queued <= SOURCE_QUEUE_BOUND,
+        "{what}: serve's source queue reached {queued} frames, over {SOURCE_QUEUE_BOUND}: serve fell behind the producer; session {}, source {}",
+        status["stats"],
+        status["source"]["stats"]
+    );
+    queued
 }
 
 /// `Harness::wait`, failing with serve's drops when they explain the missing frames.
@@ -1190,65 +1237,39 @@ fn split<'a, T>(
     (frames[..i].to_vec(), frames[i..].to_vec())
 }
 
-fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
-    let _paced = exclusive_on_macos();
-    let (_, dir, trace) = traces()
-        .into_iter()
-        .find(|(n, _, _)| n == "linux-x264-main-bf0-keyint2-30fps")
-        .unwrap();
-    let want = expected(&trace);
-    let h = Harness::new(&format!("[serve]\ngrace_secs = {}\n", grace.as_secs()));
-    let canary = StallCanary::start(&h.rt);
-    let _s = h.serve();
-    let mut c = h.external_session();
+fn restart_kept_pace(
+    status: &Value,
+    stalls: &[Stall],
+    window: (Instant, Instant),
+    fps: i64,
+    what: &str,
+    strict_mode: bool,
+) {
+    if let Err(Stalled(why)) = serve_kept_pace(status, stalls, window, fps, what) {
+        assert!(!strict_mode, "{why}");
+        eprintln!("{why}");
+    }
+    source_queue_peak(status, what);
+}
 
-    let mut first = h.replay(&dir, &[]);
-    let id = first.attached();
-    c.source("producing", |e| {
-        e["state"] == "producing" && e["attachment"] == id
-    });
-    wait_or_drops(&h, &mut c, &canary, "75 video and 125 audio frames", |r| {
-        (stream_video(r).len() >= 75 && producer_audio(r).len() >= 125).then_some(())
-    });
-    first.kill();
-    let killed = Instant::now();
-    c.source("interrupted", |e| {
-        e["state"] == "interrupted" && e["reason"] == "detached"
-    });
-    std::thread::sleep(gap.saturating_sub(killed.elapsed()));
-    let reattached = Instant::now();
-    let second = h.replay(&dir, &[]);
-    let id2 = second.attached();
-    let detached_for = killed.elapsed();
-    assert!(
-        detached_for < grace,
-        "detached for {detached_for:?}, beyond the {grace:?} grace period"
+fn check_restart_prefix(
+    v1: &[&RecordedVideoFrame],
+    a1: &[&RecordedAudioFrame],
+    want: &Expected,
+    lost_first: usize,
+    status: &Value,
+    stalls: &[Stall],
+    window: (Instant, Instant),
+) {
+    restart_kept_pace(
+        status,
+        stalls,
+        window,
+        want.fps,
+        "restarted replay",
+        strict(),
     );
-    c.source("producing again", |e| {
-        e["state"] == "producing" && e["attachment"] == id2
-    });
-    let (status, stderr) = second.finish();
-    assert!(status.success(), "{stderr}");
-    let (frames, packets) = (want.video.len(), want.audio.len());
-    let recorded = wait_or_drops(&h, &mut c, &canary, "the whole second replay", |r| {
-        let (_, v2) = split(&stream_video(r), |v| v.received_at, reattached);
-        let (_, a2) = split(&producer_audio(r), |a| a.received_at, reattached);
-        (v2.len() >= frames && a2.len() >= packets).then(|| r.clone())
-    });
-    let lost_first = start_drops(&recorded, "a restarted replay");
-    assert_eq!(c.status()["session"]["state"], "streaming");
-    monotonic(&recorded);
-
-    let (v1, v2) = split(&stream_video(&recorded), |v| v.received_at, reattached);
-    let (a1, a2) = split(&producer_audio(&recorded), |a| a.received_at, reattached);
-    let stalls = canary.stalls();
-    let origin = stalls.first().map_or_else(Instant::now, |s| s.0);
-    let drops = serve_drops(&c.status(), &stalls, origin);
-    assert!(
-        is_keyframe(&v2[0].data),
-        "first video after the gap is not an IDR; {drops:?}; stalls {:?}",
-        canary.stalls()
-    );
+    let drops = serve_drops(status, stalls, window.0);
     assert_eq!(
         a1[0].data, want.audio[lost_first].key,
         "audio lost before the kill"
@@ -1296,14 +1317,108 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
             v1.len(),
             kept_until - kept_from
         );
-        assert_av_aligned(v1_kept, &a1_kept, &want, "before the kill");
+        assert_av_aligned(v1_kept, &a1_kept, want, "before the kill");
     }
+}
+
+fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
+    let _one = exclusive();
+    let (_, dir, trace) = traces()
+        .into_iter()
+        .find(|(n, _, _)| n == "linux-x264-main-bf0-keyint2-30fps")
+        .unwrap();
+    let want = expected(&trace);
+    let h = Harness::new(&format!("[serve]\ngrace_secs = {}\n", grace.as_secs()));
+    let canary = StallCanary::start(&h.rt);
+    let _s = h.serve();
+    let mut c = h.external_session();
+
+    let first_started = Instant::now();
+    let mut first = h.replay(&dir, &[]);
+    let id = first.attached();
+    c.source("producing", |e| {
+        e["state"] == "producing" && e["attachment"] == id
+    });
+    wait_or_drops(&h, &mut c, &canary, "75 video and 125 audio frames", |r| {
+        (stream_video(r).len() >= 75 && producer_audio(r).len() >= 125).then_some(())
+    });
+    let first_status = c.status();
+    let first_window = (first_started, Instant::now());
+    restart_kept_pace(
+        &first_status,
+        &canary.stalls(),
+        first_window,
+        want.fps,
+        "before the kill",
+        strict(),
+    );
+    first.kill();
+    let killed = Instant::now();
+    c.source("interrupted", |e| {
+        e["state"] == "interrupted" && e["reason"] == "detached"
+    });
+    std::thread::sleep(gap.saturating_sub(killed.elapsed()));
+    let reattached = Instant::now();
+    let second = h.replay(&dir, &[]);
+    let id2 = second.attached();
+    let detached_for = killed.elapsed();
+    assert!(
+        detached_for < grace,
+        "detached for {detached_for:?}, beyond the {grace:?} grace period"
+    );
+    c.source("producing again", |e| {
+        e["state"] == "producing" && e["attachment"] == id2
+    });
+    let (status, stderr) = second.finish();
+    assert!(status.success(), "{stderr}");
+    let (frames, packets) = (want.video.len(), want.audio.len());
+    let recorded = wait_or_drops(&h, &mut c, &canary, "the whole second replay", |r| {
+        let (_, v2) = split(&stream_video(r), |v| v.received_at, reattached);
+        let (_, a2) = split(&producer_audio(r), |a| a.received_at, reattached);
+        (v2.len() >= frames && a2.len() >= packets).then(|| r.clone())
+    });
+    let lost_first = start_drops(&recorded, "a restarted replay");
+    assert_eq!(c.status()["session"]["state"], "streaming");
+    monotonic(&recorded);
+
+    let (v1, v2) = split(&stream_video(&recorded), |v| v.received_at, reattached);
+    let (a1, a2) = split(&producer_audio(&recorded), |a| a.received_at, reattached);
+    let completed = Instant::now();
+    let stalls: Vec<_> = canary
+        .stalls()
+        .into_iter()
+        .flat_map(|(from, to)| {
+            [(first_started, killed), (reattached, completed)]
+                .into_iter()
+                .filter_map(move |(start, end)| {
+                    let clipped = (from.max(start), to.min(end));
+                    (clipped.1 > clipped.0).then_some(clipped)
+                })
+        })
+        .collect();
+    let origin = first_started;
+    let status = c.status();
+    let drops = serve_drops(&status, &stalls, origin);
+    assert!(
+        is_keyframe(&v2[0].data),
+        "first video after the gap is not an IDR; {drops:?}; stalls {:?}",
+        canary.stalls()
+    );
+    check_restart_prefix(
+        &v1,
+        &a1,
+        &want,
+        lost_first,
+        &status,
+        &stalls,
+        (origin, completed),
+    );
     check_replay(&v2, &a2, &want, 0, &canary.stalls(), "after the restart")
         .unwrap_or_else(|Stalled(e)| panic!("{e}"));
 
     let last_before = rtp_us(v1.last().unwrap().rtp_timestamp, VIDEO_HZ);
     let resumed = rtp_us(v2[0].rtp_timestamp, VIDEO_HZ) - last_before;
-    let frame_us = 1_000_000 / fps;
+    let frame_us = 1_000_000 / want.fps;
     assert!(
         resumed >= gap.as_micros() as i64 && resumed <= detached_for.as_micros() as i64 + 1_000_000,
         "video resumed {resumed} µs after the last frame; detached for {detached_for:?}, gap {gap:?}, one frame {frame_us} µs"
@@ -1472,6 +1587,83 @@ fn only_queue_overflow_without_errors_is_excused() {
     ));
 }
 
+/// Serve's status with `dropped` video frames at the pump, `overflows` of its video queue and a source queue that peaked at `max_queued`.
+fn serve_status(dropped: u64, overflows: u64, max_queued: u64) -> Value {
+    serde_json::json!({
+        "stats": {"last_error": Value::Null, "video_queue_overflows": overflows, "keyframe_requests": 5,
+                  "video_frames_dropped": dropped, "audio_frames_dropped": 0},
+        "source": {"stats": {"dropped_video": 0, "dropped_audio": 0, "queued": 0, "max_queued": max_queued}},
+    })
+}
+
+fn five_seconds() -> (Instant, Instant) {
+    let origin = Instant::now();
+    (origin, origin + Duration::from_secs(5))
+}
+
+#[test]
+fn nothing_dropped_and_a_shallow_queue_is_serve_keeping_pace() {
+    let window = five_seconds();
+    serve_kept_pace(
+        &serve_status(0, 0, SOURCE_QUEUE_BOUND),
+        &[],
+        window,
+        30,
+        "synthetic",
+    )
+    .unwrap();
+}
+
+#[test]
+#[should_panic(expected = "synthetic: serve dropped video_frames_dropped 40")]
+fn serve_drops_without_a_stall_fail_a_replay() {
+    let window = five_seconds();
+    let _ = serve_kept_pace(&serve_status(40, 2, 1), &[], window, 30, "synthetic");
+}
+
+#[test]
+#[should_panic(expected = "synthetic: serve dropped dropped_audio 3")]
+fn serve_drops_of_audio_fail_a_replay_whatever_the_stalls() {
+    let window = five_seconds();
+    let long = [(
+        window.0 + Duration::from_secs(1),
+        window.0 + Duration::from_millis(1_300),
+    )];
+    let mut status = serve_status(0, 0, 1);
+    status["source"]["stats"]["dropped_audio"] = 3.into();
+    let _ = serve_kept_pace(&status, &long, window, 30, "synthetic");
+}
+
+#[test]
+fn serve_drops_after_stalls_that_fill_its_queue_are_inconclusive() {
+    let window = five_seconds();
+    let long = [(
+        window.0 + Duration::from_secs(1),
+        window.0 + Duration::from_millis(1_300),
+    )];
+    let verdict = serve_kept_pace(&serve_status(40, 2, 1), &long, window, 30, "synthetic");
+    let Err(Stalled(why)) = verdict else {
+        panic!("{verdict:?}")
+    };
+    assert!(
+        why.contains("video_frames_dropped 40") && why.contains("2 queue overflows"),
+        "{why}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "source queue reached 9 frames")]
+fn a_deep_source_queue_fails_a_replay_without_any_drop() {
+    let window = five_seconds();
+    let _ = serve_kept_pace(
+        &serve_status(0, 0, SOURCE_QUEUE_BOUND + 1),
+        &[],
+        window,
+        30,
+        "synthetic",
+    );
+}
+
 #[test]
 fn stalls_over_a_quarter_of_the_trace_are_inconclusive_not_passed() {
     let start = Instant::now();
@@ -1530,4 +1722,67 @@ fn a_trace_mostly_inside_stalls_is_inconclusive_not_a_baseline_failure() {
         panic!("{verdict:?}")
     };
     assert!(why.contains("too few for a baseline"), "{why}");
+}
+
+#[test]
+#[should_panic(expected = "restarted replay: serve dropped video_frames_dropped 40")]
+fn early_restart_loss_followed_by_an_idr_cannot_skip_alignment_without_a_stall() {
+    let origin = Instant::now();
+    let first = RecordedVideoFrame {
+        kind: VoiceKind::Stream,
+        server_id: String::new(),
+        ssrc: 1,
+        payload_type: 101,
+        codec: dstreamy_mock_discord::VideoCodec::H264,
+        rtp_timestamp: 0,
+        data: vec![0, 0, 0, 1, 0x65, 0x88],
+        e2ee: false,
+        playout_delay: None,
+        received_at: origin,
+    };
+    let mut idr = first.clone();
+    idr.rtp_timestamp = 6000;
+    let audio = RecordedAudioFrame {
+        kind: VoiceKind::Stream,
+        server_id: String::new(),
+        ssrc: 2,
+        payload_type: 120,
+        rtp_timestamp: 0,
+        data: vec![0xf8, 0xff, 0xfe],
+        e2ee: false,
+        received_at: origin,
+    };
+    let want = Expected {
+        fps: 30,
+        video: Vec::new(),
+        audio: vec![Sent {
+            key: audio.data.clone(),
+            pts_us: 0,
+            dts_usec: 0,
+        }],
+    };
+    check_restart_prefix(
+        &[&first, &idr],
+        &[&audio],
+        &want,
+        0,
+        &serve_status(40, 1, 1),
+        &[],
+        (origin, origin + Duration::from_secs(3)),
+    );
+}
+
+#[test]
+fn measured_restart_overflow_is_inconclusive_only_outside_strict_mode() {
+    let window = five_seconds();
+    let stalls = [(
+        window.0 + Duration::from_secs(1),
+        window.0 + Duration::from_millis(1_300),
+    )];
+    let status = serve_status(40, 2, 1);
+    restart_kept_pace(&status, &stalls, window, 30, "restart", false);
+    let failed = std::panic::catch_unwind(|| {
+        restart_kept_pace(&status, &stalls, window, 30, "restart", true)
+    });
+    assert!(failed.is_err(), "strict replay accepted measured overflow");
 }

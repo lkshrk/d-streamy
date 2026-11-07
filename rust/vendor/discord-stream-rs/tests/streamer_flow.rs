@@ -270,7 +270,7 @@ async fn channel_move_retargets_next_stream_without_rejoining() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn missing_heartbeat_acks_trigger_resume() {
+async fn missing_heartbeat_acks_before_ready_reconnect_with_a_fresh_identify() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let (gw_tx, _gw_rx) = mpsc::unbounded_channel();
@@ -286,10 +286,43 @@ async fn missing_heartbeat_acks_trigger_resume() {
     ));
     let mut ws = accept_with_heartbeat(&listener, 30).await;
     recv_op(&mut ws, 0).await;
+    // A 30 ms HELLO interval is clamped, so no heartbeat comes within half a second.
+    assert!(
+        timeout(Duration::from_millis(500), recv_op(&mut ws, 3))
+            .await
+            .is_err()
+    );
     let silent = tokio::spawn(async move { while ws.next().await.is_some() {} });
     let mut ws = accept(&listener).await;
-    assert_eq!(recv_op(&mut ws, 7).await["session_id"], "sess");
+    assert_eq!(recv_op(&mut ws, 0).await["session_id"], "sess");
     silent.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ready_without_a_video_stream_fails_the_join_at_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let (_streamer, _gw_rx, mut voice) = join_dialing(&endpoint);
+    let mut ws = accept(&listener).await;
+    recv_op(&mut ws, 0).await;
+    send(
+        &mut ws,
+        json!({ "op": 2, "seq": 1, "d": {
+            "ssrc": 1111, "ip": "127.0.0.1", "port": 1234, "modes": [], "streams": []
+        }}),
+    )
+    .await;
+    let failed = timeout(Duration::from_secs(2), voice.ready())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            failed,
+            Err(StreamerError::Connection(ConnectionError::Protocol(_)))
+        ),
+        "{failed:?}"
+    );
+    closed_event(&mut voice.events, Duration::from_secs(2)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -333,5 +366,104 @@ async fn unusable_dave_channel_ids_fail_the_connection() {
         timeout(Duration::from_millis(300), listener.accept())
             .await
             .is_err()
+    );
+}
+
+/// Joins voice against `endpoint` with session and tokens set, so the connection dials at once.
+fn join_dialing(
+    endpoint: &str,
+) -> (
+    Streamer,
+    mpsc::UnboundedReceiver<GatewayPayload>,
+    discord_stream_rs::PendingConnection,
+) {
+    let (gw_tx, gw_rx) = mpsc::unbounded_channel();
+    let mut streamer = Streamer::new("42".into(), gw_tx);
+    let voice = streamer.join_voice(Some("100".into()), "200".into());
+    streamer.handle_event(dispatch(
+        "VOICE_STATE_UPDATE",
+        json!({ "user_id": "42", "session_id": "sess" }),
+    ));
+    streamer.handle_event(dispatch(
+        "VOICE_SERVER_UPDATE",
+        json!({ "guild_id": "100", "endpoint": endpoint, "token": "tok" }),
+    ));
+    (streamer, gw_rx, voice)
+}
+
+async fn closed_event(events: &mut mpsc::UnboundedReceiver<VoiceEvent>, within: Duration) {
+    timeout(within, async {
+        loop {
+            match events.recv().await {
+                Some(VoiceEvent::Closed { .. }) | None => return,
+                Some(_) => {}
+            }
+        }
+    })
+    .await
+    .expect("the connection did not end");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_while_the_socket_is_still_connecting_ends_the_task_at_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let (mut streamer, _gw_rx, mut voice) = join_dialing(&endpoint);
+    // Accept TCP but never answer the WebSocket handshake, so the dial hangs until its timeout.
+    let (_held, _) = timeout(T, listener.accept()).await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    streamer.leave_voice();
+    closed_event(&mut voice.events, Duration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_established_session_that_drops_waits_before_resuming() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let (_streamer, _gw_rx, _voice) = join_dialing(&endpoint);
+    let mut ws = accept(&listener).await;
+    recv_op(&mut ws, 0).await;
+    send(&mut ws, json!({ "op": 9, "seq": 1, "d": null })).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    ws.close(Some(CloseFrame {
+        code: CloseCode::from(4015),
+        reason: "".into(),
+    }))
+    .await
+    .unwrap();
+    assert!(
+        timeout(Duration::from_millis(500), listener.accept())
+            .await
+            .is_err(),
+        "reconnected without waiting"
+    );
+    let mut ws = accept(&listener).await;
+    assert_eq!(recv_op(&mut ws, 7).await["session_id"], "sess");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flapping_voice_server_is_given_up_on_within_the_window() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let (_streamer, _gw_rx, mut voice) = join_dialing(&endpoint);
+    let sockets = discord_stream_rs::voice::connection::MAX_SESSIONS_PER_WINDOW;
+    for i in 0..sockets {
+        let mut ws = accept(&listener).await;
+        let op = if i == 0 { 0 } else { 7 };
+        recv_op(&mut ws, op).await;
+        send(&mut ws, json!({ "op": 9, "seq": i + 1, "d": null })).await;
+        ws.close(Some(CloseFrame {
+            code: CloseCode::from(4015),
+            reason: "".into(),
+        }))
+        .await
+        .unwrap();
+    }
+    closed_event(&mut voice.events, Duration::from_secs(5)).await;
+    assert!(
+        timeout(Duration::from_millis(300), listener.accept())
+            .await
+            .is_err(),
+        "kept reconnecting after giving up"
     );
 }

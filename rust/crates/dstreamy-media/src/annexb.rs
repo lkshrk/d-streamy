@@ -1,9 +1,13 @@
 //! Annex B byte-stream helpers for H.264 and H.265.
 
+/// The four-byte Annex B start code every NAL unit must begin with.
 pub const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
+/// IDR slice; a keyframe must carry one.
 pub const H264_NAL_IDR: u8 = 5;
+/// Sequence parameter set; a keyframe must carry one.
 pub const H264_NAL_SPS: u8 = 7;
+/// Picture parameter set; a keyframe must carry one.
 pub const H264_NAL_PPS: u8 = 8;
 
 /// Appends a start code and `nalu` to `out`.
@@ -62,10 +66,12 @@ fn trim_trailing_zeros(nalu: &[u8]) -> &[u8] {
     &nalu[..end]
 }
 
+/// The NAL unit type of an H.264 NAL unit, or `None` when it is empty.
 pub fn h264_nal_type(nalu: &[u8]) -> Option<u8> {
     nalu.first().map(|b| b & 0x1f)
 }
 
+/// The NAL unit type of an H.265 NAL unit, or `None` when it is empty.
 pub fn h265_nal_type(nalu: &[u8]) -> Option<u8> {
     nalu.first().map(|b| (b >> 1) & 0x3f)
 }

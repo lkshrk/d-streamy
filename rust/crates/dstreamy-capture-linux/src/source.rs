@@ -6,6 +6,7 @@ use dstreamy_media::{
     MediaError, TargetKind,
 };
 use gstreamer as gst;
+use tokio::task::JoinHandle;
 
 use crate::audio;
 use crate::pipeline::{self, AudioInput, Capture, VideoInput};
@@ -19,14 +20,32 @@ pub struct LinuxCaptureSource {
     sources: PortalSources,
     restore_token: Option<String>,
     running: Option<Running>,
+    drops: Option<pipeline::Ender>,
     activity: AudioActivity,
 }
 
 /// Fields drop in order: the pipeline stops before its PipeWire fd closes and the portal session ends.
 struct Running {
+    closed_watch: Option<ClosedWatch>,
     capture: Capture,
     _pipewire_fd: OwnedFd,
     portal: PortalStream,
+}
+
+/// Ends the capture when the portal session closes under it; aborted before a requested stop.
+struct ClosedWatch(JoinHandle<()>);
+
+impl ClosedWatch {
+    async fn stop(mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for ClosedWatch {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Default for LinuxCaptureSource {
@@ -41,6 +60,7 @@ impl LinuxCaptureSource {
             sources: PortalSources::default(),
             restore_token: None,
             running: None,
+            drops: None,
             activity: AudioActivity::default(),
         }
     }
@@ -61,6 +81,10 @@ impl LinuxCaptureSource {
         self.restore_token.as_deref()
     }
 
+    pub(crate) fn retain_drops(&mut self, drops: pipeline::Ender) {
+        self.drops = Some(drops);
+    }
+
     /// The GStreamer encoder element of the running capture.
     pub fn encoder(&self) -> Option<&'static str> {
         self.running.as_ref().map(|r| r.capture.encoder())
@@ -69,6 +93,13 @@ impl LinuxCaptureSource {
     /// Why the frame channel closed early, if the pipeline failed rather than being stopped.
     pub fn last_error(&self) -> Option<String> {
         self.running.as_ref().and_then(|r| r.capture.error())
+    }
+
+    /// Frames lost before encoding since the latest successful start, retained after stop.
+    pub fn dropped_frames(&self) -> u64 {
+        self.drops
+            .as_ref()
+            .map_or(0, pipeline::Ender::dropped_frames)
     }
 }
 
@@ -107,6 +138,13 @@ impl CaptureSource for LinuxCaptureSource {
         Some(self.activity.clone())
     }
 
+    fn capture_drops(&self) -> dstreamy_media::CaptureDrops {
+        dstreamy_media::CaptureDrops {
+            video_frames: self.dropped_frames(),
+            audio_frames: 0,
+        }
+    }
+
     async fn start(&mut self, config: CaptureConfig) -> Result<FrameReceiver, MediaError> {
         if self.running.is_some() {
             return Err(MediaError::AlreadyRunning);
@@ -122,10 +160,7 @@ impl CaptureSource for LinuxCaptureSource {
         gst::init().map_err(|e| MediaError::Backend(format!("GStreamer init: {e}")))?;
         let candidates = pipeline::installed_candidates(&config);
         if candidates.is_empty() {
-            return Err(MediaError::Unsupported(format!(
-                "no GStreamer encoder for {:?}",
-                config.codec
-            )));
+            return Err(pipeline::no_encoder(config.codec));
         }
         let audio = if config.audio {
             if let Some(id) = config.audio_source.as_deref() {
@@ -168,7 +203,18 @@ impl CaptureSource for LinuxCaptureSource {
         .map_err(|e| MediaError::Backend(e.to_string()))?;
         match started {
             Ok((capture, rx)) => {
+                let mut portal = portal;
+                let closed_watch = portal.closed().map(|closed| {
+                    let ender = capture.ender();
+                    ClosedWatch(tokio::spawn(async move {
+                        if closed.await.is_ok() {
+                            ender.fail(pipeline::SOURCE_GONE);
+                        }
+                    }))
+                });
+                self.retain_drops(capture.ender());
                 self.running = Some(Running {
+                    closed_watch,
                     capture,
                     _pipewire_fd: pipewire_fd,
                     portal,
@@ -183,9 +229,11 @@ impl CaptureSource for LinuxCaptureSource {
         }
     }
 
+    /// Returns the pipeline failure, if the capture ended on its own rather than by this call.
     async fn stop(&mut self) -> Result<(), MediaError> {
         self.activity.stopped();
         let Some(Running {
+            closed_watch,
             capture,
             _pipewire_fd: pipewire_fd,
             portal,
@@ -193,15 +241,22 @@ impl CaptureSource for LinuxCaptureSource {
         else {
             return Ok(());
         };
-        let portal = tokio::task::spawn_blocking(move || {
-            capture.stop();
+        if let Some(watch) = closed_watch {
+            watch.stop().await;
+        }
+        let (result, portal) = tokio::task::spawn_blocking(move || {
+            let error = capture.error();
+            let stopped = capture.stop();
             drop(pipewire_fd);
-            portal
+            (
+                error.map_or(stopped, |message| Err(MediaError::Backend(message))),
+                portal,
+            )
         })
         .await
         .map_err(|e| MediaError::Backend(e.to_string()))?;
         portal.close().await;
-        Ok(())
+        result
     }
 
     fn request_keyframe(&self) {

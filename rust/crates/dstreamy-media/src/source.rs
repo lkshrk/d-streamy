@@ -4,15 +4,18 @@ use tokio::sync::mpsc;
 
 use crate::{AudioActivity, AudioSource, CaptureTarget, MediaError, MediaFrame, VideoCodec};
 
+/// Frames a source may queue before the session reads them.
 pub const FRAME_CHANNEL_CAPACITY: usize = 64;
 
 /// Frames in presentation order per kind; the channel closes when the source stops.
 pub type FrameReceiver = mpsc::Receiver<MediaFrame>;
 
+/// What a session asks a capture backend for: target, crop, codec, size, frame rate, bitrate and audio.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaptureConfig {
     /// `None` lets the backend choose (main display, or the portal picker on Wayland).
     pub target_id: Option<String>,
+    /// Crop in source pixels, before conversion to the requested output dimensions.
     pub crop: Option<CropRect>,
     pub width: u32,
     pub height: u32,
@@ -44,9 +47,19 @@ impl Default for CaptureConfig {
 }
 
 impl CaptureConfig {
+    /// Frames in the requested two-second keyframe interval.
     pub fn keyframe_interval_frames(&self) -> u32 {
         self.fps * 2
     }
+}
+
+/// Frames lost inside a source since its latest successful start, before reaching its frame receiver.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureDrops {
+    /// Video frames lost inside capture, separate from pump and transport losses.
+    pub video_frames: u64,
+    /// Audio frames lost inside capture, separate from delivery failures.
+    pub audio_frames: u64,
 }
 
 /// A capture backend that yields encoded video and Opus audio.
@@ -62,6 +75,12 @@ pub trait CaptureSource: Send + Sync {
     /// A handle that reports silence in the captured audio; `None` if the backend cannot tell.
     fn audio_activity(&self) -> Option<AudioActivity> {
         None
+    }
+
+    /// Totals since the latest successful start, retained while idle; zero if unsupported.
+    /// A completed stop finalizes them; a failed or timed-out teardown may leave a lower bound.
+    fn capture_drops(&self) -> CaptureDrops {
+        CaptureDrops::default()
     }
 
     /// Starts capturing; fails with [`MediaError::AlreadyRunning`] if not stopped first.

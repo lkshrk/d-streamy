@@ -48,6 +48,13 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertEqual(errors, [DaemonError(code: "not_logged_in", message: "no token")])
     }
 
+    func testShutdownKillsADaemonThatIgnoresSigterm() async throws {
+        let client = shell("trap '' TERM; read line; exec sleep 30")
+        try client.launch()
+        await client.shutdown(grace: .milliseconds(300))
+        XCTAssertFalse(client.isRunning)
+    }
+
     func testPendingRequestsFailWhenTheDaemonExits() async throws {
         let client = shell("read line; exit 3")
         try client.launch()

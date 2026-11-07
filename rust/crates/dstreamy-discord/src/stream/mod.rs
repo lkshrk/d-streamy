@@ -25,7 +25,10 @@ pub struct StreamOptions {
     /// How long to hold media back for DAVE before sending anyway.
     pub dave_timeout: Duration,
     pub max_queued_video: usize,
+    /// Audio waits behind the video frame being paced; 60 frames (1.2 s) cover one at the size cap.
     pub max_queued_audio: usize,
+    /// Refuse to stream when Discord offers no end-to-end encryption or DAVE never comes up.
+    pub require_e2ee: bool,
 }
 
 impl Default for StreamOptions {
@@ -41,7 +44,8 @@ impl StreamOptions {
             step_timeout: Duration::from_secs(30),
             dave_timeout: Duration::from_secs(10),
             max_queued_video: 8,
-            max_queued_audio: 25,
+            max_queued_audio: 60,
+            require_e2ee: false,
         }
     }
 }
@@ -58,6 +62,32 @@ pub enum StreamError {
     Media(#[from] MediaError),
     #[error("the capture source was not handed back")]
     SourceLost,
+    #[error(
+        "Discord offers no end-to-end encryption for this stream (DAVE protocol {0}) and require_e2ee is set"
+    )]
+    E2eeUnavailable(u16),
+}
+
+/// Whether frames leave this machine end-to-end encrypted (DAVE) or with hop-by-hop SRTP only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum E2ee {
+    /// No stream connection yet.
+    #[default]
+    Unknown,
+    Encrypted,
+    /// Protocol version 0, or the MLS group never came up: Discord's servers can read the media.
+    Unencrypted,
+}
+
+pub(crate) fn e2ee_of(conn: &MediaConnection) -> (E2ee, u16) {
+    let version = conn.dave_protocol_version();
+    let state = if conn.dave_ready() {
+        E2ee::Encrypted
+    } else {
+        E2ee::Unencrypted
+    };
+    (state, version)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
@@ -66,6 +96,10 @@ pub struct StreamStats {
     pub video_frames_dropped: u64,
     pub audio_frames_sent: u64,
     pub audio_frames_dropped: u64,
+    /// Video frames lost inside the source, separate from pump and transport drops.
+    pub source_video_frames_dropped: u64,
+    /// Opus packets lost inside the source, separate from pump and transport drops.
+    pub source_audio_frames_dropped: u64,
     pub bytes_sent: u64,
     pub keyframe_requests: u64,
     /// Times the video queue was full and video was dropped to the next keyframe.
@@ -84,6 +118,9 @@ pub struct StreamStats {
     pub connection_closed: bool,
     /// Viewers other than this account; `None` until Discord reports them.
     pub viewers: Option<u32>,
+    pub e2ee: E2ee,
+    /// The negotiated DAVE protocol version; 0 is a call without E2EE.
+    pub dave_protocol_version: u16,
 }
 
 pub struct StreamHandle {
@@ -178,7 +215,12 @@ impl StreamHandle {
     }
 
     pub fn stats(&self) -> StreamStats {
-        self.pump().stats()
+        let (e2ee, dave_protocol_version) = e2ee_of(&self.conn);
+        StreamStats {
+            e2ee,
+            dave_protocol_version,
+            ..self.pump().stats()
+        }
     }
 
     /// Announces new video attributes (op 12) after a resolution or frame-rate change.
@@ -257,6 +299,10 @@ async fn watch_connections([mut voice, mut stream]: ConnectionEvents, stats: pum
             Some(VoiceEvent::Closed { code }) => stats.update(|s| {
                 s.connection_closed = true;
                 s.last_error = Some(format!("{name} connection closed (code {code:?})"));
+            }),
+            Some(VoiceEvent::MediaFailed { reason }) => stats.update(|s| {
+                s.connection_closed = true;
+                s.last_error = Some(format!("{name} media path failed: {reason}"));
             }),
             Some(_) => {}
             None => {

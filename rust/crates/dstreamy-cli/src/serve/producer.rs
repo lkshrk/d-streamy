@@ -31,30 +31,38 @@ fn incompatible(message: String) -> Failure {
     Failure::new("incompatible", message)
 }
 
+/// `path` names the field for the error; absent and mistyped are told apart.
+fn field<'a, T>(
+    fields: &'a Map<String, Value>,
+    path: &str,
+    (kind, want): (&str, &str),
+    as_kind: impl FnOnce(&'a Value) -> Option<T>,
+) -> Result<T, Failure> {
+    let key = path.rsplit('.').next().unwrap_or(path);
+    let value = fields
+        .get(key)
+        .ok_or_else(|| invalid(&format!("missing {kind} field \"{path}\"")))?;
+    as_kind(value).ok_or_else(|| invalid(&format!("field \"{path}\" must be {want}: got {value}")))
+}
+
 fn object<'a>(
     fields: &'a Map<String, Value>,
     key: &str,
 ) -> Result<&'a Map<String, Value>, Failure> {
-    fields
-        .get(key)
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid(&format!("missing object field \"{key}\"")))
+    field(fields, key, ("object", "an object"), Value::as_object)
 }
 
 fn text<'a>(fields: &'a Map<String, Value>, path: &str) -> Result<&'a str, Failure> {
-    let key = path.rsplit('.').next().unwrap_or(path);
-    fields
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid(&format!("missing string field \"{path}\"")))
+    field(fields, path, ("string", "a string"), Value::as_str)
 }
 
 fn number(fields: &Map<String, Value>, path: &str) -> Result<u64, Failure> {
-    let key = path.rsplit('.').next().unwrap_or(path);
-    fields
-        .get(key)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| invalid(&format!("missing integer field \"{path}\"")))
+    field(
+        fields,
+        path,
+        ("integer", "a non-negative integer"),
+        Value::as_u64,
+    )
 }
 
 fn expect(path: &str, got: u64, want: u64) -> Result<(), Failure> {
@@ -153,6 +161,8 @@ pub(super) enum Event {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct HealthView {
     reconnecting: bool,
+    e2ee: dstreamy_discord::E2ee,
+    dave_protocol_version: Option<u16>,
     reconnects: u64,
     /// Lost by this attachment's source queue plus on the way to Discord.
     dropped_video: u64,
@@ -171,6 +181,8 @@ impl HealthView {
         let m = health.metrics;
         Self {
             reconnecting: health.reconnecting,
+            e2ee: health.e2ee,
+            dave_protocol_version: health.dave_protocol_version,
             reconnects: health.reconnects(),
             dropped_video: health.dropped_video + source_dropped_video,
             audio_per_sec: m.map(|m| m.a_sent),
@@ -189,6 +201,7 @@ impl HealthView {
 enum Detach {
     Stopped(String),
     Shutdown,
+    Replaced,
     Incompatible(String),
     Oversized(String),
 }
@@ -198,6 +211,7 @@ impl Detach {
         let (reason, message) = match self {
             Self::Stopped(m) => ("stopped", m.clone()),
             Self::Shutdown => ("shutdown", "the service is shutting down".to_owned()),
+            Self::Replaced => ("replaced", CloseReason::Replaced.to_string()),
             Self::Incompatible(m) => ("incompatible", m.clone()),
             Self::Oversized(m) => ("oversized", m.clone()),
         };
@@ -208,6 +222,7 @@ impl Detach {
         match self {
             Self::Incompatible(m) => CloseReason::Incompatible(m.clone()),
             Self::Oversized(m) => CloseReason::Failed(m.clone()),
+            Self::Replaced => CloseReason::Replaced,
             Self::Stopped(_) | Self::Shutdown => CloseReason::Ended,
         }
     }
@@ -280,6 +295,7 @@ pub(super) async fn run<R, W>(
         }
         match attachment.close_reason() {
             Some(CloseReason::Incompatible(m)) => Detach::Incompatible(m),
+            Some(CloseReason::Replaced) => Detach::Replaced,
             Some(reason) => Detach::Stopped(reason.to_string()),
             None => Detach::Stopped(CloseReason::SourceGone.to_string()),
         }
@@ -500,6 +516,8 @@ mod tests {
                     &LiveHealth {
                         reconnect_episodes: 1,
                         resumes: 1,
+                        e2ee: dstreamy_discord::E2ee::Encrypted,
+                        dave_protocol_version: Some(1),
                         metrics: Some(dstreamy_core::StreamMetrics {
                             fps: 59,
                             gap_p95_ms: 18,
@@ -542,6 +560,40 @@ mod tests {
         let mut expected = fixture("producer_events.ndjson");
         expected.retain(|v| v.get("attached").is_none());
         assert_eq!(events, expected);
+    }
+
+    #[test]
+    fn a_mistyped_hello_field_is_told_apart_from_a_missing_one() {
+        let mut absent = producer_hello();
+        absent["video"].as_object_mut().unwrap().remove("fps");
+        let f = hello(absent.as_object().unwrap()).unwrap_err();
+        assert_eq!(f.message, "missing integer field \"video.fps\"");
+        for (path, value, want) in [
+            (
+                &["video", "fps"][..],
+                json!(-30),
+                "field \"video.fps\" must be a non-negative integer: got -30",
+            ),
+            (
+                &["video", "fps"],
+                json!("30"),
+                "field \"video.fps\" must be a non-negative integer: got \"30\"",
+            ),
+            (
+                &["audio"],
+                json!("opus"),
+                "field \"audio\" must be an object: got \"opus\"",
+            ),
+            (
+                &["video", "codec"],
+                json!(264),
+                "field \"video.codec\" must be a string: got 264",
+            ),
+        ] {
+            let f = checked(producer_hello(), path, value).unwrap_err();
+            assert_eq!(f.code, "invalid_params");
+            assert_eq!(f.message, want);
+        }
     }
 
     #[test]
@@ -771,6 +823,7 @@ mod tests {
             next_of("health", &mut reader).await,
             json!({
                 "type": "health", "reconnecting": true, "reconnects": 1, "dropped_video": 0,
+                "e2ee": "unknown", "dave_protocol_version": null,
                 "audio_per_sec": null, "audio_dropouts": null, "audio_level": null, "video_level": null, "fps": null,
                 "jitter_p95_ms": null, "jitter_max_ms": null, "bitrate_kbps": null
             })
@@ -831,6 +884,24 @@ mod tests {
     }
 
     #[test]
+    fn producer_health_exposes_unknown_encrypted_and_unencrypted_states() {
+        use dstreamy_discord::E2ee;
+
+        let mut h = LiveHealth::default();
+        for (state, version, want) in [
+            (E2ee::Unknown, None, "unknown"),
+            (E2ee::Encrypted, Some(1), "encrypted"),
+            (E2ee::Unencrypted, Some(0), "unencrypted"),
+        ] {
+            h.e2ee = state;
+            h.dave_protocol_version = version;
+            let view = serde_json::to_value(HealthView::new(&h, 0)).unwrap();
+            assert_eq!(view["e2ee"], want);
+            assert_eq!(view["dave_protocol_version"], json!(version));
+        }
+    }
+
+    #[test]
     fn health_counts_the_attachments_own_drops_too() {
         let h = LiveHealth {
             dropped_video: 3,
@@ -885,7 +956,7 @@ mod tests {
     #[test]
     fn every_ingest_fixture_is_refused_with_its_message() {
         let fixtures = ingest_fixtures();
-        assert_eq!(fixtures.len(), 5);
+        assert_eq!(fixtures.len(), 6);
         for (name, bytes, detached) in fixtures {
             assert_eq!(detached["reason"], "incompatible", "{name}");
             let mut buf = BytesMut::from(&bytes[..]);

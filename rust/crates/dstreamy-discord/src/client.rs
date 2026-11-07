@@ -114,7 +114,9 @@ impl DiscordClient {
         self.streamer().set_voice_channel(guild_id, channel_id);
     }
 
+    /// Ends the media connections, drains queued gateway ops and closes the gateway.
     pub async fn close(mut self) {
+        self.streamer().stop_connections();
         let _ = self.stop_bridge.send(());
         let _ = tokio::time::timeout(BRIDGE_DRAIN, &mut self.bridge.0).await;
         self.gateway.close().await;

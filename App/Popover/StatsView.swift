@@ -25,6 +25,19 @@ struct StatsView: View {
                 }
             }
 
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: state.encryption.state == .encrypted ? "lock.fill" : "lock.open.fill")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(state.encryption.title)
+                        .font(.caption.bold())
+                    Text(state.encryption.detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .foregroundStyle(encryptionColor)
+
             VStack(spacing: 6) {
                 HealthRow(label: "Video", score: health?.videoScore ?? 100,
                           level: videoLevel, series: health?.fpsSeries ?? [])
@@ -43,13 +56,28 @@ struct StatsView: View {
                          value: "\(metrics?.gapP95Ms ?? 0)/\(metrics?.gapMaxMs ?? 0) ms",
                          valueColor: videoLevel.color)
                 StatCard(label: "Bitrate", value: formatBitrate(metrics?.bitrateKbps ?? 0))
-                StatCard(label: "Dropped", value: "\(snapshot?.stats.videoFramesDropped ?? 0)",
-                         valueColor: (metrics?.vDrop ?? 0) > 1 ? .yellow : .primary)
+                StatCard(label: "Video dropped", value: "\(snapshot?.stats.totalVideoFramesDropped ?? 0)")
                 StatCard(label: "Audio/s", value: "\(metrics?.aSent ?? 0)",
                          valueColor: audioLevel.color)
                 StatCard(label: "Enc Err", value: "\(metrics?.aEncErr ?? 0)",
                          valueColor: (metrics?.aEncErr ?? 0) > 0 ? .red : .primary)
             }
+
+            VStack(spacing: 4) {
+                LabeledContent("Video source / transport", value: "\(snapshot?.stats.sourceVideoFramesDropped ?? 0) / \(snapshot?.stats.videoFramesDropped ?? 0)")
+                LabeledContent("Audio source dropped", value: "\(snapshot?.stats.sourceAudioFramesDropped ?? 0)")
+                LabeledContent("Audio not ready/s", value: "\(metrics?.aDropNotReady ?? 0)")
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private var encryptionColor: Color {
+        switch state.encryption.state {
+        case .encrypted: return .green
+        case .unencrypted: return .orange
+        case .unknown: return .secondary
         }
     }
 

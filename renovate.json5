@@ -1,0 +1,16 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "github>lkshrk/gh-ops//renovate/presets/app-library.json5",
+    "github>lkshrk/gh-ops//renovate/presets/automerge-major.json5",
+    "helpers:pinGitHubActionDigests",
+  ],
+  packageRules: [
+    {
+      // Patched through [patch.crates-io] in rust/Cargo.toml; a newer requirement would silently drop the patch.
+      matchManagers: ["cargo"],
+      matchPackageNames: ["webrtc"],
+      enabled: false,
+    },
+  ],
+}

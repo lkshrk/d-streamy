@@ -46,7 +46,7 @@ use webrtc::{
     track::track_local::{TrackLocal, TrackLocalContext, TrackLocalWriter},
 };
 
-/// ICE servers configured by the JS reference.
+/// The reference client's STUN server; override with `set_ice_servers`, including an empty list to disable STUN.
 pub const DEFAULT_ICE_SERVERS: &[&str] = &["stun:stun.l.google.com:19302"];
 
 /// Video pacing rate of the JS reference (`PacingHandler(25 * 1000 * 1000, 1)`).
@@ -1088,6 +1088,17 @@ mod tests {
         a=candidate:1 1 UDP 4261412862 203.0.113.7 50003 typ host\n";
 
     #[test]
+    fn ice_defaults_keep_the_reference_stun_server_and_allow_overrides() {
+        let dave = Arc::new(StdMutex::new(DaveHandler::new(42, 7)));
+        let mut transport = WebRtcWrapper::new(dave);
+        assert_eq!(transport.ice_servers, ["stun:stun.l.google.com:19302"]);
+        transport.set_ice_servers(vec!["stun:stun.example.test:3478".into()]);
+        assert_eq!(transport.ice_servers, ["stun:stun.example.test:3478"]);
+        transport.set_ice_servers(Vec::new());
+        assert!(transport.ice_servers.is_empty());
+    }
+
+    #[test]
     fn answer_is_parseable_and_carries_discord_transport() {
         let sdp = build_answer_sdp(DISCORD_SDP);
         RTCSessionDescription::answer(sdp.clone()).unwrap();
@@ -1241,6 +1252,83 @@ mod tests {
         .expect("pacer progress")
         .unwrap()
         .clone()
+    }
+
+    fn ready_dave() -> DaveHandler {
+        let mut server = dstreamy_mock_discord::dave::DaveServer::new(
+            std::num::NonZeroU16::new(1).unwrap(),
+            1,
+            2,
+            9999,
+        )
+        .unwrap();
+        let mut client = DaveHandler::new(1, 2);
+        let key_package = client.init(1).unwrap().unwrap();
+        client
+            .set_external_sender(server.external_sender_package())
+            .unwrap();
+        let proposals = server.on_key_package(&key_package).unwrap();
+        let cw = client
+            .process_proposals(proposals[0], &proposals[1..], &[9999])
+            .unwrap()
+            .unwrap();
+        let mut payload = cw.commit;
+        payload.extend(cw.welcome.unwrap());
+        let (_, announce) = server.on_commit_welcome(&payload).unwrap();
+        client.process_commit(&announce[2..]).unwrap();
+        assert!(client.is_ready());
+        client.require_e2ee().unwrap();
+        client
+    }
+
+    #[tokio::test]
+    async fn strict_queued_video_is_refused_when_dave_downgrades_or_reinitializes() {
+        for reinitialize in [false, true] {
+            let writes = Arc::new(StdMutex::new(Vec::new()));
+            let writer = TestWriter::Timed(writes.clone(), |_| Duration::ZERO);
+            let (pacer, mut progress) = pacer(writer).await;
+            *lock_dave(&pacer.shared.dave) = ready_dave();
+            let order = pacer.shared.send_order.lock().await;
+            queue(&pacer, 3);
+            {
+                let mut dave = lock_dave(&pacer.shared.dave);
+                if reinitialize {
+                    dave.init(1).unwrap();
+                } else {
+                    dave.set_protocol_version(0);
+                }
+            }
+            drop(order);
+            let outcome = settled(&mut progress, 3).await;
+            assert_eq!((outcome.sent_frames, outcome.dropped_frames), (0, 3));
+            assert!(writes.lock().unwrap().is_empty());
+            assert_eq!(
+                lock_dave(&pacer.shared.dave).e2ee_unavailable(),
+                Some(u16::from(reinitialize))
+            );
+        }
+    }
+
+    #[test]
+    fn strict_audio_is_refused_when_dave_downgrades_or_reinitializes() {
+        for reinitialize in [false, true] {
+            let mut dave = ready_dave();
+            let audio = [0xf8, 1, 2];
+            assert_ne!(dave.encrypt_opus(&audio).unwrap(), audio);
+            if reinitialize {
+                dave.init(1).unwrap();
+            } else {
+                dave.set_protocol_version(0);
+            }
+            assert!(matches!(
+                dave.encrypt_opus(&audio),
+                Err(crate::dave::DaveError::E2eeUnavailable(_))
+            ));
+            assert!(matches!(
+                dave.encrypt_opus(&[0xf8, 0xff, 0xfe]),
+                Err(crate::dave::DaveError::E2eeUnavailable(_))
+            ));
+        }
     }
 
     #[tokio::test]

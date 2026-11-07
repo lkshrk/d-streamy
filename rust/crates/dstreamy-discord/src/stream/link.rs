@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
+use tracing::warn;
 
 use super::{StreamError, StreamOptions};
 use crate::DiscordClient;
@@ -32,7 +33,7 @@ pub(crate) async fn join_voice(
     Ok((conn, voice.events))
 }
 
-/// Creates Go Live on the joined channel and configures it as `src/core/stream.ts` does.
+/// Creates Go Live on the joined channel and configures it as the Bun daemon this crate replaced did.
 pub(crate) async fn open_stream(
     client: &DiscordClient,
     options: &StreamOptions,
@@ -57,17 +58,32 @@ pub(crate) async fn open_stream(
                 dave_version: v, ..
             } => dave_version = Some(v),
             VoiceEvent::Closed { .. } => return Err(ConnectionError::Closed.into()),
+            VoiceEvent::MediaFailed { reason } => {
+                return Err(ConnectionError::MediaFailed(reason).into());
+            }
             _ => {}
         }
     }
-    if dave_version != Some(0) {
+    if dave_version == Some(0) {
+        warn!("Discord negotiated DAVE protocol 0: this stream is not end-to-end encrypted");
+    } else {
         // A failed DAVE handshake should not block the stream; frames then go out unencrypted.
-        let _ = timeout(options.dave_timeout, async {
+        let ready = timeout(options.dave_timeout, async {
             while !conn.dave_ready() {
                 sleep(POLL).await;
             }
         })
         .await;
+        if ready.is_err() {
+            warn!(
+                "DAVE did not come up within {:?}; streaming without end-to-end encryption",
+                options.dave_timeout
+            );
+        }
+    }
+    if options.require_e2ee {
+        conn.require_e2ee()
+            .map_err(|_| StreamError::E2eeUnavailable(conn.dave_protocol_version()))?;
     }
 
     conn.set_packetizer(codec_name(options.capture.codec))

@@ -34,6 +34,24 @@ pub struct Obs;
 
 #[cfg(unix)]
 impl Log for Obs {
+    fn keyframe_sent(&self, pts_us: i64, arrived_ns: i64) {
+        crate::hooks::observe(
+            "keyframe_sent",
+            || serde_json::json!({"pts_us":pts_us,"arrived_ns":arrived_ns}),
+        );
+    }
+    fn stop_drain_started(&self, queued: usize) {
+        crate::hooks::observe(
+            "stop_drain_started",
+            || serde_json::json!({"queued":queued}),
+        );
+    }
+    fn stop_drain_timed_out(&self, deadline_ms: u64) {
+        crate::hooks::observe(
+            "stop_drain_timed_out",
+            || serde_json::json!({"deadline_ms":deadline_ms}),
+        );
+    }
     fn log(&self, level: Level, message: &str) {
         match level {
             Level::Debug => debug(message),

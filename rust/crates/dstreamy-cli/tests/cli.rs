@@ -619,3 +619,26 @@ fn stream_rejects_an_unknown_guild_after_one_identify() {
     assert_eq!(identifies(), before + 1);
     assert!(h.mock.streams().is_empty());
 }
+
+#[test]
+fn requiring_encryption_refuses_a_stream_without_dave_from_flag_or_config() {
+    let h = Harness::with(MockConfig {
+        dave_protocol_version: 0,
+        ..MockConfig::default()
+    })
+    .logged_in();
+    let mut args = stream_args(MOCK_VOICE_CHANNEL_ID);
+    args.push("--require-e2ee");
+    let err = stderr_of_failure(h.cmd().args(&args));
+    assert!(err.contains("end-to-end encryption"), "{err}");
+    std::fs::write(
+        h.config_dir().join("config.toml"),
+        "[stream]\nrequire_e2ee = true\n",
+    )
+    .unwrap();
+    let err = stderr_of_failure(h.cmd().args(stream_args(MOCK_VOICE_CHANNEL_ID)));
+    assert!(err.contains("end-to-end encryption"), "{err}");
+    let media = h.mock.recorded();
+    assert!(media.video.is_empty());
+    assert!(media.audio.is_empty());
+}

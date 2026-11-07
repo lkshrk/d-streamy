@@ -8,7 +8,6 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc as std_mpsc;
 use std::sync::{Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -32,9 +31,6 @@ use crate::log;
 use crate::output::{OutputPtr, text};
 use crate::settings_source::{change, refresh, with_controls};
 
-/// How long the UI thread waits for a dialog job (Start, Stop, server lists) before it shows the state reached so far.
-/// The wait lets the dialog's first paint carry the loaded server lists and a fast `not_running` reply show at click time.
-pub const UI_WAIT: Duration = Duration::from_secs(3);
 /// How long Stop waits for the output to end before it still stops the service session.
 const OUTPUT_STOP_WAIT: Duration = Duration::from_secs(10);
 /// How long after OBS starts closing the service calls in flight may still finish, all of them together.
@@ -51,18 +47,16 @@ const GONE: &str = "D-Streamy's control thread is not running, so Start and Stop
 const LOGIN_GONE: &str = "D-Streamy's control thread is not running, so the login can't start. \
      See the OBS log and restart OBS";
 
-type Done = std_mpsc::SyncSender<()>;
-
 enum Job {
-    Lists(Option<String>, Done, ListsFinished),
+    Lists(Option<String>, ListsFinished),
     #[cfg(unix)]
-    Start(StartRequest, Option<Ownership>, Done),
+    Start(StartRequest, Option<Ownership>),
     #[cfg(unix)]
-    Stop(Option<Ownership>, Done),
+    Stop(Option<Ownership>),
     #[cfg(unix)]
-    Login(Option<String>, tokio::sync::oneshot::Receiver<()>, Done),
+    Login(Option<String>, tokio::sync::oneshot::Receiver<()>),
     #[cfg(unix)]
-    Account(AccountChange, Done),
+    Account(AccountChange),
     OutputStopped(i64),
     Shutdown,
 }
@@ -120,25 +114,14 @@ fn send(job: Job) -> bool {
     session.as_ref().is_some_and(|s| s.jobs.send(job).is_ok())
 }
 
-/// Whether the UI thread waits for a job; the status-bar panel polls instead.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Wait {
-    Dialog,
-    No,
-}
-
-/// Queues `job`; with [`Wait::Dialog`] waits up to [`UI_WAIT`], and the job finishes on its own if that runs out.
+/// Queues `job` without waiting: the model shows it in progress and the control thread's `refresh` shows its end.
 /// False when no control thread took it.
-fn queue(job: impl FnOnce(Done) -> Job, wait: Wait) -> bool {
-    let (done, finished) = std_mpsc::sync_channel(1);
-    if !send(job(done)) {
+fn queue(job: Job) -> bool {
+    let taken = send(job);
+    if !taken {
         log::warn("the D-Streamy control thread is gone");
-        return false;
     }
-    if wait == Wait::Dialog {
-        let _ = finished.recv_timeout(UI_WAIT);
-    }
-    true
+    taken
 }
 
 /// A model step from the control thread: saved off the model lock, then shown in an open dialog.
@@ -208,11 +191,16 @@ pub fn shutdown() {
     if let Some(session) = session {
         let begun = Instant::now();
         session.closing.send_replace(Some(begun));
+        crate::hooks::observe("control_closing", || serde_json::json!({}));
         log::info("OBS is closing: D-Streamy finishes its control steps");
         let _ = session.jobs.send(Job::Shutdown);
         if session.thread.join().is_err() {
             log::warn("the D-Streamy control thread panicked");
         }
+        crate::hooks::observe(
+            "control_closed",
+            || serde_json::json!({"elapsed_ms":begun.elapsed().as_millis()}),
+        );
         log::info(&format!(
             "the D-Streamy control thread ended in {} ms",
             begun.elapsed().as_millis()
@@ -220,14 +208,10 @@ pub fn shutdown() {
     }
 }
 
-/// Loads the server list, and the selected server's channels, for a dialog about to show them.
+/// Loads the server list, and the selected server's channels; the model shows them loading until they arrive.
 pub fn load_lists(guild: Option<String>) {
-    send_lists(guild, Wait::Dialog);
-}
-
-/// Loads the lists without waiting, for the status-bar panel, which polls; the model shows them loading.
-pub fn request_lists(guild: Option<String>) {
-    send_lists(guild, Wait::No);
+    change(|c, _| c.model.lists_requested());
+    queue(Job::Lists(guild, ListsFinished));
 }
 
 /// Ends a list job in the model when dropped: handled, panicked, or never handled.
@@ -237,11 +221,6 @@ impl Drop for ListsFinished {
     fn drop(&mut self) {
         change(|c, _| c.model.lists_finished());
     }
-}
-
-fn send_lists(guild: Option<String>, wait: Wait) {
-    change(|c, _| c.model.lists_requested());
-    queue(|done| Job::Lists(guild, done, ListsFinished), wait);
 }
 
 fn canvas() -> Option<Canvas> {
@@ -257,7 +236,7 @@ fn canvas() -> Option<Canvas> {
 
 /// Start from the dialog or the status-bar panel, on the UI thread.
 #[cfg(unix)]
-pub fn start(wait: Wait) {
+pub fn start() {
     if let Some(guard) = crate::audio::mic_guard()
         && with_controls(|c| c.model.state() == &DockState::Idle)
     {
@@ -280,7 +259,7 @@ pub fn start(wait: Wait) {
     });
     match begun {
         Ok((request, persisted)) => {
-            if !queue(|done| Job::Start(request, persisted, done), wait) {
+            if !queue(Job::Start(request, persisted)) {
                 settle_pending(GONE, FIX_RESTART_OBS);
             }
         }
@@ -290,9 +269,9 @@ pub fn start(wait: Wait) {
 
 /// Stop from the dialog or the status-bar panel, on the UI thread.
 #[cfg(unix)]
-pub fn stop(wait: Wait) {
+pub fn stop() {
     if let Some(ownership) = change(|c, p| c.session(p.write(), |m| m.stop()))
-        && !queue(|done| Job::Stop(ownership, done), wait)
+        && !queue(Job::Stop(ownership))
     {
         settle_pending(GONE, FIX_RESTART_OBS);
     }
@@ -309,23 +288,23 @@ const ACCOUNT_GONE: &str = "D-Streamy's control thread is not running, so the ac
 
 /// The account picker of the dialog or the status-bar panel, on the UI thread.
 #[cfg(unix)]
-pub fn select_account(name: &str, wait: Wait) {
+pub fn select_account(name: &str) {
     if change(|c, _| c.model.begin_select_account(name)) {
-        queue_account(AccountChange::Select(name.to_owned()), wait);
+        queue_account(AccountChange::Select(name.to_owned()));
     }
 }
 
 /// Log out of `name`, on the UI thread.
 #[cfg(unix)]
-pub fn logout_account(name: &str, wait: Wait) {
+pub fn logout_account(name: &str) {
     if change(|c, _| c.model.begin_logout_account(name)) {
-        queue_account(AccountChange::Logout(name.to_owned()), wait);
+        queue_account(AccountChange::Logout(name.to_owned()));
     }
 }
 
 #[cfg(unix)]
-fn queue_account(account: AccountChange, wait: Wait) {
-    if !queue(|done| Job::Account(account, done), wait) {
+fn queue_account(account: AccountChange) {
+    if !queue(Job::Account(account)) {
         change(|c, _| {
             c.model
                 .account_changed(Err(ControlError::Connect(ACCOUNT_GONE.into())))
@@ -335,26 +314,26 @@ fn queue_account(account: AccountChange, wait: Wait) {
 
 /// "Add account…": serve's login window, saved as a new account.
 #[cfg(unix)]
-pub fn add_account(wait: Wait) {
+pub fn add_account() {
     if change(|c, _| c.model.begin_add_account()) {
-        open_login(wait);
+        open_login();
     }
 }
 
 /// The login button of the dialog or the status-bar panel, on the UI thread: serve opens its login window.
 #[cfg(unix)]
-pub fn login(wait: Wait) {
+pub fn login() {
     if change(|c, _| c.model.begin_login()) {
-        open_login(wait);
+        open_login();
     }
 }
 
 #[cfg(unix)]
-fn open_login(wait: Wait) {
+fn open_login() {
     let (cancel, cancelled) = tokio::sync::oneshot::channel();
     *LOGIN_CANCEL.lock().unwrap_or_else(PoisonError::into_inner) = Some(cancel);
     let account = with_controls(|c| c.model.login_account());
-    if !queue(|done| Job::Login(account, cancelled, done), wait) {
+    if !queue(Job::Login(account, cancelled)) {
         LOGIN_CANCEL
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -379,27 +358,27 @@ pub fn cancel_login() {
 static LOGIN_CANCEL: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
 
 #[cfg(not(unix))]
-pub fn login(_wait: Wait) {}
+pub fn login() {}
 
 #[cfg(not(unix))]
-pub fn add_account(_wait: Wait) {}
+pub fn add_account() {}
 
 #[cfg(not(unix))]
-pub fn select_account(_name: &str, _wait: Wait) {}
+pub fn select_account(_name: &str) {}
 
 #[cfg(not(unix))]
-pub fn logout_account(_name: &str, _wait: Wait) {}
+pub fn logout_account(_name: &str) {}
 
 #[cfg(not(unix))]
 pub fn cancel_login() {}
 
 #[cfg(not(unix))]
-pub fn start(_wait: Wait) {
+pub fn start() {
     log::warn("D-Streamy for OBS doesn't support Windows yet");
 }
 
 #[cfg(not(unix))]
-pub fn stop(_wait: Wait) {}
+pub fn stop() {}
 
 /// The output the dialog starts; the control thread alone creates, starts, stops and releases it.
 struct Output {
@@ -606,7 +585,7 @@ pub fn health() -> Option<ServiceHealth> {
 }
 
 /// The output's counters while it is active: bytes, frames and dropped frames. Cheap; callable on the UI thread.
-pub fn output_counters() -> Option<(u64, u64, u64)> {
+pub fn output_counters() -> Option<(u64, u64, u64, u64)> {
     let strong = WATCHED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -619,10 +598,25 @@ pub fn output_counters() -> Option<(u64, u64, u64)> {
     // SAFETY: a strong reference taken above, released at once; the getters only read counters.
     unsafe {
         let counters = sys::obs_output_active(strong).then(|| {
+            let mut data = sys::calldata_t::default();
+            let mut dropped_audio = 0i64;
+            sys::proc_handler_call(
+                sys::obs_output_get_proc_handler(strong),
+                c"get_stats".as_ptr(),
+                &mut data,
+            );
+            sys::calldata_get_data(
+                &data,
+                c"dropped_audio".as_ptr(),
+                (&raw mut dropped_audio).cast(),
+                size_of::<i64>(),
+            );
+            sys::bfree(data.stack.cast());
             (
                 sys::obs_output_get_total_bytes(strong),
                 u64::try_from(sys::obs_output_get_total_frames(strong)).unwrap_or(0),
                 u64::try_from(sys::obs_output_get_frames_dropped(strong)).unwrap_or(0),
+                u64::try_from(dropped_audio).unwrap_or(0),
             )
         });
         sys::obs_output_release(strong);
@@ -783,37 +777,33 @@ const STOPPED_WAITING: &str =
 
 async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &mut Brought) {
     match job {
-        Job::Lists(guild, done, finished) => {
+        Job::Lists(guild, finished) => {
             if !closing.is_closing() {
                 lists(guild, &mut closing).await;
             }
             drop(finished);
-            let _ = done.try_send(());
+            refresh();
         }
         #[cfg(unix)]
-        Job::Start(request, persisted, done) => {
+        Job::Start(request, persisted) => {
             if closing.is_closing() {
                 abort_pending(CLOSING, FIX_AFTER_CLOSING);
             } else {
                 start_session(output, &request, persisted.as_ref(), &mut closing, brought).await;
             }
-            let _ = done.try_send(());
         }
         #[cfg(unix)]
-        Job::Stop(ownership, done) => {
+        Job::Stop(ownership) => {
             let _ = stop_session(output, ownership.as_ref(), &mut closing).await;
-            let _ = done.try_send(());
         }
         #[cfg(unix)]
-        Job::Login(account, cancelled, done) => {
+        Job::Login(account, cancelled) => {
             // The window stays open for minutes, so the login must not hold up Start, Stop or the lists.
             tokio::spawn(login_session(closing, account, cancelled));
-            let _ = done.try_send(());
         }
         #[cfg(unix)]
-        Job::Account(account, done) => {
+        Job::Account(account) => {
             account_session(account, &mut closing).await;
-            let _ = done.try_send(());
         }
         Job::OutputStopped(code) => {
             let message = (code != i64::from(sys::OBS_OUTPUT_SUCCESS)).then(|| {
@@ -826,7 +816,31 @@ async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &m
             if let Err(e) = output.wait_inactive(&closing) {
                 log::warn(&e);
             }
-            step(|m| m.ended(message));
+            #[cfg(unix)]
+            if let Some(message) = message
+                .filter(|_| with_controls(|c| matches!(c.model.state(), DockState::Live { .. })))
+            {
+                let ownership = with_controls(|c| c.model.persisted().cloned());
+                let ended = match control() {
+                    Ok(control) => end_unused(&control, ownership.as_ref(), &mut closing).await,
+                    Err(error) => Err(error),
+                };
+                let result = match ended {
+                    Ok(()) => Ok(message),
+                    Err(error) => Err(format!(
+                        "{message}. The Discord session may still be live ({error}); press Stop to end it"
+                    )),
+                };
+                step(|m| m.output_ended(result));
+                return;
+            }
+            step(|m| {
+                let was_live = matches!(m.state(), DockState::Live { .. });
+                m.ended(None);
+                if was_live {
+                    m.restore_ownership(None);
+                }
+            });
         }
         Job::Shutdown => {}
     }
@@ -910,7 +924,7 @@ async fn login_session(
         Err(e) => log::warn(&format!("the D-Streamy login didn't finish: {e}")),
     }
     if step(|m| m.login_finished(result)) {
-        request_lists(None);
+        load_lists(None);
     }
 }
 
@@ -946,7 +960,7 @@ async fn account_session(account: AccountChange, closing: &mut Closing) {
     let reload = change(|c, p| c.edit(p.write(), |m| m.account_changed(result)));
     refresh();
     if reload {
-        request_lists(None);
+        load_lists(None);
     }
 }
 
@@ -974,6 +988,10 @@ async fn end_while_closing(
     closing: &mut Closing,
 ) {
     let ended = end_unused(control, ownership.as_ref(), closing).await;
+    crate::hooks::observe(
+        "closing_unstreamed_session",
+        || serde_json::json!({"ended":ended.is_ok()}),
+    );
     match &ended {
         Ok(()) => log::info("D-Streamy stopped the Discord session it started, before streaming"),
         Err(e) => log::warn(&format!(
@@ -1009,6 +1027,7 @@ async fn start_session(
             }
         });
         if opened.await.is_none() {
+            crate::hooks::observe("closing_start_abandoned", || serde_json::json!({}));
             log::warn(STOPPED_WAITING);
             abort_pending(CLOSING, FIX_AFTER_CLOSING);
             return;
@@ -1021,6 +1040,7 @@ async fn start_session(
     let started = match started {
         Ok(started) => started,
         Err(failed) if failed.error == ControlError::Abandoned => {
+            crate::hooks::observe("closing_start_abandoned", || serde_json::json!({}));
             log::warn(STOPPED_WAITING);
             match failed.ownership {
                 // The start was sent, so it may still land: its candidate is stopped or kept saved.
@@ -1050,6 +1070,10 @@ async fn start_session(
     match output.start(&settings) {
         Ok(()) => {
             crate::hooks::after_output_start();
+            crate::hooks::observe(
+                "tools_output_started",
+                || serde_json::json!({"track":settings["audio_track"]}),
+            );
             log::info(&format!(
                 "started from Tools > D-Streamy on Track {}",
                 settings["audio_track"]
@@ -1087,10 +1111,17 @@ async fn stop_on_close(output: &Output, mut closing: Closing) {
     let Some(ownership) = step(DockModel::stop) else {
         return;
     };
+    crate::hooks::observe("closing_live_session", || serde_json::json!({}));
     log::info(
         "OBS is closing while D-Streamy is live: it stops its output, then the Discord session",
     );
-    match stop_session(output, ownership.as_ref(), &mut closing).await {
+    let result = stop_session(output, ownership.as_ref(), &mut closing).await;
+    crate::hooks::observe("closing_live_session_finished", || {
+        serde_json::json!({
+            "output_stopped":result.is_ok(), "session_ended": result.as_ref().err().is_none_or(|e| e.0)
+        })
+    });
+    match result {
         Ok(()) => log::info("OBS is closing: D-Streamy stopped its output and the Discord session"),
         Err(SessionEnded(true)) => {
             log::info("OBS is closing: D-Streamy stopped the Discord session")
@@ -1158,16 +1189,15 @@ mod tests {
     async fn a_list_job_ends_loading_when_dropped_unhandled_or_when_it_panics() {
         let _serial = crate::serial();
         let loading = || with_controls(|c| c.model.loading().0);
-        let (done, _finished) = std_mpsc::sync_channel(1);
 
         change(|c, _| c.model.lists_requested());
-        let queued = Job::Lists(None, done.clone(), ListsFinished);
+        let queued = Job::Lists(None, ListsFinished);
         assert!(loading());
         drop(queued);
         assert!(!loading(), "a queued job the control thread never took");
 
         change(|c, _| c.model.lists_requested());
-        let job = Job::Lists(None, done, ListsFinished);
+        let job = Job::Lists(None, ListsFinished);
         let run: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
             let _job = job;
             tokio::task::yield_now().await;

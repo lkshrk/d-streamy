@@ -18,6 +18,7 @@ use crate::types::service_text;
 
 /// How often a start in flight is looked at again until serve names its starter.
 const SETTLE_POLL: Duration = Duration::from_millis(50);
+const SETTLE_MAX_POLL: Duration = Duration::from_millis(500);
 
 /// How long a `stop` this plugin sends waits for its reply.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -437,11 +438,13 @@ impl Connection {
         timeout: Duration,
     ) -> Result<Value, ControlError> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut poll = SETTLE_POLL;
         while start_in_flight(&status, persisted, self.instance)? {
             tokio::time::sleep(
-                SETTLE_POLL.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                poll.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
             )
             .await;
+            poll = (poll * 2).min(SETTLE_MAX_POLL);
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             if left.is_zero() {
                 return Err(ControlError::StillStarting);

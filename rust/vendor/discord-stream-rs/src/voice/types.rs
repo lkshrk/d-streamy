@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 // Outbound (client → server)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct Identify {
     pub server_id: String,
     pub user_id: String,
@@ -12,6 +12,19 @@ pub struct Identify {
     pub token: String,
     pub video: bool,
     pub streams: Vec<StreamDesc>,
+}
+
+impl std::fmt::Debug for Identify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identify")
+            .field("server_id", &self.server_id)
+            .field("user_id", &self.user_id)
+            .field("session_id", &"<redacted>")
+            .field("token", &"<redacted>")
+            .field("video", &self.video)
+            .field("streams", &self.streams)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -22,12 +35,23 @@ pub struct StreamDesc {
     pub quality: u8, // 100
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct Resume {
     pub server_id: String,
     pub session_id: String,
     pub token: String,
     pub seq_ack: i64,
+}
+
+impl std::fmt::Debug for Resume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resume")
+            .field("server_id", &self.server_id)
+            .field("session_id", &"<redacted>")
+            .field("token", &"<redacted>")
+            .field("seq_ack", &self.seq_ack)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]

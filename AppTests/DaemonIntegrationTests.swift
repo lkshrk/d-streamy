@@ -34,7 +34,7 @@ final class DaemonIntegrationTests: XCTestCase {
         let url = environment[env].map { URL(fileURLWithPath: $0) }
             ?? DaemonFixtureTests.repoRoot.appendingPathComponent("rust/target/debug/\(name)")
         guard FileManager.default.isExecutableFile(atPath: url.path) else {
-            let message = "\(url.path) is missing; run `cargo build -p dstreamy-cli -p dstreamy-mock-discord` in rust/"
+            let message = "\(url.path) is missing; run `cargo build -p dstreamy-cli --features test-pattern -p dstreamy-mock-discord` in rust/"
             if environment["DSTREAMY_INTEGRATION"] == "1" {
                 XCTFail(message)
             }
@@ -128,10 +128,25 @@ final class DaemonIntegrationTests: XCTestCase {
             }
         }
 
+        try await waitFor("an explicit encryption event and health encryption fields") {
+            let all = events.all
+            return all.contains {
+                if case .e2ee(let state, let version) = $0 { return state != .unknown && version != nil }
+                return false
+            } && all.contains {
+                if case .health(let snapshot) = $0 {
+                    return snapshot.stats.e2ee != nil && snapshot.stats.daveProtocolVersion != nil
+                }
+                return false
+            }
+        }
+
         try await client.request(.update(UpdateRequest(crop: CropRect(x: 0, y: 0, width: 640, height: 360))), as: Empty.self, timeout: .seconds(15))
 
         let stats: StreamStats = try await client.request(.stop, timeout: .seconds(30))
         XCTAssertGreaterThan(stats.videoFramesSent, 0)
+        XCTAssertNotNil(stats.e2ee)
+        XCTAssertNotNil(stats.daveProtocolVersion)
         try await waitFor("the stopped state") { events.all.contains(.state(.stopped(.requested))) }
 
         try await client.request(.shutdown, as: Empty.self, timeout: .seconds(15))

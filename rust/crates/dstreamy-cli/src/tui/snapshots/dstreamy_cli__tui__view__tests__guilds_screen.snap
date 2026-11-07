@@ -3,7 +3,7 @@ source: crates/dstreamy-cli/src/tui/view.rs
 expression: render(&app)
 ---
 "dstreamy  ·  logged in as mockuser                                              "
-"┌ Guilds ──────────────────────────────────────────────────────────────────────┐"
+"┌ Servers ─────────────────────────────────────────────────────────────────────┐"
 "│  Mock Guild                                                                  │"
 "│› Outage (unavailable)                                                        │"
 "│                                                                              │"

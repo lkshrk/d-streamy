@@ -5,6 +5,8 @@ Protocol: `docs/adr/0003-macos-menu-bar-on-rust-daemon.md`. Each scenario has tw
 - `<scenario>.in.ndjson`: the lines written to the daemon's stdin, in order. `errors.in.ndjson` starts with a line that is deliberately not JSON.
 - `<scenario>.out.ndjson`: what the daemon wrote to stdout after normalisation. The `result`/`error` replies come first, in request order, followed by the `event` messages in the order they arrived. On the wire, events interleave with replies.
 
+`unknown.ndjson` is not a scenario: it holds event lines with a stop reason, a session state and an event kind that no daemon emits. The Swift tests decode them into the app's `unknown` cases, and the Rust test checks the tags stay unknown to the daemon's own types.
+
 The Rust test (`tests/daemon.rs`) sends one request at a time and waits for its reply. During `session` it also waits for the `streaming` state and one `health` event before sending `update`. It runs against the mock Discord server with `--skip-platform`, so `targets` lists only the test pattern.
 
 Normalisation, applied to the real output before comparing:

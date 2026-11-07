@@ -16,6 +16,7 @@ pub const AUDIO_LOST_BELOW: u64 = AUDIO_PER_SEC / 2;
 /// Shown for a figure nobody reported yet.
 pub const UNKNOWN: &str = "–";
 
+/// Colour of the status-bar dot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
@@ -27,6 +28,7 @@ pub enum State {
     Error,
 }
 
+/// Tint of a counter's icon: normal, amber or red.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Level {
@@ -35,6 +37,7 @@ pub enum Level {
     Error,
 }
 
+/// One status-bar counter: icon, value, level and tooltip words.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Counter {
     pub id: &'static str,
@@ -46,6 +49,7 @@ pub struct Counter {
     pub label: String,
 }
 
+/// The status-bar item as the C++ side renders it (ADR 0007).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StatusBar {
     pub state: State,
@@ -55,6 +59,7 @@ pub struct StatusBar {
     pub tooltip: String,
 }
 
+/// What the audio counter shows: unknown, ok, or trouble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Audio {
     Unknown,
@@ -65,6 +70,7 @@ pub enum Audio {
     Lost,
 }
 
+/// The audio counter's state from the live figures.
 pub fn audio(stats: &LiveStats) -> Audio {
     let service = stats.service.filter(|s| !s.reconnecting);
     match (service.and_then(|s| s.audio_per_sec), stats.audio_fed) {
@@ -254,6 +260,12 @@ pub fn status_lines(stats: &LiveStats) -> Vec<String> {
         }
         _ => {}
     }
+    if stats.dropped_audio > 0 {
+        audio_line.push_str(&format!(
+            ", {} audio packets dropped in OBS",
+            stats.dropped_audio
+        ));
+    }
     lines.push(audio_line);
     lines.push(match stats.service {
         Some(s) if s.reconnecting => format!("Reconnects: {}, reconnecting now", s.reconnects),
@@ -264,6 +276,20 @@ pub fn status_lines(stats: &LiveStats) -> Vec<String> {
         Some(n) => format!("Viewers: {n}"),
         None => "Viewers: unknown".to_owned(),
     });
+    if let Some(service) = stats
+        .service
+        .filter(|s| s.e2ee != crate::live::Encryption::Unknown || s.dave_protocol_version.is_some())
+    {
+        let encryption = match service.e2ee {
+            crate::live::Encryption::Unknown => "Encryption: unknown",
+            crate::live::Encryption::Encrypted => "End-to-end encrypted",
+            crate::live::Encryption::Unencrypted => "Unencrypted: Discord can read this stream",
+        };
+        lines.push(match service.dave_protocol_version {
+            Some(version) => format!("{encryption} (DAVE version {version})"),
+            None => encryption.to_owned(),
+        });
+    }
     lines.push(format!("Duration: {}", clock(stats.uptime_ms)));
     let mut video = Vec::new();
     if let Some(r) = stats.rates {

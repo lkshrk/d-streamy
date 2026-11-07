@@ -19,11 +19,17 @@ pub const AUDIO_DROPOUT_WINDOW_MS: u64 = 10_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputSample {
     pub at_ms: u64,
+    /// Cumulative encoded payload bytes written to the service.
     pub bytes: u64,
+    /// Cumulative video-frame count from the OBS output.
     pub frames: u64,
+    /// Video packets lost in the OBS ring since the output started.
     pub dropped: u64,
+    /// Audio packets lost in the OBS ring, separate from video and service dropout intervals.
+    pub dropped_audio: u64,
 }
 
+/// Bitrate and frame rate over the last sampling window.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rates {
     pub bits_per_sec: f64,
@@ -49,13 +55,39 @@ impl ServiceLevel {
     }
 }
 
+/// The service's negotiated media encryption; missing and future states remain unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Encryption {
+    /// No recognized encryption report, including while reconnecting.
+    #[default]
+    Unknown,
+    /// The service reports DAVE end-to-end encryption ready.
+    Encrypted,
+    /// Hop-by-hop SRTP only: Discord can read the media.
+    Unencrypted,
+}
+
+impl Encryption {
+    fn parse(value: &Value) -> Self {
+        match value.as_str() {
+            Some("encrypted") => Self::Encrypted,
+            Some("unencrypted") => Self::Unencrypted,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// serve's `health` event (ADR 0004); the last interval's figures are `None` until serve has one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServiceHealth {
     pub reconnecting: bool,
+    pub e2ee: Encryption,
+    /// Reported version when valid; a version alone does not establish encryption.
+    pub dave_protocol_version: Option<u16>,
     pub reconnects: u64,
     /// Video frames serve lost after the plugin sent them.
     pub dropped_video: u64,
+    /// Service-reported Opus frames sent during its latest sampling interval.
     pub audio_per_sec: Option<u64>,
     /// serve's intervals of this stream with too few audio frames; `None` before the first, or from an older serve.
     pub audio_dropouts: Option<u64>,
@@ -72,6 +104,14 @@ impl ServiceHealth {
     pub fn from_event(event: &Value) -> Option<Self> {
         Some(Self {
             reconnecting: event["reconnecting"].as_bool()?,
+            e2ee: if event["reconnecting"].as_bool()? {
+                Encryption::Unknown
+            } else {
+                Encryption::parse(&event["e2ee"])
+            },
+            dave_protocol_version: event["dave_protocol_version"]
+                .as_u64()
+                .and_then(|n| u16::try_from(n).ok()),
             reconnects: event["reconnects"].as_u64()?,
             dropped_video: event["dropped_video"].as_u64().unwrap_or(0),
             audio_per_sec: event["audio_per_sec"].as_u64(),
@@ -86,12 +126,15 @@ impl ServiceHealth {
     }
 }
 
+/// What the status bar and tooltip show while live: uptime, rates, counters and the service's `health`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LiveStats {
     pub uptime_ms: u64,
     pub rates: Option<Rates>,
     /// Video packets D-Streamy's output dropped because the service fell behind.
     pub dropped: u64,
+    /// Audio packets lost in the OBS ring, separate from video and service dropout intervals.
+    pub dropped_audio: u64,
     /// From the service; `None` until Discord reports the viewers.
     pub viewers: Option<u32>,
     /// `None` until the service reports health; a service from before the event never does.
@@ -140,6 +183,7 @@ impl<const WINDOW: u64> Recent<WINDOW> {
     }
 }
 
+/// Turns sent packets and service events into `LiveStats` once a second.
 #[derive(Debug, Default)]
 pub struct Sampler {
     started_ms: Option<u64>,
@@ -155,6 +199,7 @@ impl Sampler {
         *self = Self::default();
     }
 
+    /// Samples cumulative output totals; clock, byte or frame counter regression starts a new uptime.
     pub fn push(&mut self, sample: OutputSample) -> LiveStats {
         let restarted = self.samples.back().is_some_and(|last| {
             sample.at_ms < last.at_ms || sample.bytes < last.bytes || sample.frames < last.frames
@@ -177,6 +222,7 @@ impl Sampler {
             uptime_ms: sample.at_ms - started,
             rates,
             dropped: sample.dropped,
+            dropped_audio: sample.dropped_audio,
             ..LiveStats::default()
         }
     }
@@ -250,6 +296,7 @@ mod tests {
             bytes,
             frames,
             dropped,
+            dropped_audio: 0,
         }
     }
 

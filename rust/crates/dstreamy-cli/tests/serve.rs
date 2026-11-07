@@ -956,7 +956,7 @@ fn shutdown_waits_for_commands_of_clients_that_already_left() {
     a.send(&json!({"id": "hold", "cmd": "test_hold", "ms": 1500}));
     a.until("hold event", |m| m["event"]["message"] == "test hold true");
     drop(a);
-    h.wait_for_connections(0);
+    h.wait_for_connections(1);
     let (mut b, _) = h.control();
     assert_eq!(
         b.request(&json!({"id": "bye", "cmd": "shutdown"}))["type"],

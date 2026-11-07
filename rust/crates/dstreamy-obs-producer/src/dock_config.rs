@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::dock::{DockModel, DockSettings, track_name};
 
+/// Why the plugin's saved settings could not be read or written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     /// OBS gave the module no config folder.

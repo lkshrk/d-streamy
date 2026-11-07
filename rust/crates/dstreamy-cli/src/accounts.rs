@@ -84,12 +84,14 @@ pub fn account_user(user: &CurrentUser) -> AccountUser {
 }
 
 /// Fills in the user of an account that lacks it, as after an offline migration.
-pub fn remember_user(ctx: &Ctx, source: &TokenSource, user: &CurrentUser) {
-    let Some(name) = source.account() else { return };
+pub fn remember_user(ctx: &Ctx, resolved: &ResolvedToken, user: &CurrentUser) {
+    let Some(name) = resolved.source.account() else {
+        return;
+    };
     if let Err(e) = ctx
         .paths
         .accounts()
-        .remember_user(name, &account_user(user))
+        .remember_user(name, &resolved.token, &account_user(user))
     {
         tracing::warn!("saving the user of account {name}: {e}");
     }

@@ -156,13 +156,17 @@ impl Conn {
 
     /// Waits for the client to close the socket, returning the close code.
     pub async fn closed(&mut self) -> Option<u16> {
+        let code = self.close_frame().await;
+        self.flush().await;
+        code
+    }
+
+    /// The client's Close frame, or `None` if it dropped the socket; the reply stays queued until `flush`.
+    pub async fn close_frame(&mut self) -> Option<u16> {
         timeout(STEP, async {
             loop {
                 match self.ws.next().await {
-                    Some(Ok(Message::Close(frame))) => {
-                        let _ = self.ws.flush().await;
-                        return frame.map(|f| u16::from(f.code));
-                    }
+                    Some(Ok(Message::Close(frame))) => return frame.map(|f| u16::from(f.code)),
                     Some(Ok(_)) => continue,
                     _ => return None,
                 }
@@ -170,6 +174,10 @@ impl Conn {
         })
         .await
         .expect("client did not close")
+    }
+
+    pub async fn flush(&mut self) {
+        let _ = self.ws.flush().await;
     }
 
     pub async fn close(&mut self, code: u16) {

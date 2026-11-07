@@ -45,13 +45,17 @@ impl Harness {
     }
 
     fn spawn(&self, verbose: bool) -> Daemon {
+        self.spawn_at(&self.mock.gateway_url(), verbose)
+    }
+
+    fn spawn_at(&self, gateway: &str, verbose: bool) -> Daemon {
         let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("dstreamy"));
         cmd.env_remove("DSTREAMY_TOKEN")
             .env_remove("DSTREAMY_CONFIG_DIR")
             .arg("--config-dir")
             .arg(self.dir.path())
             .arg("--gateway-url")
-            .arg(self.mock.gateway_url());
+            .arg(gateway);
         if verbose {
             cmd.arg("-vv");
         }
@@ -273,6 +277,84 @@ fn check_fixture(name: &str, messages: &[Value]) {
         "{name}: expected\n{}\ngot\n{}",
         show(&expected),
         show(&actual)
+    );
+}
+
+/// The app decodes these lines into `unknown` cases; the tags must stay ones the daemon never emits.
+#[test]
+fn unknown_fixture_only_uses_tags_the_daemon_never_emits() {
+    use dstreamy_discord::{SessionEvent, SessionState, StopReason};
+    let tag = |value: &Value, key: &str| value[key].as_str().unwrap().to_owned();
+    let reasons: Vec<String> = [
+        StopReason::Requested,
+        StopReason::CaptureEnded,
+        StopReason::GatewayClosed,
+        StopReason::GaveUp { attempts: 1 },
+        StopReason::SourceFailed {
+            message: String::new(),
+        },
+        StopReason::VoiceTakenOver,
+    ]
+    .iter()
+    .map(|r| tag(&serde_json::to_value(r).unwrap(), "reason"))
+    .collect();
+    let states: Vec<String> = [
+        SessionState::Idle,
+        SessionState::Connecting,
+        SessionState::Streaming,
+        SessionState::Reconnecting { attempt: 1 },
+        SessionState::Stopped {
+            reason: StopReason::Requested,
+        },
+    ]
+    .iter()
+    .map(|s| tag(&serde_json::to_value(s).unwrap(), "state"))
+    .collect();
+    let mut events: Vec<String> = [
+        SessionEvent::State {
+            state: SessionState::Idle,
+        },
+        SessionEvent::ChannelMoved {
+            guild_id: None,
+            channel_id: String::new(),
+        },
+        SessionEvent::Resumed,
+        SessionEvent::Error {
+            message: String::new(),
+            fatal: false,
+        },
+    ]
+    .iter()
+    .map(|e| tag(&serde_json::to_value(e).unwrap(), "event"))
+    .collect();
+    events.push("health".to_owned());
+
+    let mut covered = (false, false, false);
+    for line in std::fs::read_to_string(fixture("unknown.ndjson"))
+        .unwrap()
+        .lines()
+    {
+        let m: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(m["type"], "event", "{line}");
+        let event = &m["event"];
+        if tag(event, "event") != "state" {
+            assert!(!events.contains(&tag(event, "event")), "{line}");
+            covered.2 = true;
+        } else if tag(&event["state"], "state") == "stopped" {
+            assert!(
+                !reasons.contains(&tag(&event["state"]["reason"], "reason")),
+                "{line}"
+            );
+            covered.0 = true;
+        } else {
+            assert!(!states.contains(&tag(&event["state"], "state")), "{line}");
+            covered.1 = true;
+        }
+    }
+    assert_eq!(
+        covered,
+        (true, true, true),
+        "reason, state and event each need a line"
     );
 }
 
@@ -541,4 +623,279 @@ fn start_with_target_external_fails_as_in_protocol_1() {
     d.close_stdin();
     let done = d.finish();
     assert!(done.status.success(), "{}: {}", done.status, done.stderr);
+}
+
+fn second_user() -> dstreamy_core::AccountUser {
+    dstreamy_core::AccountUser {
+        id: "100000000000000222".to_owned(),
+        username: "second".to_owned(),
+        global_name: Some("Second One".to_owned()),
+    }
+}
+
+fn mock_user() -> dstreamy_core::AccountUser {
+    dstreamy_core::AccountUser {
+        id: "100000000000000001".to_owned(),
+        username: "mockuser".to_owned(),
+        global_name: Some("Mock User".to_owned()),
+    }
+}
+
+#[test]
+fn set_token_refuses_another_users_token_for_the_chosen_account() {
+    let h = Harness::new();
+    let second = second_user();
+    let other =
+        h.rt.block_on(MockDiscord::start_with(dstreamy_mock_discord::MockConfig {
+            token: "second.account.token".to_owned(),
+            user: dstreamy_mock_discord::MockUser {
+                id: second.id.clone(),
+                username: second.username.clone(),
+                global_name: second.global_name.clone(),
+            },
+            ..dstreamy_mock_discord::MockConfig::default()
+        }))
+        .unwrap();
+    let accounts = dstreamy_core::Accounts::new(h.dir.path());
+    accounts
+        .save("mockuser", MOCK_TOKEN, Some(&mock_user()))
+        .unwrap();
+    let mut d = h.spawn_at(&other.gateway_url(), false);
+    let reply = d.request(
+        &json!({"id": "t", "cmd": "set_token", "token": "second.account.token"}).to_string(),
+    );
+    assert_eq!(reply["code"], "invalid_params", "{reply}");
+    let message = reply["message"].as_str().unwrap();
+    assert!(
+        message.contains("signed in as second, but account mockuser belongs to mockuser"),
+        "{message}"
+    );
+    assert_eq!(
+        accounts.load_token("mockuser").unwrap().as_deref(),
+        Some(MOCK_TOKEN)
+    );
+    assert_eq!(accounts.user("mockuser"), Some(mock_user()));
+    assert_eq!(accounts.names().unwrap(), ["mockuser"]);
+    d.close_stdin();
+    let done = d.finish();
+    assert!(done.status.success(), "{}: {}", done.status, done.stderr);
+    assert!(!done.stdout.contains("second.account.token"));
+}
+
+#[test]
+fn an_oversized_line_is_malformed_and_the_daemon_stays_usable() {
+    let h = Harness::new();
+    let mut d = h.spawn(false);
+    let big = "x".repeat((1 << 20) + 10);
+    d.send(&big);
+    let reply = d.reply(None);
+    assert_eq!(reply["code"], "malformed", "{reply}");
+    assert!(
+        reply["message"].as_str().unwrap().contains("line limit"),
+        "{reply}"
+    );
+    let hello = d.request(&json!({"id": "h", "cmd": "hello"}).to_string());
+    assert_eq!(hello["type"], "result", "{hello}");
+    d.close_stdin();
+    let done = d.finish();
+    assert!(done.status.success(), "{}: {}", done.status, done.stderr);
+}
+
+#[test]
+fn a_stale_pid_file_from_a_crashed_session_does_not_block_a_start() {
+    let h = Harness::new().logged_in();
+    let lock_dir = h.dir.path().join("accounts/default");
+    assert!(lock_dir.join("token").is_file());
+    std::fs::write(lock_dir.join("session.pid"), "4000000000\n").unwrap();
+    let mut d = h.spawn(false);
+    let reply = d.request(&start_line());
+    assert_eq!(reply["type"], "result", "{reply}");
+    d.state("streaming");
+    assert_eq!(
+        std::fs::read_to_string(lock_dir.join("session.pid"))
+            .unwrap()
+            .trim(),
+        d.child.id().to_string()
+    );
+    d.close_stdin();
+    let done = d.finish();
+    assert!(done.status.success(), "{}: {}", done.status, done.stderr);
+}
+
+#[test]
+fn the_daemon_honours_the_saved_encryption_policy_even_if_start_says_false() {
+    let h = Harness::new().logged_in();
+    let mock =
+        h.rt.block_on(MockDiscord::start_with(dstreamy_mock_discord::MockConfig {
+            dave_protocol_version: 0,
+            ..dstreamy_mock_discord::MockConfig::default()
+        }))
+        .unwrap();
+    std::fs::write(
+        h.dir.path().join("config.toml"),
+        "[stream]\nrequire_e2ee = true\n",
+    )
+    .unwrap();
+    let mut d = h.spawn_at(&mock.gateway_url(), false);
+    let mut start: Value = serde_json::from_str(&start_line()).unwrap();
+    start["require_e2ee"] = json!(false);
+    assert_eq!(d.request(&start.to_string())["type"], "result");
+    let stopped = d.until("unencrypted stream refused", |m| {
+        m["event"]["state"]["reason"]["reason"] == "e2ee_unavailable"
+    });
+    assert_eq!(stopped["event"]["state"]["state"], "stopped");
+    d.close_stdin();
+    assert!(d.finish().status.success());
+    let recorded = mock.recorded();
+    assert!(recorded.video.is_empty());
+    assert!(recorded.audio.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn unread_stdout_overflow_keeps_shutdown_deadline_responsive() {
+    unread_stdout_overflow(false, false, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn unread_stdout_overflow_keeps_second_signal_responsive() {
+    unread_stdout_overflow(true, false, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn unread_output_pipes_keep_shutdown_deadline_responsive() {
+    for verbose in [false, true] {
+        unread_stdout_overflow(false, true, verbose);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unread_output_pipes_keep_shutdown_signal_responsive() {
+    for verbose in [false, true] {
+        unread_stdout_overflow(true, true, verbose);
+    }
+}
+
+#[cfg(unix)]
+fn unread_stdout_overflow(second_signal: bool, unread_stderr: bool, verbose: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let (held_stderr, stderr_target) = if unread_stderr {
+        use std::os::fd::OwnedFd;
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        loop {
+            match writer.write(&[0u8; 4096]) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("prefilling private stderr endpoint: {e}"),
+            }
+        }
+        writer.set_nonblocking(false).unwrap();
+        (Some(reader), Stdio::from(OwnedFd::from(writer)))
+    } else {
+        (None, Stdio::piped())
+    };
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("dstreamy"))
+        .env_remove("DSTREAMY_TOKEN")
+        .env_remove("DSTREAMY_CONFIG_DIR")
+        .arg("--config-dir")
+        .arg(dir.path())
+        .args(if verbose {
+            vec!["-vv", "daemon", "--skip-platform"]
+        } else {
+            vec!["daemon", "--skip-platform"]
+        })
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(stderr_target)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let (fault_tx, fault_rx) = mpsc::channel();
+    let errors = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || {
+            let mut stderr = BufReader::new(stderr);
+            let mut text = String::new();
+            loop {
+                let mut line = String::new();
+                if stderr.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                if line.contains("read stdout") {
+                    let _ = fault_tx.send(());
+                }
+                text.push_str(&line);
+            }
+            text
+        })
+    });
+    let producer = std::thread::spawn(move || {
+        for i in 0..1_000 {
+            let id = format!("{i}-{}", "x".repeat(16_000));
+            if writeln!(stdin, "{}", json!({"id": id, "cmd": "hello"})).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+    let observed = if held_stderr.is_some() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::fs::read_to_string(dir.path().join("dstreamy.log"))
+                .is_ok_and(|text| text.contains("read stdout"))
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    } else {
+        fault_rx.recv_timeout(Duration::from_secs(10)).is_ok()
+    };
+    if !observed {
+        let _ = child.kill();
+        let _ = child.wait();
+        producer.join().unwrap();
+        panic!(
+            "no actionable stdout overflow: {}",
+            errors.map(|e| e.join().unwrap()).unwrap_or_default()
+        );
+    }
+    let started = Instant::now();
+    if second_signal {
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let limit = Duration::from_secs(if second_signal { 2 } else { 7 });
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            producer.join().unwrap();
+            panic!("output backpressure prevented the shutdown deadline or signal escape");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!status.success());
+    if second_signal {
+        assert_eq!(status.code(), Some(130));
+    }
+    producer.join().unwrap();
+    if let Some(errors) = errors {
+        assert!(errors.join().unwrap().contains("read stdout"));
+    }
+    drop(held_stderr);
 }

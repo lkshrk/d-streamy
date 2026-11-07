@@ -1,6 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
+/// Why the socket could not be bound, trusted or connected to; the message names the path.
 #[derive(Debug, thiserror::Error)]
 pub enum IpcError {
     #[error("already running at {0}")]

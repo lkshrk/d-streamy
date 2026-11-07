@@ -331,6 +331,7 @@ fn open_in_browser(url: &str) {
     let opener = "open";
     let spawned = std::process::Command::new(opener)
         .arg(url)
+        .env_remove(dstreamy_core::TOKEN_ENV)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -394,6 +395,8 @@ struct Step {
 enum Notice {
     Verifying,
     Attention(Failure),
+    /// A check failed while the Discord page stays up, so only the terminal can say so.
+    Quiet(Failure),
 }
 
 /// Everything the login window decides, apart from the window and the webviews themselves.
@@ -482,11 +485,12 @@ impl Session {
         let visible = self.state.window_visible();
         let toggle = (visible != self.visible).then_some(visible);
         self.visible = visible;
+        let quiet = self.state.take_quiet_failure();
         let notice = match (toggle, current) {
             _ if !self.state.is_open() => None,
             (Some(false), _) => Some(Notice::Verifying),
             (Some(true), Screen::Recovery(failure)) => Some(Notice::Attention(failure)),
-            _ => None,
+            _ => quiet.map(Notice::Quiet),
         };
         Step {
             command,
@@ -953,6 +957,7 @@ fn drive(
         match step.notice {
             Some(Notice::Verifying) => report_verifying(out),
             Some(Notice::Attention(failure)) => report_attention(out, failure),
+            Some(Notice::Quiet(failure)) => report_quiet(out, failure),
             None => {}
         }
         match step.command {
@@ -1061,6 +1066,20 @@ fn report_attention(out: &Out, failure: Failure) {
         out.json_line(&ProgressRow::Attention);
     } else {
         out.line(attention_line(failure));
+    }
+}
+
+fn quiet_line(failure: Failure) -> String {
+    format!(
+        "{} The window stays on Discord: finish the login there, or close it to cancel.",
+        recovery_text(failure).1
+    )
+}
+
+/// Only the terminal hears of it: the page is still Discord's, and the JSON parent has no terminal.
+fn report_quiet(out: &Out, failure: Failure) {
+    if !out.json {
+        out.line(quiet_line(failure));
     }
 }
 
@@ -1804,6 +1823,29 @@ mod tests {
         let step = commit(&mut session, "https://discordstatus.com/", now);
         assert_eq!(step.load, Some(Screen::Recovery(Failure::LeftDiscord)));
         assert_eq!((step.visible, step.notice), (None, None));
+    }
+
+    #[test]
+    fn a_rejection_before_sign_in_is_reported_on_the_terminal_only() {
+        let now = Instant::now();
+        let mut session = session(now);
+        let step = discord(&mut session, "candidate:aaa.bbb.ccc", now);
+        let Some(Command::Validate(job)) = step.command else {
+            panic!("expected a validation job");
+        };
+        let step = session.step(
+            LoopEvent::Msg(Msg::Validated {
+                generation: job.generation,
+                seen: job.seen,
+                result: Validation::Rejected,
+            }),
+            now,
+        );
+        assert_eq!(step.notice, Some(Notice::Quiet(Failure::Rejected)));
+        assert_eq!((step.load, step.visible), (None, None));
+        assert_eq!(session.state.view(), View::Discord);
+        assert_eq!(wake(&mut session, now).notice, None);
+        assert!(quiet_line(Failure::Rejected).contains(recovery_text(Failure::Rejected).1));
     }
 
     #[test]

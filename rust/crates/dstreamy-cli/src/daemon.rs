@@ -1,11 +1,14 @@
 //! `dstreamy daemon`: protocol 1 of ADR 0003, one JSON object per line on stdin and stdout.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::BufRead;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
+use dstreamy_core::lock;
 use dstreamy_discord::SessionEvent;
+use dstreamy_ipc::control::{MAX_LINE, Malformed};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -16,6 +19,13 @@ pub use crate::engine::{Options, PROTOCOL};
 use crate::output::Out;
 use crate::signals::Signals;
 use crate::{CliError, Ctx};
+
+/// How long the daemon waits for its stream to end after stdin closes or the first signal; the app kills it after.
+pub const SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+const MAX_COMMANDS: usize = 64;
+const MAX_TASKS: usize = 16;
+const MAX_OUTPUT: usize = 64;
 
 pub(crate) const COMMANDS: [&str; 10] = [
     "hello",
@@ -100,25 +110,50 @@ fn parse(line: &[u8]) -> Result<(String, Request), (Option<String>, Failure)> {
     Ok((id, Request::Engine(command)))
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
+enum Line {
+    Ok(Vec<u8>),
+    Oversized,
 }
 
-/// Lines from stdin until EOF or a read error; invalid UTF-8 still arrives as a line.
-fn read_stdin(lines: mpsc::UnboundedSender<Vec<u8>>) {
-    let mut stdin = std::io::stdin().lock();
+fn read_lines(mut input: impl BufRead, lines: &mpsc::Sender<Line>) -> Result<(), &'static str> {
     loop {
         let mut line = Vec::new();
-        match stdin.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
-                if line.last() == Some(&b'\n') {
-                    line.pop();
-                }
-                if lines.send(line).is_err() {
-                    break;
-                }
+        let mut oversized = false;
+        let ended = loop {
+            let buf = match input.fill_buf() {
+                Ok(buf) => buf,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break true,
+            };
+            if buf.is_empty() {
+                break true;
             }
+            let newline = buf.iter().position(|&b| b == b'\n');
+            let chunk = &buf[..newline.unwrap_or(buf.len())];
+            if !oversized && line.len() + chunk.len() > MAX_LINE {
+                oversized = true;
+                line = Vec::new();
+            }
+            if !oversized {
+                line.extend_from_slice(chunk);
+            }
+            let consumed = chunk.len() + usize::from(newline.is_some());
+            input.consume(consumed);
+            if newline.is_some() {
+                break false;
+            }
+        };
+        if ended && line.is_empty() && !oversized {
+            return Ok(());
+        }
+        let line = if oversized {
+            Line::Oversized
+        } else {
+            Line::Ok(line)
+        };
+        lines.try_send(line).map_err(|_| "daemon command queue full or disconnected; send fewer outstanding commands and restart the daemon")?;
+        if ended {
+            return Ok(());
         }
     }
 }
@@ -149,14 +184,15 @@ fn event_line(event: &EngineEvent) -> Option<String> {
 
 /// Until both channels close; every event sent before a reply is written before it.
 async fn write_out(
-    mut events: mpsc::UnboundedReceiver<EngineEvent>,
-    mut replies: mpsc::UnboundedReceiver<Reply>,
-    out: std::sync::mpsc::Sender<String>,
-) {
-    let send = |line: Option<String>| {
+    mut events: mpsc::Receiver<EngineEvent>,
+    mut replies: mpsc::Receiver<Reply>,
+    out: std::sync::mpsc::SyncSender<String>,
+) -> Result<(), &'static str> {
+    let send = |line: Option<String>| -> Result<(), &'static str> {
         if let Some(line) = line {
-            let _ = out.send(line);
+            out.try_send(line).map_err(|_| "daemon stdout queue full or disconnected; read stdout continuously and restart the daemon")?;
         }
+        Ok(())
     };
     let mut events_open = true;
     let mut replies_open = true;
@@ -164,48 +200,110 @@ async fn write_out(
         tokio::select! {
             biased;
             event = events.recv(), if events_open => match event {
-                Some(event) => send(event_line(&event)),
-                None => events_open = false,
+                Some(event) => send(event_line(&event))?,
+                None => {
+                    if !replies.is_closed() {
+                        return Err("daemon event subscription overflowed or disconnected; read stdout continuously and restart the daemon");
+                    }
+                    events_open = false;
+                }
             },
             reply = replies.recv(), if replies_open => match reply {
                 Some((id, result)) => {
                     while let Ok(event) = events.try_recv() {
-                        send(event_line(&event));
+                        send(event_line(&event))?;
                     }
-                    send(reply_line(id.as_deref(), result));
+                    send(reply_line(id.as_deref(), result))?;
                 }
                 None => replies_open = false,
             },
         }
     }
+    Ok(())
+}
+
+fn spawn_command(
+    tasks: &mut JoinSet<()>,
+    command: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), &'static str> {
+    if tasks.len() >= MAX_TASKS {
+        return Err(
+            "daemon concurrent command limit reached; wait for replies before sending more commands",
+        );
+    }
+    tasks.spawn(command);
+    Ok(())
 }
 
 pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliError> {
-    let (lines_tx, mut lines) = mpsc::unbounded_channel();
-    // A detached thread: a blocked stdin read must not hold up the runtime's shutdown.
-    std::thread::spawn(move || read_stdin(lines_tx));
-    let (writer, written) = std::sync::mpsc::channel::<String>();
-    let writer_out = out.clone();
-    let writing = std::thread::spawn(move || {
-        for line in written {
-            writer_out.line(line);
+    let (fault, mut fault_rx) = tokio::sync::watch::channel(None);
+    let (lines_tx, mut lines) = mpsc::channel(MAX_COMMANDS);
+    let input_fault = fault.clone();
+    std::thread::spawn(move || {
+        if let Err(message) = read_lines(std::io::stdin().lock(), &lines_tx) {
+            input_fault.send_replace(Some(message));
         }
     });
+    let (writer, written) = std::sync::mpsc::sync_channel::<String>(MAX_OUTPUT);
+    let writer_out = out.clone();
+    let writer_fault = fault.clone();
+    let (writing_done, written_all) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        for line in written {
+            writer_out.line(line);
+            if writer_out.stdout_broken() {
+                writer_fault.send_replace(Some(
+                    "daemon stdout disconnected; keep stdout open and restart the daemon",
+                ));
+                break;
+            }
+        }
+        let _ = writing_done.send(());
+    });
     let engine = Engine::new(ctx, opts);
-    let (replies, replies_rx) = mpsc::unbounded_channel::<Reply>();
-    let output = tokio::spawn(write_out(engine.subscribe_lossless(), replies_rx, writer));
+    let (replies, replies_rx) = mpsc::channel::<Reply>(MAX_OUTPUT);
+    let mut output = tokio::spawn(write_out(engine.subscribe_lossless(), replies_rx, writer));
     let reply = |id: Option<String>, result| {
-        let _ = replies.send((id, result));
+        if replies.try_send((id, result)).is_err() {
+            fault.send_replace(Some("daemon reply queue full or disconnected; read stdout and send fewer outstanding commands"));
+        }
     };
     let pending: Arc<Mutex<HashMap<u64, String>>> = Arc::default();
     let mut signals = Signals::new();
     let mut tasks = JoinSet::new();
     let mut next_key = 0u64;
     let mut shutdown_id = None;
+    let mut failed = None;
+    let mut output_done = false;
     loop {
         tokio::select! {
+            biased;
+            () = signals.recv() => break,
+            changed = fault_rx.changed() => {
+                if changed.is_ok() {
+                    failed = *fault_rx.borrow_and_update();
+                    break;
+                }
+            }
+            result = &mut output => {
+                output_done = true;
+                failed = Some(match result {
+                    Ok(Err(message)) => message,
+                    _ => "daemon event delivery disconnected; restart the daemon",
+                });
+                break;
+            }
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
             line = lines.recv() => {
-                let Some(line) = line else { break };
+                let line = match line {
+                    Some(Line::Ok(line)) => line,
+                    Some(Line::Oversized) => {
+                        let (id, failure) = malformed(None, &Malformed::Oversized.to_string());
+                        reply(id, Err(failure));
+                        continue;
+                    }
+                    None => break,
+                };
                 match parse(&line) {
                     Err((id, failure)) => reply(id, Err(failure)),
                     Ok((id, Request::Shutdown)) => {
@@ -218,45 +316,155 @@ pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliErr
                         lock(&pending).insert(key, id);
                         let engine = engine.clone();
                         let replies = replies.clone();
-                        let pending = pending.clone();
-                        tasks.spawn(async move {
+                        let task_pending = pending.clone();
+                        let fault = fault.clone();
+                        if let Err(message) = spawn_command(&mut tasks, async move {
                             let result = engine.handle(command).await;
-                            if let Some(id) = lock(&pending).remove(&key) {
-                                let _ = replies.send((Some(id), result));
+                            if let Some(id) = lock(&task_pending).remove(&key)
+                                && replies.try_send((Some(id), result)).is_err()
+                            {
+                                fault.send_replace(Some("daemon reply queue full or disconnected; read stdout and send fewer outstanding commands"));
                             }
-                        });
+                        }) {
+                            reply(lock(&pending).remove(&key), Err(Failure::new("overloaded", message)));
+                            failed = Some(message);
+                            break;
+                        }
                     }
                 }
             }
-            () = signals.recv() => break,
-            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
         }
         if out.stdout_broken() {
             break;
         }
     }
-    tasks.shutdown().await;
-    let unanswered: Vec<String> = lock(&pending).drain().map(|(_, id)| id).collect();
-    for id in unanswered {
-        reply(
-            Some(id),
-            Err(Failure::new("internal", "daemon shutting down")),
-        );
+    if let Some(message) = failed {
+        tracing::error!("{message}");
+        out.error(message);
     }
-    engine.shutdown().await;
-    if let Some(id) = shutdown_id {
-        reply(Some(id), Ok(Value::Null));
+    drop(lines);
+    let shutdown_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_fault = shutdown_failed.clone();
+    let stopped = async {
+        tasks.shutdown().await;
+        let unanswered: Vec<String> = lock(&pending).drain().map(|(_, id)| id).collect();
+        for id in unanswered {
+            if replies
+                .try_send((
+                    Some(id),
+                    Err(Failure::new("internal", "daemon shutting down")),
+                ))
+                .is_err()
+            {
+                shutdown_fault.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        engine.shutdown().await;
+        if let Some(id) = shutdown_id
+            && replies.try_send((Some(id), Ok(Value::Null))).is_err()
+        {
+            shutdown_fault.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        drop(replies);
+        drop(engine);
+        if !output_done {
+            match output.await {
+                Ok(Ok(())) => {}
+                result => {
+                    tracing::error!(
+                        ?result,
+                        "daemon output failed during shutdown; read stdout continuously and restart the daemon"
+                    );
+                    shutdown_fault.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        let _ = written_all.await;
+    };
+    if cut_short(&mut signals, stopped, SHUTDOWN_LIMIT).await {
+        tracing::warn!("exiting without a finished shutdown");
+        return Ok(ExitCode::from(crate::stream::FORCED_EXIT));
     }
-    drop(replies);
-    drop(engine);
-    let _ = output.await;
-    let _ = tokio::task::spawn_blocking(move || writing.join()).await;
-    Ok(ExitCode::SUCCESS)
+    Ok(
+        if failed.is_some() || shutdown_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        },
+    )
+}
+
+/// Whether `stopped` had to be abandoned: another signal arrived, or `limit` passed.
+async fn cut_short(
+    signals: &mut Signals,
+    stopped: impl Future<Output = ()>,
+    limit: std::time::Duration,
+) -> bool {
+    let stopped = tokio::time::timeout(limit, stopped);
+    tokio::select! {
+        biased;
+        () = signals.recv() => true,
+        finished = stopped => finished.is_err(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn live_command_tasks_have_a_fixed_bound() {
+        let mut tasks = JoinSet::new();
+        for index in 0..1_000 {
+            let admitted = spawn_command(&mut tasks, std::future::pending::<()>());
+            assert_eq!(admitted.is_ok(), index < MAX_TASKS);
+        }
+        assert!(
+            tasks.len() <= MAX_TASKS,
+            "{} live command tasks",
+            tasks.len()
+        );
+    }
+
+    #[test]
+    fn stdin_burst_has_a_fixed_resident_queue_bound() {
+        let (tx, rx) = mpsc::channel(MAX_COMMANDS);
+        assert!(read_lines(std::io::Cursor::new(b"hello\n".repeat(1_000)), &tx).is_err());
+        assert!(rx.len() <= 64, "queued {} commands", rx.len());
+    }
+
+    #[tokio::test]
+    async fn unread_stdout_has_a_fixed_resident_queue_bound() {
+        let (events, event_rx) = mpsc::channel(MAX_OUTPUT);
+        let (replies, reply_rx) = mpsc::channel(1_000);
+        let (out, lines) = std::sync::mpsc::sync_channel(MAX_OUTPUT);
+        for i in 0..1_000 {
+            replies
+                .try_send((Some(i.to_string()), Ok(Value::Null)))
+                .unwrap();
+        }
+        drop((events, replies));
+        assert!(
+            write_out(event_rx, reply_rx, out)
+                .await
+                .unwrap_err()
+                .contains("read stdout")
+        );
+        assert!(lines.try_iter().count() <= 64, "unbounded stdout backlog");
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_is_cut_short_by_a_signal_or_the_limit() {
+        let limit = std::time::Duration::from_millis(100);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut signals = Signals::from_channel(rx);
+        assert!(!cut_short(&mut signals, async {}, limit).await);
+        let started = std::time::Instant::now();
+        assert!(cut_short(&mut signals, std::future::pending(), limit).await);
+        assert!(started.elapsed() >= limit);
+        tx.send(()).unwrap();
+        assert!(cut_short(&mut signals, std::future::pending(), limit).await);
+    }
 
     fn error(line: &str) -> (Option<String>, &'static str, String) {
         match parse(line.as_bytes()) {
@@ -298,6 +506,46 @@ mod tests {
         assert_eq!(message, "invalid fps 24: expected 15, 30 or 60");
     }
 
+    fn lines_of(input: &[u8]) -> Vec<Option<Vec<u8>>> {
+        let (tx, mut rx) = mpsc::channel(MAX_COMMANDS);
+        read_lines(std::io::Cursor::new(input), &tx).unwrap();
+        drop(tx);
+        let mut lines = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            lines.push(match line {
+                Line::Ok(line) => Some(line),
+                Line::Oversized => None,
+            });
+        }
+        lines
+    }
+
+    #[test]
+    fn lines_are_split_at_newlines_and_the_last_one_needs_none() {
+        assert_eq!(
+            lines_of(b"a\n\nbc\r\nlast"),
+            [
+                Some(b"a".to_vec()),
+                Some(Vec::new()),
+                Some(b"bc\r".to_vec()),
+                Some(b"last".to_vec()),
+            ]
+        );
+        assert_eq!(lines_of(b""), []);
+        assert_eq!(lines_of(b"\n"), [Some(Vec::new())]);
+    }
+
+    #[test]
+    fn a_line_past_the_limit_is_dropped_while_read_and_the_next_one_arrives() {
+        let mut input = vec![b'x'; MAX_LINE + 1];
+        input.extend_from_slice(b"\nok\n");
+        assert_eq!(lines_of(&input), [None, Some(b"ok".to_vec())]);
+        let exact = vec![b'y'; MAX_LINE];
+        assert_eq!(lines_of(&exact), [Some(exact.clone())]);
+        let unterminated = vec![b'z'; MAX_LINE + 1];
+        assert_eq!(lines_of(&unterminated), [None]);
+    }
+
     #[test]
     fn extra_fields_are_ignored() {
         let (id, command) = parse(b"{\"id\":\"x\",\"cmd\":\"stop\",\"later\":true}").unwrap();
@@ -310,14 +558,14 @@ mod tests {
         replies: Vec<Reply>,
         late: Vec<EngineEvent>,
     ) -> Vec<Value> {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (reply_tx, reply_rx) = mpsc::unbounded_channel();
-        let (out, lines) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel(20_000);
+        let (reply_tx, reply_rx) = mpsc::channel(20_000);
+        let (out, lines) = std::sync::mpsc::sync_channel(20_001);
         for event in events {
-            event_tx.send(event).unwrap();
+            event_tx.try_send(event).unwrap();
         }
         for reply in replies {
-            reply_tx.send(reply).unwrap();
+            reply_tx.try_send(reply).unwrap();
         }
         drop(reply_tx);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -327,10 +575,10 @@ mod tests {
             let writer = tokio::spawn(write_out(event_rx, reply_rx, out));
             tokio::task::yield_now().await;
             for event in late {
-                event_tx.send(event).unwrap();
+                event_tx.try_send(event).unwrap();
             }
             drop(event_tx);
-            writer.await.unwrap();
+            writer.await.unwrap().unwrap();
         });
         lines
             .into_iter()
@@ -373,14 +621,14 @@ mod tests {
             .worker_threads(2)
             .build()
             .unwrap();
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (reply_tx, reply_rx) = mpsc::unbounded_channel::<Reply>();
-        let (out, lines) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel(20_000);
+        let (reply_tx, reply_rx) = mpsc::channel::<Reply>(20_000);
+        let (out, lines) = std::sync::mpsc::sync_channel(20_001);
         let writer = runtime.spawn(write_out(event_rx, reply_rx, out));
         for i in 0..N {
-            event_tx.send(resumed()).unwrap();
+            event_tx.try_send(resumed()).unwrap();
             reply_tx
-                .send((Some(i.to_string()), Ok(Value::Null)))
+                .try_send((Some(i.to_string()), Ok(Value::Null)))
                 .unwrap();
             let event = lines.recv().unwrap();
             assert!(
@@ -390,6 +638,6 @@ mod tests {
             assert!(lines.recv().unwrap().contains(&format!("\"id\":\"{i}\"")));
         }
         drop((event_tx, reply_tx));
-        runtime.block_on(writer).unwrap();
+        runtime.block_on(writer).unwrap().unwrap();
     }
 }

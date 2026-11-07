@@ -11,6 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 dstreamy-ipc = { path = "../crates/dstreamy-ipc" }
+dstreamy-media = { path = "../crates/dstreamy-media" }
 libfuzzer-sys = "0.4"
 serde_json = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
@@ -25,6 +26,13 @@ bench = false
 [[bin]]
 name = "producer_frame"
 path = "fuzz_targets/producer_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ingest"
+path = "fuzz_targets/ingest.rs"
 test = false
 doc = false
 bench = false

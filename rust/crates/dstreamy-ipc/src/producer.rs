@@ -5,20 +5,26 @@ use std::io;
 use tokio_util::bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
+/// Largest producer frame `length` (8 MiB); a bigger one detaches the producer with `oversized` (ADR 0004).
 pub const MAX_FRAME_LEN: u32 = 8 << 20;
+/// Bytes after `length` before the payload: kind, pts and flags (ADR 0004 producer role).
 pub const HEADER_LEN: u32 = 1 + 8 + 1;
+/// Flag bit 0: the video frame is a keyframe; ignored on audio.
 pub const FLAG_KEYFRAME: u8 = 1;
 
 const LEN_PREFIX: usize = 4;
 /// Most a header may make the decoder reserve before the payload bytes arrive.
 pub const MAX_RESERVE: usize = 64 << 10;
 
+/// The producer frame kinds of ADR 0004: video, Opus, or end of stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Kind {
     /// One H.264 access unit in Annex B form.
     Video = 1,
+    /// One Opus packet; media validation is separate from wire framing.
     Opus = 2,
+    /// Ends the attachment without a payload.
     EndOfStream = 3,
 }
 
@@ -35,10 +41,13 @@ impl TryFrom<u8> for Kind {
     }
 }
 
+/// One decoded producer frame: kind, signed pts in microseconds, keyframe flag and payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub kind: Kind,
+    /// Producer presentation time in microseconds; may be negative before timeline rebasing.
     pub pts_us: i64,
+    /// Meaningful only for video; the codec clears it for other frame kinds.
     pub keyframe: bool,
     pub payload: Bytes,
 }
@@ -53,6 +62,7 @@ impl Frame {
         }
     }
 
+    /// Total wire bytes, including the four-byte length prefix excluded from `MAX_FRAME_LEN`.
     pub fn encoded_len(&self) -> usize {
         LEN_PREFIX + HEADER_LEN as usize + self.payload.len()
     }
@@ -77,6 +87,7 @@ pub enum ProducerError {
     Io(#[from] io::Error),
 }
 
+/// Encoder and decoder of the binary producer frames (ADR 0004 producer role); the plugin and serve share it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProducerCodec;
 

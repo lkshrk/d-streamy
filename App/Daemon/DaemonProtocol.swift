@@ -153,6 +153,41 @@ struct CaptureTarget: Codable, Identifiable, Hashable {
     }
 }
 
+enum E2eeState: String, Codable {
+    case unknown, encrypted, unencrypted
+
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = E2eeState(rawValue: value) ?? .unknown
+    }
+}
+
+struct EncryptionStatus: Equatable {
+    var state: E2eeState = .unknown
+    var daveProtocolVersion: Int?
+
+    var title: String {
+        switch state {
+        case .encrypted: return "End-to-end encrypted"
+        case .unencrypted: return "Not end-to-end encrypted"
+        case .unknown: return "Encryption status unknown"
+        }
+    }
+
+    var detail: String {
+        if let version = daveProtocolVersion {
+            return "DAVE protocol \(version)"
+        }
+        return "DAVE protocol not reported"
+    }
+
+    var warning: String? {
+        state == .unencrypted
+            ? "This session is not end-to-end encrypted. Discord can read its audio and video."
+            : nil
+    }
+}
+
 struct StreamStats: Codable, Equatable {
     let videoFramesSent: Int
     let videoFramesDropped: Int
@@ -161,6 +196,32 @@ struct StreamStats: Codable, Equatable {
     let resumes: Int
     let fps: Double
     let lastError: String?
+    var e2ee: E2eeState?
+    var daveProtocolVersion: Int?
+    let sourceVideoFramesDropped: Int
+    let sourceAudioFramesDropped: Int
+
+    var totalVideoFramesDropped: Int { videoFramesDropped + sourceVideoFramesDropped }
+
+    private enum CodingKeys: String, CodingKey {
+        case videoFramesSent, videoFramesDropped, audioFramesSent, bytesSent, resumes, fps, lastError
+        case e2ee, daveProtocolVersion, sourceVideoFramesDropped, sourceAudioFramesDropped
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        videoFramesSent = try c.decode(Int.self, forKey: .videoFramesSent)
+        videoFramesDropped = try c.decode(Int.self, forKey: .videoFramesDropped)
+        audioFramesSent = try c.decode(Int.self, forKey: .audioFramesSent)
+        bytesSent = try c.decode(Int.self, forKey: .bytesSent)
+        resumes = try c.decode(Int.self, forKey: .resumes)
+        fps = try c.decode(Double.self, forKey: .fps)
+        lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
+        e2ee = try c.decodeIfPresent(E2eeState.self, forKey: .e2ee)
+        daveProtocolVersion = try c.decodeIfPresent(Int.self, forKey: .daveProtocolVersion)
+        sourceVideoFramesDropped = try c.decodeIfPresent(Int.self, forKey: .sourceVideoFramesDropped) ?? 0
+        sourceAudioFramesDropped = try c.decodeIfPresent(Int.self, forKey: .sourceAudioFramesDropped) ?? 0
+    }
 }
 
 struct StreamMetrics: Codable, Equatable {
@@ -214,6 +275,8 @@ enum StopReason: Decodable, Equatable {
     case gaveUp(attempts: Int)
     case sourceFailed(message: String)
     case voiceTakenOver
+    case e2eeUnavailable
+    case unknown(String)
 
     private enum Keys: String, CodingKey { case reason, attempts, message }
 
@@ -227,8 +290,8 @@ enum StopReason: Decodable, Equatable {
         case "gave_up": self = .gaveUp(attempts: try c.decode(Int.self, forKey: .attempts))
         case "source_failed": self = .sourceFailed(message: try c.decode(String.self, forKey: .message))
         case "voice_taken_over": self = .voiceTakenOver
-        default:
-            throw DecodingError.dataCorruptedError(forKey: .reason, in: c, debugDescription: "unknown reason \(reason)")
+        case "e2ee_unavailable": self = .e2eeUnavailable
+        default: self = .unknown(reason)
         }
     }
 
@@ -240,6 +303,8 @@ enum StopReason: Decodable, Equatable {
         case .gaveUp(let attempts): return "Gave up after \(attempts) reconnect attempts"
         case .sourceFailed(let message): return "Capture failed: \(message)"
         case .voiceTakenOver: return "Another device of this account joined voice"
+        case .e2eeUnavailable: return "Session stopped because end-to-end encryption is unavailable. Try another channel or retry later."
+        case .unknown(let reason): return "Stopped: \(reason)"
         }
     }
 }
@@ -250,6 +315,7 @@ enum SessionState: Decodable, Equatable {
     case streaming
     case reconnecting(attempt: Int)
     case stopped(StopReason)
+    case unknown(String)
 
     private enum Keys: String, CodingKey { case state, attempt, reason }
 
@@ -262,8 +328,7 @@ enum SessionState: Decodable, Equatable {
         case "streaming": self = .streaming
         case "reconnecting": self = .reconnecting(attempt: try c.decode(Int.self, forKey: .attempt))
         case "stopped": self = .stopped(try c.decode(StopReason.self, forKey: .reason))
-        default:
-            throw DecodingError.dataCorruptedError(forKey: .state, in: c, debugDescription: "unknown state \(state)")
+        default: self = .unknown(state)
         }
     }
 }
@@ -273,9 +338,11 @@ enum SessionEvent: Decodable, Equatable {
     case health(HealthSnapshot)
     case channelMoved(guildId: String?, channelId: String)
     case resumed
+    case e2ee(state: E2eeState, daveProtocolVersion: Int?)
     case error(message: String, fatal: Bool)
+    case unknown(String)
 
-    private enum Keys: String, CodingKey { case event, state, guildId, channelId, message, fatal }
+    private enum Keys: String, CodingKey { case event, state, guildId, channelId, message, fatal, daveProtocolVersion }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -289,13 +356,17 @@ enum SessionEvent: Decodable, Equatable {
                 channelId: try c.decode(String.self, forKey: .channelId)
             )
         case "resumed": self = .resumed
+        case "e2ee":
+            self = .e2ee(
+                state: try c.decodeIfPresent(E2eeState.self, forKey: .state) ?? .unknown,
+                daveProtocolVersion: try c.decodeIfPresent(Int.self, forKey: .daveProtocolVersion)
+            )
         case "error":
             self = .error(
                 message: try c.decode(String.self, forKey: .message),
                 fatal: try c.decode(Bool.self, forKey: .fatal)
             )
-        default:
-            throw DecodingError.dataCorruptedError(forKey: .event, in: c, debugDescription: "unknown event \(event)")
+        default: self = .unknown(event)
         }
     }
 }

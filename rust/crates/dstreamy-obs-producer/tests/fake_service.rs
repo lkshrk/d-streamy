@@ -138,7 +138,7 @@ async fn a_detached_already_sent_is_read_after_the_write_fails() {
     assert_eq!(
         end,
         End::Detached {
-            reason: "stopped".into(),
+            reason: dstreamy_obs_producer::DetachReason::Stopped,
             message: "no media".into()
         }
     );
@@ -219,4 +219,206 @@ async fn viewer_counts_from_the_service_are_reported() {
     assert_eq!(first.video_level, Some(ServiceLevel::Warn));
     assert_eq!(health[1], None, "no stream runs");
     service.abort();
+}
+
+#[tokio::test]
+async fn a_closed_socket_reattaches_and_keeps_capturing_until_stop() {
+    let (_dir, path, listener) = socket();
+    let (attached, reattached) = tokio::sync::oneshot::channel();
+    let service = tokio::spawn(async move {
+        let mut attached = Some(attached);
+        for attempt in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let mut line = String::new();
+            read.read_line(&mut line).await.unwrap();
+            assert!(line.contains("producer"));
+            write
+                .write_all(format!("{{\"attached\":{attempt}}}\n").as_bytes())
+                .await
+                .unwrap();
+            if attempt == 1 {
+                attached.take().unwrap().send(()).unwrap();
+                std::future::pending::<()>().await;
+                return;
+            }
+        }
+    });
+    let endpoint = Endpoint::new(&path);
+    let connection = attach(&endpoint, &hello()).await.unwrap();
+    let ring = Ring::default();
+    let end = tokio::time::timeout(
+        Duration::from_secs(5),
+        dstreamy_obs_producer::client::run_reconnecting(
+            (&endpoint, &hello()),
+            connection,
+            &ring,
+            || None,
+            Reports::ignored(),
+            reattached,
+            &Quiet,
+        ),
+    )
+    .await
+    .expect("the producer did not reattach");
+    assert!(matches!(end, End::Stopped(Ok(()))), "{end:?}");
+    service.abort();
+}
+
+#[tokio::test]
+async fn peer_eof_during_a_consumed_stop_drain_keeps_the_stop_outcome() {
+    struct DrainStarted(Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+    impl Log for DrainStarted {
+        fn log(&self, _: Level, _: &str) {}
+        fn stop_drain_started(&self, queued: usize) {
+            assert!(queued > 0);
+            self.0.lock().unwrap().take().unwrap().send(()).unwrap();
+        }
+    }
+    let (_dir, path, listener) = socket();
+    let (draining, drain_started) = tokio::sync::oneshot::channel();
+    let service = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut read = BufReader::new(read);
+        let mut line = String::new();
+        read.read_line(&mut line).await.unwrap();
+        write.write_all(b"{\"attached\":1}\n").await.unwrap();
+        drain_started.await.unwrap();
+        write.shutdown().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let endpoint = Endpoint::new(&path);
+    let connection = attach(&endpoint, &hello()).await.unwrap();
+    let ring = Ring::new(100, 128 << 20);
+    for i in 0..64 {
+        ring.push(audio(i * 960, 1 << 20));
+    }
+    let stop = async { String::from("shutdown") };
+    let log = DrainStarted(Mutex::new(Some(draining)));
+    let end = tokio::time::timeout(
+        STOP_DEADLINE + Duration::from_secs(2),
+        dstreamy_obs_producer::client::run_reconnecting(
+            (&endpoint, &hello()),
+            connection,
+            &ring,
+            || None,
+            Reports::ignored(),
+            stop,
+            &log,
+        ),
+    )
+    .await
+    .expect("stop must stay bounded");
+    assert_eq!(end, End::Stopped(String::from("shutdown")));
+    assert!(
+        ring.stats().queued > 0,
+        "the unread peer interrupted a nonempty drain"
+    );
+    service.abort();
+    let _ = service.await;
+}
+
+#[tokio::test]
+async fn reattachment_sends_a_queued_gop_and_audio_without_replaying_the_old_idr() {
+    use dstreamy_ipc::{Kind, ProducerCodec};
+    use futures_util::StreamExt;
+    use tokio_util::codec::FramedRead;
+    let video = |pts, keyframe| Packet {
+        track: Track::Video,
+        pts,
+        dts: pts,
+        keyframe,
+        timebase: (1, 30),
+        data: vec![0, 0, 0, 1, if keyframe { 0x65 } else { 0x41 }, 0x88],
+        arrived: Instant::now(),
+    };
+    let (_dir, path, listener) = socket();
+    let (complete, stop) = tokio::sync::oneshot::channel();
+    let service = tokio::spawn(async move {
+        let mut after = Vec::new();
+        for attempt in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let mut line = String::new();
+            read.read_line(&mut line).await.unwrap();
+            write
+                .write_all(format!("{{\"attached\":{attempt}}}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut frames = FramedRead::new(read, ProducerCodec::new());
+            if attempt == 0 {
+                let first = frames.next().await.unwrap().unwrap();
+                assert!(first.keyframe);
+                assert_eq!(first.pts_us, 0);
+            } else {
+                for _ in 0..3 {
+                    after.push(frames.next().await.unwrap().unwrap());
+                }
+                complete.send(()).unwrap();
+                return after;
+            }
+        }
+        unreachable!()
+    });
+    let endpoint = Endpoint::new(&path);
+    let connection = attach(&endpoint, &hello()).await.unwrap();
+    let ring = Ring::default();
+    ring.push(video(0, true));
+    let mut reset_count = 0;
+    let health = |state: Option<dstreamy_obs_producer::live::ServiceHealth>| {
+        assert!(state.is_none());
+        ring.push(video(29, false));
+        ring.push(video(30, true));
+        ring.push(video(31, false));
+        ring.push(audio(48_000, 3));
+    };
+    let end = tokio::time::timeout(
+        Duration::from_secs(5),
+        dstreamy_obs_producer::client::run_reconnecting(
+            (&endpoint, &hello()),
+            connection,
+            &ring,
+            || {
+                reset_count += 1;
+                Some(vec![0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce])
+            },
+            Reports {
+                viewers: &|_| {},
+                health: &health,
+            },
+            async {
+                stop.await.unwrap();
+            },
+            &Quiet,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(end, End::Stopped(()));
+    let after = service.await.unwrap();
+    assert_eq!(
+        after
+            .iter()
+            .map(|f| (f.kind, f.pts_us, f.keyframe))
+            .collect::<Vec<_>>(),
+        [
+            (Kind::Video, 1_000_000, true),
+            (Kind::Video, 1_033_333, false),
+            (Kind::Opus, 1_000_000, false)
+        ]
+    );
+    assert!(after[0].payload.windows(5).any(|w| w == [0, 0, 0, 1, 0x67]));
+    assert!(after[0].payload.windows(5).any(|w| w == [0, 0, 0, 1, 0x68]));
+    assert_eq!(
+        reset_count, 2,
+        "fresh conversion state restores parameter sets after reattach"
+    );
+    assert_eq!(
+        ring.stats().dropped_video,
+        1,
+        "only the stale delta before the queued IDR is discarded"
+    );
 }

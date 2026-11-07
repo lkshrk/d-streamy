@@ -119,6 +119,28 @@ pub struct VoiceStateSnapshot {
     pub self_stream: bool,
 }
 
+/// VOICE_STATE_UPDATE of a member other than the mock's user; `None` leaves voice.
+pub(crate) fn other_user_voice_state(
+    user_id: &str,
+    guild_id: &str,
+    channel_id: Option<&str>,
+) -> Value {
+    let state = VoiceStateSnapshot {
+        guild_id: guild_id.to_owned(),
+        channel_id: channel_id.unwrap_or_default().to_owned(),
+        session_id: crate::util::random_hex(16),
+        self_mute: false,
+        self_deaf: false,
+        self_video: false,
+        self_stream: false,
+    };
+    let mut payload = state.dispatch(user_id);
+    if channel_id.is_none() {
+        payload["channel_id"] = Value::Null;
+    }
+    payload
+}
+
 impl VoiceStateSnapshot {
     pub(crate) fn dispatch(&self, user_id: &str) -> Value {
         json!({
@@ -150,6 +172,10 @@ pub struct StreamSnapshot {
 #[derive(Debug)]
 pub(crate) enum Control {
     Send(String),
+    /// A sequenced voice gateway text op; ignored on the main gateway.
+    VoiceJson(u8, Value),
+    /// A sequenced voice gateway binary op; ignored on the main gateway.
+    VoiceBinary(u8, Vec<u8>),
     /// `None` drops the TCP connection without a close frame.
     Close(Option<u16>),
     /// Ends the voice session, then drops TCP without a close frame, as an RST that lost the close frame would look.
@@ -192,6 +218,8 @@ pub(crate) struct State {
     pub before_join_answer: Vec<Value>,
     /// Applied between the next join's VOICE_STATE_UPDATE and its VOICE_SERVER_UPDATE.
     pub move_during_join: Option<(String, String)>,
+    /// Other members' voice states dispatched after `move_during_join`, before the VOICE_SERVER_UPDATE.
+    pub others_during_join: Vec<Value>,
     pub kick_during_join: bool,
     pub defer_join: bool,
     pub deferred_join: Option<Value>,
@@ -200,6 +228,7 @@ pub(crate) struct State {
     pub reset_voice_on_stream_create: bool,
     pub ignore_stream_creates: usize,
     pub quiet_set_paused: bool,
+    pub accept_repeated_select_protocol: bool,
 }
 
 pub(crate) struct Shared {

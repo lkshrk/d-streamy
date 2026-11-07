@@ -154,11 +154,7 @@ id_ed25519
 # Build artifacts
 bin/
 dist/
-node_modules/
 .build/
-
-# Swift
-capture/.build/
 
 # Docs (local only, except ADRs and the spec register)
 docs/*

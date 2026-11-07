@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dstreamy_core::{MetricsSampler, PipelineStats, StreamHealth, StreamMetrics};
-use dstreamy_media::{CaptureConfig, CaptureSource};
+use dstreamy_media::{CaptureConfig, CaptureSource, MediaError};
 use rand::Rng;
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -17,7 +17,8 @@ use crate::DiscordClient;
 use crate::gateway::{GatewayEvent, VoiceState};
 use crate::stream::pump::{MediaPump, TASK_JOIN_TIMEOUT};
 use crate::stream::{
-    Events, StreamError, StreamOptions, StreamStats, initial_attributes, join_voice, open_stream,
+    E2ee, Events, StreamError, StreamOptions, StreamStats, e2ee_of, initial_attributes, join_voice,
+    open_stream,
 };
 use crate::transport::{MediaConnection, VideoAttributes, VoiceEvent};
 use crate::viewers::Viewers;
@@ -65,6 +66,8 @@ pub enum StopReason {
     },
     /// Another device of this account joined voice; Discord allows one voice connection per user.
     VoiceTakenOver,
+    /// `require_e2ee` is set and Discord offered no end-to-end encryption for the stream.
+    E2eeUnavailable,
 }
 
 impl fmt::Display for StopReason {
@@ -76,6 +79,9 @@ impl fmt::Display for StopReason {
             Self::GaveUp { attempts } => write!(f, "gave up after {attempts} reconnect attempts"),
             Self::SourceFailed { message } => write!(f, "the capture source failed: {message}"),
             Self::VoiceTakenOver => f.write_str("another device of this account joined voice"),
+            Self::E2eeUnavailable => {
+                f.write_str("Discord offers no end-to-end encryption for this stream")
+            }
         }
     }
 }
@@ -96,6 +102,11 @@ pub enum SessionEvent {
     },
     /// A voice or stream WebSocket dropped and resumed in place.
     Resumed,
+    /// Whether media leaves end-to-end encrypted; sent when a stream connection is up and whenever it changes.
+    E2ee {
+        state: E2ee,
+        dave_protocol_version: u16,
+    },
     Error {
         message: String,
         fatal: bool,
@@ -109,7 +120,7 @@ pub struct HealthSnapshot {
     pub stats: StreamStats,
 }
 
-/// Exponential backoff with 50–100 % jitter; the defaults follow `src/core/stream.ts`.
+/// Exponential backoff with 50–100 % jitter; the defaults follow the Bun daemon this crate replaced.
 #[derive(Debug, Clone, Copy)]
 pub struct Backoff {
     pub base: Duration,
@@ -225,6 +236,7 @@ pub struct Session {
     commands: mpsc::UnboundedSender<Command>,
     state: watch::Receiver<SessionState>,
     events: broadcast::Sender<SessionEvent>,
+    terminal_stats: watch::Receiver<Option<StreamStats>>,
     task: JoinHandle<()>,
 }
 
@@ -233,11 +245,13 @@ impl Session {
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let (state_tx, state) = watch::channel(SessionState::Idle);
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
+        let (terminal_tx, terminal_stats) = watch::channel(None);
         let actor = Actor {
             client,
             commands: commands_rx,
             state: state_tx,
             events: events.clone(),
+            terminal_stats: terminal_tx,
             retained: None,
         };
         let task = tokio::spawn(actor.run());
@@ -245,8 +259,17 @@ impl Session {
             commands,
             state,
             events,
+            terminal_stats,
             task,
         }
+    }
+
+    /// Final counters of the stopped run, or a lower bound with `last_error` if teardown failed.
+    /// Cleared when the next run starts; never returns an older run's totals while active.
+    pub fn terminal_stats(&self) -> Option<StreamStats> {
+        matches!(*self.state.borrow(), SessionState::Stopped { .. })
+            .then(|| self.terminal_stats.borrow().clone())
+            .flatten()
     }
 
     pub fn state(&self) -> watch::Receiver<SessionState> {
@@ -366,6 +389,7 @@ struct Actor {
     commands: mpsc::UnboundedReceiver<Command>,
     state: watch::Sender<SessionState>,
     events: broadcast::Sender<SessionEvent>,
+    terminal_stats: watch::Sender<Option<StreamStats>>,
     retained: Option<Box<dyn CaptureSource>>,
 }
 
@@ -383,6 +407,7 @@ impl Actor {
                     if matches!(*self.state.borrow(), SessionState::Stopped { .. }) {
                         self.retained = None;
                     }
+                    self.terminal_stats.send_replace(None);
                     let _ = reply.send(Ok(()));
                     let run = Run::new(&self, guild_id, channel_id, *options);
                     let ended = run.drive(&mut self, source).await;
@@ -496,6 +521,8 @@ struct Run {
     /// The latest voice state held back while not `joined`.
     unacked: Option<VoiceState>,
     viewers: Viewers,
+    /// The E2EE state last reported, so the event goes out on changes only.
+    e2ee: Option<(E2ee, u16)>,
 }
 
 impl Run {
@@ -521,6 +548,7 @@ impl Run {
             joined: false,
             unacked: None,
             viewers: Viewers::default(),
+            e2ee: None,
         };
         run.viewers.expect(
             run.guild_id.as_deref(),
@@ -542,7 +570,7 @@ impl Run {
         health.set_missed_tick_behavior(MissedTickBehavior::Delay);
         health.reset();
 
-        let (reason, stop_reply, exit) = 'run: loop {
+        let (mut reason, stop_reply, exit) = 'run: loop {
             tokio::select! {
                 biased;
                 command = actor.commands.recv() => match command {
@@ -580,7 +608,7 @@ impl Run {
                             let _ = reply.send(Ok(()));
                             continue;
                         };
-                        match self.restart_pump(conn, true).await {
+                        match self.restart_pump(actor, conn, true).await {
                             Ok(()) => {
                                 let _ = reply.send(Ok(()));
                             }
@@ -633,7 +661,7 @@ impl Run {
                             }
                             match self.pump.as_ref() {
                                 Some(_) if self.reconfigure_pending => {
-                                    if let Err((src, e)) = self.restart_pump(conn, false).await {
+                                    if let Err((src, e)) = self.restart_pump(actor, conn, false).await {
                                         source = src;
                                         let message = e.to_string();
                                         actor.error(format!("capture source failed to restart: {message}"), true);
@@ -672,6 +700,14 @@ impl Run {
                             }
                             phase = Phase::Streaming;
                             actor.set_state(SessionState::Streaming);
+                            self.report_e2ee(actor);
+                        }
+                        Err(StreamError::E2eeUnavailable(version)) => {
+                            actor.error(
+                                format!("Discord offers no end-to-end encryption for this stream (DAVE protocol {version}); refusing to stream unencrypted"),
+                                true,
+                            );
+                            break (StopReason::E2eeUnavailable, None, false);
                         }
                         Err(e) => {
                             actor.error(format!("connecting failed: {e}"), false);
@@ -706,10 +742,15 @@ impl Run {
                         actor.error("capture source ended", true);
                         break (StopReason::CaptureEnded, None, false);
                     }
-                    if matches!(phase, Phase::Streaming)
-                        && let Some(snapshot) = self.sample()
-                    {
-                        actor.emit(SessionEvent::Health(snapshot));
+                    if matches!(phase, Phase::Streaming) {
+                        if self.stream.as_ref().is_some_and(|(conn, _)| conn.e2ee_unavailable().is_some()) {
+                            actor.error("end-to-end encryption became unavailable; stopped before sending unencrypted media", true);
+                            break (StopReason::E2eeUnavailable, None, false);
+                        }
+                        self.report_e2ee(actor);
+                        if let Some(snapshot) = self.sample() {
+                            actor.emit(SessionEvent::Health(snapshot));
+                        }
                     }
                 }
             }
@@ -726,13 +767,30 @@ impl Run {
             self.client.leave_voice();
         }
         if let Some(pump) = self.pump.take() {
+            let final_stats = pump.stats_updater();
             let (stopped, result) = pump.stop().await;
-            if let Err(e) = result {
-                actor.error(format!("stopping the capture source: {e}"), false);
+            self.remember_terminal_stats(actor, final_stats.stats(), result.as_ref().err());
+            match result {
+                Err(e) if reason == StopReason::CaptureEnded => {
+                    let message = match e {
+                        StreamError::Media(MediaError::Backend(message)) => message,
+                        e => e.to_string(),
+                    };
+                    reason = StopReason::SourceFailed { message };
+                }
+                Err(e) => actor.error(format!("stopping the capture source: {e}"), false),
+                Ok(_) => {}
             }
             source = stopped.or(source);
         }
         self.viewers.reset();
+        if let StopReason::SourceFailed { message } = &reason {
+            actor.terminal_stats.send_modify(|stats| {
+                if let Some(stats) = stats {
+                    stats.last_error = Some(message.clone());
+                }
+            });
+        }
         actor.set_state(SessionState::Stopped { reason });
         Ended {
             source,
@@ -790,11 +848,34 @@ impl Run {
             pump.detach();
         }
         self.stream = None;
+        self.e2ee = None;
         self.client.stop_stream();
         if redo == Redo::Voice {
             self.drop_voice();
         }
         self.wait(actor, redo, attempt)
+    }
+
+    fn report_e2ee(&mut self, actor: &Actor) {
+        let Some((conn, _)) = &self.stream else {
+            return;
+        };
+        let current = e2ee_of(conn);
+        if self.e2ee == Some(current) {
+            return;
+        }
+        self.e2ee = Some(current);
+        let (state, dave_protocol_version) = current;
+        if state != E2ee::Encrypted {
+            warn!(
+                dave_protocol_version,
+                "media is not end-to-end encrypted on this stream connection"
+            );
+        }
+        actor.emit(SessionEvent::E2ee {
+            state,
+            dave_protocol_version,
+        });
     }
 
     /// Discord may not answer a join for the channel the account is still in, so the rejoin must follow a leave.
@@ -819,12 +900,12 @@ impl Run {
                 return Ok(None);
             }
             Some(VoiceEvent::Closed { code }) => {
-                let name = if kind == Redo::Voice {
-                    "voice"
-                } else {
-                    "stream"
-                };
+                let name = connection_name(kind);
                 actor.error(format!("{name} connection closed (code {code:?})"), false);
+            }
+            Some(VoiceEvent::MediaFailed { reason }) => {
+                let name = connection_name(kind);
+                actor.error(format!("{name} media path failed: {reason}"), false);
             }
             Some(_) => return Ok(None),
             None => {}
@@ -848,6 +929,7 @@ impl Run {
             pump.detach();
         }
         self.stream = None;
+        self.e2ee = None;
         self.client.stop_stream();
         // A failed stream-only retry may mean voice is gone too; the reference always rejoins.
         self.drop_voice();
@@ -865,6 +947,9 @@ impl Run {
                 Gateway::Phase(self.reconnect(actor, phase, Redo::Voice))
             }
             Some(GatewayEvent::VoiceStateUpdate(state)) => {
+                if state.user_id != self.client.user().id {
+                    return Gateway::Handled;
+                }
                 if self.is_other_session(&state) {
                     if state.channel_id.is_some() {
                         actor.error("another device of this account joined voice", true);
@@ -922,6 +1007,7 @@ impl Run {
                     pump.detach();
                 }
                 self.stream = None;
+                self.e2ee = None;
                 let attempt = match phase {
                     Phase::Streaming => 1,
                     Phase::Connecting { attempt, .. } | Phase::Waiting { attempt, .. } => {
@@ -944,9 +1030,24 @@ impl Run {
         }
     }
 
+    fn remember_terminal_stats(
+        &self,
+        actor: &Actor,
+        mut stats: StreamStats,
+        error: Option<&StreamError>,
+    ) {
+        stats.viewers = None;
+        (stats.e2ee, stats.dave_protocol_version) = self.e2ee.unwrap_or_default();
+        if let Some(error) = error {
+            stats.last_error = Some(error.to_string());
+        }
+        actor.terminal_stats.send_replace(Some(stats));
+    }
+
     /// Restarts the source with the current capture config on `conn`, continuing the pump's timeline.
     async fn restart_pump(
         &mut self,
+        actor: &Actor,
         conn: MediaConnection,
         same_connection: bool,
     ) -> Result<(), (Option<Box<dyn CaptureSource>>, StreamError)> {
@@ -954,7 +1055,9 @@ impl Run {
         let Some(pump) = self.pump.take() else {
             return Ok(());
         };
+        let final_stats = pump.stats_updater();
         let (source, mut resume, stopped) = pump.stop_resumable().await;
+        self.remember_terminal_stats(actor, final_stats.stats(), stopped.as_ref().err());
         let Some(source) = source else {
             return Err((None, StreamError::SourceLost));
         };
@@ -981,6 +1084,7 @@ impl Run {
         self.sampler.reset();
         self.history.clear();
         self.pump = Some(pump);
+        actor.terminal_stats.send_replace(None);
         Ok(())
     }
 
@@ -1015,19 +1119,15 @@ impl Run {
 
     fn sample(&mut self) -> Option<HealthSnapshot> {
         let pump = self.pump.as_ref()?;
+        let (e2ee, dave_protocol_version) = self.e2ee.unwrap_or_default();
         let stats = StreamStats {
             viewers: self.viewers.count(),
+            e2ee,
+            dave_protocol_version,
             ..pump.stats()
         };
         let jitter = pump.take_frame_intervals();
-        let cumulative = PipelineStats {
-            frame_count: stats.video_frames_sent + stats.video_frames_dropped,
-            bytes_sent: stats.bytes_sent,
-            audio_frames_encoded: stats.audio_frames_sent + stats.audio_frames_dropped,
-            audio_frames_sent: stats.audio_frames_sent,
-            audio_frames_dropped_not_ready: stats.audio_frames_dropped,
-            audio_encode_errors: 0,
-        };
+        let cumulative = pipeline_stats(&stats);
         let metrics = self.sampler.sample(Instant::now(), cumulative, jitter)?;
         self.history.push(metrics);
         let excess = self
@@ -1040,6 +1140,30 @@ impl Run {
             health: StreamHealth::compute(&self.history, self.attrs.fps),
             stats,
         })
+    }
+}
+
+fn pipeline_stats(stats: &StreamStats) -> PipelineStats {
+    PipelineStats {
+        frame_count: stats
+            .video_frames_sent
+            .saturating_add(stats.video_frames_dropped)
+            .saturating_add(stats.source_video_frames_dropped),
+        bytes_sent: stats.bytes_sent,
+        audio_frames_encoded: stats
+            .audio_frames_sent
+            .saturating_add(stats.audio_frames_dropped)
+            .saturating_add(stats.source_audio_frames_dropped),
+        audio_frames_sent: stats.audio_frames_sent,
+        audio_frames_dropped_not_ready: stats.audio_frames_dropped,
+        audio_encode_errors: 0,
+    }
+}
+
+fn connection_name(kind: Redo) -> &'static str {
+    match kind {
+        Redo::Voice => "voice",
+        Redo::Stream => "stream",
     }
 }
 
@@ -1096,6 +1220,46 @@ async fn next_event(conn: &mut Option<(MediaConnection, Events)>) -> Option<Voic
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_losses_affect_video_health_without_becoming_network_not_ready_audio() {
+        let mut sampler = MetricsSampler::new();
+        let now = Instant::now();
+        assert!(
+            sampler
+                .sample(
+                    now,
+                    pipeline_stats(&StreamStats::default()),
+                    Default::default()
+                )
+                .is_none()
+        );
+        let stats = StreamStats {
+            video_frames_sent: 30,
+            video_frames_dropped: 2,
+            audio_frames_sent: 48,
+            audio_frames_dropped: 1,
+            source_video_frames_dropped: 3,
+            source_audio_frames_dropped: 4,
+            ..Default::default()
+        };
+        let metrics = sampler
+            .sample(
+                now + Duration::from_secs(1),
+                pipeline_stats(&stats),
+                dstreamy_core::FrameIntervalSnapshot {
+                    samples: 30,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(metrics.fps, 30);
+        assert_eq!(metrics.v_drop, 5);
+        assert_eq!(metrics.a_enc, 53);
+        assert_eq!(metrics.a_sent, 48);
+        assert_eq!(metrics.a_drop_not_ready, 1);
+        assert_eq!(stats.audio_frames_dropped, 1);
+    }
 
     #[test]
     fn backoff_doubles_with_jitter_up_to_the_cap() {

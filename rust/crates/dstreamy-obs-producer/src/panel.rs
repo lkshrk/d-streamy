@@ -16,6 +16,7 @@ use crate::mixer::{
 };
 use crate::status_bar::{StatusBar, status_bar};
 
+/// A picker entry: id, label and whether it is picked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Item {
     pub id: String,
@@ -32,6 +33,7 @@ pub struct Choices {
     pub enabled: bool,
 }
 
+/// An audio track in the track picker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TrackItem {
     pub track: u8,
@@ -39,6 +41,7 @@ pub struct TrackItem {
     pub selected: bool,
 }
 
+/// A question with its buttons, shown before an action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Confirm {
     pub text: String,
@@ -48,6 +51,7 @@ pub struct Confirm {
     pub instead: Option<TrackAction>,
 }
 
+/// A track button in the audio section and what it does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TrackAction {
     pub track: u8,
@@ -61,6 +65,7 @@ pub struct Notice {
     pub release: Option<TrackAction>,
 }
 
+/// An OBS audio source and whether it feeds the managed track.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Source {
     pub uuid: String,
@@ -68,6 +73,7 @@ pub struct Source {
     pub on: bool,
 }
 
+/// The audio track section of the view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Audio {
     pub title: String,
@@ -83,6 +89,7 @@ pub struct Audio {
     pub notices: Vec<Notice>,
 }
 
+/// What the login button does in its current state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoginAction {
@@ -97,9 +104,13 @@ pub struct Login {
     pub action: LoginAction,
 }
 
+/// The login button while a login window is open.
 pub const CANCEL_LOGIN: &str = "Cancel login";
+/// Label in front of the account picker.
 pub const ACCOUNT_LABEL: &str = "Account";
+/// The account row's Log out button.
 pub const LOG_OUT: &str = "Log out";
+/// Shown for a saved server the account is no longer in.
 pub const NOT_AVAILABLE: &str = "Not available";
 
 /// Log out's confirm question for `name`.
@@ -107,11 +118,17 @@ pub fn logout_question(name: &str) -> String {
     format!("Log out {name}?")
 }
 
+/// The main button while idle.
 pub const GO_LIVE: &str = "Go live";
+/// The main button while live.
 pub const STOP: &str = "Stop";
+/// The confirm's cancel button.
 pub const CANCEL: &str = "Cancel";
+/// The question Stop asks.
 pub const STOP_QUESTION: &str = "Stop the Discord stream?";
+/// Theme icon name of the main button while idle.
 pub const PLAY_ICON: &str = "player-play";
+/// Theme icon name of the main button while live.
 pub const STOP_ICON: &str = "player-stop";
 
 /// The question Start or Stop asks before it acts.
@@ -124,7 +141,7 @@ pub struct StreamConfirm {
     pub default_ok: bool,
 }
 
-/// "Go live in <channel> on <server>?", naming the account once serve has more than one.
+/// `"Go live in <channel> on <server>?"`, naming the account once serve has more than one.
 pub fn go_live_question(m: &DockModel) -> String {
     let settings = m.settings();
     let name = |list: &[Named], id: Option<&str>| {
@@ -147,6 +164,7 @@ pub fn go_live_question(m: &DockModel) -> String {
     }
 }
 
+/// The question Start or Stop asks for the model's current state.
 pub fn stream_confirm(m: &DockModel, action: Action) -> StreamConfirm {
     match action {
         Action::Start => StreamConfirm {
@@ -199,6 +217,7 @@ fn control(m: &DockModel, dock: &DockView, controls: bool) -> Control {
     }
 }
 
+/// An account in the account picker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AccountItem {
     pub name: String,
@@ -264,6 +283,7 @@ pub fn account_row(m: &DockModel) -> Option<AccountRow> {
     })
 }
 
+/// The whole view JSON for the status-bar panel and the settings dialog (ADR 0007).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PanelView {
     pub tone: Tone,
@@ -283,10 +303,14 @@ pub struct PanelView {
     pub account: Option<AccountRow>,
 }
 
+/// State line while the lists load.
 pub const LOADING: &str = "Loading…";
+/// State line while no server and channel are picked.
 pub const NOT_SET_UP: &str = "Not set up";
+/// Fix line under `NOT_SET_UP`.
 pub const NOT_SET_UP_FIX: &str = "Pick a server and voice channel below";
-pub const NO_AUDIO_CONTROLS: &str = "D-Streamy can't change Discord audio on Windows yet.";
+/// Audio section line on Windows, where the plugin cannot touch the mixer.
+pub const NO_AUDIO_CONTROLS: &str = "D-Streamy for OBS is not supported on Windows yet.";
 
 fn choices(
     list: &[Named],
@@ -504,6 +528,15 @@ pub fn panel_view(
     } else {
         state_fix
     };
+    let state_fix = if live
+        .and_then(|s| s.service)
+        .is_some_and(|s| s.e2ee == crate::live::Encryption::Unencrypted)
+        && !state_fix.contains("Discord can read this stream")
+    {
+        format!("{state_fix} · Unencrypted: Discord can read this stream")
+    } else {
+        state_fix
+    };
     PanelView {
         tone: dock.tone,
         mark: dock.mark,
@@ -607,6 +640,169 @@ mod tests {
 
     fn view(s: &ConfigState) -> PanelView {
         panel_view(s, true, None, &sources(), false)
+    }
+
+    #[test]
+    fn failed_output_cleanup_is_visible_until_a_later_stop_succeeds() {
+        use crate::live::Encryption;
+        let mut state = live(picked(true));
+        let failure = "The output stopped; the Discord session may still be live; press Stop";
+        state.model.output_ended(Err(failure.into()));
+        let stats = LiveStats {
+            service: Some(ServiceHealth {
+                e2ee: Encryption::Unencrypted,
+                ..ServiceHealth::default()
+            }),
+            ..LiveStats::default()
+        };
+        let panel = panel_view(&state, true, Some(&stats), &mic_on_track_6(), false);
+        assert_eq!(
+            panel.state_line, "Stream stopped",
+            "terminal failure precedes mic and encryption warnings"
+        );
+        assert_eq!(panel.tone, Tone::Attention);
+        assert!(
+            panel
+                .state_fix
+                .starts_with("Press Stop to end the Discord session")
+        );
+        assert!(panel.state_tooltip.contains(failure));
+        assert_eq!(panel.button.action, crate::dock_view::Action::Stop);
+        assert!(panel.button.enabled);
+        state.model.stop().unwrap();
+        state.model.stopped(Ok(()));
+        let panel = panel_view(&state, true, None, &sources(), false);
+        assert_eq!(panel.tone, Tone::Idle);
+        assert!(!panel.state_tooltip.contains(failure));
+        assert_eq!(panel.button.action, crate::dock_view::Action::Start);
+        assert!(panel.button.enabled);
+    }
+
+    #[test]
+    fn encryption_downgrades_recovery_and_unknown_states_update_without_latching() {
+        use crate::live::Encryption;
+        let state = live(picked(true));
+        for (wire, reconnecting, version, expected) in [
+            (
+                "encrypted",
+                false,
+                serde_json::json!(1),
+                Encryption::Encrypted,
+            ),
+            (
+                "unencrypted",
+                false,
+                serde_json::json!(0),
+                Encryption::Unencrypted,
+            ),
+            (
+                "encrypted",
+                false,
+                serde_json::json!(1),
+                Encryption::Encrypted,
+            ),
+            (
+                "encrypted",
+                true,
+                serde_json::json!(null),
+                Encryption::Unknown,
+            ),
+            (
+                "future_state",
+                false,
+                serde_json::json!(99),
+                Encryption::Unknown,
+            ),
+        ] {
+            let event = serde_json::json!({"type":"health", "reconnecting":reconnecting, "reconnects":1, "e2ee":wire, "dave_protocol_version":version});
+            let health = ServiceHealth::from_event(&event).unwrap();
+            assert_eq!(health.e2ee, expected);
+            let stats = LiveStats {
+                service: Some(health),
+                ..LiveStats::default()
+            };
+            let panel = panel_view(&state, true, Some(&stats), &sources(), false);
+            assert_eq!(
+                panel.state_line.contains("Unencrypted"),
+                expected == Encryption::Unencrypted
+            );
+            assert_eq!(
+                panel.status.counters.len(),
+                4,
+                "the existing counters stay visible"
+            );
+        }
+        for event in [
+            serde_json::json!({"reconnecting":false,"reconnects":0}),
+            serde_json::json!({"reconnecting":false,"reconnects":0,"e2ee":123,"dave_protocol_version":65536}),
+        ] {
+            let health = ServiceHealth::from_event(&event).unwrap();
+            assert_eq!(health.e2ee, Encryption::Unknown);
+            assert_eq!(health.dave_protocol_version, None);
+        }
+        let stats = LiveStats {
+            service: None,
+            ..LiveStats::default()
+        };
+        assert!(
+            !panel_view(&state, true, Some(&stats), &sources(), false)
+                .state_line
+                .contains("Unencrypted")
+        );
+    }
+
+    #[test]
+    fn ring_audio_losses_are_separate_from_video_losses_and_dropout_intervals() {
+        let state = live(picked(true));
+        let stats = LiveStats {
+            dropped: 2,
+            dropped_audio: 7,
+            service: Some(ServiceHealth {
+                dropped_video: 3,
+                audio_dropouts: Some(4),
+                ..ServiceHealth::default()
+            }),
+            ..LiveStats::default()
+        };
+        let panel = panel_view(&state, true, Some(&stats), &sources(), false);
+        assert!(
+            panel
+                .state_tooltip
+                .contains("Missed frames: 5 (2 in OBS, 3 in the service)")
+        );
+        assert!(panel.state_tooltip.contains("Audio dropouts: 4"));
+        assert!(
+            panel
+                .state_tooltip
+                .contains("7 audio packets dropped in OBS")
+        );
+        assert_eq!(stats.missed(), 5);
+    }
+
+    #[test]
+    fn producer_encryption_health_reaches_the_visible_panel_and_accessible_details() {
+        let state = live(picked(true));
+        let health = serde_json::json!({"type":"health", "reconnecting":false, "reconnects":0, "e2ee":"unencrypted", "dave_protocol_version":0});
+        let stats = LiveStats {
+            service: ServiceHealth::from_event(&health),
+            ..LiveStats::default()
+        };
+        let panel = panel_view(&state, true, Some(&stats), &sources(), false);
+        assert!(
+            panel.state_line.contains("Unencrypted"),
+            "{}",
+            panel.state_line
+        );
+        assert!(
+            panel.state_tooltip.contains("Unencrypted"),
+            "{}",
+            panel.state_tooltip
+        );
+        assert!(
+            panel.status.tooltip.contains("DAVE version 0"),
+            "{}",
+            panel.status.tooltip
+        );
     }
 
     #[test]
@@ -840,7 +1036,10 @@ mod tests {
             secs: 630,
         }));
         let v = view(&s);
-        assert_eq!(v.state_fix, "Check the service, then retry");
+        #[cfg(target_os = "linux")]
+        assert_eq!(v.state_fix, "Run `dstreamy service status`");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(v.state_fix, "Check that `dstreamy serve` runs");
         assert_eq!(v.login, Some(log_in("Log in again")));
         s.model.begin_login();
         s.model.login_finished(Err(ControlError::LoginRunning));

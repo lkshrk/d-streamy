@@ -267,13 +267,20 @@ fn install_writes_the_unit_then_reloads_and_enables_it_and_uninstall_reverses_it
     );
 }
 
-/// Waits 300 ms and checks that `child` still runs, so a failed start can't pass as a match.
-fn alive(mut child: Child) -> KillOnDrop {
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "the process exited early"
-    );
+/// Waits until `child`, a `serve`, listens on `socket`, so a failed start can't pass as a match.
+fn listening(mut child: Child, socket: &Path) -> KillOnDrop {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while std::os::unix::net::UnixStream::connect(socket).is_err() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("serve {status} before listening on {}", socket.display());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "serve never listened on {}",
+            socket.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     KillOnDrop(child)
 }
 
@@ -290,7 +297,12 @@ fn serve_like_the_unit(fake: &Fake, extra: &[&str]) -> (KillOnDrop, TempDir) {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    (alive(child), runtime)
+    let socket = extra.iter().position(|a| *a == "--endpoint").map_or_else(
+        || runtime.path().join("dstreamy/serve.sock"),
+        |i| PathBuf::from(extra[i + 1]),
+    );
+    let serve = listening(child, &socket);
+    (serve, runtime)
 }
 
 fn reinstall_over(fake: &Fake, show: &str) -> Value {
@@ -401,6 +413,31 @@ fn install_refuses_a_symlink_at_the_unit_path() {
             .file_type()
             .is_symlink()
     );
+    assert_eq!(fake.actions(), "");
+}
+
+#[test]
+fn uninstall_leaves_a_symlink_at_the_unit_path_alone() {
+    let fake = Fake::new();
+    let theirs = fake.dir.path().join("dotfiles.service");
+    fs::write(&theirs, "theirs").unwrap();
+    fs::create_dir_all(fake.unit_dir()).unwrap();
+    std::os::unix::fs::symlink(&theirs, fake.unit_path()).unwrap();
+    fake.answer_show(&running(std::process::id()));
+    for args in [
+        &["service", "uninstall"][..],
+        &["service", "uninstall", "--dry-run"],
+    ] {
+        let stderr = failure(&fake.run(args));
+        assert!(stderr.contains("is a symbolic link"), "{stderr}");
+    }
+    assert!(
+        fs::symlink_metadata(fake.unit_path())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_to_string(&theirs).unwrap(), "theirs");
     assert_eq!(fake.actions(), "");
 }
 
@@ -606,7 +643,7 @@ fn a_service_whose_binary_was_replaced_at_the_same_path_is_restarted() {
     let fake = Fake::new();
     let exe = copy_of_dstreamy_in(&fake.dir.path().join("bin"));
     let runtime = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let old = alive(
+    let old = listening(
         Command::new(&exe)
             .arg("serve")
             .env("XDG_RUNTIME_DIR", runtime.path())
@@ -616,6 +653,7 @@ fn a_service_whose_binary_was_replaced_at_the_same_path_is_restarted() {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap(),
+        &runtime.path().join("dstreamy/serve.sock"),
     );
     stdout(
         &fake
@@ -742,11 +780,20 @@ impl Drop for KillOnDrop {
 fn status_finds_the_socket_under_the_services_runtime_directory() {
     let fake = Fake::new();
     fake.answer_show(&running(std::process::id()));
-    let real_parent = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let home = std::env::var_os("HOME").unwrap();
+    let real_parent = tempfile::Builder::new()
+        .prefix(".svc-")
+        .tempdir_in(&home)
+        .unwrap();
+    fs::set_permissions(real_parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let run = real_parent.path().join("run");
     fs::create_dir(&run).unwrap();
     fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
-    let link_parent = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let link_parent = tempfile::Builder::new()
+        .prefix(".svc-")
+        .tempdir_in(&home)
+        .unwrap();
+    fs::set_permissions(link_parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let link = link_parent.path().join("link");
     std::os::unix::fs::symlink(real_parent.path(), &link).unwrap();
     let runtime = link.join("run");

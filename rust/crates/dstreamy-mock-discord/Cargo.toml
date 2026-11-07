@@ -22,9 +22,9 @@ tracing = "0.1"
 webrtc = "0.14"
 
 [dev-dependencies]
-discord-stream-rs = { path = "../../vendor/discord-stream-rs" }
-dstreamy-discord = { path = "../dstreamy-discord" }
-dstreamy-media = { path = "../dstreamy-media" }
+discord-stream-rs = { path = "../../vendor/discord-stream-rs", features = ["test-hooks"] }
+dstreamy-discord = { path = "../dstreamy-discord", features = ["test-hooks"] }
+dstreamy-media = { path = "../dstreamy-media", features = ["openh264"] }
 secrecy = "0.10"
 tokio = { version = "1", features = ["full"] }
 

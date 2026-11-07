@@ -25,6 +25,8 @@
 #include <util/threading.h>
 #include <util/util_uint64.h>
 
+#include "events.h"
+
 #define TRACE_OUTPUT_ID "dstreamy_trace_recorder"
 #define AUDIO_SOURCE_ID "dstreamy_harness_audio"
 #define SETTINGS_SOURCE_ID "dstreamy_settings"
@@ -64,11 +66,12 @@ struct harness_args {
 	const char *expect_error;
 	const char *dump_encoder_settings;
 	const char *restart_video_settings;
-const char *restart_output_settings;
+	const char *restart_output_settings;
 	const char *format;
 	bool no_encoders;
 	bool stream_output;
 	bool report_ui;
+	bool observation_framing;
 	const char *fake_frontend;
 	const char *module_config;
 	const char *settings_update;
@@ -125,13 +128,18 @@ static os_event_t *full_event;
 
 static volatile long settles;
 
+static void on_settings_settled(void *param, calldata_t *cd)
+{
+	UNUSED_PARAMETER(param);
+	UNUSED_PARAMETER(cd);
+	os_atomic_inc_long(&settles);
+}
+
 static void log_handler(int lvl, const char *msg, va_list va, void *param)
 {
 	UNUSED_PARAMETER(param);
 	char buf[4096];
 	vsnprintf(buf, sizeof(buf), msg, va);
-	if (strstr(buf, "[obs-dstreamy] settled the settings dialog"))
-		os_atomic_inc_long(&settles);
 	if (lvl <= LOG_ERROR) {
 		if (strstr(buf, PLUGIN_PANIC_LOG))
 			os_atomic_inc_long(&plugin_panics_logged);
@@ -570,13 +578,11 @@ static void on_output_stop(void *param, calldata_t *cd)
 		stop_error = bstrdup(err ? err : "");
 		stop_code = code;
 	}
-	if (code != OBS_OUTPUT_SUCCESS) {
-		const char *err = calldata_string(cd, "last_error");
-		if (args.expect_error)
-			printf("HARNESS output stopped with code %lld: %s\n", code, err ? err : "(none)");
-		else
-			harness_error("output stopped with code %lld: %s", code, err ? err : "(none)");
-	}
+	const char *err = calldata_string(cd, "last_error");
+	harness_report("output_stop", "code message", "HARNESS output stopped with code %lld: %s\n", code,
+		       err ? err : "(none)");
+	if (code != OBS_OUTPUT_SUCCESS && !args.expect_error)
+		harness_error("output stopped with code %lld: %s", code, err ? err : "(none)");
 	os_event_signal(stopped_event);
 	os_event_signal(full_event);
 }
@@ -584,7 +590,8 @@ static void on_output_stop(void *param, calldata_t *cd)
 static void on_tools_output_stop(void *param, calldata_t *cd)
 {
 	UNUSED_PARAMETER(param);
-	printf("HARNESS tools output_stopped code=%lld\n", calldata_int(cd, "code"));
+	harness_report("tools_output_stopped", "code", "HARNESS tools output_stopped code=%lld\n",
+		       calldata_int(cd, "code"));
 	fflush(stdout);
 }
 
@@ -592,7 +599,7 @@ static void on_output_start(void *param, calldata_t *cd)
 {
 	UNUSED_PARAMETER(param);
 	UNUSED_PARAMETER(cd);
-	printf("HARNESS capture_start_ns=%" PRIu64 "\n", os_gettime_ns());
+	harness_report("capture_start", "ns", "HARNESS capture_start_ns=%" PRIu64 "\n", os_gettime_ns());
 }
 
 static enum video_format canvas_format(void)
@@ -662,6 +669,7 @@ static void usage(void)
 		"   managing a track Discord doesn't get)]\n"
 		"  [--audio-mixers MASK (route the harness audio source to these mixer tracks only, as Advanced Audio\n"
 		"   Properties > Tracks does: bit 0 is Track 1; default all six)]\n"
+		"  [--observation-framing (concurrent C and Rust test-hook records, then exit)]\n"
 		"  [--dump-encoder-settings DIR (write every H.264 encoder's defaults and properties as JSON, then exit)]\n"
 		"  [--bitrate KBPS] [--audio-bitrate KBPS]\n"
 		"  [--bf N] [--keyint-sec N] [--profile NAME] [--preset NAME] [--graphics MODULE]\n"
@@ -705,6 +713,10 @@ static int parse_args(int argc, char **argv)
 		if (strcmp(a, "--help") == 0) {
 			usage();
 			return 0;
+		}
+		if (strcmp(a, "--observation-framing") == 0) {
+			args.observation_framing = true;
+			continue;
 		}
 		if (strcmp(a, "--no-encoders") == 0) {
 			args.no_encoders = true;
@@ -807,7 +819,7 @@ static int parse_args(int argc, char **argv)
 		else if (strcmp(a, "--restart-video-settings") == 0)
 			args.restart_video_settings = v;
 		else if (strcmp(a, "--restart-output-settings") == 0)
-		args.restart_output_settings = v;
+			args.restart_output_settings = v;
 		else if (strcmp(a, "--update-output-while-active") == 0)
 			args.update_output_while_active = v;
 		else if (strcmp(a, "--fake-frontend") == 0)
@@ -826,7 +838,7 @@ static int parse_args(int argc, char **argv)
 			args.tools_stop_after = v;
 		else if (strcmp(a, "--replace-before-update") == 0)
 			args.replace_before_update = v;
-	else if (strcmp(a, "--dump-encoder-settings") == 0)
+		else if (strcmp(a, "--dump-encoder-settings") == 0)
 			args.dump_encoder_settings = v;
 		else if (strcmp(a, "--release-after-start") == 0)
 			ok = parse_int(a, v, 0, &args.release_after_start_ms);
@@ -915,7 +927,8 @@ static bool output_stats(obs_output_t *output, struct output_stats *out)
 
 static bool count_dstreamy_audio(void *param, obs_encoder_t *encoder)
 {
-	if (obs_encoder_get_type(encoder) == OBS_ENCODER_AUDIO && strcmp(obs_encoder_get_name(encoder), "D-Streamy audio") == 0)
+	if (obs_encoder_get_type(encoder) == OBS_ENCODER_AUDIO &&
+	    strcmp(obs_encoder_get_name(encoder), "D-Streamy audio") == 0)
 		++*(int *)param;
 	return true;
 }
@@ -926,20 +939,23 @@ static void report_audio_mixer(obs_output_t *output, const char *when)
 	obs_enum_encoders(count_dstreamy_audio, &encoders);
 	obs_encoder_t *aenc = obs_output_get_audio_encoder(output, 0);
 	if (aenc)
-		printf("HARNESS audio_mixer when=%s idx=%zu encoder=%p dstreamy_audio_encoders=%d\n", when,
-		       obs_encoder_get_mixer_index(aenc), (void *)aenc, encoders);
+		harness_report("audio_mixer", "when idx encoder dstreamy_audio_encoders",
+			       "HARNESS audio_mixer when=%s idx=%zu encoder=%p dstreamy_audio_encoders=%d\n", when,
+			       obs_encoder_get_mixer_index(aenc), (void *)aenc, encoders);
 	else
-		printf("HARNESS audio_mixer when=%s none dstreamy_audio_encoders=%d\n", when, encoders);
+		harness_report("audio_mixer", "when dstreamy_audio_encoders",
+			       "HARNESS audio_mixer when=%s none dstreamy_audio_encoders=%d\n", when, encoders);
 }
 
 static void report_output_ui(obs_output_t *output)
 {
 	obs_properties_t *props = obs_output_properties(output);
 	for (obs_property_t *p = obs_properties_first(props); p; obs_property_next(&p))
-		printf("HARNESS output_property name=%s\n", obs_property_name(p));
+		harness_report("output_property", "name", "HARNESS output_property name=%s\n", obs_property_name(p));
 	obs_properties_destroy(props);
 	obs_data_t *settings = obs_output_get_settings(output);
-	printf("HARNESS output_setting audio_track=%lld\n", obs_data_get_int(settings, "audio_track"));
+	harness_report("output_setting", "audio_track", "HARNESS output_setting audio_track=%lld\n",
+		       obs_data_get_int(settings, "audio_track"));
 	obs_data_release(settings);
 }
 
@@ -954,8 +970,9 @@ static void report_settings_source(void)
 		registered = true;
 		listed = (obs_get_source_output_flags(type) & OBS_SOURCE_CAP_DISABLED) == 0;
 	}
-	printf("HARNESS settings_source registered=%d listed=%d flags=0x%x\n", registered, listed,
-	       obs_get_source_output_flags(SETTINGS_SOURCE_ID));
+	harness_report("settings_source", "registered listed flags",
+		       "HARNESS settings_source registered=%d listed=%d flags=0x%x\n", registered, listed,
+		       obs_get_source_output_flags(SETTINGS_SOURCE_ID));
 }
 
 #ifdef __linux__
@@ -1035,7 +1052,8 @@ static bool close_open_dialog(void)
 	obs_data_t *settings = obs_source_get_settings(open_dialog);
 	bool differ = strcmp(obs_data_get_json(settings), obs_data_get_json(open_dialog_copy)) != 0;
 	obs_data_release(settings);
-	printf("HARNESS close_dialog differ=%d choice=%s\n", differ, differ ? prompt_choice : "none");
+	harness_report("close_dialog", "differ choice", "HARNESS close_dialog differ=%d choice=%s\n", differ,
+		       differ ? prompt_choice : "none");
 	if (differ && strcmp(prompt_choice, "cancel") == 0)
 		return false;
 	if (differ && strcmp(prompt_choice, "discard") == 0)
@@ -1066,8 +1084,8 @@ static void fake_frontend_exit(void)
 	}
 	uint64_t exit_ns = os_gettime_ns();
 	size_t callbacks = fire();
-	printf("HARNESS frontend_exit callbacks=%zu ms=%llu\n", callbacks,
-	       (unsigned long long)((os_gettime_ns() - exit_ns) / 1000000));
+	harness_report("frontend_exit", "callbacks ms", "HARNESS frontend_exit callbacks=%zu ms=%llu\n", callbacks,
+		       (unsigned long long)((os_gettime_ns() - exit_ns) / 1000000));
 	fflush(stdout);
 	delete_closed_dialog();
 	release_collection_sources();
@@ -1076,37 +1094,61 @@ static void fake_frontend_exit(void)
 static obs_source_t *(*fake_take_opened)(void);
 static bool (*fake_click)(void);
 
+static bool wait_for_lists(obs_source_t *source)
+{
+	uint64_t deadline = os_gettime_ns() + 60000000000ULL;
+	for (;;) {
+		obs_properties_t *props = obs_source_properties(source);
+		bool loading = obs_properties_get(props, "lists_loading") != NULL;
+		obs_properties_destroy(props);
+		if (!loading)
+			return true;
+		if (os_gettime_ns() >= deadline) {
+			harness_error("Discord lists did not finish loading");
+			return false;
+		}
+		os_sleep_ms(20);
+	}
+}
+
 static void report_settings_properties(obs_source_t *source, const char *when)
 {
+	wait_for_lists(source);
 	obs_properties_t *props = obs_source_properties(source);
 	obs_data_t *values = obs_source_get_settings(source);
 	for (obs_property_t *p = obs_properties_first(props); p; obs_property_next(&p)) {
 		const char *name = obs_property_name(p);
 		// Checkbox names carry a source UUID, which differs per run; tests match them by description.
 		if (obs_property_get_type(p) == OBS_PROPERTY_BOOL) {
-			printf("HARNESS settings_checkbox when=%s desc=%s on=%d\n", when, obs_property_description(p),
-			       obs_data_get_bool(values, name));
+			harness_report("settings_checkbox", "when desc on",
+				       "HARNESS settings_checkbox when=%s desc=%s on=%d\n", when,
+				       obs_property_description(p), obs_data_get_bool(values, name));
 			continue;
 		}
-		printf("HARNESS settings_property when=%s name=%s type=%d enabled=%d desc=%s\n", when, name,
-		       (int)obs_property_get_type(p), obs_property_enabled(p), obs_property_description(p));
+		harness_report("settings_property", "when name type enabled desc",
+			       "HARNESS settings_property when=%s name=%s type=%d enabled=%d desc=%s\n", when, name,
+			       (int)obs_property_get_type(p), obs_property_enabled(p), obs_property_description(p));
 		const char *help = obs_property_long_description(p);
 		if (help)
-			printf("HARNESS settings_help when=%s name=%s text=%s\n", when, name, help);
+			harness_report("settings_help", "when name text",
+				       "HARNESS settings_help when=%s name=%s text=%s\n", when, name, help);
 		if (obs_property_get_type(p) == OBS_PROPERTY_TEXT && obs_property_text_type(p) == OBS_TEXT_INFO)
-			printf("HARNESS settings_info when=%s name=%s kind=%d\n", when, name,
-			       (int)obs_property_text_info_type(p));
+			harness_report("settings_info", "when name kind",
+				       "HARNESS settings_info when=%s name=%s kind=%d\n", when, name,
+				       (int)obs_property_text_info_type(p));
 		if (obs_property_get_type(p) == OBS_PROPERTY_LIST)
 			for (size_t i = 0; i < obs_property_list_item_count(p); i++)
-				printf("HARNESS settings_item when=%s name=%s value=%lld text=%s\n", when, name,
-				       obs_property_list_item_int(p, i), obs_property_list_item_name(p, i));
+				harness_report("settings_item", "when name value text",
+					       "HARNESS settings_item when=%s name=%s value=%lld text=%s\n", when, name,
+					       obs_property_list_item_int(p, i), obs_property_list_item_name(p, i));
 	}
 	obs_properties_destroy(props);
 	obs_data_release(values);
 	obs_data_t *settings = obs_source_get_settings(source);
-	printf("HARNESS settings_source when=%s audio_track=%lld\n", when, obs_data_get_int(settings, "audio_track"));
-	printf("HARNESS pick when=%s guild_id=%s channel_id=%s\n", when, obs_data_get_string(settings, "guild_id"),
-	       obs_data_get_string(settings, "channel_id"));
+	harness_report("settings_source", "when audio_track", "HARNESS settings_source when=%s audio_track=%lld\n",
+		       when, obs_data_get_int(settings, "audio_track"));
+	harness_report("pick", "when guild_id channel_id", "HARNESS pick when=%s guild_id=%s channel_id=%s\n", when,
+		       obs_data_get_string(settings, "guild_id"), obs_data_get_string(settings, "channel_id"));
 	obs_data_release(settings);
 }
 
@@ -1116,7 +1158,7 @@ static bool check_settings(obs_source_t *dialog, obs_data_t *old_settings, const
 	obs_data_t *settings = obs_source_get_settings(dialog);
 	bool differ = strcmp(obs_data_get_json(settings), obs_data_get_json(old_settings)) != 0;
 	obs_data_release(settings);
-	printf("HARNESS check_settings when=%s differ=%d\n", when, differ);
+	harness_report("check_settings", "when differ", "HARNESS check_settings when=%s differ=%d\n", when, differ);
 	return !differ;
 }
 
@@ -1176,9 +1218,10 @@ static obs_source_t *open_settings_dialog(void)
 static void close_settings_dialog(obs_source_t *source)
 {
 	obs_weak_source_t *weak = obs_source_get_weak_source(source);
-	printf("HARNESS frontend held expired=%d\n", obs_weak_source_expired(weak));
+	harness_report("frontend_held", "expired", "HARNESS frontend held expired=%d\n", obs_weak_source_expired(weak));
 	obs_source_release(source);
-	printf("HARNESS frontend closed expired=%d\n", obs_weak_source_expired(weak));
+	harness_report("frontend_closed", "expired", "HARNESS frontend closed expired=%d\n",
+		       obs_weak_source_expired(weak));
 	obs_weak_source_release(weak);
 }
 
@@ -1217,8 +1260,16 @@ static bool apply_settings_update(obs_source_t *source, const char *update)
 		harness_error("--settings-update is not a JSON object");
 		return false;
 	}
-	obs_properties_t *props = obs_source_properties(source);
 	obs_data_t *settings = obs_source_get_settings(source);
+	if (obs_data_has_user_value(data, "guild_id") &&
+	    strcmp(obs_data_get_string(data, "guild_id"), obs_data_get_string(settings, "guild_id")) != 0) {
+		obs_data_t *guild = obs_data_create();
+		obs_data_set_string(guild, "guild_id", obs_data_get_string(data, "guild_id"));
+		obs_source_update(source, guild);
+		obs_data_release(guild);
+		wait_for_lists(source);
+	}
+	obs_properties_t *props = obs_source_properties(source);
 	obs_data_apply(settings, data);
 	obs_source_update(source, settings);
 	bool refresh = false;
@@ -1228,8 +1279,8 @@ static bool apply_settings_update(obs_source_t *source, const char *update)
 	}
 	obs_data_release(data);
 	obs_property_t *status = obs_properties_get(props, "status");
-	printf("HARNESS settings_modified refresh=%d status=%s\n", refresh,
-	       status ? obs_property_description(status) : "");
+	harness_report("settings_modified", "refresh status", "HARNESS settings_modified refresh=%d status=%s\n",
+		       refresh, status ? obs_property_description(status) : "");
 	obs_data_release(settings);
 	obs_properties_destroy(props);
 	return true;
@@ -1272,9 +1323,12 @@ static bool click_settings_button(obs_source_t *source, const char *name)
 	os_atomic_set_long(&clicking, 0);
 	obs_properties_destroy(props);
 	char *status = settings_status(source);
-	printf("HARNESS settings_clicked name=%s enabled=%d refresh=%d status=%s\n", name, enabled, refresh, status);
-	printf("HARNESS settings_click_sync_refreshes name=%s count=%ld\n", name,
-	       os_atomic_load_long(&click_thread_refreshes) - before);
+	harness_report("settings_clicked", "name enabled refresh status",
+		       "HARNESS settings_clicked name=%s enabled=%d refresh=%d status=%s\n", name, enabled, refresh,
+		       status);
+	harness_report("settings_click_sync_refreshes", "name count",
+		       "HARNESS settings_click_sync_refreshes name=%s count=%ld\n", name,
+		       os_atomic_load_long(&click_thread_refreshes) - before);
 	bfree(status);
 	return enabled;
 }
@@ -1286,8 +1340,9 @@ static bool click_and_answer(obs_source_t *source, const char *name, const char 
 	obs_properties_t *props = obs_source_properties(source);
 	obs_property_t *question = enabled ? obs_properties_get(props, "stream_question") : NULL;
 	obs_output_t *output = obs_get_output_by_name("D-Streamy");
-	printf("HARNESS settings_asked name=%s output_active=%d question=%s\n", name,
-	       output && obs_output_active(output) ? 1 : 0, question ? obs_property_description(question) : "");
+	harness_report("settings_asked", "name output_active question",
+		       "HARNESS settings_asked name=%s output_active=%d question=%s\n", name,
+		       output && obs_output_active(output) ? 1 : 0, question ? obs_property_description(question) : "");
 	obs_output_release(output);
 	obs_properties_destroy(props);
 	return !question || click_settings_button(source, answer);
@@ -1304,6 +1359,8 @@ static char *wait_for_refresh(obs_source_t *source, const char *transient, const
 {
 	long seen = os_atomic_load_long(&refreshes);
 	char *status = settings_status(source);
+	harness_report("refresh_baseline_ready", "when refreshes status",
+		       "HARNESS refresh_baseline_ready when=%s refreshes=%ld status=%s\n", when, seen, status);
 	uint64_t deadline = os_gettime_ns() + 60000000000ULL;
 	while (starts_with(status, transient) && os_gettime_ns() < deadline) {
 		os_sleep_ms(20);
@@ -1313,9 +1370,10 @@ static char *wait_for_refresh(obs_source_t *source, const char *transient, const
 		seen = now;
 		bfree(status);
 		status = settings_status(source);
-		printf("HARNESS settings_refreshed when=%s status=%s\n", when, status);
+		harness_report("settings_refreshed", "when status", "HARNESS settings_refreshed when=%s status=%s\n",
+			       when, status);
 	}
-	printf("HARNESS settings_status when=%s status=%s\n", when, status);
+	harness_report("settings_status", "when status", "HARNESS settings_status when=%s status=%s\n", when, status);
 	return status;
 }
 
@@ -1346,12 +1404,12 @@ static bool settings_dialog(const char *update)
 {
 	obs_source_t *source = open_settings_dialog();
 	if (!source) {
-		printf("HARNESS frontend opened none\n");
+		harness_report("frontend_opened_none", "", "HARNESS frontend opened none\n");
 		return true;
 	}
 	obs_source_t *named = obs_get_source_by_name(obs_source_get_name(source));
-	printf("HARNESS frontend opened id=%s public=%d flags=0x%x\n", obs_source_get_id(source), named == source,
-	       obs_source_get_output_flags(source));
+	harness_report("frontend_opened", "id public flags", "HARNESS frontend opened id=%s public=%d flags=0x%x\n",
+		       obs_source_get_id(source), named == source, obs_source_get_output_flags(source));
 	obs_source_release(named);
 	// OBSBasicProperties copies the settings before its view first asks for the properties.
 	obs_data_t *old_settings = obs_data_create();
@@ -1435,8 +1493,8 @@ static struct obs_source_info mixer_source_info = {
 static void report_mixers(const char *when)
 {
 	for (size_t i = 0; i < MIXER_SOURCES; i++)
-		printf("HARNESS mixers when=%s name=%s mixers=%u\n", when, mixer_source_names[i],
-		       obs_source_get_audio_mixers(mixer_sources[i]));
+		harness_report("mixers", "when name mixers", "HARNESS mixers when=%s name=%s mixers=%u\n", when,
+			       mixer_source_names[i], obs_source_get_audio_mixers(mixer_sources[i]));
 }
 
 // Like OBSPropertiesView ticking a checkbox: the setting, update, then the property's modified callback.
@@ -1459,7 +1517,7 @@ static bool tick_source(obs_source_t *dialog, const char *name, bool on)
 	os_atomic_set_long(&clicking, 1);
 	bool refresh = obs_property_modified(box, settings);
 	os_atomic_set_long(&clicking, 0);
-	printf("HARNESS ticked name=%s on=%d refresh=%d\n", name, on, refresh);
+	harness_report("ticked", "name on refresh", "HARNESS ticked name=%s on=%d refresh=%d\n", name, on, refresh);
 	obs_data_release(settings);
 	obs_properties_destroy(props);
 	return true;
@@ -1477,7 +1535,7 @@ static void pick_track(obs_source_t *dialog, int track)
 	os_atomic_set_long(&clicking, 1);
 	bool refresh = list && obs_property_modified(list, settings);
 	os_atomic_set_long(&clicking, 0);
-	printf("HARNESS picked track=%d refresh=%d\n", track, refresh);
+	harness_report("picked", "track refresh", "HARNESS picked track=%d refresh=%d\n", track, refresh);
 	obs_data_release(settings);
 	obs_properties_destroy(props);
 }
@@ -1564,7 +1622,7 @@ static bool mixer_session(void)
 		report_mixers("ticked");
 		report_settings_properties(dialog, "ticked");
 		// libobs applies the defaults to type-level properties, which untick every checkbox there.
-		printf("HARNESS mixer_step name=type_level\n");
+		harness_report("mixer_step", "", "HARNESS mixer_step name=type_level\n");
 		obs_properties_destroy(obs_get_source_properties("dstreamy_settings"));
 		run_ui_tasks();
 		report_mixers("type_level");
@@ -1575,24 +1633,24 @@ static bool mixer_session(void)
 		obs_data_t *values = obs_source_get_settings(dialog);
 		int original = (int)obs_data_get_int(values, "audio_track");
 		obs_data_release(values);
-		printf("HARNESS mixer_step name=track5\n");
+		harness_report("mixer_step", "", "HARNESS mixer_step name=track5\n");
 		seen = os_atomic_load_long(&mixer_views);
 		pick_track(dialog, 5);
 		ok = ok && wait_for_view(seen, "picking Track 5");
-		printf("HARNESS mixer_step name=track_back\n");
+		harness_report("mixer_step", "", "HARNESS mixer_step name=track_back\n");
 		seen = os_atomic_load_long(&mixer_views);
 		pick_track(dialog, original);
 		ok = ok && wait_for_view(seen, "picking the track back");
 
 		// Like Edit > Advanced Audio Properties on OBS's UI thread, outside the dialog.
-		printf("HARNESS mixer_step name=external\n");
+		harness_report("mixer_step", "", "HARNESS mixer_step name=external\n");
 		seen = os_atomic_load_long(&mixer_views);
 		obs_source_set_audio_mixers(mixer_sources[1],
 					    obs_source_get_audio_mixers(mixer_sources[1]) | (1u << (original - 1)));
 		ok = ok && wait_for_view(seen, "an outside mixer change");
 		report_mixers("external");
 
-		printf("HARNESS mixer_step name=created\n");
+		harness_report("mixer_step", "", "HARNESS mixer_step name=created\n");
 		obs_source_t *late = obs_source_create(MIXER_SOURCE_ID, "Late", NULL, NULL);
 		obs_data_t *saved = obs_data_create();
 		obs_data_set_string(saved, "id", MIXER_SOURCE_ID);
@@ -1600,13 +1658,15 @@ static bool mixer_session(void)
 		obs_data_set_int(saved, "mixers", 0x3f);
 		obs_source_t *loaded = obs_load_source(saved);
 		obs_data_release(saved);
-		printf("HARNESS mixers when=created name=Late mixers=%u\n", late ? obs_source_get_audio_mixers(late) : 0);
-		printf("HARNESS mixers when=loaded name=Saved mixers=%u\n",
-		       loaded ? obs_source_get_audio_mixers(loaded) : 0);
+		harness_report("mixers", "mixers", "HARNESS mixers when=created name=Late mixers=%u\n",
+			       late ? obs_source_get_audio_mixers(late) : 0);
+		harness_report("mixers", "mixers", "HARNESS mixers when=loaded name=Saved mixers=%u\n",
+			       loaded ? obs_source_get_audio_mixers(loaded) : 0);
 		obs_source_release(late);
 		obs_source_release(loaded);
 		run_ui_tasks();
-		printf("HARNESS mixer_sync_reloads count=%ld\n", os_atomic_load_long(&mixer_sync_reloads));
+		harness_report("mixer_sync_reloads", "count", "HARNESS mixer_sync_reloads count=%ld\n",
+			       os_atomic_load_long(&mixer_sync_reloads));
 		signal_handler_disconnect(signals, "update_properties", on_mixer_update_properties, NULL);
 		mixer_dialog = NULL;
 	}
@@ -1643,8 +1703,8 @@ static void defaults_settings_dialog(obs_source_t *dialog)
 
 static void report_source_mixers(const char *when, obs_source_t *source)
 {
-	printf("HARNESS mixers when=%s name=%s mixers=%u\n", when, obs_source_get_name(source),
-	       obs_source_get_audio_mixers(source));
+	harness_report("mixers", "when name mixers", "HARNESS mixers when=%s name=%s mixers=%u\n", when,
+		       obs_source_get_name(source), obs_source_get_audio_mixers(source));
 }
 
 static void report_mixers_of(const char *when, obs_source_t *a, obs_source_t *b)
@@ -1720,7 +1780,7 @@ static bool mixer_cancel(void)
 		run_ui_tasks();
 		report_source_mixers("changed", music);
 		report_source_mixers("changed", voice);
-		printf("HARNESS mixer_step name=gone_and_late\n");
+		harness_report("mixer_step", "", "HARNESS mixer_step name=gone_and_late\n");
 		obs_source_remove(gone);
 		obs_source_release(gone);
 		gone = NULL;
@@ -1728,7 +1788,7 @@ static bool mixer_cancel(void)
 		run_ui_tasks();
 		if (late)
 			report_source_mixers("changed", late);
-		printf("HARNESS mixer_step name=cancel\n");
+		harness_report("mixer_step", "", "HARNESS mixer_step name=cancel\n");
 		ok = cancel_settings_dialog(dialog, old_settings) && ok;
 		ok = check_settings(dialog, old_settings, "cancelled") && ok;
 		obs_data_release(old_settings);
@@ -1740,7 +1800,7 @@ static bool mixer_cancel(void)
 		signal_handler_disconnect(signals, "update_properties", on_mixer_update_properties, NULL);
 		mixer_dialog = NULL;
 
-		printf("HARNESS mixer_step name=managed\n");
+		harness_report("mixer_step", "", "HARNESS mixer_step name=managed\n");
 		obs_data_t *reopened = copy_settings(dialog);
 		click_settings_button(dialog, "take_over");
 		run_ui_tasks();
@@ -1753,7 +1813,7 @@ static bool mixer_cancel(void)
 		check_settings(dialog, reopened, "managed_ok");
 		pick_track(dialog, 4);
 		run_ui_tasks();
-		printf("HARNESS mixer_step name=defaults\n");
+		harness_report("mixer_step", "", "HARNESS mixer_step name=defaults\n");
 		defaults_settings_dialog(dialog);
 		drain_ui_tasks();
 		report_source_mixers("defaults", music);
@@ -1845,8 +1905,9 @@ static void save_collection(struct collection *c)
 		c->modules = obs_data_create();
 	fake_save(c->modules);
 	obs_data_t *ours = obs_data_get_obj(c->modules, "dstreamy");
-	printf("HARNESS collection_saved name=%s managed_mixers=%lld\n", c->name,
-	       ours ? obs_data_get_int(ours, "managed_mixers") : -1LL);
+	harness_report("collection_saved", "name managed_mixers",
+		       "HARNESS collection_saved name=%s managed_mixers=%lld\n", c->name,
+		       ours ? obs_data_get_int(ours, "managed_mixers") : -1LL);
 	obs_data_release(ours);
 }
 
@@ -1866,7 +1927,7 @@ static void load_collection(struct collection *c)
 	fake_load(c->modules);
 	fake_event(FAKE_EVENT_SCENE_COLLECTION_CHANGED);
 	run_ui_tasks();
-	printf("HARNESS collection_loaded name=%s\n", c->name);
+	harness_report("collection_loaded", "name", "HARNESS collection_loaded name=%s\n", c->name);
 }
 
 // OBSBasic::ActivateSceneCollection after the changing event.
@@ -1999,7 +2060,7 @@ static bool collection_session(void)
 	report_collection_mixers("b_loaded");
 	ok = report_dialog("b") && ok;
 
-	printf("HARNESS collection_step name=confirm_across_switch\n");
+	harness_report("collection_step", "", "HARNESS collection_step name=confirm_across_switch\n");
 	dialog = open_settings_dialog();
 	if (!dialog) {
 		harness_error("the settings dialog did not reopen");
@@ -2025,7 +2086,7 @@ static bool collection_session(void)
 	report_collection_mixers("a_again");
 	ok = report_dialog("a_again") && ok;
 
-	printf("HARNESS collection_step name=new\n");
+	harness_report("collection_step", "", "HARNESS collection_step name=new\n");
 	fake_event(FAKE_EVENT_SCENE_COLLECTION_CHANGING);
 	save_collection(&a);
 	clear_collection();
@@ -2072,7 +2133,7 @@ static bool collection_close_session(void)
 	bool ok = true;
 	load_collection(&a);
 
-	printf("HARNESS collection_step name=switch_kept\n");
+	harness_report("collection_step", "", "HARNESS collection_step name=switch_kept\n");
 	obs_source_t *dialog = open_tracked_dialog();
 	if (!dialog) {
 		harness_error("the settings dialog did not open");
@@ -2092,7 +2153,7 @@ static bool collection_close_session(void)
 	ok = report_dialog("a_kept") && ok;
 
 	// OBSBasic::SetupDuplicateSceneCollection and SetupRenameSceneCollection: save, copy, load, no changing event.
-	printf("HARNESS collection_step name=duplicate\n");
+	harness_report("collection_step", "", "HARNESS collection_step name=duplicate\n");
 	dialog = open_tracked_dialog();
 	watch_dialog_views(dialog);
 	ok = tick_source(dialog, "Music", false) && ok;
@@ -2108,7 +2169,7 @@ static bool collection_close_session(void)
 	obs_data_apply(d.modules, a.modules);
 	load_collection(&d);
 	report_collection_mixers("d_loaded");
-	printf("HARNESS collection_step name=rename\n");
+	harness_report("collection_step", "", "HARNESS collection_step name=rename\n");
 	dialog = open_tracked_dialog();
 	watch_dialog_views(dialog);
 	ok = tick_source(dialog, "Music", true) && ok;
@@ -2123,7 +2184,7 @@ static bool collection_close_session(void)
 	obs_data_release(d.modules);
 	obs_data_release(r.modules);
 
-	printf("HARNESS collection_step name=switch_discard\n");
+	harness_report("collection_step", "", "HARNESS collection_step name=switch_discard\n");
 	dialog = open_tracked_dialog();
 	watch_dialog_views(dialog);
 	ok = tick_source(dialog, "Mic", true) && ok;
@@ -2135,7 +2196,7 @@ static bool collection_close_session(void)
 	switch_collection(&b, &a);
 	report_collection_mixers("a_discarded");
 
-	printf("HARNESS collection_step name=switch_cancel\n");
+	harness_report("collection_step", "", "HARNESS collection_step name=switch_cancel\n");
 	dialog = open_tracked_dialog();
 	watch_dialog_views(dialog);
 	ok = tick_source(dialog, "Mic", false) && ok;
@@ -2160,7 +2221,7 @@ static bool collection_close_session(void)
 	close_settings_dialog(dialog);
 	run_ui_tasks();
 
-	printf("HARNESS collection_step name=exit\n");
+	harness_report("collection_step", "", "HARNESS collection_step name=exit\n");
 	dialog = open_tracked_dialog();
 	watch_dialog_views(dialog);
 	click_and_wait(dialog, "take_over", &ok);
@@ -2192,20 +2253,20 @@ static bool reopen_session(void)
 		report_settings_properties(first, "first_confirming");
 		mixer_dialog = NULL;
 
-		printf("HARNESS reopen_step name=cancelled\n");
+		harness_report("reopen_step", "", "HARNESS reopen_step name=cancelled\n");
 		prompt_choice = "cancel";
 		obs_source_t *again = open_tracked_dialog();
-		printf("HARNESS reopened opened=%d\n", again != NULL);
+		harness_report("reopened", "opened", "HARNESS reopened opened=%d\n", again != NULL);
 		mixer_dialog = first;
 		click_and_wait(first, "confirm_take_over", &ok);
 		report_source_mixers("cancelled", music);
 		report_settings_properties(first, "first_after");
 		mixer_dialog = NULL;
 
-		printf("HARNESS reopen_step name=discarded\n");
+		harness_report("reopen_step", "", "HARNESS reopen_step name=discarded\n");
 		prompt_choice = "discard";
 		obs_source_t *second = open_tracked_dialog();
-		printf("HARNESS reopened opened=%d\n", second != NULL);
+		harness_report("reopened", "opened", "HARNESS reopened opened=%d\n", second != NULL);
 		report_source_mixers("discarded", music);
 		if (second) {
 			watch_dialog_views(second);
@@ -2312,7 +2373,8 @@ static bool click_fake_frontend(void)
 	set_close_dialogs(close_open_dialog);
 	const char *name = NULL;
 	int count = items(&name);
-	printf("HARNESS frontend tools_items=%d name=%s\n", count, name ? name : "");
+	harness_report("frontend", "tools_items name", "HARNESS frontend tools_items=%d name=%s\n", count,
+		       name ? name : "");
 	if (args.mixer_session)
 		return mixer_session();
 	if (args.mixer_cancel)
@@ -2334,8 +2396,9 @@ static bool click_fake_frontend(void)
 static void report_output_audio_track(obs_output_t *output, const char *when)
 {
 	obs_data_t *settings = obs_output_get_settings(output);
-	printf("HARNESS output_audio_track when=%s active=%d track=%lld\n", when, obs_output_active(output) ? 1 : 0,
-	       obs_data_get_int(settings, "audio_track"));
+	harness_report("output_audio_track", "when active track",
+		       "HARNESS output_audio_track when=%s active=%d track=%lld\n", when,
+		       obs_output_active(output) ? 1 : 0, obs_data_get_int(settings, "audio_track"));
 	obs_data_release(settings);
 }
 
@@ -2349,15 +2412,16 @@ static bool wait_for_plugin_video(obs_output_t *output)
 			return false;
 		// With --expect-error a panic may come only at stop, so it is checked after shutdown instead.
 		if (st.video >= args.until_video && (args.expect_error || st.panics >= args.expect_panics)) {
-			printf("HARNESS reached video=%lld after %llu ms\n", st.video,
-			       (unsigned long long)((os_gettime_ns() - start) / 1000000));
+			harness_report("reached", "video ms", "HARNESS reached video=%lld after %llu ms\n", st.video,
+				       (unsigned long long)((os_gettime_ns() - start) / 1000000));
 			return true;
 		}
 		if (os_event_timedwait(full_event, 100) == 0) {
 			output_stats(output, &st);
 			if (args.expect_error)
-				printf("HARNESS output stopped after %lld of %d video packets\n", st.video,
-				       args.until_video);
+				harness_report("output_short", "video expected",
+					       "HARNESS output stopped after %lld of %d video packets\n", st.video,
+					       args.until_video);
 			else
 				harness_error("output stopped after %lld of %d video packets", st.video,
 					      args.until_video);
@@ -2377,7 +2441,8 @@ static bool wait_for_dialog_video(obs_output_t *output)
 		if (!output_stats(output, &st))
 			return false;
 		if (st.video >= args.until_video) {
-			printf("HARNESS tools video=%lld audio=%lld\n", st.video, st.audio);
+			harness_report("tools_stats", "video audio", "HARNESS tools video=%lld audio=%lld\n", st.video,
+				       st.audio);
 			return true;
 		}
 		os_sleep_ms(50);
@@ -2408,8 +2473,8 @@ static bool tools_session(void)
 	if (ok && args.tools_cancel_start) {
 		ok = click_and_answer(source, "start", "cancel_stream");
 		obs_output_t *output = obs_get_output_by_name("D-Streamy");
-		printf("HARNESS tools output=%d active=%d\n", output != NULL,
-		       output && obs_output_active(output) ? 1 : 0);
+		harness_report("tools_output", "output active", "HARNESS tools output=%d active=%d\n", output != NULL,
+			       output && obs_output_active(output) ? 1 : 0);
 		obs_output_release(output);
 		report_settings_properties(source, "cancelled");
 		signal_handler_disconnect(signals, "update_properties", on_update_properties, NULL);
@@ -2426,7 +2491,7 @@ static bool tools_session(void)
 	ok = ok && click_and_answer(source, "start", "confirm_stream");
 	if (ok && args.tools_exit_while_starting) {
 		char *status = settings_status(source);
-		printf("HARNESS tools exiting status=%s\n", status);
+		harness_report("tools_exiting", "status", "HARNESS tools exiting status=%s\n", status);
 		bfree(status);
 		signal_handler_disconnect(signals, "update_properties", on_update_properties, NULL);
 		close_settings_dialog(source);
@@ -2438,7 +2503,8 @@ static bool tools_session(void)
 	ok = ok && (live || tools_outcome(status, "Live on"));
 	bfree(status);
 	obs_output_t *output = obs_get_output_by_name("D-Streamy");
-	printf("HARNESS tools output=%d active=%d\n", output != NULL, output && obs_output_active(output) ? 1 : 0);
+	harness_report("tools_output", "output active", "HARNESS tools output=%d active=%d\n", output != NULL,
+		       output && obs_output_active(output) ? 1 : 0);
 	for (int i = 0; live && output && !obs_output_active(output) && i < 1000; i++)
 		os_sleep_ms(10);
 	if (live && output) {
@@ -2457,17 +2523,19 @@ static bool tools_session(void)
 			long before = os_atomic_load_long(&refreshes);
 			ok = apply_settings_update(source, args.settings_update_while_active);
 			drain_ui_tasks();
-			printf("HARNESS live_pick_refreshes count=%ld\n", os_atomic_load_long(&refreshes) - before);
+			harness_report("live_pick_refreshes", "count", "HARNESS live_pick_refreshes count=%ld\n",
+				       os_atomic_load_long(&refreshes) - before);
 			report_settings_properties(source, "live_updated");
 			report_output_audio_track(output, "after_settings_update");
 			report_audio_mixer(output, "after_settings_update");
 		}
 		if (ok && args.tools_exit_while_live) {
-			signal_handler_connect(obs_output_get_signal_handler(output), "stop", on_tools_output_stop, NULL);
+			signal_handler_connect(obs_output_get_signal_handler(output), "stop", on_tools_output_stop,
+					       NULL);
 			if (args.tools_stop_after)
 				ok = wait_for_file(args.tools_stop_after);
 			status = settings_status(source);
-			printf("HARNESS tools exiting status=%s\n", status);
+			harness_report("tools_exiting", "status", "HARNESS tools exiting status=%s\n", status);
 			bfree(status);
 			obs_output_release(output);
 			obs_source_release(mic);
@@ -2476,7 +2544,7 @@ static bool tools_session(void)
 			return ok;
 		}
 		if (args.tools_wait_end) {
-			printf("HARNESS tools waiting for the end\n");
+			harness_report("tools_waiting_end", "", "HARNESS tools waiting for the end\n");
 			status = wait_for_refresh(source, "Live on", "ended");
 		} else {
 			if (args.tools_stop_after)
@@ -2486,7 +2554,8 @@ static bool tools_session(void)
 		}
 		ok = tools_outcome(status, "Idle") && ok;
 		bfree(status);
-		printf("HARNESS tools stopped active=%d\n", obs_output_active(output) ? 1 : 0);
+		harness_report("tools_stopped", "active", "HARNESS tools stopped active=%d\n",
+			       obs_output_active(output) ? 1 : 0);
 	} else if (live) {
 		ok = false;
 	}
@@ -2514,7 +2583,8 @@ static bool contains_expected_error(const char *err)
 static bool stopped_with_expected_error(void)
 {
 	if (stop_code != OBS_OUTPUT_SUCCESS && contains_expected_error(stop_error)) {
-		printf("HARNESS expected_error code=%lld: %s\n", stop_code, stop_error);
+		harness_report("expected_error", "code message", "HARNESS expected_error code=%lld: %s\n", stop_code,
+			       stop_error);
 		return true;
 	}
 	harness_error("expected an output error containing \"%s\", got code %lld: %s", args.expect_error, stop_code,
@@ -2529,7 +2599,7 @@ static bool stay_alive_until(uint64_t start_ns)
 	while (os_gettime_ns() < deadline)
 		os_sleep_ms(50);
 	uint32_t rendered = obs_get_total_frames() - frames;
-	printf("HARNESS alive after the stop: %u more frames rendered\n", rendered);
+	harness_report("alive", "rendered", "HARNESS alive after the stop: %u more frames rendered\n", rendered);
 	if (!rendered) {
 		harness_error("OBS stopped rendering after the output stopped");
 		return false;
@@ -2587,7 +2657,8 @@ static int dump_encoder_settings(const char *dir)
 		dstr_printf(&path, "%s/%s.json", dir, name.array);
 		dstr_free(&name);
 		bool ok = obs_data_save_json_pretty_safe(d, path.array, "tmp", NULL);
-		printf("HARNESS encoder settings %s: %s\n", id, ok ? path.array : "write failed");
+		harness_report("encoder_settings", "id path", "HARNESS encoder settings %s: %s\n", id,
+			       ok ? path.array : "write failed");
 		written += ok;
 		dstr_free(&path);
 		obs_data_release(d);
@@ -2614,12 +2685,14 @@ static bool check_output_stats(obs_output_t *output, obs_encoder_t *aenc)
 	}
 	// libobs counts each interleaved video packet it hands encoded_packet (obs-output.c:1689-1690, 1756).
 	long long obs_video = obs_output_get_total_frames(output);
-	const struct video_output_info *voi = video_output_get_info(obs_encoder_video(obs_output_get_video_encoder(output)));
+	const struct video_output_info *voi =
+		video_output_get_info(obs_encoder_video(obs_output_get_video_encoder(output)));
 	double fps = voi && voi->fps_den ? (double)voi->fps_num / voi->fps_den : args.fps;
 	double video_s = (double)video / fps;
 	double audio_s = (double)audio * (double)obs_encoder_get_frame_size(aenc) / SAMPLE_RATE;
-	printf("HARNESS output=%s video=%lld audio=%lld panics=%lld obs_video=%lld video_s=%.2f audio_s=%.2f\n",
-	       args.output_id, video, audio, panics, obs_video, video_s, audio_s);
+	harness_report("output_stats", "output video audio panics obs_video video_s audio_s",
+		       "HARNESS output=%s video=%lld audio=%lld panics=%lld obs_video=%lld video_s=%.2f audio_s=%.2f\n",
+		       args.output_id, video, audio, panics, obs_video, video_s, audio_s);
 
 	bool pass = true;
 	if (stop_code != OBS_OUTPUT_SUCCESS) {
@@ -2706,16 +2779,19 @@ static bool write_provenance(obs_encoder_t *venc, obs_encoder_t *aenc, const str
 		obs_data_get_json_pretty_with_defaults(vs));
 	fprintf(f, "Audio encoder settings including defaults:\n\n```json\n%s\n```\n\n",
 		obs_data_get_json_pretty_with_defaults(as));
-	fprintf(f, "Scene: `color_source_v3` %dx%d, dark (0x%08X) except one white frame per second; "
-		   "harness audio source: 1 kHz beep for 20 ms at each flash, 440 Hz tone at amplitude %.2f otherwise.\n\n",
+	fprintf(f,
+		"Scene: `color_source_v3` %dx%d, dark (0x%08X) except one white frame per second; "
+		"harness audio source: 1 kHz beep for 20 ms at each flash, 440 Hz tone at amplitude %.2f otherwise.\n\n",
 		args.width, args.height, DARK_COLOR, TONE_AMPLITUDE);
-	fprintf(f, "Files: `packets.bin` (every `encoded_packet` in arrival order until %ld video packets), "
-		   "`video-extra.bin` and `audio-extra.bin` (`obs_encoder_get_extra_data` at each track's first packet), "
-		   "`trace.json`.\n\n",
+	fprintf(f,
+		"Files: `packets.bin` (every `encoded_packet` in arrival order until %ld video packets), "
+		"`video-extra.bin` and `audio-extra.bin` (`obs_encoder_get_extra_data` at each track's first packet), "
+		"`trace.json`.\n\n",
 		rec->video_limit);
-	fprintf(f, "`packets.bin`: the 8 bytes `%s`, then per packet a 40-byte little-endian header followed by the payload:\n"
-		   "type u8 (0 audio, 1 video), keyframe u8, priority u8, drop_priority u8, timebase_num i32, "
-		   "timebase_den i32, size u32, pts i64, dts i64, dts_usec i64.\n",
+	fprintf(f,
+		"`packets.bin`: the 8 bytes `%s`, then per packet a 40-byte little-endian header followed by the payload:\n"
+		"type u8 (0 audio, 1 video), keyframe u8, priority u8, drop_priority u8, timebase_num i32, "
+		"timebase_den i32, size u32, pts i64, dts i64, dts_usec i64.\n",
 		TRACE_MAGIC);
 
 	obs_data_release(vs);
@@ -2850,6 +2926,75 @@ static size_t load_modules(const char *module_bin, const char *module_data)
 }
 #endif
 
+#define FRAMING_RECORDS 64
+
+struct framing_probe {
+	pthread_mutex_t mutex;
+	pthread_cond_t condition;
+	bool ready;
+	bool go;
+	void (*emit)(uint32_t sequence);
+};
+
+static void *emit_rust_observations(void *data)
+{
+	struct framing_probe *probe = data;
+	pthread_mutex_lock(&probe->mutex);
+	probe->ready = true;
+	pthread_cond_signal(&probe->condition);
+	while (!probe->go)
+		pthread_cond_wait(&probe->condition, &probe->mutex);
+	pthread_mutex_unlock(&probe->mutex);
+	for (uint32_t sequence = 0; sequence < FRAMING_RECORDS; sequence++)
+		probe->emit(sequence);
+	return NULL;
+}
+
+static bool observation_framing(void)
+{
+	obs_module_t *module = obs_get_module("obs-dstreamy");
+	void (*emit)(uint32_t) =
+		module ? (void (*)(uint32_t))os_dlsym(obs_get_module_lib(module), "DSTREAMY_TEST_OBSERVATION_EMIT")
+		       : NULL;
+	if (!emit) {
+		harness_error("observation framing needs the plugin's test hooks");
+		return false;
+	}
+	struct framing_probe probe = {.mutex = PTHREAD_MUTEX_INITIALIZER,
+				      .condition = PTHREAD_COND_INITIALIZER,
+				      .emit = emit};
+	pthread_t thread;
+	if (pthread_create(&thread, NULL, emit_rust_observations, &probe) != 0) {
+		pthread_cond_destroy(&probe.condition);
+		pthread_mutex_destroy(&probe.mutex);
+		harness_error("cannot start the observation writer");
+		return false;
+	}
+	const char unit[] = "Gr\xc3\xbc\xc3\x9f"
+			    "e \xf0\x9f\xa7\x83";
+	size_t unit_size = sizeof(unit) - 1;
+	char *payload = bmalloc(unit_size * 1024 + 1);
+	for (size_t i = 0; i < 1024; i++)
+		memcpy(payload + i * unit_size, unit, unit_size);
+	payload[unit_size * 1024] = 0;
+	pthread_mutex_lock(&probe.mutex);
+	while (!probe.ready)
+		pthread_cond_wait(&probe.condition, &probe.mutex);
+	probe.go = true;
+	pthread_cond_signal(&probe.condition);
+	pthread_mutex_unlock(&probe.mutex);
+	for (uint32_t sequence = 0; sequence < FRAMING_RECORDS; sequence++)
+		harness_report("c_framing_probe", "sequence payload note",
+			       "HARNESS c_framing_probe sequence=%u payload=%s note=%s\n", sequence, payload,
+			       "first\nsecond");
+	pthread_join(thread, NULL);
+	pthread_cond_destroy(&probe.condition);
+	pthread_mutex_destroy(&probe.mutex);
+	bfree(payload);
+	harness_report("framing_complete", "records", "HARNESS framing_complete records=%u\n", FRAMING_RECORDS);
+	return true;
+}
+
 int main(int argc, char **argv)
 {
 	int rc = 0;
@@ -2885,7 +3030,7 @@ int main(int argc, char **argv)
 	if (!obs_startup("en-US", args.module_config, NULL))
 		FAIL("obs_startup failed (Linux needs an X display, e.g. xvfb-run)");
 	initialized = true;
-	printf("HARNESS libobs %s\n", obs_get_version_string());
+	harness_report("libobs", "version", "HARNESS libobs %s\n", obs_get_version_string());
 
 	struct obs_video_info ovi = {
 		.graphics_module = args.graphics,
@@ -2936,11 +3081,20 @@ int main(int argc, char **argv)
 	mods = bstrdup(args.modules);
 	for (char *m = strtok(mods, ","); m; m = strtok(NULL, ","))
 		if (!obs_get_module(m))
-			printf("HARNESS module not loaded: %s\n", m);
+			harness_report("module_missing", "name", "HARNESS module not loaded: %s\n", m);
+		else
+			harness_report("module_loaded", "name", "HARNESS module loaded: %s\n", m);
 	bfree(mods);
 	obs_post_load_modules();
+	if (obs_source_get_display_name(SETTINGS_SOURCE_ID))
+		signal_handler_connect(obs_get_signal_handler(), "dstreamy_test_settings_settled", on_settings_settled,
+				       NULL);
 	obs_log_loaded_modules();
 
+	if (args.observation_framing) {
+		rc = observation_framing() ? 0 : 1;
+		goto cleanup;
+	}
 	if (args.report_ui)
 		report_settings_source();
 #ifdef __linux__
@@ -2960,7 +3114,8 @@ int main(int argc, char **argv)
 	// Mid-frame, so the beep - flash offset is about half a frame instead of anywhere in [0, 1) frames.
 	marker_base_ns = obs_get_video_frame_time() + util_mul_div64(FLASH_PERIOD_NS, 1, interval_ns) * interval_ns +
 			 interval_ns / 2;
-	printf("HARNESS markers base_ns=%" PRIu64 " period_ns=%llu\n", marker_base_ns, FLASH_PERIOD_NS);
+	harness_report("markers", "base_ns period_ns", "HARNESS markers base_ns=%" PRIu64 " period_ns=%llu\n",
+		       marker_base_ns, FLASH_PERIOD_NS);
 
 	obs_data_t *cs = obs_data_create();
 	obs_data_set_int(cs, "color", DARK_COLOR);
@@ -2978,7 +3133,8 @@ int main(int argc, char **argv)
 		FAIL("harness audio source create failed");
 	if (args.audio_mixers) {
 		obs_source_set_audio_mixers(audio, (uint32_t)args.audio_mixers);
-		printf("HARNESS audio_source mixers=0x%x\n", obs_source_get_audio_mixers(audio));
+		harness_report("audio_source", "mixers", "HARNESS audio_source mixers=0x%x\n",
+			       obs_source_get_audio_mixers(audio));
 	}
 
 	scene = obs_scene_create("harness scene");
@@ -3050,7 +3206,7 @@ int main(int argc, char **argv)
 		obs_output_set_audio_encoder(stream, aenc, 0);
 		if (!obs_output_start(stream))
 			FAIL("stream output start failed");
-		printf("HARNESS stream output started\n");
+		harness_report("stream_started", "", "HARNESS stream output started\n");
 	}
 
 	if (args.report_ui)
@@ -3059,7 +3215,7 @@ int main(int argc, char **argv)
 	if (!obs_output_start(output)) {
 		const char *err = obs_output_get_last_error(output);
 		if (contains_expected_error(err)) {
-			printf("HARNESS expected_error start: %s\n", err);
+			harness_report("expected_error_start", "message", "HARNESS expected_error start: %s\n", err);
 			report_audio_mixer(output, "start_failed");
 			goto cleanup;
 		}
@@ -3070,7 +3226,7 @@ int main(int argc, char **argv)
 	}
 	started = true;
 	uint64_t start_ns = os_gettime_ns();
-	printf("HARNESS obs_output_start=ok\n");
+	harness_report("output_started", "", "HARNESS obs_output_start=ok\n");
 	report_audio_mixer(output, "start");
 	if (args.update_output_while_active) {
 		for (int i = 0; !obs_output_active(output); i++) {
@@ -3109,8 +3265,9 @@ int main(int argc, char **argv)
 		obs_output_release(output);
 		output = NULL;
 		started = false;
-		printf("HARNESS released the output during its start in %llu ms\n",
-		       (unsigned long long)((os_gettime_ns() - before) / 1000000));
+		harness_report("release_during_start", "ms",
+			       "HARNESS released the output during its start in %llu ms\n",
+			       (unsigned long long)((os_gettime_ns() - before) / 1000000));
 		goto cleanup;
 	}
 
@@ -3156,7 +3313,7 @@ int main(int argc, char **argv)
 		if (rc || (!args.restart_video_settings && !args.restart_output_settings))
 			goto cleanup;
 		const char *update_json = args.restart_video_settings ? args.restart_video_settings
-								       : args.restart_output_settings;
+								      : args.restart_output_settings;
 		obs_data_t *update = obs_data_create_from_json(update_json);
 		if (!update)
 			FAIL("--restart-*-settings is not a JSON object");
@@ -3173,7 +3330,7 @@ int main(int argc, char **argv)
 			FAIL("stream output restart failed");
 		os_event_reset(stopped_event);
 		os_event_reset(full_event);
-		printf("HARNESS restarting the output\n");
+		harness_report("output_restarting", "", "HARNESS restarting the output\n");
 		if (!obs_output_start(output))
 			FAIL("obs_output_start on restart: %s", obs_output_get_last_error(output));
 		started = true;
@@ -3196,8 +3353,9 @@ int main(int argc, char **argv)
 
 	struct trace_recorder *rec = obs_obj_get_data(output);
 	join_stop_thread(rec);
-	printf("HARNESS packets video=%ld audio=%ld lagged=%u skipped=%u\n", rec->video_packets, rec->audio_packets,
-	       frame_delta.lagged, frame_delta.skipped);
+	harness_report("packets", "video audio lagged skipped",
+		       "HARNESS packets video=%ld audio=%ld lagged=%u skipped=%u\n", rec->video_packets,
+		       rec->audio_packets, frame_delta.lagged, frame_delta.skipped);
 	if (stop_code != OBS_OUTPUT_SUCCESS)
 		FAIL("output stopped with code %lld", stop_code);
 	if (rec->write_failed || !close_packets(rec))
@@ -3240,13 +3398,15 @@ cleanup:
 		run_ui_tasks();
 #endif
 		obs_output_t *left = obs_get_output_by_name("D-Streamy");
-		printf("HARNESS obs_shutdown begins dstreamy_output=%d active=%d\n", left != NULL,
-		       left && obs_output_active(left) ? 1 : 0);
+		harness_report("shutdown_begin", "dstreamy_output active",
+			       "HARNESS obs_shutdown begins dstreamy_output=%d active=%d\n", left != NULL,
+			       left && obs_output_active(left) ? 1 : 0);
 		fflush(stdout);
 		obs_output_release(left);
 		uint64_t shutdown_ns = os_gettime_ns();
 		obs_shutdown();
-		printf("HARNESS obs_shutdown ms=%llu\n", (unsigned long long)((os_gettime_ns() - shutdown_ns) / 1000000));
+		harness_report("obs_shutdown", "ms", "HARNESS obs_shutdown ms=%llu\n",
+			       (unsigned long long)((os_gettime_ns() - shutdown_ns) / 1000000));
 	}
 	os_event_destroy(stopped_event);
 	os_event_destroy(full_event);
@@ -3263,13 +3423,14 @@ cleanup:
 		rc = 1;
 	}
 	long libobs_leaks = bnum_allocs();
-	printf("HARNESS stop_signals=%ld error_stop_signals=%ld\n", os_atomic_load_long(&stop_signals),
-	       os_atomic_load_long(&error_stop_signals));
-	printf("HARNESS shutdown libobs_leaks=%ld\n", libobs_leaks);
+	harness_report("stop_signals", "stop_signals error_stop_signals",
+		       "HARNESS stop_signals=%ld error_stop_signals=%ld\n", os_atomic_load_long(&stop_signals),
+		       os_atomic_load_long(&error_stop_signals));
+	harness_report("shutdown", "libobs_leaks", "HARNESS shutdown libobs_leaks=%ld\n", libobs_leaks);
 	if (initialized && libobs_leaks) {
 		harness_error("%ld libobs allocation(s) leaked after obs_shutdown", libobs_leaks);
 		rc = 1;
 	}
-	printf("HARNESS result=%s\n", rc == 0 ? "PASS" : "FAIL");
+	harness_report("result", "value", "HARNESS result=%s\n", rc == 0 ? "PASS" : "FAIL");
 	return rc;
 }

@@ -13,6 +13,7 @@ on:
       - ".github/workflows/obs-ci.yml"
       - ".github/actions/obs-prefix-*/**"
       - ".github/scripts/obs-*.sh"
+      - ".github/scripts/apt-install.sh"
   pull_request:
     branches: [main, rust-rewrite]
     paths:
@@ -25,7 +26,8 @@ on:
       - ".github/workflows/obs-ci.yml"
       - ".github/actions/obs-prefix-*/**"
       - ".github/scripts/obs-*.sh"
-  # Dispatching on rust-rewrite re-publishes the OBS prefix artifacts, e.g. after a long gap without pushes.
+      - ".github/scripts/apt-install.sh"
+  # Dispatching on the default branch re-publishes the OBS prefix artifacts, e.g. after a long gap without pushes.
   workflow_dispatch:
 
 permissions:
@@ -42,12 +44,26 @@ env:
   OBS_BUILD_REV: "1"
   # Line tables keep file:line in backtraces at a fraction of full debuginfo's size.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  PUBLISH_OBS_PREFIX: ${{ github.ref == 'refs/heads/rust-rewrite' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+  PUBLISH_OBS_PREFIX: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
 
 jobs:
   obs-linux-plugin:
+    name: obs-linux-plugin (OBS ${{ matrix.obs }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - obs: "32.2.2"
+            commit: ba2f32bdf791005443988a4955e963663e16b1ed
+            baseline: true
+          - obs: "33.0.1"
+            commit: 65c320b46e1af5c7a555161aea6182cdf7a8c524
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    env:
+      APT_CACHE: apt-obs-linux-ubuntu-24.04
+      OBS_TAG: ${{ matrix.obs }}
+      OBS_COMMIT: ${{ matrix.commit }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -62,15 +78,15 @@ jobs:
           mkdir -p "$RUNNER_TEMP/obs-logs"
 
       - name: OBS pin matches obs/buildspec.json
+        if: matrix.baseline
         run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
 
       - name: Restore apt archives
-        id: apt-restore
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/apt-archives
-          key: apt-obs-linux-ubuntu-24.04-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: apt-obs-linux-ubuntu-24.04-
+          key: ${{ env.APT_CACHE }}-${{ github.run_id }}
+          restore-keys: ${{ env.APT_CACHE }}-
       - name: Install system dependencies
         timeout-minutes: 30
         run: |
@@ -86,22 +102,24 @@ jobs:
             libspeexdsp-dev libudev-dev libv4l-dev libva-dev libpci-dev libdrm-dev \
             nlohmann-json3-dev libwebsocketpp-dev libasio-dev libqrcodegencpp-dev qt6-base-dev \
             libqt6svg6-dev qt6-base-private-dev xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils \
-            libclang-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libopus-dev
+            libclang-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
       - name: Check apt archives
         id: apt-check
         if: always()
         run: |
           sudo chown -R "$USER" ~/apt-archives ~/apt-archives.manifest 2>/dev/null || true
-          if [ -f ~/apt-archives.manifest ] &&
-            ! find ~/apt-archives -type f ! -name lock ! -path '*/partial/*' -printf '%P %s\n' | sort | cmp -s - ~/apt-archives.manifest; then
+          listing="$RUNNER_TEMP/apt-listing"
+          find ~/apt-archives -type f ! -name lock ! -path '*/partial/*' -printf '%P %s\n' 2>/dev/null | sort >"$listing" || true
+          if [ -f ~/apt-archives.manifest ] && ! cmp -s "$listing" ~/apt-archives.manifest; then
             echo changed=true >>"$GITHUB_OUTPUT"
           fi
+          echo "key=$APT_CACHE-$(sha256sum <"$listing" | cut -c1-16)" >>"$GITHUB_OUTPUT"
       - name: Save apt archives
         if: always() && steps.apt-check.outputs.changed == 'true'
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/apt-archives
-          key: ${{ steps.apt-restore.outputs.cache-primary-key }}
+          key: ${{ steps.apt-check.outputs.key }}
 
       - name: Restore OBS build
         id: obs
@@ -162,12 +180,14 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: obs-logs-linux-plugin
+          name: obs-logs-linux-plugin-obs-${{ matrix.obs }}
           path: ${{ runner.temp }}/obs-logs
 
   obs-linux-checks:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    env:
+      APT_CACHE: apt-obs-linux-ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -190,8 +210,8 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/apt-archives
-          key: apt-obs-linux-ubuntu-24.04-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: apt-obs-linux-ubuntu-24.04-
+          key: ${{ env.APT_CACHE }}-${{ github.run_id }}
+          restore-keys: ${{ env.APT_CACHE }}-
       - name: Install system dependencies
         timeout-minutes: 30
         run: |
@@ -207,7 +227,7 @@ jobs:
             libspeexdsp-dev libudev-dev libv4l-dev libva-dev libpci-dev libdrm-dev \
             nlohmann-json3-dev libwebsocketpp-dev libasio-dev libqrcodegencpp-dev qt6-base-dev \
             libqt6svg6-dev qt6-base-private-dev xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils \
-            libclang-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libopus-dev
+            libclang-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
       - name: Restore OBS build
         id: obs
@@ -253,8 +273,8 @@ jobs:
           find "$stage" -print
           plugins="$stage/lib/x86_64-linux-gnu/obs-plugins"
           test -f "$plugins/obs-dstreamy.so"
-          test -f "$plugins/obs-dstreamy-ui/obs-dstreamy-ui.so"
-          grep -q "Tabler Icons" "$plugins/obs-dstreamy-ui/THIRD_PARTY_NOTICES.txt"
+          test -f "$plugins/dstreamy-ui/obs-dstreamy-ui.so"
+          grep -q "Tabler Icons" "$plugins/dstreamy-ui/THIRD_PARTY_NOTICES.txt"
           if find "$plugins" -maxdepth 1 -name '*.so' ! -name obs-dstreamy.so | grep .; then
             echo "libobs would try these as modules: only obs-dstreamy.so may sit in the module folder"
             exit 1
@@ -281,6 +301,9 @@ jobs:
           plugin = tomllib.load(open("rust/crates/dstreamy-obs/Cargo.toml", "rb"))["workspace"]
           for key in ("package", "lints"):
               assert main[key] == plugin[key], f"[workspace.{key}] differs"
+          import json
+          build = json.load(open("obs/buildspec.json"))
+          assert build["version"] == plugin["package"]["version"], "plugin versions differ"
           PY
 
       - name: Plugin crate gates
@@ -321,6 +344,9 @@ jobs:
             bash "$GITHUB_WORKSPACE/obs/tests/record-traces.sh" "$HARNESS" "$TRACE_CHECK" traces \
             | tee "$OBS_LOGS/record-traces.log"
 
+      - name: Compare fresh trace metadata and packet counts with committed traces
+        run: python3 -I obs/tests/check-trace-drift.py obs/tests/traces "$OBS_TRACES"
+
       - name: Check recorded traces against the specs
         working-directory: rust
         run: |
@@ -338,7 +364,7 @@ jobs:
             echo "libobs would try these as modules: only obs-dstreamy.so may sit in the module folder"
             exit 1
           fi
-          cp -R obs/build_x86_64/rundir/obs-dstreamy.so obs/build_x86_64/rundir/obs-dstreamy-ui "$plugin/bin/64bit/"
+          cp -R obs/build_x86_64/rundir/obs-dstreamy.so obs/build_x86_64/rundir/dstreamy-ui "$plugin/bin/64bit/"
           # The test-hooks build clicks Tools > D-Streamy once this file exists.
           touch "$RUNNER_TEMP/open-dialog"
           export DSTREAMY_TEST_OPEN_DIALOG="$RUNNER_TEMP/open-dialog"
@@ -730,7 +756,7 @@ jobs:
             "$DUMPBIN" -nologo -dependents obs/build_x64/rundir/obs-dstreamy.dll
           } | tee "$OBS_LOGS/plugin-dll.log"
           grep -qw obs_module_load "$OBS_LOGS/plugin-dll.log"
-          "$DUMPBIN" -nologo -exports -dependents obs/build_x64/rundir/obs-dstreamy-ui/obs-dstreamy-ui.dll | tee "$OBS_LOGS/ui-dll.log"
+          "$DUMPBIN" -nologo -exports -dependents obs/build_x64/rundir/dstreamy-ui/obs-dstreamy-ui.dll | tee "$OBS_LOGS/ui-dll.log"
           if find obs/build_x64/rundir -maxdepth 1 -name '*.dll' ! -name obs-dstreamy.dll | grep .; then
             echo "libobs would try these as modules: only obs-dstreamy.dll may sit in the module folder"
             exit 1
@@ -758,11 +784,11 @@ jobs:
           cmake --install obs/build_x64 --config RelWithDebInfo --prefix "$stage"
           find "$stage" -print
           bin="$stage/obs-dstreamy/bin/64bit"
-          for f in obs-dstreamy.dll dstreamy_obs.pdb obs-dstreamy-ui/obs-dstreamy-ui.dll obs-dstreamy-ui/obs-dstreamy-ui.pdb \
-            obs-dstreamy-ui/THIRD_PARTY_NOTICES.txt; do
+          for f in obs-dstreamy.dll dstreamy_obs.pdb dstreamy-ui/obs-dstreamy-ui.dll dstreamy-ui/obs-dstreamy-ui.pdb \
+            dstreamy-ui/THIRD_PARTY_NOTICES.txt; do
             test -f "$bin/$f" || { echo "the install lacks obs-dstreamy/bin/64bit/$f"; exit 1; }
           done
-          grep -q "Tabler Icons" "$bin/obs-dstreamy-ui/THIRD_PARTY_NOTICES.txt"
+          grep -q "Tabler Icons" "$bin/dstreamy-ui/THIRD_PARTY_NOTICES.txt"
           if find "$bin" -maxdepth 1 -name '*.dll' ! -name obs-dstreamy.dll | grep .; then
             echo "libobs would try these as modules: only obs-dstreamy.dll may sit in the module folder"
             exit 1
@@ -795,7 +821,7 @@ jobs:
           # Windows OBS looks for plugins under CSIDL_COMMON_APPDATA (35), not %APPDATA% (frontend/widgets/OBSBasic.cpp:149).
           plugin="$(cygpath -u -F 35)/obs-studio/plugins/obs-dstreamy"
           mkdir -p "$plugin/bin/64bit" "$plugin/data"
-          cp -R "$ws/obs/build_x64/rundir/obs-dstreamy.dll" "$ws/obs/build_x64/rundir/obs-dstreamy-ui" "$plugin/bin/64bit/"
+          cp -R "$ws/obs/build_x64/rundir/obs-dstreamy.dll" "$ws/obs/build_x64/rundir/dstreamy-ui" "$plugin/bin/64bit/"
           export EXPECT_LOG_LINE=$'[obs-dstreamy] added the D-Streamy status-bar panel\n[obs-dstreamy] added Tools > D-Streamy\n[obs-dstreamy] unloaded'
           cd "$(cygpath -u "$OBS_PREFIX")/bin/64bit"
           bash "$ws/obs/tests/frontend/frontend-smoke.sh" "$cfg" "$OBS_LOGS/frontend-stdout.log" ./obs64.exe \

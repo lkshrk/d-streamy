@@ -1,0 +1,74 @@
+# Contributing
+
+Contributions are welcome: bug reports, fixes and improvements to capture, the service, the OBS plugin and the macOS app.
+
+Please read the [Disclaimer](README.md#disclaimer) first. Never put your Discord token, or an account's `token` file, into issues, logs, fixtures or commits; redact ids you don't want public.
+
+## Reporting issues
+
+Open an issue with your OS and version, which frontend you used (`dstreamy stream` or `tui`, the OBS plugin, the macOS app), the OBS version if it was involved, and the relevant lines of `dstreamy.log` from the config directory (`dstreamy.log` next to `config.toml`; `-v` adds them to stderr) with tokens and ids removed.
+
+## Layout
+
+Three build units and the Swift app; see [CLAUDE.md](CLAUDE.md) for the crate list.
+
+- `rust/`: the Cargo workspace that builds `dstreamy`.
+- `rust/crates/dstreamy-obs` (with `dstreamy-obs-sys`): the OBS plugin, its own workspace because it links libobs. It is built only through `obs/`.
+- `obs/`: the CMake project for the plugin, its Qt panel, the headless harness and the recorded traces.
+- `App/`: the SwiftUI menu bar app over `dstreamy daemon`.
+
+Design decisions are ADRs in `docs/adr/`; a change that contradicts one needs a new ADR or an amendment. `docs/specs.md` pins every external behaviour the service and the plugin rely on: a behaviour with no source there is neither relied on nor mocked, so add the row (with its source) before the code. Golden fixtures (`rust/crates/dstreamy-cli/tests/fixtures/`, `rust/crates/dstreamy-ipc/tests/fixtures/`, `obs/tests/traces/`) are contracts; changing one needs a protocol bump or new provenance.
+
+## Development
+
+The Rust toolchain is pinned in `rust/rust-toolchain.toml` (1.99.0 with `rustfmt` and `clippy`); `rustup` picks it up in `rust/`. Linux needs the build packages from the README's [Build from source](README.md#build-from-source) section (`clang`, `libclang-dev`, `pkg-config`, `libpipewire-0.3-dev`, `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`, plus the WebKitGTK 4.1 development packages for `--features browser-login`) and the GStreamer runtime plugins to run the tests. macOS needs Xcode 27.1.
+
+Before opening a PR, run the same checks as CI. Rust, from `rust/`:
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --locked -p dstreamy-cli -p dstreamy-test-producer --features dstreamy-cli/test-pattern --bin dstreamy --bin mock-producer
+export DSTREAMY_BIN="$PWD/target/debug/dstreamy"
+export DSTREAMY_MOCK_PRODUCER="$PWD/target/debug/mock-producer"
+cargo nextest run --workspace --locked --profile ci -E 'not binary_id(dstreamy-cli::trace_replay)'
+DSTREAMY_TRACE_REPLAY_STRICT=1 cargo test --workspace --locked --test trace_replay
+cargo test --workspace --locked --doc
+```
+
+The explicit binary build and environment variables prepare the paths used by the tests. CI applies the same nextest exclusion: `trace_replay` must not run under nextest.
+
+`cargo nextest` is [cargo-nextest](https://nexte.st); plain `cargo test --workspace --locked` works too, but `trace_replay` must run under `cargo test` either way because it relies on in-process guards. Builds that touch the browser login also run `cargo clippy -p dstreamy-cli --features browser-login --all-targets --locked -- -D warnings` and `cargo test -p dstreamy-cli --features browser-login --locked --lib --test browser_login --test cli`. Linux browser CI also requires a real smoke under a virtual display:
+
+```sh
+xvfb-run -a -s "-screen 0 1280x720x24" cargo test -p dstreamy-cli --features browser-login --locked --test browser_smoke -- --nocapture
+```
+
+The Rust workflow defines macOS on `xcode-27`, Linux x86_64 on `ubuntu-24.04` and Linux aarch64 on `ubuntu-24.04-arm`. Cross-user IPC and the real systemd installer are separate integration gates; the installer test changes its isolated test user's service manager and is not part of the ordinary workspace command. Do not run it against your own service setup without reviewing that job.
+
+For documentation changes, check both public workspaces with warnings denied:
+
+```sh
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --no-deps
+```
+
+Repeat from the plugin workspace after configuring OBS. This catches rustdoc warnings, not undocumented public items unless the corresponding lint is enabled. Public API method, field and variant coverage remains pending a dedicated review; the earlier type, constant and free-function pass did not cover every public item.
+
+OBS plugin, from `obs/`, against the baseline OBS 32.2.2 build whose prefix is in `OBS_PREFIX` (`.github/scripts/obs-linux-build.sh` builds one the way CI does):
+
+```sh
+cmake --preset ubuntu-ci-x86_64 -DCMAKE_PREFIX_PATH="$OBS_PREFIX" -DDSTREAMY_PLUGIN_TEST_HOOKS=ON
+cmake --build --preset ubuntu-ci-x86_64
+xvfb-run -a -s "-screen 0 1280x720x24" ctest --preset ubuntu-ci-x86_64
+```
+
+Set `DSTREAMY_OBS_CONFIG` to the absolute path of `obs/build_x86_64/obs-config-RelWithDebInfo.txt` generated by CMake before running the plugin crate's own gates from `rust/crates/dstreamy-obs`: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` (also with `--features test-hooks`) and `xvfb-run -a -s "-screen 0 1280x720x24" cargo test --workspace --locked`. The Linux plugin compatibility matrix adds OBS 33.0.1; macOS and Windows jobs retain 32.2.2. On macOS use the `macos-ci` preset and `ctest --test-dir build_macos -C RelWithDebInfo -R dstreamy-ui --output-on-failure`. The workflow separately checks both Rust target slices and runs architecture-specific load tests. `.github/workflows/obs-ci.yml` has the platform setup and full steps.
+
+macOS app: `swift test` (it needs `rust/target/debug/dstreamy` and the mock Discord server, so run `cargo build --locked -p dstreamy-cli --features test-pattern -p dstreamy-mock-discord` in `rust/` first) and `bash scripts/build.sh`.
+
+## Pull requests
+
+- Fork, branch from `main`, and keep each PR focused on one change.
+- Add tests for new behaviour; pin any new external fact in `docs/specs.md`.
+- Use [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `chore:`) with a scope where it helps, e.g. `fix(serve): ...`, `feat(obs): ...`.
+- Write plain, short sentences in docs, help text and messages; see `CONTEXT.md` for the words to use.

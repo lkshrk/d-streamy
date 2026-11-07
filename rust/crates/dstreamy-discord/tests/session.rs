@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dstreamy_core::StreamHealth;
+use dstreamy_discord::transport::{MediaTimeouts, Streamer};
 use dstreamy_discord::{
-    Backoff, DiscordClient, GatewayOptions, Session, SessionError, SessionEvent, SessionOptions,
-    SessionState, StopReason, StreamError, StreamOptions,
+    Backoff, DiscordClient, E2ee, GatewayEvent, GatewayOptions, Session, SessionError,
+    SessionEvent, SessionOptions, SessionState, StopReason, StreamError, StreamOptions,
 };
 use dstreamy_media::{
     CaptureConfig, CaptureSource, CaptureTarget, FRAME_CHANNEL_CAPACITY, FrameReceiver, MediaError,
@@ -16,7 +17,7 @@ use dstreamy_mock_discord::opcodes::gateway as gw;
 use dstreamy_mock_discord::opcodes::voice as vo;
 use dstreamy_mock_discord::{
     MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID, MOCK_TOKEN, MOCK_USER_ID, MOCK_VOICE_CHANNEL_ID,
-    MockDiscord, VoiceKind, rtc,
+    MockConfig, MockDiscord, VoiceKind, rtc,
 };
 use secrecy::SecretString;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -26,6 +27,13 @@ use tokio::time::{sleep, timeout};
 const T: Duration = Duration::from_secs(20);
 
 async fn client(mock: &MockDiscord) -> Arc<DiscordClient> {
+    client_configured(mock, |_| {}).await
+}
+
+async fn client_configured(
+    mock: &MockDiscord,
+    configure: impl FnOnce(&mut Streamer),
+) -> Arc<DiscordClient> {
     let mut opts = GatewayOptions::new(SecretString::from(MOCK_TOKEN)).with_url(mock.gateway_url());
     opts.reconnect_delay_min = Duration::from_millis(10);
     opts.reconnect_delay_max = Duration::from_millis(50);
@@ -38,6 +46,11 @@ async fn client(mock: &MockDiscord) -> Arc<DiscordClient> {
         let mut streamer = client.streamer();
         streamer.set_ice_servers(vec![]);
         streamer.set_setting_engine(rtc::loopback_settings(false));
+        streamer.set_media_timeouts(MediaTimeouts {
+            disconnected_grace: Duration::from_secs(1),
+            restart_timeout: Duration::from_secs(1),
+        });
+        configure(&mut streamer);
     }
     Arc::new(client)
 }
@@ -86,6 +99,9 @@ enum Behaviour {
     HangStart,
     FailRestart,
     GateRestart,
+    StopDrops,
+    StopError,
+    HangStop,
     EndAfter(usize),
 }
 
@@ -94,6 +110,7 @@ struct Counted {
     counters: Arc<Counters>,
     behaviour: Behaviour,
     forward: Option<JoinHandle<()>>,
+    drops: dstreamy_media::CaptureDrops,
 }
 
 impl Counted {
@@ -108,6 +125,7 @@ impl Counted {
             counters: counters.clone(),
             behaviour,
             forward: None,
+            drops: dstreamy_media::CaptureDrops::default(),
         };
         (Box::new(source), counters)
     }
@@ -134,6 +152,14 @@ impl CaptureSource for Counted {
             }
             _ => self.inner.start(config).await?,
         };
+        self.drops = if self.behaviour == Behaviour::HangStop {
+            dstreamy_media::CaptureDrops {
+                video_frames: 3,
+                audio_frames: 5,
+            }
+        } else {
+            dstreamy_media::CaptureDrops::default()
+        };
         let Behaviour::EndAfter(n) = self.behaviour else {
             return Ok(frames);
         };
@@ -155,7 +181,24 @@ impl CaptureSource for Counted {
         if let Some(forward) = self.forward.take() {
             forward.abort();
         }
-        self.inner.stop().await
+        self.inner.stop().await?;
+        if self.behaviour == Behaviour::HangStop {
+            std::future::pending::<()>().await;
+        }
+        if matches!(self.behaviour, Behaviour::StopDrops | Behaviour::StopError) {
+            self.drops = dstreamy_media::CaptureDrops {
+                video_frames: 7,
+                audio_frames: 11,
+            };
+        }
+        if self.behaviour == Behaviour::StopError {
+            return Err(MediaError::Backend("injected teardown failure".into()));
+        }
+        Ok(())
+    }
+
+    fn capture_drops(&self) -> dstreamy_media::CaptureDrops {
+        self.drops
     }
 
     fn request_keyframe(&self) {
@@ -193,9 +236,28 @@ impl Fixture {
         behaviour: Behaviour,
         arm: impl FnOnce(&MockDiscord),
     ) -> Self {
-        let mock = MockDiscord::start().await.unwrap();
+        Self::streaming_configured(options, behaviour, arm, |_| {}).await
+    }
+
+    async fn streaming_configured(
+        options: SessionOptions,
+        behaviour: Behaviour,
+        arm: impl FnOnce(&MockDiscord),
+        configure: impl FnOnce(&mut Streamer),
+    ) -> Self {
+        Self::streaming_on(MockConfig::default(), options, behaviour, arm, configure).await
+    }
+
+    async fn streaming_on(
+        config: MockConfig,
+        options: SessionOptions,
+        behaviour: Behaviour,
+        arm: impl FnOnce(&MockDiscord),
+        configure: impl FnOnce(&mut Streamer),
+    ) -> Self {
+        let mock = MockDiscord::start_with(config).await.unwrap();
         arm(&mock);
-        let client = client(&mock).await;
+        let client = client_configured(&mock, configure).await;
         let session = Session::new(client.clone());
         let events = session.subscribe();
         let state = session.state();
@@ -303,6 +365,24 @@ impl Fixture {
         )
     }
 
+    /// The states entered before the first event matching `f`.
+    async fn states_until(&mut self, f: impl Fn(&SessionEvent) -> bool) -> Vec<SessionState> {
+        let mut states = Vec::new();
+        let found = timeout(T, async {
+            loop {
+                match self.events.recv().await {
+                    Ok(event) if f(&event) => return,
+                    Ok(SessionEvent::State { state }) => states.push(state),
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(e) => panic!("session events: {e}"),
+                }
+            }
+        })
+        .await;
+        found.unwrap_or_else(|_| panic!("no such session event: {}", self.context(&[])));
+        states
+    }
+
     async fn wait_event(&mut self, f: impl Fn(&SessionEvent) -> bool) -> SessionEvent {
         let mut skipped = Vec::new();
         let found = timeout(T, async {
@@ -349,6 +429,80 @@ async fn voice_ws_drop_resumes_in_place() {
     assert_eq!(f.states_seen(), []);
     assert_eq!(*f.state.borrow(), SessionState::Streaming);
     assert_eq!(f.gateway_ops(gw::OP_STREAM_CREATE), 1);
+    assert_eq!(f.starts(), 1);
+    f.finish().await;
+}
+
+fn media_failure(e: &SessionEvent) -> bool {
+    matches!(e, SessionEvent::Error { message, fatal: false } if message.contains("media path failed"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_peer_connection_whose_restart_goes_unanswered_recreates_go_live() {
+    let mut f = Fixture::streaming().await;
+    f.states_seen();
+    f.client
+        .streamer()
+        .stream_connection()
+        .expect("stream connection")
+        .simulate_peer_failed();
+    f.mock
+        .wait_for_op(Some(VoiceKind::Stream), vo::OP_SELECT_PROTOCOL, 1, T)
+        .await
+        .expect("the restart's SELECT_PROTOCOL");
+    f.wait_event(media_failure).await;
+    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    f.video_flowing().await;
+
+    assert!(
+        f.states_seen()
+            .contains(&SessionState::Reconnecting { attempt: 1 })
+    );
+    assert_eq!(f.gateway_ops(gw::OP_STREAM_CREATE), 2);
+    assert_eq!(f.voice_joins(), [MOCK_VOICE_CHANNEL_ID]);
+    assert_eq!(f.starts(), 1);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_connection_disconnected_past_the_grace_recreates_go_live() {
+    let mut f = Fixture::streaming().await;
+    f.states_seen();
+    f.client
+        .streamer()
+        .stream_connection()
+        .expect("stream connection")
+        .simulate_peer_disconnected();
+    f.wait_event(media_failure).await;
+    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    f.video_flowing().await;
+
+    assert_eq!(f.gateway_ops(gw::OP_STREAM_CREATE), 2);
+    assert_eq!(f.voice_joins(), [MOCK_VOICE_CHANNEL_ID]);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_udp_path_under_a_live_voice_socket_is_detected_and_go_live_recreated() {
+    let configure = |streamer: &mut Streamer| {
+        let mut engine = rtc::loopback_settings(false);
+        engine.set_ice_timeouts(
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_millis(200)),
+        );
+        streamer.set_setting_engine(engine);
+    };
+    let mut f =
+        Fixture::streaming_configured(options(), Behaviour::Normal, |_| {}, configure).await;
+    f.states_seen();
+    assert!(f.mock.drop_media(VoiceKind::Stream).await);
+    f.wait_event(media_failure).await;
+    wait_state(&mut f.state, |s| *s == SessionState::Streaming).await;
+    f.video_flowing().await;
+
+    assert_eq!(f.gateway_ops(gw::OP_STREAM_CREATE), 2);
+    assert_eq!(f.voice_joins(), [MOCK_VOICE_CHANNEL_ID]);
     assert_eq!(f.starts(), 1);
     f.finish().await;
 }
@@ -767,6 +921,56 @@ async fn late_voice_states_of_the_last_run_never_move_the_next_one() {
     f.finish().await;
 }
 
+const OTHER_MEMBER: &str = "100000000000000777";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_members_voice_state_during_the_join_never_hides_the_accounts_move() {
+    let mut f = Fixture::streaming().await;
+    restart_in(&mut f, MOCK_VOICE_CHANNEL_ID, |mock| {
+        mock.move_during_next_join(MOCK_GUILD_ID, MOCK_OTHER_VOICE_CHANNEL_ID);
+        mock.other_user_voice_state_during_next_join(
+            OTHER_MEMBER,
+            MOCK_GUILD_ID,
+            Some(MOCK_VOICE_CHANNEL_ID),
+        );
+    })
+    .await;
+    assert_eq!(moves_seen(&mut f), [MOCK_OTHER_VOICE_CHANNEL_ID]);
+    let streams = f.mock.streams();
+    assert!(
+        !streams.is_empty()
+            && streams
+                .iter()
+                .all(|s| s.stream_key.contains(MOCK_OTHER_VOICE_CHANNEL_ID)),
+        "{streams:?}"
+    );
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_members_voice_states_while_streaming_change_nothing() {
+    let mut f = Fixture::streaming().await;
+    f.states_seen();
+    assert!(f.mock.voice_state_of_other_user(
+        OTHER_MEMBER,
+        MOCK_GUILD_ID,
+        Some(MOCK_OTHER_VOICE_CHANNEL_ID)
+    ));
+    assert!(
+        f.mock
+            .voice_state_of_other_user(OTHER_MEMBER, MOCK_GUILD_ID, None)
+    );
+    // Gateway events are handled in order, so a viewer count that arrives later proves both states were seen.
+    assert!(f.mock.set_viewers(&[OTHER_MEMBER]));
+    wait_viewers(&mut f, Some(1)).await;
+
+    assert_eq!(*f.state.borrow(), SessionState::Streaming);
+    assert_eq!(f.gateway_ops(gw::OP_STREAM_CREATE), 1);
+    assert_eq!(f.gateway_ops(gw::OP_STREAM_DELETE), 0);
+    assert_eq!(f.voice_joins(), [MOCK_VOICE_CHANNEL_ID]);
+    f.finish().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_move_while_joining_is_followed() {
     let mut f = Fixture::streaming().await;
@@ -814,15 +1018,25 @@ async fn a_move_while_joining_is_followed() {
 async fn gateway_drop_resumes_and_leaves_the_stream_alone() {
     let mut f = Fixture::streaming().await;
     f.states_seen();
+    let mut gateway = f.client.subscribe();
     assert!(f.mock.drop_gateway(Some(4000)));
     f.mock
         .wait_for_op(None, gw::OP_RESUME, 0, T)
         .await
         .expect("gateway RESUME");
+    // The session reads the same broadcast, so Disconnected and Resumed are in its queue by now.
+    timeout(T, async {
+        while !matches!(gateway.recv().await, Ok(GatewayEvent::Resumed)) {}
+    })
+    .await
+    .expect("the client's Resumed");
+    let mut states = f
+        .states_until(|e| matches!(e, SessionEvent::Health(_)))
+        .await;
     f.video_flowing().await;
-    sleep(Duration::from_millis(200)).await;
+    states.extend(f.states_seen());
 
-    assert_eq!(f.states_seen(), []);
+    assert_eq!(states, []);
     assert_eq!(f.gateway_ops(gw::OP_STREAM_CREATE), 1);
     assert_eq!(f.voice_joins(), [MOCK_VOICE_CHANNEL_ID]);
     f.finish().await;
@@ -960,6 +1174,274 @@ async fn update_video_announces_op_12_and_survives_reconnects() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn e2ee_is_reported_once_dave_is_up_and_in_every_health_snapshot() {
+    let mut f = Fixture::streaming().await;
+    let reported = f
+        .wait_event(|e| matches!(e, SessionEvent::E2ee { .. }))
+        .await;
+    assert!(
+        matches!(
+            reported,
+            SessionEvent::E2ee {
+                state: E2ee::Encrypted,
+                dave_protocol_version: 1
+            }
+        ),
+        "{reported:?}"
+    );
+    f.wait_event(|e| {
+        matches!(e, SessionEvent::Health(h) if h.stats.e2ee == E2ee::Encrypted && h.stats.dave_protocol_version == 1)
+    })
+    .await;
+    f.finish().await;
+}
+
+const GUEST: u64 = 100_000_000_000_008_888;
+
+async fn dave_guest_present(f: &Fixture, want: bool) {
+    timeout(T, async {
+        while f.mock.dave_has_guest(VoiceKind::Stream).await != want {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the mock's DAVE guest never became {want}"));
+}
+
+fn tagged_first_frame_drops(r: &dstreamy_mock_discord::Recorded) -> usize {
+    r.dropped_frames
+        .iter()
+        .filter(|d| d.starts_with(dstreamy_mock_discord::FIRST_FRAME_DAVE_DROP))
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_joining_and_leaving_the_call_rekeys_dave_without_losing_frames() {
+    let mut f = Fixture::streaming().await;
+    f.wait_event(|e| {
+        matches!(
+            e,
+            SessionEvent::E2ee {
+                state: E2ee::Encrypted,
+                ..
+            }
+        )
+    })
+    .await;
+    let before = f.mock.recorded();
+    let drops_before = before.dropped_frames.len() - tagged_first_frame_drops(&before);
+
+    assert!(f.mock.join_dave_guest(VoiceKind::Stream, GUEST).await);
+    dave_guest_present(&f, true).await;
+    f.mock
+        .wait_for_op(Some(VoiceKind::Stream), vo::OP_DAVE_TRANSITION_READY, 1, T)
+        .await
+        .expect("the join's TRANSITION_READY");
+    f.video_flowing().await;
+
+    assert!(f.mock.leave_dave_guest(VoiceKind::Stream, GUEST).await);
+    dave_guest_present(&f, false).await;
+    f.mock
+        .wait_for_op(Some(VoiceKind::Stream), vo::OP_DAVE_TRANSITION_READY, 2, T)
+        .await
+        .expect("the leave's TRANSITION_READY");
+    f.video_flowing().await;
+
+    let after = f.mock.recorded();
+    let drops_after = after.dropped_frames.len() - tagged_first_frame_drops(&after);
+    assert_eq!(drops_after, drops_before, "{:?}", after.dropped_frames);
+    assert!(after.video.iter().rev().take(10).all(|v| v.e2ee));
+    assert_eq!(*f.state.borrow(), SessionState::Streaming);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dave_downgrade_and_upgrade_are_followed_and_reported() {
+    let mut f = Fixture::streaming().await;
+    f.wait_event(|e| {
+        matches!(
+            e,
+            SessionEvent::E2ee {
+                state: E2ee::Encrypted,
+                ..
+            }
+        )
+    })
+    .await;
+    let before = f.mock.recorded();
+    let drops_before = before.dropped_frames.len() - tagged_first_frame_drops(&before);
+
+    assert!(f.mock.downgrade_dave(VoiceKind::Stream).await);
+    f.wait_event(|e| {
+        matches!(
+            e,
+            SessionEvent::E2ee {
+                state: E2ee::Unencrypted,
+                dave_protocol_version: 0
+            }
+        )
+    })
+    .await;
+    f.video_flowing().await;
+    let plain = f.mock.recorded();
+    assert!(plain.video.iter().rev().take(10).all(|v| !v.e2ee));
+
+    assert!(f.mock.upgrade_dave(VoiceKind::Stream).await);
+    f.wait_event(|e| {
+        matches!(
+            e,
+            SessionEvent::E2ee {
+                state: E2ee::Encrypted,
+                dave_protocol_version: 1
+            }
+        )
+    })
+    .await;
+    f.video_flowing().await;
+
+    let after = f.mock.recorded();
+    assert!(after.video.iter().rev().take(10).all(|v| v.e2ee));
+    let drops_after = after.dropped_frames.len() - tagged_first_frame_drops(&after);
+    assert_eq!(drops_after, drops_before, "{:?}", after.dropped_frames);
+    assert_eq!(*f.state.borrow(), SessionState::Streaming);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn require_e2ee_stops_a_running_stream_before_downgraded_media_is_sent() {
+    let mut opts = options();
+    opts.stream.require_e2ee = true;
+    let mut f = Fixture::streaming_with(opts).await;
+    assert!(f.mock.recorded().video.iter().all(|v| v.e2ee));
+    assert!(f.mock.downgrade_dave(VoiceKind::Stream).await);
+    let stopped = timeout(
+        Duration::from_secs(3),
+        f.state
+            .wait_for(|s| matches!(s, SessionState::Stopped { .. })),
+    )
+    .await;
+    assert!(
+        stopped.is_ok(),
+        "strict stream continued after DAVE downgrade"
+    );
+    drop(stopped);
+    assert_eq!(
+        *f.state.borrow(),
+        SessionState::Stopped {
+            reason: StopReason::E2eeUnavailable
+        }
+    );
+    let recorded = f.mock.recorded();
+    assert!(
+        recorded.video.iter().all(|v| v.e2ee),
+        "plaintext video escaped"
+    );
+    assert!(
+        recorded.audio.iter().all(|a| a.e2ee),
+        "plaintext audio escaped"
+    );
+    f.wait_event(|e| matches!(e, SessionEvent::Error { fatal: true, .. }))
+        .await;
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gateway_rate_limit_close_resumes_and_leaves_the_stream_alone() {
+    let mut f = Fixture::streaming().await;
+    f.states_seen();
+    assert!(f.mock.drop_gateway(Some(4008)));
+    f.mock
+        .wait_for_op(None, gw::OP_RESUME, 0, T)
+        .await
+        .expect("gateway RESUME");
+    f.video_flowing().await;
+
+    assert_eq!(f.states_seen(), []);
+    assert_eq!(f.gateway_ops(gw::OP_STREAM_CREATE), 1);
+    assert_eq!(f.voice_joins(), [MOCK_VOICE_CHANNEL_ID]);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voice_server_without_dave_is_reported_as_unencrypted() {
+    let config = MockConfig {
+        dave_protocol_version: 0,
+        ..MockConfig::default()
+    };
+    let mut f = Fixture::streaming_on(config, options(), Behaviour::Normal, |_| {}, |_| {}).await;
+    let reported = f
+        .wait_event(|e| matches!(e, SessionEvent::E2ee { .. }))
+        .await;
+    assert!(
+        matches!(
+            reported,
+            SessionEvent::E2ee {
+                state: E2ee::Unencrypted,
+                dave_protocol_version: 0
+            }
+        ),
+        "{reported:?}"
+    );
+    f.wait_event(|e| matches!(e, SessionEvent::Health(h) if h.stats.e2ee == E2ee::Unencrypted))
+        .await;
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn require_e2ee_refuses_a_voice_server_without_dave() {
+    let config = MockConfig {
+        dave_protocol_version: 0,
+        ..MockConfig::default()
+    };
+    let mock = MockDiscord::start_with(config).await.unwrap();
+    let client = client(&mock).await;
+    let session = Session::new(client.clone());
+    let mut events = session.subscribe();
+    let mut state = session.state();
+    let mut options = options();
+    options.stream.require_e2ee = true;
+    let (source, counters) = Counted::boxed();
+    session
+        .start(
+            Some(MOCK_GUILD_ID.into()),
+            MOCK_VOICE_CHANNEL_ID.into(),
+            source,
+            options,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("start: {e}"));
+    wait_state(&mut state, |s| matches!(s, SessionState::Stopped { .. })).await;
+    assert_eq!(
+        *state.borrow(),
+        SessionState::Stopped {
+            reason: StopReason::E2eeUnavailable
+        }
+    );
+    let mut fatal = None;
+    while let Ok(event) = events.try_recv() {
+        if let SessionEvent::Error {
+            message,
+            fatal: true,
+        } = event
+        {
+            fatal = Some(message);
+        }
+    }
+    assert!(
+        fatal
+            .as_deref()
+            .is_some_and(|m| m.contains("no end-to-end encryption")),
+        "{fatal:?}"
+    );
+    assert_eq!(counters.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(mock.recorded_video().len(), 0);
+    assert!(timeout(T, session.stop()).await.unwrap().unwrap().is_some());
+    timeout(T, session.shutdown()).await.unwrap();
+    Arc::try_unwrap(client).ok().unwrap().close().await;
+    mock.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn gives_up_and_stops_when_voice_never_connects() {
     let mock = MockDiscord::start().await.unwrap();
     let client = client(&mock).await;
@@ -1058,6 +1540,79 @@ async fn close(client: Arc<DiscordClient>, session: Session, mock: MockDiscord) 
     timeout(T, session.shutdown()).await.unwrap();
     Arc::try_unwrap(client).ok().unwrap().close().await;
     mock.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_stats_include_shutdown_losses_and_clear_before_the_next_run() {
+    let mut opts = options();
+    opts.health_interval = Duration::from_secs(3600);
+    let mut f = Fixture::streaming_source(opts.clone(), Behaviour::StopDrops).await;
+    assert!(f.session.terminal_stats().is_none());
+    let source = f.session.stop().await.unwrap().unwrap();
+    let stats = f.session.terminal_stats().unwrap();
+    assert_eq!(stats.source_video_frames_dropped, 7);
+    assert_eq!(stats.source_audio_frames_dropped, 11);
+    assert_eq!(stats.e2ee, E2ee::Encrypted);
+    assert_eq!(source.capture_drops().video_frames, 7);
+    while let Ok(event) = f.events.try_recv() {
+        assert!(
+            !matches!(event, SessionEvent::Health(_)),
+            "stop fabricated a health sample"
+        );
+    }
+    f.session
+        .start(
+            Some(MOCK_GUILD_ID.into()),
+            MOCK_VOICE_CHANNEL_ID.into(),
+            source,
+            opts,
+        )
+        .await
+        .unwrap();
+    assert!(f.session.terminal_stats().is_none());
+    wait_state(&mut f.state, |s| matches!(s, SessionState::Streaming)).await;
+    assert!(f.session.terminal_stats().is_none());
+    f.session.stop().await.unwrap();
+    assert_eq!(
+        f.session
+            .terminal_stats()
+            .unwrap()
+            .source_video_frames_dropped,
+        7
+    );
+    close(f.client, f.session, f.mock).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_stats_preserve_teardown_errors_and_timeout_lower_bounds() {
+    for behaviour in [Behaviour::StopError, Behaviour::HangStop] {
+        let f = Fixture::streaming_source(options(), behaviour).await;
+        let source = f.session.stop().await.unwrap().unwrap();
+        let stats = f.session.terminal_stats().unwrap();
+        let expected = if behaviour == Behaviour::StopError {
+            (7, 11)
+        } else {
+            (3, 5)
+        };
+        assert_eq!(
+            (
+                stats.source_video_frames_dropped,
+                stats.source_audio_frames_dropped
+            ),
+            expected
+        );
+        let error = stats.last_error.unwrap();
+        assert!(
+            error.contains(if behaviour == Behaviour::StopError {
+                "injected teardown failure"
+            } else {
+                "stopping the capture source"
+            }),
+            "{error}"
+        );
+        assert_eq!(source.capture_drops().video_frames, expected.0);
+        close(f.client, f.session, f.mock).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1238,6 +1793,21 @@ fn session_state_and_events_serialize_for_json_output() {
     assert_eq!(
         serde_json::to_value(&event).unwrap(),
         serde_json::json!({ "event": "state", "state": { "state": "reconnecting", "attempt": 2 } })
+    );
+    let e2ee = SessionEvent::E2ee {
+        state: E2ee::Unencrypted,
+        dave_protocol_version: 0,
+    };
+    assert_eq!(
+        serde_json::to_value(&e2ee).unwrap(),
+        serde_json::json!({ "event": "e2ee", "state": "unencrypted", "dave_protocol_version": 0 })
+    );
+    let refused = SessionState::Stopped {
+        reason: StopReason::E2eeUnavailable,
+    };
+    assert_eq!(
+        serde_json::to_value(&refused).unwrap(),
+        serde_json::json!({ "state": "stopped", "reason": { "reason": "e2ee_unavailable" } })
     );
 }
 

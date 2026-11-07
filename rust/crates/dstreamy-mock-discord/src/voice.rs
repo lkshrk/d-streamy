@@ -37,8 +37,11 @@ pub const OP_HELLO: u8 = 8;
 pub const OP_RESUMED: u8 = 9;
 pub const OP_CLIENTS_CONNECT: u8 = 11;
 pub const OP_VIDEO: u8 = 12;
+pub const OP_CLIENT_DISCONNECT: u8 = 13;
+pub const OP_DAVE_PREPARE_TRANSITION: u8 = 21;
 pub const OP_DAVE_EXECUTE_TRANSITION: u8 = 22;
 pub const OP_DAVE_TRANSITION_READY: u8 = 23;
+pub const OP_DAVE_PREPARE_EPOCH: u8 = 24;
 pub const OP_MLS_EXTERNAL_SENDER: u8 = 25;
 pub const OP_MLS_KEY_PACKAGE: u8 = 26;
 pub const OP_MLS_PROPOSALS: u8 = 27;
@@ -70,6 +73,8 @@ pub(crate) struct VoiceConn {
     pub audio_ssrc: u32,
     pub video_ssrc: u32,
     pub dave: SharedDave,
+    /// The PREPARE_TRANSITION to protocol 0 the client has yet to confirm.
+    pub pending_downgrade: Option<u16>,
     peer: Option<(Arc<RTCPeerConnection>, JoinHandle<()>)>,
 }
 
@@ -112,11 +117,14 @@ impl VoiceConn {
         pc.write_rtcp(&[Box::new(fir)]).await.is_ok()
     }
 
-    pub(crate) async fn close_peer(&mut self) {
-        if let Some((pc, sink)) = self.peer.take() {
-            let _ = pc.close().await;
-            sink.abort();
-        }
+    /// Closes the media peer connection; false when there was none.
+    pub(crate) async fn close_peer(&mut self) -> bool {
+        let Some((pc, sink)) = self.peer.take() else {
+            return false;
+        };
+        let _ = pc.close().await;
+        sink.abort();
+        true
     }
 }
 
@@ -266,6 +274,7 @@ async fn open(shared: &Arc<Shared>, ws: &mut Ws) -> Result<SharedConn, u16> {
                 audio_ssrc: base,
                 video_ssrc: base + 1,
                 dave: Arc::new(Mutex::new(None)),
+                pending_downgrade: None,
                 peer: None,
             };
             let ready = json!({
@@ -364,6 +373,12 @@ async fn run(
                         return;
                     }
                 }
+                Some(Control::VoiceJson(op, d)) => {
+                    send_json(&mut ws, &mut *conn.lock().await, op, d).await;
+                }
+                Some(Control::VoiceBinary(op, payload)) => {
+                    send_binary(&mut ws, &mut *conn.lock().await, op, &payload).await;
+                }
                 Some(Control::Close(Some(code))) => {
                     if ends_session(code) {
                         end_session(shared, conn).await;
@@ -409,8 +424,18 @@ async fn on_text(
         }
         OP_VIDEO => check_video_ssrcs(&c, d)?,
         OP_DAVE_TRANSITION_READY => {
+            let downgrade = c
+                .pending_downgrade
+                .is_some_and(|id| d["transition_id"].as_u64() == Some(u64::from(id)));
             if let Some(server) = lock_dave(&c.dave).as_mut() {
                 server.execute_transition();
+                if downgrade {
+                    server.downgraded = true;
+                }
+            }
+            if downgrade {
+                c.pending_downgrade = None;
+                c.dave_version = 0;
             }
             let transition_id = d["transition_id"].clone();
             send_json(
@@ -513,6 +538,11 @@ async fn select_protocol(
         .to_owned();
     if !offered_fmtp(&offer, audio_payload_type).is_some_and(|f| same_params(f, rtc::OPUS_FMTP)) {
         return Err(CLOSE_BAD_REQUEST);
+    }
+    // What Discord answers to a second SELECT_PROTOCOL on a live session is unverified, so by default nothing.
+    if c.peer.is_some() && !shared.state().accept_repeated_select_protocol {
+        warn!("mock voice: repeated SELECT_PROTOCOL left unanswered");
+        return Ok(());
     }
     c.close_peer().await;
     let answered = answer(video_codec, audio_payload_type, video_payload_type, offer).await;

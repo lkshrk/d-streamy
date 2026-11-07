@@ -30,8 +30,21 @@ impl EncoderSettings {
     }
 }
 
-const H264_ORDER: [&str; 4] = ["vah264enc", "vaapih264enc", "nvh264enc", "x264enc"];
-const H265_ORDER: [&str; 4] = ["vah265enc", "vaapih265enc", "nvh265enc", "x265enc"];
+/// gst-va registers `*lpenc` for the VA low-power entrypoint, the only one Intel Gen12+ and Arc expose for AVC/HEVC.
+const H264_ORDER: [&str; 5] = [
+    "vah264enc",
+    "vah264lpenc",
+    "vaapih264enc",
+    "nvh264enc",
+    "x264enc",
+];
+const H265_ORDER: [&str; 5] = [
+    "vah265enc",
+    "vah265lpenc",
+    "vaapih265enc",
+    "nvh265enc",
+    "x265enc",
+];
 
 /// Encoders to try for `settings.codec`, best first, limited to factories in `available`.
 pub fn encoder_candidates<S: AsRef<str>>(
@@ -53,7 +66,7 @@ fn encoder_spec(factory: &'static str, s: EncoderSettings) -> EncoderSpec {
     let gop = s.keyframe_interval();
     let kbps = s.bitrate_kbps();
     let properties: Vec<(&'static str, String)> = match factory {
-        "vah264enc" | "vah265enc" => vec![
+        "vah264enc" | "vah264lpenc" | "vah265enc" | "vah265lpenc" => vec![
             ("rate-control", "cbr".into()),
             ("bitrate", kbps),
             ("key-int-max", gop),
@@ -136,12 +149,26 @@ mod tests {
             "x264enc",
             "nvh264enc",
             "vaapih264enc",
+            "vah264lpenc",
             "vah264enc",
             "x265enc",
         ];
         assert_eq!(
             factories(&encoder_candidates(settings(VideoCodec::H264), &all)),
-            ["vah264enc", "vaapih264enc", "nvh264enc", "x264enc"]
+            [
+                "vah264enc",
+                "vah264lpenc",
+                "vaapih264enc",
+                "nvh264enc",
+                "x264enc"
+            ]
+        );
+        assert_eq!(
+            factories(&encoder_candidates(
+                settings(VideoCodec::H264),
+                &["x264enc", "vah264lpenc"]
+            )),
+            ["vah264lpenc", "x264enc"]
         );
         assert_eq!(
             factories(&encoder_candidates(
@@ -161,10 +188,16 @@ mod tests {
 
     #[test]
     fn h265_uses_h265_elements_only() {
-        let all = ["x264enc", "vah264enc", "x265enc", "vaapih265enc"];
+        let all = [
+            "x264enc",
+            "vah264enc",
+            "x265enc",
+            "vah265lpenc",
+            "vaapih265enc",
+        ];
         assert_eq!(
             factories(&encoder_candidates(settings(VideoCodec::H265), &all)),
-            ["vaapih265enc", "x265enc"]
+            ["vah265lpenc", "vaapih265enc", "x265enc"]
         );
     }
 
@@ -197,7 +230,7 @@ mod tests {
     fn hardware_encoders_take_nv12_and_cbr() {
         for spec in encoder_candidates(
             settings(VideoCodec::H264),
-            &["vah264enc", "vaapih264enc", "nvh264enc"],
+            &["vah264enc", "vah264lpenc", "vaapih264enc", "nvh264enc"],
         ) {
             assert_eq!(spec.input_format, "NV12");
             assert!(

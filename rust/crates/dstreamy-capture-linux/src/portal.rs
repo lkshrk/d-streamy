@@ -1,13 +1,16 @@
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
 
-use ashpd::desktop::PersistMode;
-use ashpd::desktop::Session;
 use ashpd::desktop::screencast::{
     CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
 };
+use ashpd::desktop::{PersistMode, ResponseError, Session};
 use ashpd::enumflags2::BitFlags;
 use dstreamy_media::MediaError;
+use futures_util::StreamExt;
 use tokio::runtime::Handle;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 /// What the ScreenCast portal dialog offers the user to pick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -31,8 +34,12 @@ impl PortalSources {
 /// An open ScreenCast session; the stream lives until [`PortalStream::close`] or drop.
 pub(crate) struct PortalStream {
     proxy: Screencast,
-    session: Option<Session<Screencast>>,
+    /// Shared with the task that watches for the session's `Closed` signal.
+    session: Option<Arc<Session<Screencast>>>,
     runtime: Handle,
+    /// Resolves when the compositor or the user ends the session; taken once by [`PortalStream::closed`].
+    closed: Option<oneshot::Receiver<()>>,
+    closed_watch: JoinHandle<()>,
     pub(crate) node_id: u32,
     /// The stream size the portal reports, in compositor coordinates that may differ from frame pixels.
     pub(crate) size: Option<(u32, u32)>,
@@ -40,7 +47,17 @@ pub(crate) struct PortalStream {
 }
 
 fn portal_err(context: &str) -> impl FnOnce(ashpd::Error) -> MediaError + '_ {
-    move |e| MediaError::Backend(format!("ScreenCast portal {context}: {e}"))
+    move |e| match e {
+        ashpd::Error::Response(ResponseError::Cancelled) => MediaError::Cancelled,
+        e => MediaError::Backend(format!("ScreenCast portal {context}: {e}")),
+    }
+}
+
+fn connect_err(e: ashpd::Error) -> MediaError {
+    MediaError::Backend(format!(
+        "ScreenCast portal connect: {e}; is xdg-desktop-portal running with a backend for your \
+         desktop (xdg-desktop-portal-gnome, -kde, -wlr or -hyprland)?"
+    ))
 }
 
 impl PortalStream {
@@ -49,15 +66,45 @@ impl PortalStream {
         sources: PortalSources,
         restore_token: Option<&str>,
     ) -> Result<(Self, OwnedFd), MediaError> {
-        let proxy = Screencast::new().await.map_err(portal_err("connect"))?;
+        let proxy = Screencast::new().await.map_err(connect_err)?;
         let session = proxy
             .create_session(Default::default())
             .await
             .map_err(portal_err("create session"))?;
+        let session = Arc::new(session);
+        let (closed_tx, closed_rx) = oneshot::channel();
+        let (subscribed_tx, subscribed_rx) = oneshot::channel();
+        let closed_watch = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                let signals = session.receive_closed().await;
+                let _ = subscribed_tx.send(signals.as_ref().map(drop).map_err(|e| e.to_string()));
+                let Ok(signals) = signals else {
+                    return;
+                };
+                let mut signals = std::pin::pin!(signals);
+                if signals.next().await.is_some() {
+                    let _ = closed_tx.send(());
+                }
+            }
+        });
+        // Subscribed before the picker shows, so a session closed right after it is never missed.
+        match subscribed_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = session.close().await;
+                return Err(MediaError::Backend(format!(
+                    "ScreenCast portal watch session: {e}"
+                )));
+            }
+            Err(_) => {}
+        }
         let mut stream = Self {
             proxy,
             session: Some(session),
             runtime: Handle::current(),
+            closed: Some(closed_rx),
+            closed_watch,
             node_id: 0,
             size: None,
             restore_token: None,
@@ -87,8 +134,18 @@ impl PortalStream {
             .session
             .as_ref()
             .expect("session is open until close or drop");
+        // Older portals lack the property; they all accept Embedded.
+        let cursor_modes = proxy
+            .available_cursor_modes()
+            .await
+            .unwrap_or_else(|_| CursorMode::Embedded.into());
+        let cursor_mode = if cursor_modes.contains(CursorMode::Embedded) {
+            CursorMode::Embedded
+        } else {
+            CursorMode::Hidden
+        };
         let options = SelectSourcesOptions::default()
-            .set_cursor_mode(CursorMode::Embedded)
+            .set_cursor_mode(cursor_mode)
             .set_sources(sources.flags())
             .set_multiple(false)
             .set_persist_mode(PersistMode::ExplicitlyRevoked)
@@ -125,7 +182,13 @@ impl PortalStream {
         ))
     }
 
+    /// Resolves with `Ok` when the session ends on its own; `Err` once this stream is closed or dropped.
+    pub(crate) fn closed(&mut self) -> Option<oneshot::Receiver<()>> {
+        self.closed.take()
+    }
+
     pub(crate) async fn close(mut self) {
+        self.closed_watch.abort();
         if let Some(session) = &self.session {
             // Ignored: the compositor may have ended the session already.
             let _ = session.close().await;
@@ -136,6 +199,7 @@ impl PortalStream {
 
 impl Drop for PortalStream {
     fn drop(&mut self) {
+        self.closed_watch.abort();
         if let Some(session) = self.session.take() {
             // Ignored as in `close`; a runtime that already shut down cancels the task.
             self.runtime.spawn(async move {

@@ -15,14 +15,14 @@ use libloading::Library;
 use crate::guard::guard;
 use crate::log;
 use crate::output::text;
-use crate::session::{self, Wait};
+use crate::session;
 use crate::settings_source::{self, change, with_controls};
 
 const ABI_VERSION: u32 = sys::DSTREAMY_UI_ABI_VERSION;
 
 // libobs scans the module's own folder for modules, never this subfolder; macOS's bundle folder isn't scanned.
 #[cfg(not(target_os = "macos"))]
-const FOLDER: &str = "obs-dstreamy-ui";
+const FOLDER: &str = "dstreamy-ui";
 #[cfg(target_os = "macos")]
 const FOLDER: &str = "";
 #[cfg(target_os = "macos")]
@@ -235,7 +235,7 @@ fn live_stats() -> Option<LiveStats> {
     let counters = session::output_counters();
     let mut sampler = SAMPLER.lock().unwrap_or_else(PoisonError::into_inner);
     let sampler = sampler.get_or_insert_with(Sampler::default);
-    let Some((bytes, frames, dropped)) = counters else {
+    let Some((bytes, frames, dropped, dropped_audio)) = counters else {
         sampler.reset();
         return None;
     };
@@ -246,6 +246,7 @@ fn live_stats() -> Option<LiveStats> {
             bytes,
             frames,
             dropped,
+            dropped_audio,
         },
         session::viewers(),
         session::health(),
@@ -283,17 +284,17 @@ extern "C" fn free_string(s: *mut c_char) {
 }
 
 extern "C" fn start(_ctx: Ctx) {
-    guard("panel start", (), || session::start(Wait::No));
+    guard("panel start", (), session::start);
 }
 
 extern "C" fn stop(_ctx: Ctx) {
-    guard("panel stop", (), || session::stop(Wait::No));
+    guard("panel stop", (), session::stop);
 }
 
 // Not a dialog callback, so the open dialog can rebuild at once.
 extern "C" fn login(_ctx: Ctx) {
     guard("panel login", (), || {
-        session::login(Wait::No);
+        session::login();
         settings_source::refresh();
     });
 }
@@ -308,7 +309,7 @@ extern "C" fn cancel_login(_ctx: Ctx) {
 extern "C" fn select_account(_ctx: Ctx, name: *const c_char) {
     guard("panel select_account", (), || {
         if let Some(name) = picked(name) {
-            session::select_account(&name, Wait::No);
+            session::select_account(&name);
             settings_source::refresh();
         }
     });
@@ -316,7 +317,7 @@ extern "C" fn select_account(_ctx: Ctx, name: *const c_char) {
 
 extern "C" fn add_account(_ctx: Ctx) {
     guard("panel add_account", (), || {
-        session::add_account(Wait::No);
+        session::add_account();
         settings_source::refresh();
     });
 }
@@ -334,7 +335,7 @@ extern "C" fn logout_account(_ctx: Ctx, name: *const c_char) {
 extern "C" fn confirm_logout(_ctx: Ctx, yes: bool) {
     guard("panel confirm_logout", (), || {
         if let Some(name) = change(|c, _| c.model.confirm_logout(yes)) {
-            session::logout_account(&name, Wait::No);
+            session::logout_account(&name);
         }
         settings_source::refresh();
     });
@@ -345,7 +346,7 @@ extern "C" fn load_lists(_ctx: Ctx) {
         PANEL_OPEN.store(true, Ordering::Release);
         CONFIRMING.store(false, Ordering::Release);
         settings_source::open_config();
-        session::request_lists(None);
+        session::load_lists(None);
     });
 }
 
@@ -361,7 +362,7 @@ extern "C" fn select_guild(_ctx: Ctx, id: *const c_char) {
         let id = picked(id);
         let load = change(|c, p| c.edit(p.write(), |m| m.choose_guild(id.as_deref())));
         if let Some(guild) = load {
-            session::request_lists(Some(guild));
+            session::load_lists(Some(guild));
         }
     });
 }

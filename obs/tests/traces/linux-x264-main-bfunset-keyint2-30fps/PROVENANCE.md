@@ -68,3 +68,5 @@ Files: `packets.bin` (every `encoded_packet` in arrival order until 150 video pa
 
 `packets.bin`: the 8 bytes `DSTRACE1`, then per packet a 40-byte little-endian header followed by the payload:
 type u8 (0 audio, 1 video), keyframe u8, priority u8, drop_priority u8, timebase_num i32, timebase_den i32, size u32, pts i64, dts i64, dts_usec i64.
+
+Re-record after an OBS pin, x264, FFmpeg or runner-image change, or when OBS CI reports metadata or packet-count drift. Compare the fresh trace artifact before replacing this fixture; byte-for-byte encoded output is not stable across encoder builds.

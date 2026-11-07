@@ -68,6 +68,16 @@ struct PopoverView: View {
                     .padding(.bottom, 8)
             }
 
+            if state.streamState.canStop, let warning = state.encryption.warning {
+                Label(warning, systemImage: "lock.open.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            }
+
             if let authError = state.authError {
                 Text(authError)
                     .font(.caption2)

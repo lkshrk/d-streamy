@@ -1,9 +1,13 @@
+/// Opus runs at 48 kHz, stereo, in 20 ms frames: what Discord expects.
 pub const OPUS_SAMPLE_RATE: u32 = 48_000;
+/// Channels in the Opus stream sent to Discord.
 pub const OPUS_CHANNELS: usize = 2;
 /// Samples per channel in one 20 ms Opus frame.
 pub const OPUS_FRAME_SAMPLES: usize = 960;
+/// One Opus frame in microseconds; the pts step between audio frames.
 pub const OPUS_FRAME_DURATION_US: u64 = 20_000;
 
+/// The codec of an encoded video frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VideoCodec {
     H264,
@@ -15,6 +19,7 @@ pub enum VideoCodec {
 pub struct EncodedVideoFrame {
     pub codec: VideoCodec,
     pub data: Vec<u8>,
+    /// Nonnegative presentation time in microseconds on the source's timeline.
     pub pts_us: u64,
     pub keyframe: bool,
 }
@@ -23,9 +28,11 @@ pub struct EncodedVideoFrame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioFrame {
     pub data: Vec<u8>,
+    /// Presentation time in microseconds on the same timeline as video.
     pub pts_us: u64,
 }
 
+/// One encoded frame from a source, video or audio, with its pts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaFrame {
     Video(EncodedVideoFrame),

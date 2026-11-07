@@ -9,6 +9,7 @@ publish.workspace = true
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"] }
 async-trait = "0.1"
 dstreamy-media = { path = "../dstreamy-media" }
+futures-util = { version = "0.3", default-features = false }
 glib = { version = "0.22", features = ["v2_74"] }
 gstreamer = "0.25"
 gstreamer-app = "0.25"

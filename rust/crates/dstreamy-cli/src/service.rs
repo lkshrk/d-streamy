@@ -58,6 +58,9 @@ pub enum Action {
     /// Report whether the service is installed and running, and whether its socket answers
     Status {
         /// Socket path; defaults to the one the service's `dstreamy serve` uses
+        ///
+        /// Its directory must be yours with mode 0700, so a shared directory such as /tmp
+        /// is refused.
         #[arg(long, value_name = "PATH")]
         endpoint: Option<PathBuf>,
     },
@@ -94,7 +97,7 @@ pub enum ServiceError {
     )]
     NotSearched { dir: PathBuf, search_path: String },
     #[error(
-        "{0} is a symbolic link; dstreamy does not replace a link it did not create. Remove it, or install the service by hand"
+        "{0} is a symbolic link; dstreamy does not replace or remove a link it did not create. Remove it, or manage the service by hand"
     )]
     DefinitionIsSymlink(PathBuf),
     #[error("{action} {path}: {source}")]
@@ -391,7 +394,13 @@ fn manager_state(
 
 fn uninstall(out: &Out, backend: &dyn Backend, dry_run: bool) -> Result<ExitCode, CliError> {
     let path = backend.definition_path();
-    let present = fs::symlink_metadata(path).is_ok();
+    let present = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(ServiceError::DefinitionIsSymlink(path.to_owned()).into());
+        }
+        Ok(_) => true,
+        Err(_) => false,
+    };
     let state = manager_state(out, backend, dry_run)?;
     if !present && let Some(foreign) = state.as_ref().and_then(|s| s.foreign.as_ref()) {
         if out.json {

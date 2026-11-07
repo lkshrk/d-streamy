@@ -20,6 +20,31 @@ pub const LOGIN_ENV: [&str; 6] = [
     "DBUS_SESSION_BUS_ADDRESS",
 ];
 
+/// D-Bus unixexec and autolaunch addresses can run programs, unlike these graphical-session values.
+pub fn login_env_value_ok(name: &str, value: &str) -> bool {
+    const MAX_VALUE: usize = 4096;
+    if value.len() > MAX_VALUE || value.chars().any(char::is_control) {
+        return false;
+    }
+    match name {
+        "XAUTHORITY" => value.starts_with('/'),
+        "WAYLAND_DISPLAY" => !value.is_empty() && (value.starts_with('/') || !value.contains('/')),
+        "DISPLAY" => {
+            value.contains(':')
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_' | '/'))
+        }
+        "XDG_SESSION_TYPE" => value.chars().all(|c| c.is_ascii_alphanumeric()),
+        "DBUS_SESSION_BUS_ADDRESS" => value.split(';').all(|entry| {
+            ["unix:", "tcp:", "nonce-tcp:", "systemd:", "launchd:"]
+                .iter()
+                .any(|transport| entry.starts_with(transport))
+        }),
+        _ => true,
+    }
+}
+
 /// How long serve keeps a login window open before it closes it.
 pub const LOGIN_WINDOW_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -34,6 +59,8 @@ pub enum Malformed {
     NotJson(String),
 }
 
+/// NDJSON framing of the control role (ADR 0004 IPC), with a 1 MiB content limit by default.
+/// Malformed lines are reported as items and discarded; later lines remain decodable.
 #[derive(Debug)]
 pub struct ControlCodec {
     max_line: usize,
@@ -52,6 +79,7 @@ impl ControlCodec {
         Self::default()
     }
 
+    /// Sets the content-byte limit, excluding the newline and an optional trailing carriage return.
     pub fn with_max_line(max_line: usize) -> Self {
         Self {
             max_line,
@@ -296,6 +324,47 @@ mod tests {
         codec.encode(json!({"id": "1"}), &mut buf).unwrap();
         assert_eq!(drain(&mut codec, &mut buf), [Ok(json!({"id": "1"}))]);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn login_env_values_must_look_like_a_sessions() {
+        for (name, value) in [
+            ("DISPLAY", ":0"),
+            ("DISPLAY", "localhost:10.0"),
+            ("DISPLAY", "unix/:1"),
+            ("WAYLAND_DISPLAY", "wayland-1"),
+            ("WAYLAND_DISPLAY", "/run/user/1000/wayland-0"),
+            ("XAUTHORITY", "/run/user/1000/.mutter-Xwaylandauth.ABC"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("XDG_CURRENT_DESKTOP", "GNOME:ubuntu"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+            (
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:abstract=/tmp/dbus-x,guid=1;tcp:host=localhost,port=1",
+            ),
+        ] {
+            assert!(login_env_value_ok(name, value), "{name}={value}");
+        }
+        for (name, value) in [
+            ("DISPLAY", "0"),
+            ("DISPLAY", ":0\n"),
+            ("DISPLAY", ":0;rm -rf x"),
+            ("WAYLAND_DISPLAY", ""),
+            ("WAYLAND_DISPLAY", "../x/wayland-0"),
+            ("XAUTHORITY", "relative/auth"),
+            ("XAUTHORITY", ""),
+            ("XDG_SESSION_TYPE", "x11;y"),
+            ("XDG_CURRENT_DESKTOP", "KDE\u{7}"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unixexec:path=/bin/sh"),
+            ("DBUS_SESSION_BUS_ADDRESS", "autolaunch:"),
+            (
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/run/user/1000/bus;unixexec:path=/bin/sh",
+            ),
+        ] {
+            assert!(!login_env_value_ok(name, value), "{name}={value:?}");
+        }
+        assert!(!login_env_value_ok("DISPLAY", &":".repeat(5000)));
     }
 
     #[test]

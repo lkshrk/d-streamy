@@ -106,6 +106,18 @@ final class DaemonFixtureTests: XCTestCase {
         XCTAssertEqual(try result("1").decode(as: HelloInfo.self).protocol, daemonProtocolVersion)
     }
 
+    func testUnknownValuesDecodeWithoutDroppingTheLine() throws {
+        let output = try lines(of: "unknown.ndjson").map { try DaemonCoding.decoder.decode(DaemonMessage.self, from: $0) }
+        var events: [SessionEvent] = []
+        for case .event(let event) in output { events.append(event) }
+        XCTAssertEqual(events, [
+            .state(.stopped(.unknown("future_reason"))),
+            .state(.unknown("future_state")),
+            .unknown("future_event"),
+        ])
+        XCTAssertEqual(StopReason.unknown("future_reason").message, "Stopped: future_reason")
+    }
+
     private func decodeReply(_ data: JSONValue, for command: DaemonCommand) throws {
         switch command {
         case .hello: _ = try data.decode(as: HelloInfo.self)
@@ -124,7 +136,9 @@ final class DaemonFixtureTests: XCTestCase {
         case .health: return "health"
         case .channelMoved: return "channel_moved"
         case .resumed: return "resumed"
+        case .e2ee: return "e2ee"
         case .error: return "error"
+        case .unknown(let event): return event
         }
     }
 }

@@ -14,6 +14,7 @@ pub const MAX_BYTES: usize = 32 << 20;
 /// A producer frame's largest payload; bigger packets still go to the writer, which refuses them with their size.
 pub const MAX_PACKET: usize = (8 << 20) - 10;
 
+/// Which track a packet belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Track {
     Video,
@@ -27,8 +28,10 @@ pub struct Packet {
     pub keyframe: bool,
     pub pts: i64,
     pub dts: i64,
+    /// OBS time base; `pts` and `dts` use ticks of 1 / denominator seconds.
     pub timebase: (i32, i32),
     pub data: Vec<u8>,
+    /// Arrival at the encoded-packet callback, used for latency rather than render time.
     pub arrived: Instant,
 }
 
@@ -39,6 +42,7 @@ pub struct Oversized {
     pub len: usize,
 }
 
+/// Current queued payload and per-track loss totals since the latest `Ring::reopen`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RingStats {
     pub queued: usize,
@@ -77,11 +81,22 @@ impl Inner {
         self.queue.len() >= capacity || self.bytes + incoming > max_bytes
     }
 
-    fn drop_queued_video(&mut self) {
+    fn drop_oldest_gop(&mut self) {
+        let first = self.queue.iter().position(|p| p.track == Track::Video);
+        let next = first.and_then(|first| {
+            self.queue
+                .iter()
+                .enumerate()
+                .skip(first + 1)
+                .find(|(_, p)| p.track == Track::Video && p.keyframe)
+                .map(|(index, _)| index)
+        });
         let before = self.queue.len();
         let mut freed = 0;
+        let mut index = 0;
         self.queue.retain(|p| {
-            let keep = p.track == Track::Audio;
+            let keep = p.track == Track::Audio || next.is_some_and(|next| index >= next);
+            index += 1;
             if !keep {
                 freed += p.data.len();
             }
@@ -89,7 +104,7 @@ impl Inner {
         });
         self.bytes -= freed;
         self.dropped_video += (before - self.queue.len()) as u64;
-        self.awaiting_keyframe = true;
+        self.awaiting_keyframe = next.is_none();
     }
 
     fn drop_oldest_audio(&mut self) -> bool {
@@ -136,13 +151,27 @@ impl Inner {
                     self.dropped_video += 1;
                     return;
                 }
-                if self.full(capacity, max_bytes, len) {
-                    self.drop_queued_video();
-                    while self.full(capacity, max_bytes, len) && self.drop_oldest_audio() {}
-                    if !packet.keyframe || self.full(capacity, max_bytes, len) {
-                        self.dropped_video += 1;
-                        return;
+                while self.full(capacity, max_bytes, len) {
+                    let keyframes = self
+                        .queue
+                        .iter()
+                        .filter(|p| p.track == Track::Video && p.keyframe)
+                        .count();
+                    if keyframes > 1
+                        || (packet.keyframe && self.queue.iter().any(|p| p.track == Track::Video))
+                    {
+                        self.drop_oldest_gop();
+                    } else if !self.drop_oldest_audio() {
+                        self.drop_oldest_gop();
+                        if self.awaiting_keyframe {
+                            self.dropped_video += 1;
+                            return;
+                        }
                     }
+                }
+                if self.awaiting_keyframe && !packet.keyframe {
+                    self.dropped_video += 1;
+                    return;
                 }
                 if packet.keyframe {
                     self.awaiting_keyframe = false;
@@ -157,7 +186,16 @@ impl Inner {
                         self.dropped_audio += 1;
                         return;
                     }
-                    self.drop_queued_video();
+                    let keyframes = self
+                        .queue
+                        .iter()
+                        .filter(|p| p.track == Track::Video && p.keyframe)
+                        .count();
+                    if keyframes < 2 {
+                        self.dropped_audio += 1;
+                        return;
+                    }
+                    self.drop_oldest_gop();
                 }
             }
         }
@@ -166,6 +204,7 @@ impl Inner {
     }
 }
 
+/// The bounded packet queue of ADR 0009: `encoded_packet` pushes, the writer thread pops.
 #[derive(Debug)]
 pub struct Ring {
     capacity: usize,
@@ -183,6 +222,7 @@ impl Default for Ring {
 }
 
 impl Ring {
+    /// Bounds queued packets and payload bytes; packet capacity is at least one.
     pub fn new(capacity: usize, max_bytes: usize) -> Self {
         Self {
             capacity: capacity.max(1),
@@ -198,6 +238,7 @@ impl Ring {
         self.sent.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    /// Payload bytes written to IPC since reopen, excluding wire headers and queued packets.
     pub fn sent_bytes(&self) -> u64 {
         self.sent.load(Ordering::Relaxed)
     }
@@ -218,6 +259,37 @@ impl Ring {
             was_empty && (!inner.queue.is_empty() || inner.oversized.is_some())
         };
         if wake {
+            self.ready.notify_one();
+        }
+    }
+
+    /// Discards video before the first queued keyframe while retaining audio and accumulated losses.
+    pub fn reattach(&self) {
+        let mut inner = self.lock();
+        let mut ready = false;
+        let mut bytes = 0;
+        let mut dropped = 0;
+        inner.queue.retain(|packet| {
+            if packet.track == Track::Audio {
+                return true;
+            }
+            ready |= packet.keyframe;
+            if !ready {
+                bytes += packet.data.len();
+                dropped += 1;
+            }
+            ready
+        });
+        inner.bytes -= bytes;
+        inner.dropped_video += dropped;
+        inner.awaiting_keyframe = !ready;
+    }
+
+    /// Latches a size-only error ahead of queued media without retaining its oversized payload.
+    pub fn refuse(&self, oversized: Oversized) {
+        let mut inner = self.lock();
+        if !inner.closed {
+            inner.oversized.get_or_insert(oversized);
             self.ready.notify_one();
         }
     }
@@ -349,21 +421,58 @@ mod tests {
     }
 
     #[test]
-    fn full_drops_video_until_the_next_keyframe() {
+    fn overflow_of_a_partially_consumed_gop_never_skips_a_delta() {
+        let ring = Ring::new(3, 1 << 20);
+        ring.push(video(0, true));
+        ring.pop();
+        ring.push(video(1, false));
+        ring.push(video(2, true));
+        ring.push(video(3, false));
+        ring.push(video(4, false));
+        ring.push(video(5, false));
+        let got = drain(&ring);
+        assert!(
+            got == [(Track::Video, 2), (Track::Video, 3), (Track::Video, 4)] || got.is_empty(),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn overflow_evicts_the_oldest_gop_and_keeps_the_newest_keyframe() {
+        let ring = Ring::new(5, 1 << 20);
+        ring.push(video(0, true));
+        ring.push(video(1, false));
+        ring.push(video(2, true));
+        ring.push(video(3, false));
+        ring.push(video(4, false));
+        ring.push(video(5, false));
+        assert_eq!(
+            drain(&ring),
+            [
+                (Track::Video, 2),
+                (Track::Video, 3),
+                (Track::Video, 4),
+                (Track::Video, 5)
+            ]
+        );
+        assert_eq!(ring.stats().dropped_video, 2);
+    }
+
+    #[test]
+    fn a_single_gop_uses_audio_space_then_waits_for_the_next_keyframe() {
         let ring = Ring::new(3, 1 << 20);
         ring.push(video(0, true));
         ring.push(video(1, false));
         ring.push(audio(0));
         ring.push(video(2, false));
-        assert_eq!(ring.stats().dropped_video, 3, "0 and 1 queued, then 2");
+        assert_eq!(ring.stats().dropped_audio, 1);
+        assert_eq!(ring.stats().dropped_video, 0);
         ring.push(video(3, false));
-        assert_eq!(drain(&ring), [(Track::Audio, 0)]);
+        assert!(drain(&ring).is_empty());
         ring.push(video(4, true));
         ring.push(video(5, false));
         assert_eq!(drain(&ring), [(Track::Video, 4), (Track::Video, 5)]);
-        let stats = ring.stats();
-        assert_eq!(stats.dropped_video, 4, "3 waited for a keyframe");
-        assert_eq!(stats.dropped_audio, 0);
+        assert_eq!(ring.stats().dropped_video, 4);
     }
 
     #[test]
@@ -378,15 +487,14 @@ mod tests {
     }
 
     #[test]
-    fn audio_into_a_ring_full_of_video_drops_the_video() {
+    fn audio_does_not_evict_the_only_decodable_gop() {
         let ring = Ring::new(2, 1 << 20);
         ring.push(video(0, true));
         ring.push(video(1, false));
         ring.push(audio(0));
-        ring.push(video(2, false));
-        ring.push(video(3, true));
-        assert_eq!(drain(&ring), [(Track::Audio, 0), (Track::Video, 3)]);
-        assert_eq!(ring.stats().dropped_video, 3);
+        assert_eq!(drain(&ring), [(Track::Video, 0), (Track::Video, 1)]);
+        assert_eq!(ring.stats().dropped_video, 0);
+        assert_eq!(ring.stats().dropped_audio, 1);
     }
 
     #[test]
@@ -569,8 +677,8 @@ mod tests {
         produce(&ring, N);
         let got = consume(&ring);
         assert!(
-            got.iter().all(|p| p.0 == Track::Audio),
-            "every queued keyframe was evicted by the delta after it"
+            got.iter().any(|p| p.0 == Track::Video && p.2),
+            "the newest GOP survives"
         );
         assert_stream_follows_the_policy(&got, ring.stats(), N);
     }
