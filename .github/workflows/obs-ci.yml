@@ -55,20 +55,18 @@ jobs:
         include:
           - obs: "32.2.2"
             commit: ba2f32bdf791005443988a4955e963663e16b1ed
+            os: ubuntu-24.04
             baseline: true
+          # OBS 33 needs FFmpeg 8 and MbedTLS 3, as on upstream's own Linux runner.
           - obs: "33.0.1"
             commit: 65c320b46e1af5c7a555161aea6182cdf7a8c524
-            # OBS 33 needs FFmpeg 8; Ubuntu 24.04 ships 6.1.
-            ffmpeg: n8.0.3
-            ffmpeg-commit: 8ae0b34901ba60a802f183ee75a250a9fc3e09a5
-    runs-on: ubuntu-24.04
+            os: ubuntu-26.04
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:
-      APT_CACHE: apt-obs-linux-ubuntu-24.04
+      APT_CACHE: apt-obs-linux-${{ matrix.os }}
       OBS_TAG: ${{ matrix.obs }}
       OBS_COMMIT: ${{ matrix.commit }}
-      FFMPEG_TAG: ${{ matrix.ffmpeg }}
-      FFMPEG_COMMIT: ${{ matrix.ffmpeg-commit }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -107,7 +105,7 @@ jobs:
             libspeexdsp-dev libudev-dev libv4l-dev libva-dev libpci-dev libdrm-dev \
             nlohmann-json3-dev libwebsocketpp-dev libasio-dev libqrcodegencpp-dev qt6-base-dev \
             libqt6svg6-dev qt6-base-private-dev xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils \
-            libclang-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev nasm
+            libclang-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
       - name: Check apt archives
         id: apt-check
         if: always()
@@ -130,7 +128,7 @@ jobs:
         id: obs
         uses: ./.github/actions/obs-prefix-fetch
         with:
-          key: obs-${{ env.OBS_TAG }}-ubuntu-24.04-r${{ env.OBS_BUILD_REV }}
+          key: obs-${{ env.OBS_TAG }}-${{ matrix.os }}-r${{ env.OBS_BUILD_REV }}
           path: ${{ runner.temp }}/obs-prefix
 
       - name: Build OBS ${{ env.OBS_TAG }} with the frontend and obs-websocket
@@ -142,13 +140,13 @@ jobs:
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/obs-prefix
-          key: obs-${{ env.OBS_TAG }}-ubuntu-24.04-r${{ env.OBS_BUILD_REV }}
+          key: obs-${{ env.OBS_TAG }}-${{ matrix.os }}-r${{ env.OBS_BUILD_REV }}
 
       - name: Publish OBS build
         if: env.PUBLISH_OBS_PREFIX == 'true'
         uses: ./.github/actions/obs-prefix-publish
         with:
-          key: obs-${{ env.OBS_TAG }}-ubuntu-24.04-r${{ env.OBS_BUILD_REV }}
+          key: obs-${{ env.OBS_TAG }}-${{ matrix.os }}-r${{ env.OBS_BUILD_REV }}
           path: ${{ runner.temp }}/obs-prefix
 
       - name: Check the OBS install
