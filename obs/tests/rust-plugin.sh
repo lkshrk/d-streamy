@@ -43,8 +43,9 @@ expect_event() {
 }
 
 if [[ ${OS:-} == Windows_NT ]]; then
-  absent="/dstreamy-absent/d/s.sock"
-  not_running="D-Streamy for OBS doesn't support Windows yet"
+  # A named pipe, escaped for the JSON settings it goes into.
+  absent='\\\\.\\pipe\\dstreamy-absent'
+  not_running="The D-Streamy service is not running"
 else
   absent="${TMPDIR:-/tmp}/dstreamy-absent-$$/d/s.sock"
   not_running="The D-Streamy service is not running"

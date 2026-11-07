@@ -178,7 +178,6 @@ mod enabled {
 }
 
 pub use enabled::{Hooks, dialog_built, no_control_thread, open_dialog_trigger};
-#[cfg(unix)]
 pub use enabled::{after_output_start, lists_gate, start_gate};
 
 /// Structured observations of decisions in test builds, independent of human log wording.

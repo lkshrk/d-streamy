@@ -1,6 +1,5 @@
 //! The control side of the OBS plugin: listing guilds and channels, and starting or stopping the session it feeds.
 
-#[cfg(unix)]
 mod service;
 
 use std::fmt;
@@ -10,7 +9,6 @@ use serde_json::{Value, json};
 
 use crate::types::service_text;
 
-#[cfg(unix)]
 pub use service::{LOGIN_TIMEOUT, ObsControl, STOP_TIMEOUT};
 
 /// What a serve must offer beyond protocol 2 as first released.
@@ -73,7 +71,7 @@ pub struct Named {
     pub name: String,
 }
 
-/// One run of `dstreamy serve`, told apart by its socket file, which every serve binds anew.
+/// One run of `dstreamy serve`: its socket file on Unix, which every serve binds anew; on Windows `dev` and `ino` hold the pid and start time its hello names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Instance {
     pub dev: u64,

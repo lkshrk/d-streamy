@@ -1,6 +1,4 @@
 //! Tools > D-Streamy's Start, Stop and server lists: one thread runs every service call and drives the plugin's output.
-// Windows has no service client yet, so only the lists and the stop signal reach the thread there.
-#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::cell::Cell;
 use std::ffi::{CString, c_void};
@@ -17,7 +15,6 @@ use dstreamy_obs_producer::dock::{
     FIX_RESTART_OBS, FIX_START_THEN_STOP, FIX_VIDEO,
 };
 use dstreamy_obs_producer::live::ServiceHealth;
-#[cfg(unix)]
 use dstreamy_obs_producer::{
     Endpoint,
     control::{ControlError, ObsControl, Ownership, StartRequest},
@@ -49,13 +46,9 @@ const LOGIN_GONE: &str = "D-Streamy's control thread is not running, so the logi
 
 enum Job {
     Lists(Option<String>, ListsFinished),
-    #[cfg(unix)]
     Start(StartRequest, Option<Ownership>),
-    #[cfg(unix)]
     Stop(Option<Ownership>),
-    #[cfg(unix)]
     Login(Option<String>, tokio::sync::oneshot::Receiver<()>),
-    #[cfg(unix)]
     Account(AccountChange),
     OutputStopped(i64),
     Shutdown,
@@ -235,7 +228,6 @@ fn canvas() -> Option<Canvas> {
 }
 
 /// Start from the dialog or the status-bar panel, on the UI thread.
-#[cfg(unix)]
 pub fn start() {
     if let Some(guard) = crate::audio::mic_guard()
         && with_controls(|c| c.model.state() == &DockState::Idle)
@@ -268,7 +260,6 @@ pub fn start() {
 }
 
 /// Stop from the dialog or the status-bar panel, on the UI thread.
-#[cfg(unix)]
 pub fn stop() {
     if let Some(ownership) = change(|c, p| c.session(p.write(), |m| m.stop()))
         && !queue(Job::Stop(ownership))
@@ -277,7 +268,6 @@ pub fn stop() {
     }
 }
 
-#[cfg(unix)]
 enum AccountChange {
     Select(String),
     Logout(String),
@@ -287,7 +277,6 @@ const ACCOUNT_GONE: &str = "D-Streamy's control thread is not running, so the ac
      See the OBS log and restart OBS";
 
 /// The account picker of the dialog or the status-bar panel, on the UI thread.
-#[cfg(unix)]
 pub fn select_account(name: &str) {
     if change(|c, _| c.model.begin_select_account(name)) {
         queue_account(AccountChange::Select(name.to_owned()));
@@ -295,14 +284,12 @@ pub fn select_account(name: &str) {
 }
 
 /// Log out of `name`, on the UI thread.
-#[cfg(unix)]
 pub fn logout_account(name: &str) {
     if change(|c, _| c.model.begin_logout_account(name)) {
         queue_account(AccountChange::Logout(name.to_owned()));
     }
 }
 
-#[cfg(unix)]
 fn queue_account(account: AccountChange) {
     if !queue(Job::Account(account)) {
         change(|c, _| {
@@ -313,7 +300,6 @@ fn queue_account(account: AccountChange) {
 }
 
 /// "Add account…": serve's login window, saved as a new account.
-#[cfg(unix)]
 pub fn add_account() {
     if change(|c, _| c.model.begin_add_account()) {
         open_login();
@@ -321,14 +307,12 @@ pub fn add_account() {
 }
 
 /// The login button of the dialog or the status-bar panel, on the UI thread: serve opens its login window.
-#[cfg(unix)]
 pub fn login() {
     if change(|c, _| c.model.begin_login()) {
         open_login();
     }
 }
 
-#[cfg(unix)]
 fn open_login() {
     let (cancel, cancelled) = tokio::sync::oneshot::channel();
     *LOGIN_CANCEL.lock().unwrap_or_else(PoisonError::into_inner) = Some(cancel);
@@ -343,7 +327,6 @@ fn open_login() {
 }
 
 /// Closes the login window D-Streamy waits for: serve closes it once the request goes away.
-#[cfg(unix)]
 pub fn cancel_login() {
     let cancel = LOGIN_CANCEL
         .lock()
@@ -354,31 +337,7 @@ pub fn cancel_login() {
     }
 }
 
-#[cfg(unix)]
 static LOGIN_CANCEL: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
-
-#[cfg(not(unix))]
-pub fn login() {}
-
-#[cfg(not(unix))]
-pub fn add_account() {}
-
-#[cfg(not(unix))]
-pub fn select_account(_name: &str) {}
-
-#[cfg(not(unix))]
-pub fn logout_account(_name: &str) {}
-
-#[cfg(not(unix))]
-pub fn cancel_login() {}
-
-#[cfg(not(unix))]
-pub fn start() {
-    log::warn("D-Streamy for OBS doesn't support Windows yet");
-}
-
-#[cfg(not(unix))]
-pub fn stop() {}
 
 /// The output the dialog starts; the control thread alone creates, starts, stops and releases it.
 struct Output {
@@ -561,7 +520,6 @@ const VIEWERS_UNKNOWN: u64 = u64::MAX;
 /// The service's latest viewer count for the running output.
 static VIEWERS: AtomicU64 = AtomicU64::new(VIEWERS_UNKNOWN);
 
-#[cfg(unix)]
 pub fn set_viewers(count: Option<u32>) {
     VIEWERS.store(count.map_or(VIEWERS_UNKNOWN, u64::from), Ordering::Release);
 }
@@ -574,7 +532,6 @@ pub fn viewers() -> Option<u32> {
 /// The service's latest health for the running output.
 static HEALTH: Mutex<Option<ServiceHealth>> = Mutex::new(None);
 
-#[cfg(unix)]
 pub fn set_health(health: Option<ServiceHealth>) {
     *HEALTH.lock().unwrap_or_else(PoisonError::into_inner) = health;
 }
@@ -643,10 +600,7 @@ extern "C" fn on_stop(_data: *mut c_void, cd: *mut sys::calldata_t) {
 }
 
 /// The service session the job in progress brought up: `Some(ownership)` from the service's answer until the job ends.
-#[cfg(unix)]
 type Brought = Option<Option<Ownership>>;
-#[cfg(not(unix))]
-type Brought = Option<()>;
 
 fn run(
     runtime: &tokio::runtime::Runtime,
@@ -696,7 +650,6 @@ fn run(
 
 /// After a panic: a start or stop it left pending never leaves an output or a service session behind unseen.
 /// A session already shown live keeps its Stop.
-#[cfg(unix)]
 async fn recover(output: &Output, brought: Brought, mut closing: Closing, failure: &str) {
     let (state, persisted) =
         with_controls(|c| (c.model.state().clone(), c.model.persisted().cloned()));
@@ -755,17 +708,6 @@ async fn recover(output: &Output, brought: Brought, mut closing: Closing, failur
     });
 }
 
-#[cfg(not(unix))]
-async fn recover(_output: &Output, _brought: Brought, _closing: Closing, failure: &str) {
-    abort_pending(
-        &format!(
-            "D-Streamy's control step failed ({failure}). See the OBS log, then press Start again"
-        ),
-        FIX_LOG,
-    );
-}
-
-#[cfg(unix)]
 fn control() -> Result<ObsControl, String> {
     Endpoint::default_for_user()
         .map(ObsControl::new)
@@ -784,7 +726,6 @@ async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &m
             drop(finished);
             refresh();
         }
-        #[cfg(unix)]
         Job::Start(request, persisted) => {
             if closing.is_closing() {
                 abort_pending(CLOSING, FIX_AFTER_CLOSING);
@@ -792,21 +733,17 @@ async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &m
                 start_session(output, &request, persisted.as_ref(), &mut closing, brought).await;
             }
         }
-        #[cfg(unix)]
         Job::Stop(ownership) => {
             let _ = stop_session(output, ownership.as_ref(), &mut closing).await;
         }
-        #[cfg(unix)]
         Job::Login(account, cancelled) => {
             // The window stays open for minutes, so the login must not hold up Start, Stop or the lists.
             tokio::spawn(login_session(closing, account, cancelled));
         }
-        #[cfg(unix)]
         Job::Account(account) => {
             account_session(account, &mut closing).await;
         }
         Job::OutputStopped(code) => {
-            #[cfg_attr(not(unix), allow(unused_variables))]
             let message = (code != i64::from(sys::OBS_OUTPUT_SUCCESS)).then(|| {
                 let reason = output
                     .last_error()
@@ -817,7 +754,6 @@ async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &m
             if let Err(e) = output.wait_inactive(&closing) {
                 log::warn(&e);
             }
-            #[cfg(unix)]
             if let Some(message) = message
                 .filter(|_| with_controls(|c| matches!(c.model.state(), DockState::Live { .. })))
             {
@@ -845,11 +781,8 @@ async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &m
         }
         Job::Shutdown => {}
     }
-    #[cfg(not(unix))]
-    let _ = brought;
 }
 
-#[cfg(unix)]
 async fn lists(guild: Option<String>, closing: &mut Closing) {
     let control = match control() {
         Ok(control) => control,
@@ -888,10 +821,6 @@ async fn lists(guild: Option<String>, closing: &mut Closing) {
     }
 }
 
-#[cfg(not(unix))]
-async fn lists(_guild: Option<String>, _closing: &mut Closing) {}
-
-#[cfg(unix)]
 async fn login_session(
     mut closing: Closing,
     account: Option<String>,
@@ -929,7 +858,6 @@ async fn login_session(
     }
 }
 
-#[cfg(unix)]
 async fn account_session(account: AccountChange, closing: &mut Closing) {
     let result = match control() {
         Err(e) => Err(ControlError::Connect(e)),
@@ -966,7 +894,6 @@ async fn account_session(account: AccountChange, closing: &mut Closing) {
 }
 
 /// Ends a session this plugin brought up but won't stream; true once it is gone.
-#[cfg(unix)]
 async fn end_unused(
     control: &ObsControl,
     ownership: Option<&Ownership>,
@@ -982,7 +909,6 @@ async fn end_unused(
 
 /// A session that came up while OBS was closing is stopped, not streamed. When that can't finish in time its
 /// ownership stays saved, so the service's grace period ends it and the next Start takes it over or Stop ends it.
-#[cfg(unix)]
 async fn end_while_closing(
     control: &ObsControl,
     ownership: Option<Ownership>,
@@ -1006,7 +932,6 @@ async fn end_while_closing(
     });
 }
 
-#[cfg(unix)]
 async fn start_session(
     output: &mut Output,
     request: &StartRequest,
@@ -1107,7 +1032,6 @@ async fn start_session(
 }
 
 /// OBS closes while live: the output stops first, then the Discord session, within the closing deadlines.
-#[cfg(unix)]
 async fn stop_on_close(output: &Output, mut closing: Closing) {
     let Some(ownership) = step(DockModel::stop) else {
         return;
@@ -1134,13 +1058,9 @@ async fn stop_on_close(output: &Output, mut closing: Closing) {
     }
 }
 
-#[cfg(not(unix))]
-async fn stop_on_close(_output: &Output, _closing: Closing) {}
-
 /// Why a stop didn't finish: whether the service still ended the Discord session.
 struct SessionEnded(bool);
 
-#[cfg(unix)]
 async fn stop_session(
     output: &Output,
     ownership: Option<&Ownership>,

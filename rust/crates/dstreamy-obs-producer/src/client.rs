@@ -421,6 +421,7 @@ pub fn block_sigpipe_on_this_thread() -> std::io::Result<()> {
 }
 
 /// CLOCK_MONOTONIC in ns at `at`, comparable across processes (std `Instant` uses it on Linux).
+#[cfg(unix)]
 fn monotonic_ns(at: Instant) -> i64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -433,6 +434,12 @@ fn monotonic_ns(at: Instant) -> i64 {
     }
     let now_ns = ts.tv_sec * 1_000_000_000 + ts.tv_nsec;
     now_ns - i64::try_from(now.saturating_duration_since(at).as_nanos()).unwrap_or(0)
+}
+
+/// The cross-process keyframe markers are compared only by the Unix harness.
+#[cfg(not(unix))]
+fn monotonic_ns(_at: Instant) -> i64 {
+    0
 }
 
 /// A packet as a frame the protocol can carry; conversion and size refusals become the stop message.

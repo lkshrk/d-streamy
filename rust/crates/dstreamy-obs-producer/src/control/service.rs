@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
@@ -301,12 +302,31 @@ impl ObsControl {
             })?;
         c.require(STATUS_PLACE)?;
         // The path names whichever serve bound it last, so it must be the same file on both sides of the hello.
+        #[cfg(unix)]
         if self.instance() != Some(before) {
             return Err(ControlError::Restarted);
+        }
+        #[cfg(not(unix))]
+        {
+            c.instance = hello_instance(&c.hello).ok_or(ControlError::Outdated {
+                feature: "instance",
+            })?;
         }
         Ok(c)
     }
 
+    /// A pipe has no file to identify; the run comes from the hello on the same connection.
+    #[cfg(not(unix))]
+    fn instance(&self) -> Option<Instance> {
+        Some(Instance {
+            dev: 0,
+            ino: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+        })
+    }
+
+    #[cfg(unix)]
     fn instance(&self) -> Option<Instance> {
         let meta = std::fs::metadata(self.endpoint.as_path()).ok()?;
         Some(Instance {
@@ -316,6 +336,17 @@ impl ObsControl {
             mtime_nsec: meta.mtime_nsec(),
         })
     }
+}
+
+#[cfg(not(unix))]
+fn hello_instance(hello: &Value) -> Option<Instance> {
+    let run = &hello["instance"];
+    Some(Instance {
+        dev: run["pid"].as_u64()?,
+        ino: run["started"].as_u64()?,
+        mtime: 0,
+        mtime_nsec: 0,
+    })
 }
 
 impl Connection {

@@ -256,18 +256,11 @@ fn live_stats() -> Option<LiveStats> {
 extern "C" fn view_json(_ctx: Ctx) -> *mut c_char {
     guard("panel view", ptr::null_mut(), || {
         let live = live_stats();
-        if cfg!(unix) {
-            settings_source::recheck_unrestored();
-        }
-        let sources = if cfg!(unix) {
-            crate::audio::sources()
-        } else {
-            Vec::new()
-        };
+        settings_source::recheck_unrestored();
+        let sources = crate::audio::sources();
         let confirming = CONFIRMING.load(Ordering::Acquire);
-        let json = with_controls(|c| {
-            panel_view(c, cfg!(unix), live.as_ref(), &sources, confirming).to_json()
-        });
+        let json =
+            with_controls(|c| panel_view(c, true, live.as_ref(), &sources, confirming).to_json());
         CString::new(json.replace('\0', " "))
             .expect("NUL bytes were replaced")
             .into_raw()
@@ -393,7 +386,7 @@ fn shown_track() -> u8 {
 extern "C" fn request_take_over(_ctx: Ctx) {
     guard("panel request_take_over", (), || {
         let track = shown_track();
-        if cfg!(unix) && !with_controls(|c| c.model.manages(track)) {
+        if !with_controls(|c| c.model.manages(track)) {
             CONFIRMING.store(true, Ordering::Release);
         }
     });

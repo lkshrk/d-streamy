@@ -13,7 +13,6 @@ use dstreamy_obs_producer::mixer::{
     AudioSource, MIC_AUX_CHANNELS, is_input_device, restored_managed, restored_mixers, track_bit,
     with_track,
 };
-#[cfg(unix)]
 use dstreamy_obs_producer::mixer::{MicGuard, mic_guard as guard_for};
 use dstreamy_obs_sys as sys;
 
@@ -139,12 +138,6 @@ fn set_track(source: *mut sys::obs_source_t, track: u8, on: bool) {
 
 /// Turns `track` off on every audio source, then marks it managed in the loaded scene collection. On the UI thread.
 pub fn take_over(track: u8) -> bool {
-    if !cfg!(unix) {
-        log::warn(&format!(
-            "ignored taking over Track {track}: D-Streamy can't change Discord audio on Windows yet"
-        ));
-        return false;
-    }
     let audio = sources();
     for source in &audio {
         with_source(&source.uuid, |s| set_track(s, track, false));
@@ -161,10 +154,6 @@ pub fn take_over(track: u8) -> bool {
 
 /// Turns managed `track` on or off for one source. On the UI thread.
 pub fn set_source(uuid: &str, track: u8, on: bool) -> bool {
-    if !cfg!(unix) {
-        log::warn("ignored a tick: D-Streamy can't change Discord audio on Windows yet");
-        return false;
-    }
     if !with_controls(|c| c.model.manages(track)) {
         log::warn(&format!(
             "ignored a tick for Track {track}: D-Streamy doesn't manage it in this scene collection"
@@ -179,7 +168,6 @@ pub fn set_source(uuid: &str, track: u8, on: bool) -> bool {
 }
 
 /// Why Go Live must wait: the next start's track is unmanaged and carries a microphone.
-#[cfg(unix)]
 pub fn mic_guard() -> Option<MicGuard> {
     let audio = sources();
     with_controls(|c| guard_for(&c.model, &audio))

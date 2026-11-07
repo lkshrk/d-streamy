@@ -12,13 +12,13 @@ use dstreamy_obs_producer::dock::{
     track_name,
 };
 use dstreamy_obs_producer::dock_config::{ConfigError, ConfigState};
-use dstreamy_obs_producer::dock_view::{Action, UNSUPPORTED};
+use dstreamy_obs_producer::dock_view::Action;
 use dstreamy_obs_producer::mixer::{
     AudioView, CONFIRM, NOT_NOW, audio_view, instead_label, mic_guard, notices, release_label,
     track_bit,
 };
 use dstreamy_obs_producer::panel::{
-    AccountRow, CANCEL_LOGIN, NO_AUDIO_CONTROLS, NOT_AVAILABLE, account_row, stream_confirm,
+    AccountRow, CANCEL_LOGIN, NOT_AVAILABLE, account_row, stream_confirm,
 };
 use dstreamy_obs_sys as sys;
 
@@ -279,7 +279,7 @@ fn successor() -> Option<DialogSource> {
 fn activate(source: *mut sys::obs_source_t) {
     watch_dialog(source);
     let (choice, managed) = with_controls(|c| (c.model.choice(), c.model.managed_mixers()));
-    let mixers = cfg!(unix).then(crate::audio::mixers);
+    let mixers = Some(crate::audio::mixers());
     CONFIRMING.store(0, Ordering::Release);
     STREAM_CONFIRM.store(0, Ordering::Release);
     OPENED
@@ -334,11 +334,7 @@ fn selected_track(settings: *mut sys::obs_data_t) -> Option<u8> {
 
 /// The status line for a dialog showing `selected`, how OBS should colour it, and whether a mic or a login holds Start back.
 fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type, bool) {
-    let sources = if cfg!(unix) {
-        crate::audio::sources()
-    } else {
-        Vec::new()
-    };
+    let sources = crate::audio::sources();
     with_controls(|c| {
         let mut preview = c.model.clone();
         if let Some(track) = selected {
@@ -346,21 +342,20 @@ fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type, bool) {
         }
         let idle = preview.state() == &DockState::Idle;
         let live = matches!(preview.state(), DockState::Live { .. });
-        let mic = (cfg!(unix) && (idle || live))
+        let mic = (idle || live)
             .then(|| mic_guard(&preview, &sources))
             .flatten();
         let held = idle && (mic.is_some() || preview.logging_in() || preview.account_changing());
         let login = preview.logging_in() || preview.login_offer().is_some();
         let quiet = idle && preview.error().is_none() && mic.is_none();
         let session = match &mic {
-            _ if !cfg!(unix) => UNSUPPORTED.to_owned(),
             _ if let Some(problem) = preview.output_problem() => problem.message.clone(),
             Some(guard) if !login => guard.message(),
             _ => preview.status_text(true),
         };
         if let Some(e) = c.error() {
             let config = e.message(preview.settings().audio_track);
-            let text = if quiet && cfg!(unix) {
+            let text = if quiet {
                 config
             } else {
                 format!("{}. {config}", session.trim_end_matches('.'))
@@ -368,9 +363,9 @@ fn status(selected: Option<u8>) -> (String, sys::obs_text_info_type, bool) {
             return (text, sys::OBS_TEXT_INFO_ERROR, held);
         }
         let kind = match (preview.track_status(), preview.error()) {
-            _ if cfg!(unix) && preview.logging_in() => sys::OBS_TEXT_INFO_NORMAL,
+            _ if preview.logging_in() => sys::OBS_TEXT_INFO_NORMAL,
             _ if preview.output_problem().is_some() => sys::OBS_TEXT_INFO_ERROR,
-            _ if !cfg!(unix) || (mic.is_some() && !login) => sys::OBS_TEXT_INFO_WARNING,
+            _ if mic.is_some() && !login => sys::OBS_TEXT_INFO_WARNING,
             (TrackStatus::Pending { .. }, _) => sys::OBS_TEXT_INFO_WARNING,
             (TrackStatus::Idle { .. }, Some(_)) => sys::OBS_TEXT_INFO_ERROR,
             _ => sys::OBS_TEXT_INFO_NORMAL,
@@ -648,7 +643,7 @@ pub fn collection_loaded() {
         return;
     }
     let (mixers, managed) = (
-        cfg!(unix).then(crate::audio::mixers),
+        Some(crate::audio::mixers()),
         with_controls(|c| c.model.managed_mixers()),
     );
     for o in OPENED
@@ -1117,10 +1112,6 @@ unsafe fn add_audio(props: *mut sys::obs_properties_t, settings: *mut sys::obs_d
             let label = c_text(label);
             sys::obs_properties_add_button(props, key.as_ptr(), label.as_ptr(), clicked);
         };
-        if !cfg!(unix) {
-            info(AUDIO_HELP, NO_AUDIO_CONTROLS);
-            return;
-        }
         let sources = crate::audio::sources();
         let (view, warnings) = with_controls(|c| {
             (
@@ -1483,7 +1474,7 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
         // SAFETY: OBS builds a dialog's view on the UI thread, from the settings it shows.
         unsafe { write_changed(source, settings) };
         RELOADING.with(|r| r.set(true));
-        if cfg!(unix) && !source.is_null() {
+        if !source.is_null() {
             recheck_unrestored();
         }
         let selected = (!settings.is_null())
@@ -1508,9 +1499,8 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
                         c.model
                             .logging_in()
                             .then_some((CANCEL_LOGIN, Some(cancel_login_clicked as LoginClicked)))
-                    })
-                    .filter(|_| cfg!(unix)),
-                account_row(&c.model).filter(|_| cfg!(unix)),
+                    }),
+                account_row(&c.model),
                 (c.model.guild_unavailable(), c.model.channel_unavailable()),
             )
         });
@@ -1584,13 +1574,9 @@ extern "C" fn get_properties(data: *mut c_void) -> *mut sys::obs_properties_t {
             let picked_both = [&picked.guild_id, &picked.channel_id]
                 .iter()
                 .all(|id| id.as_deref().is_some_and(|id| !id.is_empty()));
-            let can_start = cfg!(unix)
-                && state == DockState::Idle
-                && picked_both
-                && !blocked
-                && !gone.0
-                && !gone.1;
-            let can_stop = cfg!(unix) && matches!(state, DockState::Live { .. });
+            let can_start =
+                state == DockState::Idle && picked_both && !blocked && !gone.0 && !gone.1;
+            let can_stop = matches!(state, DockState::Live { .. });
             let confirming = match STREAM_CONFIRM.load(Ordering::Acquire) {
                 CONFIRM_START if can_start => Some(Action::Start),
                 CONFIRM_STOP if can_stop => Some(Action::Stop),
