@@ -307,6 +307,7 @@ impl Accounts {
     fn create_dir(&self, name: &str) -> Result<(), ConfigError> {
         fs::create_dir_all(&self.dir).map_err(io_err(&self.dir))?;
         for dir in [self.root(), self.account_dir(name)] {
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut builder = fs::DirBuilder::new();
             #[cfg(unix)]
             std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);

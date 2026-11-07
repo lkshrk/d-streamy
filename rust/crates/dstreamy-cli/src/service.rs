@@ -4,8 +4,11 @@
 pub mod systemd;
 
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions, Permissions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Output, Stdio};
@@ -537,12 +540,13 @@ fn write_atomically(path: &Path, contents: &str) -> Result<(), (bool, ServiceErr
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let temp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let written = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(DEFINITION_MODE)
-            .open(&temp)?;
-        file.set_permissions(Permissions::from_mode(DEFINITION_MODE))?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(DEFINITION_MODE);
+        let mut file = options.open(&temp)?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(DEFINITION_MODE))?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
         fs::rename(&temp, path)
@@ -551,6 +555,10 @@ fn write_atomically(path: &Path, contents: &str) -> Result<(), (bool, ServiceErr
         let _ = fs::remove_file(&temp);
         return Err((false, file_err("writing")(e)));
     }
+    // Windows cannot open a directory as a file; NTFS journals the rename itself.
+    #[cfg(not(unix))]
+    return Ok(());
+    #[cfg(unix)]
     File::open(dir)
         .and_then(|dir| dir.sync_all())
         .map_err(|e| (true, file_err("syncing the directory of")(e)))
@@ -893,6 +901,7 @@ mod tests {
         assert_eq!(vanishing_place(&exe, &[]), Some("a Cargo target directory"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_write_replaces_a_symlink_instead_of_following_it_and_sets_the_mode() {
         let dir = tempfile::tempdir().unwrap();
@@ -913,6 +922,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn previous_refuses_a_symlink_and_compares_contents() {
         let dir = tempfile::tempdir().unwrap();
