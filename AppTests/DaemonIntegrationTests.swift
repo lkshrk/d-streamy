@@ -25,7 +25,13 @@ final class DaemonIntegrationTests: XCTestCase {
     override func tearDown() {
         try? mockInput?.fileHandleForWriting.close()
         if mock?.isRunning == true { mock?.terminate() }
-        if let configDir { try? FileManager.default.removeItem(at: configDir) }
+        if let configDir {
+            if (testRun?.failureCount ?? 0) > 0,
+               let daemonLog = try? String(contentsOf: configDir.appendingPathComponent("dstreamy.log"), encoding: .utf8) {
+                print("dstreamy.log:\n\(daemonLog)")
+            }
+            try? FileManager.default.removeItem(at: configDir)
+        }
         super.tearDown()
     }
 
@@ -84,7 +90,7 @@ final class DaemonIntegrationTests: XCTestCase {
 
         let client = DaemonClient(
             executableURL: dstreamy,
-            arguments: ["--config-dir", dir.path, "--gateway-url", info.gatewayUrl, "daemon", "--skip-platform"]
+            arguments: ["-v", "--config-dir", dir.path, "--gateway-url", info.gatewayUrl, "daemon", "--skip-platform"]
         )
         let events = Recorder<SessionEvent>()
         let exits = Recorder<Int32>()
