@@ -80,11 +80,11 @@ settings_error share-bf2 "D-Streamy needs B-frames off: " "Tune: zerolatency, or
 settings_error share-bf-unset "D-Streamy needs B-frames off: " "Tune: zerolatency, or Profile: baseline" "${share[@]}" --keyint-sec 2 --output-settings "$no_fallback" "$@"
 settings_error share-keyint0 "D-Streamy needs a keyframe interval of 1 or 2 seconds, not 0" "Keyframe Interval \(0=auto\)" \
   "${share[@]}" --bf 0 --keyint-sec 0 --output-settings "$no_fallback" "$@"
-settings_error share-1440p "D-Streamy needs an output size of at most 1920" "1920×1080 with even sides, not 2560×1440: Settings › Video › Output \(Scaled\) Resolution" \
+settings_error share-1440p "D-Streamy needs an output size of at most 1920" "1920.1080 with even sides, not 2560.1440: Settings . Video . Output \(Scaled\) Resolution" \
   "${share[@]}" --bf 0 --keyint-sec 2 --width 2560 --height 1440 --output-settings "$no_fallback" "$@"
 settings_error share-idle "D-Streamy can share the stream's encoder only while streaming" "start streaming first" \
   --video-encoder obs_x264 --audio-encoder ffmpeg_opus --bf 0 --keyint-sec 2 --output-settings "$no_fallback" "$@"
-settings_error own-24fps "D-Streamy needs 15, 30 or 60 FPS, not 24" "not 24: Settings › Video › Common FPS Values" \
+settings_error own-24fps "D-Streamy needs 15, 30 or 60 FPS, not 24" "not 24: Settings . Video . Common FPS Values" \
   --no-encoders --fps 24 --output-settings "{\"endpoint\": \"$absent\"}" "$@"
 settings_error no-opus "D-Streamy needs the FFmpeg Opus audio encoder" "ffmpeg_opus, from the obs-ffmpeg module" \
   --no-encoders --output-settings "{\"endpoint\": \"$absent\"}" "$@" --modules image-source,obs-x264,obs-dstreamy

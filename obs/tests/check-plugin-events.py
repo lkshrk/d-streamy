@@ -6,7 +6,7 @@ from pathlib import Path
 
 path, event, *conditions = sys.argv[1:]
 events = []
-for line in Path(path).read_text().splitlines():
+for line in Path(path).read_text(encoding="utf-8").splitlines():
     if line.startswith('{"'):
         events.append(json.loads(line))
 
