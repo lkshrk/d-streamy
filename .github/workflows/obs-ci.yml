@@ -58,12 +58,17 @@ jobs:
             baseline: true
           - obs: "33.0.1"
             commit: 65c320b46e1af5c7a555161aea6182cdf7a8c524
+            # OBS 33 needs FFmpeg 8; Ubuntu 24.04 ships 6.1.
+            ffmpeg: n8.0.3
+            ffmpeg-commit: 8ae0b34901ba60a802f183ee75a250a9fc3e09a5
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
       APT_CACHE: apt-obs-linux-ubuntu-24.04
       OBS_TAG: ${{ matrix.obs }}
       OBS_COMMIT: ${{ matrix.commit }}
+      FFMPEG_TAG: ${{ matrix.ffmpeg }}
+      FFMPEG_COMMIT: ${{ matrix.ffmpeg-commit }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -102,7 +107,7 @@ jobs:
             libspeexdsp-dev libudev-dev libv4l-dev libva-dev libpci-dev libdrm-dev \
             nlohmann-json3-dev libwebsocketpp-dev libasio-dev libqrcodegencpp-dev qt6-base-dev \
             libqt6svg6-dev qt6-base-private-dev xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils \
-            libclang-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+            libclang-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev nasm
       - name: Check apt archives
         id: apt-check
         if: always()
