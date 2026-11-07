@@ -637,7 +637,8 @@ mod tests {
             );
             assert!(lines.recv().unwrap().contains(&format!("\"id\":\"{i}\"")));
         }
-        drop((event_tx, reply_tx));
+        drop(reply_tx);
+        drop(event_tx);
         runtime.block_on(writer).unwrap().unwrap();
     }
 }
