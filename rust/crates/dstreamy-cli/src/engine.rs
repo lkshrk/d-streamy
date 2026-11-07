@@ -3011,12 +3011,14 @@ mod tests {
             let f = Fixture::new().await;
             f.engine.start(params(), None).await.unwrap();
             f.wait_state(|s| matches!(s, SessionState::Streaming)).await;
+            let conn = f.engine.current().unwrap();
             assert!(
                 f.mock
                     .voice_state_from_other_session(MOCK_GUILD_ID, Some(MOCK_VOICE_CHANNEL_ID))
             );
             f.wait_state(|s| matches!(s, SessionState::Stopped { .. }))
                 .await;
+            assert!(f.engine.catch_up(&conn).await);
             f.engine.release_if_stopped();
             assert!(f.lock_is_free());
 
