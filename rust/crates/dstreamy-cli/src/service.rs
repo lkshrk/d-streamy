@@ -887,6 +887,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_executable_in_a_temporary_or_cargo_target_directory_is_flagged() {
         let tmp = tempfile::tempdir_in("/tmp").unwrap();

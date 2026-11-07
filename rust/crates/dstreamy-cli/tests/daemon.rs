@@ -591,6 +591,7 @@ fn states(messages: &[Value]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn start_with_target_external_fails_as_in_protocol_1() {
     let h = Harness::new().logged_in();

@@ -6,7 +6,9 @@ use std::process::Child;
 use std::process::Stdio;
 #[cfg(unix)]
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use assert_cmd::Command;
 use clap::Parser;
@@ -164,7 +166,11 @@ fn login_verifies_and_stores_the_token() {
         (&row["account"], &row["default"]),
         (&Value::from("mockuser"), &Value::Bool(true))
     );
-    let token_file = h.config_dir().join("accounts/mockuser/token");
+    let token_file = h
+        .config_dir()
+        .join("accounts")
+        .join("mockuser")
+        .join("token");
     assert_eq!(row["token_file"], token_file.to_str().unwrap());
     assert_eq!(
         std::fs::read_to_string(&token_file).unwrap().trim(),

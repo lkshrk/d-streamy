@@ -226,9 +226,28 @@ impl Drop for SecurityDescriptor {
     }
 }
 
-pub(crate) enum Stream {
+enum Pipe {
     Server(NamedPipeServer),
     Client(NamedPipeClient),
+}
+
+/// A pipe has no half-close, so the end of reading means the peer closed it; writes then fail at once.
+pub(crate) struct Stream {
+    pipe: Pipe,
+    closed: bool,
+}
+
+impl Stream {
+    fn new(pipe: Pipe) -> Self {
+        Self {
+            pipe,
+            closed: false,
+        }
+    }
+
+    fn closed_error() -> io::Error {
+        io::Error::new(io::ErrorKind::BrokenPipe, "the other end closed the pipe")
+    }
 }
 
 impl AsyncRead for Stream {
@@ -237,9 +256,25 @@ impl AsyncRead for Stream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Stream::Server(s) => Pin::new(s).poll_read(cx, buf),
-            Stream::Client(c) => Pin::new(c).poll_read(cx, buf),
+        let this = self.get_mut();
+        if this.closed {
+            return Poll::Ready(Ok(()));
+        }
+        let before = buf.filled().len();
+        let read = match &mut this.pipe {
+            Pipe::Server(s) => Pin::new(s).poll_read(cx, buf),
+            Pipe::Client(c) => Pin::new(c).poll_read(cx, buf),
+        };
+        match read {
+            Poll::Ready(Ok(())) if buf.filled().len() == before && buf.remaining() > 0 => {
+                this.closed = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe => {
+                this.closed = true;
+                Poll::Ready(Ok(()))
+            }
+            other => other,
         }
     }
 }
@@ -250,23 +285,35 @@ impl AsyncWrite for Stream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Stream::Server(s) => Pin::new(s).poll_write(cx, buf),
-            Stream::Client(c) => Pin::new(c).poll_write(cx, buf),
+        let this = self.get_mut();
+        if this.closed {
+            return Poll::Ready(Err(Self::closed_error()));
+        }
+        match &mut this.pipe {
+            Pipe::Server(s) => Pin::new(s).poll_write(cx, buf),
+            Pipe::Client(c) => Pin::new(c).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Stream::Server(s) => Pin::new(s).poll_flush(cx),
-            Stream::Client(c) => Pin::new(c).poll_flush(cx),
+        let this = self.get_mut();
+        if this.closed {
+            return Poll::Ready(Err(Self::closed_error()));
+        }
+        match &mut this.pipe {
+            Pipe::Server(s) => Pin::new(s).poll_flush(cx),
+            Pipe::Client(c) => Pin::new(c).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Stream::Server(s) => Pin::new(s).poll_shutdown(cx),
-            Stream::Client(c) => Pin::new(c).poll_shutdown(cx),
+        let this = self.get_mut();
+        if this.closed {
+            return Poll::Ready(Ok(()));
+        }
+        match &mut this.pipe {
+            Pipe::Server(s) => Pin::new(s).poll_shutdown(cx),
+            Pipe::Client(c) => Pin::new(c).poll_shutdown(cx),
         }
     }
 }
@@ -308,7 +355,7 @@ impl Listener {
         let fresh = create_instance(&self.path, &self.descriptor, false)?;
         let connected = std::mem::replace(&mut *next, fresh);
         let peer = client_of(&connected);
-        Ok((Stream::Server(connected), peer))
+        Ok((Stream::new(Pipe::Server(connected)), peer))
     }
 }
 
@@ -372,7 +419,7 @@ pub(crate) async fn connect(path: &Path, own: Principal) -> Result<Stream, IpcEr
         }
     };
     crate::verify_server(path, own, server_of(&client))?;
-    Ok(Stream::Client(client))
+    Ok(Stream::new(Pipe::Client(client)))
 }
 
 #[cfg(test)]
@@ -442,6 +489,27 @@ mod tests {
         client.read_exact(&mut echoed).await.unwrap();
         assert_eq!(&echoed, b"ping");
         drop(accept.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_closed_client_ends_reading_and_fails_the_next_write() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let path = unique_pipe();
+        let listener = Listener::bind(&path, Access::Private).await.unwrap();
+        let client = connect(&path, own_principal()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        drop(client);
+        let mut buf = [0; 8];
+        let read = tokio::time::timeout(Duration::from_secs(5), server.read(&mut buf))
+            .await
+            .expect("the server read never saw the client close");
+        assert_eq!(read.unwrap(), 0);
+        let err = server.write_all(b"late").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            server.flush().await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[tokio::test]

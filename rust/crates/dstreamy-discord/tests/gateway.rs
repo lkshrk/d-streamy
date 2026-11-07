@@ -334,7 +334,9 @@ async fn unreachable_gateway_gives_up_after_the_attempt_limit() {
     // Port 1 is privileged and unused, so the dial is refused without racing other tests' binds.
     let mut opts = options("ws://127.0.0.1:1");
     opts.max_failed_attempts = 3;
-    let result = timeout(STEP, GatewayClient::connect(opts)).await.unwrap();
+    // Windows retries a refused loopback connect for about two seconds per attempt.
+    let limit = if cfg!(windows) { STEP * 6 } else { STEP };
+    let result = timeout(limit, GatewayClient::connect(opts)).await.unwrap();
     assert_eq!(result.err(), Some(GatewayError::Exhausted(3)));
 }
 
