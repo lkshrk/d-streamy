@@ -2455,8 +2455,12 @@ mod tests {
             timeout(T, processed).await.unwrap().unwrap();
             forwarding.abort();
             let _ = forwarding.await;
+            let mut events =
+                published_until(&mut published, |s| matches!(s, SessionState::Streaming)).await;
             assert!(f.engine.catch_up(&current).await);
-            let states: Vec<_> = std::iter::from_fn(|| published.try_recv().ok())
+            events.extend(std::iter::from_fn(|| published.try_recv().ok()));
+            let states: Vec<_> = events
+                .into_iter()
                 .filter_map(|event| match event {
                     EngineEvent::Session(SessionEvent::State { state }) => Some(state),
                     _ => None,
