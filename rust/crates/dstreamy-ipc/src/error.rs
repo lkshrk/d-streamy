@@ -10,8 +10,8 @@ pub enum IpcError {
     NotRunning(PathBuf),
     #[error("refusing to use {path}: {reason}")]
     InsecureDirectory { path: PathBuf, reason: String },
-    #[error("the service at {path} runs as uid {uid}, not as this user")]
-    ImpostorServer { path: PathBuf, uid: u32 },
+    #[error("the service at {path} runs as {owner}, not as this user")]
+    ImpostorServer { path: PathBuf, owner: String },
     #[error("could not verify who runs the service at {path}: {reason}")]
     UnverifiedServer { path: PathBuf, reason: String },
     #[error("{0} exists and is not a socket")]

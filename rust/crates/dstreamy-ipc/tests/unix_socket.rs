@@ -404,7 +404,7 @@ async fn connect_refuses_a_server_that_verify_server_rejects() {
             .err()
             .expect("connected to a server running as another uid");
         assert!(
-            matches!(err, IpcError::ImpostorServer { uid, .. } if uid == own),
+            matches!(&err, IpcError::ImpostorServer { owner, .. } if *owner == format!("uid {own}")),
             "{err}"
         );
         drop(accepting.await.unwrap());

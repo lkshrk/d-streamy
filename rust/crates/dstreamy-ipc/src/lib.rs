@@ -6,12 +6,16 @@ mod error;
 pub mod producer;
 #[cfg(unix)]
 mod unix;
+#[cfg(windows)]
+mod windows;
 
 #[cfg(unix)]
 use unix as sys;
+#[cfg(windows)]
+use windows as sys;
 
-#[cfg(not(unix))]
-compile_error!("dstreamy-ipc has no transport for this platform yet (named pipes: issue 15)");
+#[cfg(not(any(unix, windows)))]
+compile_error!("dstreamy-ipc has no transport for this platform");
 
 use std::fmt;
 use std::io;
@@ -27,7 +31,7 @@ pub use control::{ControlCodec, Malformed};
 pub use error::IpcError;
 pub use producer::{Frame, Kind, ProducerCodec, ProducerError};
 
-/// Where the service listens: a socket path on Unix.
+/// Where the service listens: a socket path on Unix, a named pipe on Windows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
     location: PathBuf,
@@ -117,7 +121,7 @@ impl Listener {
     }
 
     /// Binds normally but authorizes peers against `own` instead of this process's user.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     #[doc(hidden)]
     pub async fn bind_as_for_tests(endpoint: &Endpoint, own: u32) -> Result<Self, IpcError> {
         Self::bind_with(endpoint, sys::Access::Private, own).await
@@ -169,12 +173,31 @@ pub async fn connect(endpoint: &Endpoint) -> Result<Stream, IpcError> {
 }
 
 /// Connects normally but expects the server to run as `own` instead of this process's user.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 #[doc(hidden)]
 pub async fn connect_as_for_tests(endpoint: &Endpoint, own: u32) -> Result<Stream, IpcError> {
     Ok(Stream {
         inner: sys::connect(endpoint.as_path(), own).await?,
     })
+}
+
+/// Refuses a server whose process the kernel cannot attribute, or that runs as another user.
+pub(crate) fn verify_server(
+    path: &Path,
+    own: sys::Principal,
+    server: io::Result<Peer>,
+) -> Result<(), IpcError> {
+    let server = server.map_err(|e| IpcError::UnverifiedServer {
+        path: path.to_owned(),
+        reason: e.to_string(),
+    })?;
+    if !authorize(&own, &server.principal()) {
+        return Err(IpcError::ImpostorServer {
+            path: path.to_owned(),
+            owner: sys::owner_name(server.principal()),
+        });
+    }
+    Ok(())
 }
 
 /// One accepted or connected socket, usable with tokio's `AsyncRead` and `AsyncWrite`.

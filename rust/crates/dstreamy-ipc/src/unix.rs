@@ -38,6 +38,10 @@ pub(crate) enum Access {
     EveryoneForTests,
 }
 
+pub(crate) fn owner_name(principal: Principal) -> String {
+    format!("uid {principal}")
+}
+
 pub(crate) fn own_principal() -> Principal {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
@@ -398,22 +402,8 @@ pub(crate) async fn connect(path: &Path, own: Principal) -> Result<Stream, IpcEr
         }
         Err(e) => return Err(e.into()),
     };
-    verify_server(path, own, peer_of(&stream))?;
+    crate::verify_server(path, own, peer_of(&stream))?;
     Ok(stream)
-}
-
-fn verify_server(path: &Path, own: Principal, server: io::Result<Peer>) -> Result<(), IpcError> {
-    let server = server.map_err(|e| IpcError::UnverifiedServer {
-        path: path.to_owned(),
-        reason: e.to_string(),
-    })?;
-    if !crate::authorize(&own, &server.principal()) {
-        return Err(IpcError::ImpostorServer {
-            path: path.to_owned(),
-            uid: server.principal(),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -612,12 +602,15 @@ mod tests {
     fn server_check_fails_closed() {
         let path = Path::new("/x/serve.sock");
         let own = own_principal();
-        verify_server(path, own, Ok(Peer::new(own, None))).unwrap();
-        let err =
-            verify_server(path, own, Ok(Peer::new(own.wrapping_add(1), Some(7)))).unwrap_err();
-        assert!(matches!(err, IpcError::ImpostorServer { uid, .. } if uid == own.wrapping_add(1)));
+        crate::verify_server(path, own, Ok(Peer::new(own, None))).unwrap();
+        let err = crate::verify_server(path, own, Ok(Peer::new(own.wrapping_add(1), Some(7))))
+            .unwrap_err();
+        assert!(
+            matches!(&err, IpcError::ImpostorServer { owner, .. } if *owner == format!("uid {}", own.wrapping_add(1))),
+            "{err}"
+        );
         let enotconn = io::Error::from_raw_os_error(libc::ENOTCONN);
-        let err = verify_server(path, own, Err(enotconn)).unwrap_err();
+        let err = crate::verify_server(path, own, Err(enotconn)).unwrap_err();
         assert!(matches!(err, IpcError::UnverifiedServer { .. }), "{err}");
     }
 

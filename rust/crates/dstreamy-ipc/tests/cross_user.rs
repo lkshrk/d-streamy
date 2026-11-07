@@ -219,7 +219,7 @@ async fn client_refuses_a_server_run_by_another_user() {
         let err = connect(&endpoint).await.err().unwrap();
         let nobody = nobody_uid();
         assert!(
-            matches!(err, IpcError::ImpostorServer { uid, .. } if uid == nobody),
+            matches!(&err, IpcError::ImpostorServer { owner, .. } if *owner == format!("uid {nobody}")),
             "expected ImpostorServer with uid {nobody}: {err}"
         );
         assert_eq!(results.recv().await.as_deref(), Some("accepted"));
