@@ -806,6 +806,7 @@ async fn handle(output: &mut Output, job: Job, mut closing: Closing, brought: &m
             account_session(account, &mut closing).await;
         }
         Job::OutputStopped(code) => {
+            #[cfg_attr(not(unix), allow(unused_variables))]
             let message = (code != i64::from(sys::OBS_OUTPUT_SUCCESS)).then(|| {
                 let reason = output
                     .last_error()
