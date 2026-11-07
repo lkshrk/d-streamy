@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 dstreamy-core = { path = "../dstreamy-core" }
 dstreamy-discord = { path = "../dstreamy-discord" }
@@ -38,7 +39,6 @@ dstreamy-capture-macos = { path = "../dstreamy-capture-macos" }
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "2.0.2", optional = true }
 gtk = { version = "0.18", optional = true }
-async-trait = "0.1"
 dstreamy-capture-linux = { path = "../dstreamy-capture-linux" }
 
 [dev-dependencies]
