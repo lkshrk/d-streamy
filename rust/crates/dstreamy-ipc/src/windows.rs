@@ -530,6 +530,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_write_into_a_dropped_client_still_lets_the_read_see_the_end() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_util::codec::{FramedRead, FramedWrite};
+        let path = unique_pipe();
+        let listener = Listener::bind(&path, Access::Private).await.unwrap();
+        let client = connect(&path, own_principal()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (read, write) = tokio::io::split(server);
+        let mut reader = FramedRead::new(read, crate::ControlCodec::new());
+        let mut writer = FramedWrite::new(write, crate::ControlCodec::new());
+        let mut client = tokio_util::codec::Framed::new(client, crate::ControlCodec::new());
+        client.send(serde_json::json!({"id": "1"})).await.unwrap();
+        assert!(reader.next().await.unwrap().is_ok());
+        writer.send(serde_json::json!({"id": "1"})).await.unwrap();
+        client.next().await.unwrap().unwrap();
+        drop(client);
+        let late = writer.send(serde_json::json!({"event": "late"})).await;
+        let end = tokio::time::timeout(Duration::from_secs(5), reader.next())
+            .await
+            .unwrap_or_else(|_| panic!("the read never saw the end after a late write ({late:?})"));
+        assert!(!matches!(end, Some(Ok(Ok(_)))), "{end:?}");
+        assert!(
+            writer
+                .send(serde_json::json!({"event": "later"}))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn a_second_listener_on_the_same_pipe_is_already_running() {
         let path = unique_pipe();
         let _first = Listener::bind(&path, Access::Private).await.unwrap();
