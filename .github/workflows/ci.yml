@@ -45,7 +45,7 @@ jobs:
 
       - name: Build dstreamy and the mock Discord server
         working-directory: rust
-        run: cargo build --locked -p dstreamy-cli --features test-pattern -p dstreamy-mock-discord
+        run: cargo build --locked -p dstreamy-cli --features test-hooks -p dstreamy-mock-discord
 
       - name: Build & test (Swift)
         env:

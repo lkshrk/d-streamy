@@ -40,7 +40,7 @@ final class DaemonIntegrationTests: XCTestCase {
         let url = environment[env].map { URL(fileURLWithPath: $0) }
             ?? DaemonFixtureTests.repoRoot.appendingPathComponent("rust/target/debug/\(name)")
         guard FileManager.default.isExecutableFile(atPath: url.path) else {
-            let message = "\(url.path) is missing; run `cargo build -p dstreamy-cli --features test-pattern -p dstreamy-mock-discord` in rust/"
+            let message = "\(url.path) is missing; run `cargo build -p dstreamy-cli --features test-hooks -p dstreamy-mock-discord` in rust/"
             if environment["DSTREAMY_INTEGRATION"] == "1" {
                 XCTFail(message)
             }

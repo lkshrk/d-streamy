@@ -45,7 +45,7 @@ xvfb-run -a -s "-screen 0 1280x720x24" cargo test --workspace --locked
 
 On macOS use `macos-ci`, then `ctest --test-dir build_macos -C RelWithDebInfo -R dstreamy-ui --output-on-failure`; no macOS test preset exists. Set `DSTREAMY_OBS_CONFIG` to that build's generated config. The workflow checks both target slices and runs load tests separately.
 
-macOS app (`.github/workflows/ci.yml`): `swift test` after `cargo build --locked -p dstreamy-cli --features test-pattern -p dstreamy-mock-discord` in `rust/`; `bash scripts/build.sh` makes `bin/D-Streamy.app`.
+macOS app (`.github/workflows/ci.yml`): `swift test` after `cargo build --locked -p dstreamy-cli --features test-hooks -p dstreamy-mock-discord` in `rust/`; `bash scripts/build.sh` makes `bin/D-Streamy.app`.
 
 ## Rules
 
