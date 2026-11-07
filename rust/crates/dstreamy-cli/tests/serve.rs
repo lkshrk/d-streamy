@@ -737,6 +737,17 @@ fn a_stall_shorter_than_the_first_frames_wait_is_refused() {
     shutdown_and_exit(&h, s);
 }
 
+/// Reports whether `dstreamy stream` printed `state: streaming`, then keeps reading: a closed stdout stops it as if interrupted.
+fn watch_streaming(stdout: std::process::ChildStdout) -> mpsc::Receiver<bool> {
+    let (tx, streaming) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = BufReader::new(stdout).lines().map_while(Result::ok);
+        let _ = tx.send(lines.any(|l| l == "state: streaming"));
+        lines.for_each(drop);
+    });
+    streaming
+}
+
 fn stream_args() -> Vec<&'static str> {
     vec![
         "stream",
@@ -777,15 +788,7 @@ fn serve_holds_the_session_lock_against_stream_and_the_reverse() {
     );
 
     let mut stream = Service::spawn(h.cmd().args(stream_args()).stdout(Stdio::piped()));
-    let (tx, streaming) = mpsc::channel();
-    let stdout = stream.child.stdout.take().unwrap();
-    std::thread::spawn(move || {
-        let seen = BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-            .any(|l| l == "state: streaming");
-        let _ = tx.send(seen);
-    });
+    let streaming = watch_streaming(stream.child.stdout.take().unwrap());
     assert_eq!(
         streaming.recv_timeout(T),
         Ok(true),
@@ -1665,29 +1668,24 @@ fn serve_streams_one_account_while_stream_streams_another() {
         .arg(h.dir.path())
         .arg("--gateway-url")
         .arg(second.gateway_url())
-        .args(["--account", "other"])
+        .args(["--account", "other", "-v"])
         .args(stream_args())
         .stdout(Stdio::piped());
     let mut stream = Service::spawn(&mut other);
-    let (tx, streaming) = mpsc::channel();
-    let stdout = stream.child.stdout.take().unwrap();
-    std::thread::spawn(move || {
-        let seen = BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-            .any(|l| l == "state: streaming");
-        let _ = tx.send(seen);
-    });
+    let streaming = watch_streaming(stream.child.stdout.take().unwrap());
     assert_eq!(
         streaming.recv_timeout(T),
         Ok(true),
         "account other never streamed"
     );
-    assert!(
-        h.rt.block_on(second.wait_for(T, |r| (stream_video(r) > 0).then_some(())))
-            .is_some(),
-        "no video reached the second account's Discord"
-    );
+    if h.rt
+        .block_on(second.wait_for(T, |r| (stream_video(r) > 0).then_some(())))
+        .is_none()
+    {
+        stream.signal("INT");
+        let (_, stderr) = stream.finish();
+        panic!("no video reached the second account's Discord; stream stderr:\n{stderr}");
+    }
     assert!(h.stream_video(1), "serve's stream stopped");
     let status = c.request(&json!({"id": "st", "cmd": "status"}));
     assert_eq!(status["data"]["session"]["state"], "streaming", "{status}");
