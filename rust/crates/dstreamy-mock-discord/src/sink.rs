@@ -51,6 +51,7 @@ struct TrackDecrypt {
 struct Decrypted {
     audio: TrackDecrypt,
     video: TrackDecrypt,
+    participant_generation: u64,
 }
 
 pub(crate) struct Sink {
@@ -208,6 +209,12 @@ impl Sink {
         let server = dave
             .as_mut()
             .ok_or_else(|| "DAVE frame without a DAVE session".to_owned())?;
+        if decrypted.participant_generation != server.participant_generation() {
+            *decrypted = Decrypted {
+                participant_generation: server.participant_generation(),
+                ..Decrypted::default()
+            };
+        }
         let (name, this, other) = if media_type == MediaType::VIDEO {
             ("video", &mut decrypted.video, decrypted.audio)
         } else {
@@ -287,8 +294,13 @@ mod tests {
     }
 
     fn dave_pair() -> (DaveServer, DaveSession) {
+        let mut server = DaveServer::new(NonZeroU16::new(1).unwrap(), CLIENT, 7, 9999).unwrap();
+        let client = join(&mut server);
+        (server, client)
+    }
+
+    fn join(server: &mut DaveServer) -> DaveSession {
         let v = NonZeroU16::new(1).unwrap();
-        let mut server = DaveServer::new(v, CLIENT, 7, 9999).unwrap();
         let mut client = DaveSession::new(v, CLIENT, 7, None).unwrap();
         let kp = client.create_key_package().unwrap();
         client
@@ -307,7 +319,7 @@ mod tests {
         payload.extend(cw.welcome.unwrap());
         let (_, announce) = server.on_commit_welcome(&payload).unwrap();
         client.process_commit(&announce[2..]).unwrap();
-        (server, client)
+        client
     }
 
     fn recorded(sink: &Sink) -> Recorded {
@@ -382,6 +394,33 @@ mod tests {
         assert!(sink.decrypt(MediaType::AUDIO, later).is_ok());
         let replayed = sink.decrypt(MediaType::AUDIO, audio).unwrap_err();
         assert!(!replayed.starts_with(FIRST_FRAME_DAVE_DROP), "{replayed}");
+    }
+
+    #[test]
+    fn a_new_participant_session_starts_first_frame_tagging_over() {
+        let (server, mut client) = dave_pair();
+        let mut sink = sink(Some(server));
+        let opus = [0xFC, 0xFF, 0xFE, 0x01];
+        let idr = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33, 0xFF];
+        for (media, codec, frame) in [
+            (MediaType::AUDIO, Codec::OPUS, &opus[..]),
+            (MediaType::VIDEO, Codec::H264, &idr[..]),
+        ] {
+            let sealed = client.encrypt(media, codec, frame).unwrap().to_vec();
+            assert!(sink.decrypt(media, sealed).is_ok());
+        }
+        let mut client = join(lock_dave(&sink.dave).as_mut().unwrap());
+        let audio = client
+            .encrypt(MediaType::AUDIO, Codec::OPUS, &opus)
+            .unwrap()
+            .to_vec();
+        let video = client
+            .encrypt(MediaType::VIDEO, Codec::H264, &idr)
+            .unwrap()
+            .to_vec();
+        assert!(sink.decrypt(MediaType::VIDEO, video).is_ok());
+        let first = sink.decrypt(MediaType::AUDIO, audio).unwrap_err();
+        assert!(first.starts_with(FIRST_FRAME_DAVE_DROP), "{first}");
     }
 
     #[test]
