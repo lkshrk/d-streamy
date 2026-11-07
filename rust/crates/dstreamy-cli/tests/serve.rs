@@ -1778,6 +1778,7 @@ mod golden {
                     data["version"] = json!("<version>");
                     data["platform"] = json!("<platform>");
                     data["connection"] = json!("<connection>");
+                    data["instance"] = json!("<instance>");
                     if let Some(features) = data["features"].as_array_mut() {
                         features.retain(|f| f != "browser_login");
                     }

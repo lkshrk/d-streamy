@@ -276,6 +276,17 @@ pub const BROWSER_LOGIN: &str = "browser_login";
 /// Offered unless the token comes from `DSTREAMY_TOKEN`, which leaves no accounts to manage.
 pub const ACCOUNTS: &str = "accounts";
 
+/// This serve run, for clients that cannot tell runs apart by the endpoint itself (a named pipe has no file).
+fn instance() -> Value {
+    static STARTED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let started = *STARTED.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
+    });
+    json!({ "pid": std::process::id(), "started": started })
+}
+
 async fn hello_data(engine: &Engine, login: &login::Login, connection: u64) -> Value {
     let mut features = FEATURES.to_vec();
     if login.available() {
@@ -289,6 +300,7 @@ async fn hello_data(engine: &Engine, login: &login::Login, connection: u64) -> V
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
         "connection": connection,
+        "instance": instance(),
         "features": features,
         "status": engine.status().await,
     })
