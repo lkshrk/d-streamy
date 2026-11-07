@@ -2426,7 +2426,7 @@ mod tests {
             let holding = std::thread::spawn(move || {
                 let _portal = lock(&portal);
                 locked.send(()).unwrap();
-                let _ = released.recv_timeout(T);
+                let _ = released.recv_timeout(3 * T);
             });
             is_locked.recv_timeout(T).unwrap();
             let receiver = old.session.subscribe();

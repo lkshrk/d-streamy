@@ -79,6 +79,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "windows-sys",
 ]
 
 [[package]]

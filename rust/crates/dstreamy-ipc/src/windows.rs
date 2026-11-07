@@ -513,6 +513,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_dropped_after_reading_still_ends_the_server_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let path = unique_pipe();
+        let listener = Listener::bind(&path, Access::Private).await.unwrap();
+        let mut client = connect(&path, own_principal()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        server.write_all(b"hi").await.unwrap();
+        let mut buf = [0; 2];
+        client.read_exact(&mut buf).await.unwrap();
+        drop(client);
+        let read = tokio::time::timeout(Duration::from_secs(5), server.read(&mut buf))
+            .await
+            .expect("a client with a read in flight never closed its end");
+        assert_eq!(read.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn a_second_listener_on_the_same_pipe_is_already_running() {
         let path = unique_pipe();
         let _first = Listener::bind(&path, Access::Private).await.unwrap();
