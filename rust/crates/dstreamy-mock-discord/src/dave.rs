@@ -55,8 +55,8 @@ pub struct DaveServer {
     pub(crate) plaintext_until: Option<Instant>,
     /// After a transition to protocol 0 the client sends plaintext for good.
     pub(crate) downgraded: bool,
-    /// Bumped for every new participant session, whose decryptor starts without a nonce baseline.
-    participant_generation: u64,
+    /// Bumped for every new participant session and epoch; davey's decryptor starts each without a nonce baseline.
+    key_generation: u64,
 }
 
 impl DaveServer {
@@ -85,7 +85,7 @@ impl DaveServer {
             next_transition: 0,
             plaintext_until: None,
             downgraded: false,
-            participant_generation: 0,
+            key_generation: 0,
         })
     }
 
@@ -108,7 +108,7 @@ impl DaveServer {
         let (participant, proposal) =
             self.member_add_proposal(self.participant_id, GroupEpoch::from(0))?;
         self.participant = Some(participant);
-        self.participant_generation += 1;
+        self.key_generation += 1;
         Ok(proposal)
     }
 
@@ -216,6 +216,7 @@ impl DaveServer {
                 member.process_welcome(welcome).map_err(davey)?;
             }
         }
+        self.key_generation += 1;
         self.next_transition = self.next_transition.wrapping_add(1).max(1);
         let transition_id = self.next_transition;
         let mut out = transition_id.to_be_bytes().to_vec();
@@ -250,8 +251,8 @@ impl DaveServer {
         self.guest.as_ref().is_some_and(DaveSession::is_ready)
     }
 
-    pub fn participant_generation(&self) -> u64 {
-        self.participant_generation
+    pub fn key_generation(&self) -> u64 {
+        self.key_generation
     }
 
     pub fn is_active(&self) -> bool {
