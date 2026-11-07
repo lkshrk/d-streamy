@@ -105,7 +105,7 @@ final class PendingStartTests: XCTestCase {
         read start
         printf '%s\\n' '{"type":"event","event":{"event":"e2ee","state":"encrypted","dave_protocol_version":1}}'
         read stop
-        printf '%s\\n' '{"type":"result","id":"2","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"2","data":null}'
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"streaming"}}}'
         printf '%s\\n' '{"type":"event","event":{"event":"e2ee","state":"unencrypted","dave_protocol_version":0}}'
         printf '%s\\n' '{"type":"error","id":"3","code":"busy","message":"start pending"}'
@@ -132,9 +132,9 @@ final class PendingStartTests: XCTestCase {
         printf '%s\\n' '\(Self.targets)'
         read start
         read release
-        printf '%s\\n' '{"type":"result","id":"2","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"2","data":null}'
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"streaming"}}}'
-        printf '%s\\n' '{"type":"result","id":"3","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"3","data":null}'
         while read rest; do :; done
         """)
         defer { client.terminate() }
@@ -185,7 +185,7 @@ final class PendingStartTests: XCTestCase {
         read targets
         printf '%s\\n' '\(Self.targets)'
         read start
-        printf '%s\\n' '{"type":"result","id":"2","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"2","data":null}'
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"streaming"}}}'
         read stop
         printf '%s\\n' '{"type":"error","id":"3","code":"busy","message":"stop unavailable"}'
@@ -235,7 +235,7 @@ final class PendingStartTests: XCTestCase {
         read targets
         printf '%s\\n' '\(Self.targets)'
         read start
-        printf '%s\\n' '{"type":"result","id":"2","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"2","data":null}'
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"streaming"}}}'
         printf '%s\\n' '{"type":"event","event":{"event":"e2ee","state":"encrypted","dave_protocol_version":1}}'
         printf '%s\\n' '\(initialHealth)'
@@ -244,7 +244,7 @@ final class PendingStartTests: XCTestCase {
         read release
         printf '%s\\n' '{"type":"event","event":{"event":"e2ee","state":"unencrypted","dave_protocol_version":0}}'
         printf '%s\\n' '\(updatedHealth)'
-        printf '%s\\n' '{"type":"result","id":"4","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"4","data":null}'
         while read rest; do :; done
         """)
         defer { client.terminate() }
@@ -280,7 +280,7 @@ final class PendingStartTests: XCTestCase {
         read targets
         printf '%s\\n' '\(Self.targets)'
         read start
-        printf '%s\\n' '{"type":"result","id":"2","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"2","data":null}'
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"streaming"}}}'
         read stop
         printf '%s\\n' '{"type":"result","id":"3","data":\(Self.stoppedStats)}'
@@ -288,7 +288,7 @@ final class PendingStartTests: XCTestCase {
         read targets
         printf '%s\\n' '\(Self.targets.replacingOccurrences(of: "\"id\":\"1\"", with: "\"id\":\"4\""))'
         read start
-        printf '%s\\n' '{"type":"result","id":"5","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"5","data":null}'
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"streaming"}}}'
         while read rest; do :; done
         """)
@@ -320,7 +320,7 @@ final class PendingStartTests: XCTestCase {
         read targets
         printf '%s\\n' '\(Self.targets)'
         read start
-        printf '%s\\n' '{"type":"result","id":"2","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"2","data":null}'
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"streaming"}}}'
         read stop
         printf '%s\\n' '{"type":"result","id":"3","data":\(Self.stoppedStats)}'
@@ -346,13 +346,13 @@ final class PendingStartTests: XCTestCase {
         read targets
         printf '%s\\n' '\(Self.targets)'
         read start
-        printf '%s\\n' '{"type":"result","id":"2","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"2","data":null}'
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"streaming"}}}'
         read stop
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"stopped","reason":{"reason":"e2ee_unavailable"}}}}'
         read release
         printf '%s\\n' '{"type":"result","id":"3","data":\(Self.stoppedStats)}'
-        printf '%s\\n' '{"type":"result","id":"4","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"4","data":null}'
         while read rest; do :; done
         """)
         defer { client.terminate() }
@@ -375,14 +375,14 @@ final class PendingStartTests: XCTestCase {
         read targets
         printf '%s\\n' '\(Self.targets)'
         read start
-        printf '%s\\n' '{"type":"result","id":"2","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"2","data":null}'
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"streaming"}}}'
         printf '%s\\n' '{"type":"event","event":{"event":"error","fatal":true,"message":"capture failed"}}'
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"stopped","reason":{"reason":"e2ee_unavailable"}}}}'
         read targets
         printf '%s\\n' '\(Self.targets.replacingOccurrences(of: "\"id\":\"1\"", with: "\"id\":\"3\""))'
         read start
-        printf '%s\\n' '{"type":"result","id":"4","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"4","data":null}'
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"streaming"}}}'
         while read rest; do :; done
         """)
@@ -415,7 +415,7 @@ final class PendingStartTests: XCTestCase {
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"stopped","reason":{"reason":"e2ee_unavailable"}}}}'
         read release
         printf '%s\\n' '{"type":"error","id":"2","code":"capture","message":"capture admission failed"}'
-        printf '%s\\n' '{"type":"result","id":"3","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"3","data":null}'
         while read rest; do :; done
         """)
         defer { client.terminate() }
@@ -452,8 +452,8 @@ final class PendingStartTests: XCTestCase {
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"streaming"}}}'
         printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"stopped","reason":{"reason":"e2ee_unavailable"}}}}'
         read release
-        printf '%s\\n' '{"type":"result","id":"2","data":{}}'
-        printf '%s\\n' '{"type":"result","id":"3","data":{}}'
+        printf '%s\\n' '{"type":"result","id":"2","data":null}'
+        printf '%s\\n' '{"type":"result","id":"3","data":null}'
         while read rest; do :; done
         """)
         defer { client.terminate() }
@@ -479,7 +479,7 @@ final class PendingStartTests: XCTestCase {
             read targets
             printf '%s\\n' '\(Self.targets.replacingOccurrences(of: "\"id\":\"1\"", with: "\"id\":\"2\""))'
             read start
-            printf '%s\\n' '{"type":"result","id":"3","data":{}}'
+            printf '%s\\n' '{"type":"result","id":"3","data":null}'
             printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"streaming"}}}'
             printf '%s\\n' '{"type":"event","event":{"event":"e2ee","state":"encrypted","dave_protocol_version":1}}'
             while read rest; do :; done
@@ -492,7 +492,7 @@ final class PendingStartTests: XCTestCase {
             printf '%s\\n' '{"type":"event","event":{"event":"state","state":{"state":"stopped","reason":{"reason":"requested"}}}}'
             read release
             printf '%s\\n' '{"type":"error","id":"2","code":"\(code)","message":"Start rejected while events were pending"}'
-            printf '%s\\n' '{"type":"result","id":"3","data":{}}'
+            printf '%s\\n' '{"type":"result","id":"3","data":null}'
             while read rest; do :; done
             """, daemonFactory: { next })
             defer { client.terminate() }
