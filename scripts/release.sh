@@ -35,7 +35,7 @@ APP_NAME="D-Streamy"
 VERSION="${VERSION:-${TAG:-0.1.0}}"
 VERSION="${VERSION#v}"
 
-if [ -z "${DSTREAMY_DAEMON:-}" ] || ! lipo "$DSTREAMY_DAEMON" -verify_arch arm64 x86_64; then
+if [ -z "${DSTREAMY_DAEMON:-}" ] || ! "$SCRIPT_DIR/check-universal.sh" "$DSTREAMY_DAEMON"; then
     echo "error: set DSTREAMY_DAEMON to a universal (arm64 + x86_64) dstreamy" >&2
     exit 1
 fi

@@ -182,12 +182,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("rust-ci.yml finished failure", result.stdout + result.stderr)
 
-    def test_lipo_input_precedes_verify_arch(self):
-        for path in (ROOT / ".github/workflows/release.yml", ROOT / "scripts/release.sh"):
-            for line in path.read_text().splitlines():
-                if "lipo " in line and "-verify_arch" in line:
-                    with self.subTest(path=path, line=line):
-                        self.assertRegex(line, r'lipo\s+\S+\s+-verify_arch\s+arm64\s+x86_64')
+    def test_universal_checks_avoid_verify_arch(self):
+        for path in (ROOT / ".github/workflows/release.yml", ROOT / "scripts/release.sh",
+                     ROOT / "scripts/build.sh"):
+            with self.subTest(path=path):
+                self.assertNotIn("-verify_arch", path.read_text())
+        self.assertIn("check-universal.sh target/universal/dstreamy", workflow("release.yml"))
+        self.assertIn("check-universal.sh", (ROOT / "scripts/release.sh").read_text())
 
     def test_normal_vendor_features_are_rejected(self):
         script = step("rust-ci.yml", "Shipped crates never enable test-only features")

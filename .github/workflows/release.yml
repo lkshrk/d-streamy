@@ -336,7 +336,7 @@ jobs:
           lipo -create -output target/universal/dstreamy \
             target/aarch64-apple-darwin/release/dstreamy \
             target/x86_64-apple-darwin/release/dstreamy
-          lipo target/universal/dstreamy -verify_arch arm64 x86_64
+          ../scripts/check-universal.sh target/universal/dstreamy
       - name: Install Rosetta
         run: sudo softwareupdate --install-rosetta --agree-to-license
       - name: Run both slices of the universal dstreamy
@@ -362,13 +362,13 @@ jobs:
         run: |
           set -euo pipefail
           DSTREAMY_DAEMON="$PWD/rust/target/universal/dstreamy" bash scripts/release.sh
-          lipo bin/D-Streamy.app/Contents/MacOS/D-Streamy -verify_arch arm64 x86_64
+          scripts/check-universal.sh bin/D-Streamy.app/Contents/MacOS/D-Streamy
       - name: Build unsigned (rehearsal without signing secrets)
         if: env.MACOS_SIGNING != 'true'
         run: |
           set -euo pipefail
           DSTREAMY_DAEMON="$PWD/rust/target/universal/dstreamy" UNIVERSAL=1 SKIP_SIGN=1 bash scripts/build.sh
-          lipo bin/D-Streamy.app/Contents/MacOS/D-Streamy -verify_arch arm64 x86_64
+          scripts/check-universal.sh bin/D-Streamy.app/Contents/MacOS/D-Streamy
       - name: Zip the app for notarization
         if: env.MACOS_SIGNING == 'true'
         run: ditto -c -k --sequesterRsrc --keepParent bin/D-Streamy.app "$RUNNER_TEMP/D-Streamy-notarize.zip"

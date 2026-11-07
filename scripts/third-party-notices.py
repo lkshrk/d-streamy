@@ -22,7 +22,7 @@ def metadata(manifest: Path, target: str, package: str, features: list[str]) -> 
         command += ["--features", ",".join(f"{package}/{feature}" for feature in features)]
     out = subprocess.run(
         command,
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, encoding="utf-8",
     ).stdout
     meta = json.loads(out)
     tree_command = ["cargo", "tree", "--locked", "--manifest-path", str(manifest),
@@ -30,7 +30,7 @@ def metadata(manifest: Path, target: str, package: str, features: list[str]) -> 
                     "--prefix", "none", "--format", "{p}"]
     if features:
         tree_command += ["--features", ",".join(f"{package}/{feature}" for feature in features)]
-    tree = subprocess.run(tree_command, check=True, capture_output=True, text=True).stdout
+    tree = subprocess.run(tree_command, check=True, capture_output=True, text=True, encoding="utf-8").stdout
     selected = {tuple(match.groups()) for line in tree.splitlines()
                 if (match := re.match(r"^(\S+) v(\S+)(?: |$)", line))}
     selected_ids = {pkg["id"] for pkg in meta["packages"] if (pkg["name"], pkg["version"]) in selected}
@@ -77,7 +77,7 @@ def template_text(pkg: dict) -> str | None:
         if spdx in ids:
             holders = ", ".join(re.sub(r"\s*<[^>]*>", "", a) for a in pkg["authors"]) \
                 or f'the {pkg["name"]} authors'
-            body = (TEMPLATES / f"{spdx}.txt").read_text().strip()
+            body = (TEMPLATES / f"{spdx}.txt").read_text(encoding="utf-8").strip()
             return f"{spdx}\n\nCopyright (c) {holders}\n\n{body}"
     return None
 
@@ -103,7 +103,7 @@ def main() -> int:
             ours = {p["id"] for p in meta["packages"]
                     if p.get("source") is None and p.get("license") == PROJECT_LICENSE}
             ids |= shipped(meta, args.package) - ours
-        additions = [path.read_text().strip() for path in args.append]
+        additions = [path.read_text(encoding="utf-8").strip() for path in args.append]
         if any(not text for text in additions):
             raise ValueError("appended notice text must not be empty")
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
@@ -114,7 +114,7 @@ def main() -> int:
     users: dict[str, list[str]] = {}
     missing = []
     for pkg in sorted((packages[i] for i in ids), key=lambda p: (p["name"], p["version"])):
-        bodies = [f.read_text(errors="replace").strip()
+        bodies = [f.read_text(encoding="utf-8", errors="replace").strip()
                   for f in license_files(Path(pkg["manifest_path"]).parent)]
         bodies = [b for b in bodies if b]
         if not bodies:
@@ -149,7 +149,7 @@ def main() -> int:
     for key in sorted(users, key=lambda k: users[k][0]):
         out.append("=" * 78 + "\n" + "\n".join(users[key]) + "\n" + "=" * 78 + "\n\n" + texts[key] + "\n")
     out.extend(additions)
-    args.output.write_text("\n".join(out) + "\n")
+    args.output.write_text("\n".join(out) + "\n", encoding="utf-8")
     crates = {label for labels in users.values() for label in labels}
     print(f"{args.output}: {len(crates)} crates, {len(texts)} license texts")
     return 0
