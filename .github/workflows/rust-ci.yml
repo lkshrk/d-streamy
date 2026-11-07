@@ -233,11 +233,9 @@ jobs:
         env:
           DSTREAMY_CROSS_USER_TESTS: "1"
 
-  # Windows has no service transport yet; this shows how far the workspace is from building there.
   rust-windows:
     runs-on: windows-2025
     timeout-minutes: 45
-    continue-on-error: true
     defaults:
       run:
         working-directory: rust
