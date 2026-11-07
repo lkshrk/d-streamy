@@ -38,7 +38,7 @@ struct Assembly {
     broken: bool,
 }
 
-/// Prefix of the one DAVE drop per track that can come from receive-side reordering: before the track's first frame, after the other track's.
+/// Prefix of the one DAVE drop per track and key that can come from receive-side reordering, once the other track decrypted under that key.
 pub const FIRST_FRAME_DAVE_DROP: &str = "DAVE decrypt before the first frame: ";
 
 #[derive(Default, Clone, Copy)]
@@ -220,7 +220,8 @@ impl Sink {
         } else {
             ("audio", &mut decrypted.audio, decrypted.video)
         };
-        let first_failure = !this.succeeded && !this.tagged && other.succeeded;
+        // Old-key frames can still decrypt after the server's re-key, so this track's own successes do not end the window.
+        let first_failure = !this.tagged && other.succeeded;
         match server.decrypt(media_type, &frame) {
             Ok(plain) => {
                 this.succeeded = true;
@@ -436,7 +437,7 @@ mod tests {
             let sealed = client.encrypt(media, codec, frame).unwrap().to_vec();
             assert!(sink.decrypt(media, sealed).is_ok());
         }
-        {
+        let announce = {
             let mut dave = lock_dave(&sink.dave);
             let server = dave.as_mut().unwrap();
             let proposals = server.add_guest_proposal(8888).unwrap();
@@ -450,9 +451,14 @@ mod tests {
                 .unwrap();
             let mut payload = cw.commit.clone();
             payload.extend(cw.welcome.unwrap());
-            let (_, announce) = server.on_commit_welcome(&payload).unwrap();
-            client.process_commit(&announce[2..]).unwrap();
-        }
+            server.on_commit_welcome(&payload).unwrap().1
+        };
+        let old_key = client
+            .encrypt(MediaType::AUDIO, Codec::OPUS, &opus)
+            .unwrap()
+            .to_vec();
+        assert!(sink.decrypt(MediaType::AUDIO, old_key).is_ok());
+        client.process_commit(&announce[2..]).unwrap();
         let audio = client
             .encrypt(MediaType::AUDIO, Codec::OPUS, &opus)
             .unwrap()
