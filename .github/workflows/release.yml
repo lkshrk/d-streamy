@@ -76,6 +76,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: needs.version.outputs.publish == 'true'
+        with:
+          persist-credentials: false
+          fetch-depth: 0
       - name: Wait for CI on the tagged commit
         if: needs.version.outputs.publish == 'true'
         env:
@@ -86,13 +91,31 @@ jobs:
           # An annotated tag's github.sha names the tag object; the ref resolves to the tested commit.
           commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$REF" --jq .sha)
           deadline=$(( $(date +%s) + 140 * 60 ))
-          for workflow in ci.yml rust-ci.yml obs-ci.yml fuzz.yml; do
+          runs() {
+            gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/$1/runs" -f event=push -f per_page=100 "${@:2}" \
+              --jq '.workflow_runs | sort_by(.run_number) | reverse | .[] | [.head_sha, .status, (.conclusion // ""), .html_url] | @tsv'
+          }
+          # OBS runs only for its push paths, so it goes last, once any run for this commit has been created.
+          for workflow in ci.yml rust-ci.yml fuzz.yml obs-ci.yml; do
             while :; do
               # The newest push run decides, so a failed rerun supersedes an older success.
-              run=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs" \
-                -f head_sha="$commit" -f event=push -f per_page=100 \
-                --jq '.workflow_runs | sort_by(.run_number) | last | [.status, (.conclusion // ""), .html_url] | @tsv')
-              IFS=$'\t' read -r status conclusion url <<< "$run"
+              IFS=$'\t' read -r _ status conclusion url < <(runs "$workflow" -f head_sha="$commit" | head -n 1) || status=
+              if [ -z "$status" ] && [ "$workflow" = obs-ci.yml ]; then
+                mapfile -t paths < <(awk '/^  push:/ { push = 1; next } /^  [a-z_]+:/ { push = 0 }
+                  push && /^    paths:/ { list = 1; next } list && /^      - / { gsub(/^      - "?|"$/, ""); print ":(glob)" $0; next }
+                  { list = 0 }' .github/workflows/obs-ci.yml)
+                [ "${#paths[@]}" -gt 0 ] || { echo "::error::no push paths found in obs-ci.yml"; exit 1; }
+                while IFS=$'\t' read -r sha status conclusion url; do
+                  [ "$status" = completed ] && [ "$conclusion" = success ] || continue
+                  git merge-base --is-ancestor "$sha" "$commit" 2>/dev/null || continue
+                  if git diff --quiet "$sha" "$commit" -- "${paths[@]}"; then
+                    echo "$workflow did not run for $commit; its paths are unchanged since $sha, which passed: $url"
+                    continue 3
+                  fi
+                done < <(runs "$workflow" -f status=success)
+                echo "::error::$workflow has no run for $commit and its paths changed since its last passing ancestor"
+                exit 1
+              fi
               if [ "$status" = completed ]; then
                 [ "$conclusion" = success ] || { echo "::error::$workflow finished $conclusion on $commit: $url"; exit 1; }
                 echo "$workflow passed: $url"

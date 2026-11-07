@@ -121,7 +121,7 @@ set_version() {
   sed -i.bak -E '/^\[workspace\.package\]/,/^\[/ s/^version = "[^"]*"/version = "'"$version"'"/' rust/Cargo.toml
   rm rust/Cargo.toml.bak
   grep -q "^version = \"$version\"" rust/Cargo.toml || { echo "Error: could not set the version in rust/Cargo.toml" >&2; exit 1; }
-  (cd rust && cargo update --workspace --offline --quiet)
+  (cd rust && cargo update --workspace --quiet)
   local spec
   spec=$(jq --indent 4 --arg v "$version" '.version = $v' obs/buildspec.json)
   printf '%s\n' "$spec" > obs/buildspec.json

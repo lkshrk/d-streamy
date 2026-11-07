@@ -15,17 +15,17 @@ for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu 
   archive="dstreamy-$version-$target.tar.gz"
   need "$archive"
   for entry in dstreamy README.md LICENSE THIRD_PARTY_NOTICES.txt; do
-    tar -tzf "$archive" | grep -qx "dstreamy-$version-$target/$entry" \
+    tar -tzf "$archive" | grep -x "dstreamy-$version-$target/$entry" >/dev/null \
       || { echo "$archive lacks $entry" >&2; exit 1; }
   done
 done
 
 app="D-Streamy-$version-macos-universal.zip"
 need "$app"
-unzip -l "$app" | grep -q ' D-Streamy.app/Contents/MacOS/dstreamy$' || { echo "$app lacks the bundled dstreamy" >&2; exit 1; }
+unzip -l "$app" | grep ' D-Streamy.app/Contents/MacOS/dstreamy$' >/dev/null || { echo "$app lacks the bundled dstreamy" >&2; exit 1; }
 
 need "obs-dstreamy-$version-linux-x86_64.tar.gz"
-tar -tzf "obs-dstreamy-$version-linux-x86_64.tar.gz" | grep -q 'obs-plugins/obs-dstreamy.so$' \
+tar -tzf "obs-dstreamy-$version-linux-x86_64.tar.gz" | grep 'obs-plugins/obs-dstreamy.so$' >/dev/null \
   || { echo "the Linux plugin archive lacks obs-dstreamy.so" >&2; exit 1; }
 need "obs-dstreamy-$version-macos-universal.zip"
 need "obs-dstreamy-$version-windows-x64.zip"

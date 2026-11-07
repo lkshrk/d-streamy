@@ -132,6 +132,56 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("obs/buildspec.json has version 0.2.0", result.stdout + result.stderr)
 
+    def gate(self, obs_runs, change_obs, failed=""):
+        """Runs the CI gate against a two-commit repo; obs_runs maps 'base'/'tip' to whether OBS ran there."""
+        script = step("release.yml", "Wait for CI on the tagged commit")
+        with tempfile.TemporaryDirectory(prefix="gate-fixture-") as directory:
+            repo = Path(directory) / "repo"
+            (repo / ".github/workflows").mkdir(parents=True)
+            (repo / "obs").mkdir()
+            (repo / ".github/workflows/obs-ci.yml").write_text((ROOT / ".github/workflows/obs-ci.yml").read_text())
+            (repo / "obs/plugin.c").write_text("1\n")
+            git = lambda *args: subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
+            git("init", "-q"); git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "base", "--allow-empty")
+            git("add", "."); git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base")
+            base = git("rev-parse", "HEAD")
+            (repo / ("obs/plugin.c" if change_obs else "README.md")).write_text("2\n")
+            git("add", "."); git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "tip")
+            tip = git("rev-parse", "HEAD")
+            lines = {"base": f"{base}\tcompleted\tsuccess\turl-base", "tip": f"{tip}\tcompleted\tsuccess\turl-tip"}
+            gh = f"""case "$*" in
+              *commits/*) echo {tip};;
+              *obs-ci.yml*head_sha=*) {"echo '" + lines["tip"] + "'" if obs_runs.get("tip") else ":"};;
+              *obs-ci.yml*status=success*) {"echo '" + lines["base"] + "'" if obs_runs.get("base") else ":"};;
+              *{failed or "never-matches"}*) printf '%s\\tcompleted\\tfailure\\turl\\n' {tip};;
+              *head_sha=*) echo '{lines["tip"]}';;
+            esac"""
+            stubs = Path(directory) / "bin"
+            stubs.mkdir()
+            for name, body in (("gh", gh),):
+                (stubs / name).write_text("#!/bin/bash\n" + body + "\n")
+                (stubs / name).chmod(0o755)
+            env = dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}", REF="refs/tags/v0.1.0",
+                       GITHUB_REPOSITORY="o/r")
+            return subprocess.run(["bash", "-c", script], cwd=repo, env=env, text=True, capture_output=True)
+
+    def test_gate_passes_when_every_workflow_passed_on_the_commit(self):
+        result = self.gate({"tip": True}, change_obs=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_gate_accepts_an_obs_ancestor_only_when_its_paths_are_unchanged(self):
+        result = self.gate({"base": True}, change_obs=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("paths are unchanged since", result.stdout)
+        result = self.gate({"base": True}, change_obs=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("its paths changed", result.stdout + result.stderr)
+
+    def test_gate_rejects_a_failed_workflow(self):
+        result = self.gate({"tip": True}, change_obs=True, failed="rust-ci.yml")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rust-ci.yml finished failure", result.stdout + result.stderr)
+
     def test_lipo_input_precedes_verify_arch(self):
         for path in (ROOT / ".github/workflows/release.yml", ROOT / "scripts/release.sh"):
             for line in path.read_text().splitlines():
