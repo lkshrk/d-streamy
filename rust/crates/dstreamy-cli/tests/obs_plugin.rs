@@ -965,24 +965,6 @@ fn stream(
     args: &[&str],
     video: usize,
 ) -> (Vec<String>, dstreamy_mock_discord::Recorded) {
-    stream_with_minimum_mock_video(settings, args, video, video * 9 / 10)
-}
-
-/// A GPU rescale can lag OBS's render loop on a slow runner, so only a quarter of the plugin's frames must reach the mock.
-fn rescaled_stream(
-    settings: Value,
-    args: &[&str],
-    video: usize,
-) -> (Vec<String>, dstreamy_mock_discord::Recorded) {
-    stream_with_minimum_mock_video(settings, args, video, video.div_ceil(4))
-}
-
-fn stream_with_minimum_mock_video(
-    settings: Value,
-    args: &[&str],
-    video: usize,
-    minimum_mock_video: usize,
-) -> (Vec<String>, dstreamy_mock_discord::Recorded) {
     let h = Harness::new("");
     let _serve = h.serve();
     let mut c = obs_session(&h);
@@ -994,18 +976,37 @@ fn stream_with_minimum_mock_video(
     c.source("the attachment ending at end of stream", |e| {
         e["reason"] == "detached"
     });
-    let recorded = h.mock.recorded();
+    let (recorded, dropped) = settled_video(&h, &mut c);
     {
         let v = stream_video(&recorded);
         let a = producer_audio(&recorded);
+        let minimum = video * 9 / 10;
         assert!(
-            v.len() >= minimum_mock_video,
-            "{} of at least {minimum_mock_video} video frames reached the mock",
+            !v.is_empty() && v.len() as u64 + dropped >= minimum as u64,
+            "{} video frames reached the mock and serve dropped {dropped}, under {minimum}",
             v.len()
         );
         decodes(&v, &a);
     }
     (lines, recorded)
+}
+
+/// The mock's recording once serve's health stats cover every frame it sent, and the video serve dropped to stay live.
+fn settled_video(h: &Harness, c: &mut Client) -> (dstreamy_mock_discord::Recorded, u64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let stats = c.status()["stats"].clone();
+        let recorded = h.mock.recorded();
+        let sent = stats["video_frames_sent"].as_u64();
+        if sent == Some(stream_video(&recorded).len() as u64) || Instant::now() >= deadline {
+            let dropped = ["video_frames_dropped", "source_video_frames_dropped"]
+                .iter()
+                .map(|key| stats[*key].as_u64().unwrap_or(0))
+                .sum();
+            return (recorded, dropped);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 #[test]
@@ -1080,8 +1081,7 @@ fn share_mode_falls_back_to_the_own_encoder_when_b_frames_are_on() {
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn the_own_encoder_scales_a_1440p_canvas_to_1080p() {
-    let (lines, recorded) =
-        rescaled_stream(json!({}), &["--width", "2560", "--height", "1440"], 60);
+    let (lines, recorded) = stream(json!({}), &["--width", "2560", "--height", "1440"], 60);
     assert!(
         plugin_observed(
             &lines,
@@ -4722,7 +4722,7 @@ fn share_mode_falls_back_from_an_i444_stream_encoder() {
 #[test]
 #[ignore = "needs obs-harness and the built plugin; obs-ci runs it"]
 fn the_own_encoder_resizes_an_i420_canvas_in_nv12() {
-    let (lines, recorded) = rescaled_stream(
+    let (lines, recorded) = stream(
         json!({}),
         &["--format", "I420", "--width", "2560", "--height", "1440"],
         60,
