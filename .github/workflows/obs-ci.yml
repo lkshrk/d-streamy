@@ -80,7 +80,7 @@ jobs:
         run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
 
       - name: Restore apt archives
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/apt-archives
           key: ${{ env.APT_CACHE }}-${{ github.run_id }}
@@ -115,7 +115,7 @@ jobs:
 
       - name: Save OBS build
         if: steps.obs.outputs.hit != 'true'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/obs-prefix
           key: obs-${{ env.OBS_TAG }}-${{ matrix.os }}-r${{ env.OBS_BUILD_REV }}
@@ -188,7 +188,7 @@ jobs:
 
       # obs-linux-plugin installs the same packages and saves the archives for both jobs.
       - name: Restore apt archives
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/apt-archives
           key: ${{ env.APT_CACHE }}-${{ github.run_id }}
@@ -429,7 +429,7 @@ jobs:
 
       - name: Save OBS build (arm64)
         if: steps.obs-arm64.outputs.hit != 'true'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/obs-prefix-arm64
           key: obs-${{ env.OBS_TAG }}-xcode-27.1-arm64-r${{ env.OBS_BUILD_REV }}
@@ -457,7 +457,7 @@ jobs:
 
       - name: Save OBS build (x86_64)
         if: steps.obs-x86_64.outputs.hit != 'true'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/obs-prefix-x86_64
           key: obs-${{ env.OBS_TAG }}-xcode-27.1-x86_64-r${{ env.OBS_BUILD_REV }}
@@ -662,7 +662,7 @@ jobs:
 
       - name: Save OBS build
         if: steps.obs.outputs.hit != 'true'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}\obs-prefix
           key: obs-${{ env.OBS_TAG }}-windows-2025-x64-r${{ env.OBS_BUILD_REV }}
