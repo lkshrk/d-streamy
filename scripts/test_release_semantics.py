@@ -784,6 +784,53 @@ class ArchRepoTests(unittest.TestCase):
         self.assertNotIn("\n    if:", job_section("arch"))
         self.assertNotIn("--sign", job_section("arch"))
 
+    @unittest.skipUnless(shutil.which("bsdtar") and shutil.which("vercmp"), "needs bsdtar and vercmp")
+    def test_deploy_refuses_to_replace_a_newer_live_repository(self):
+        def run(live):
+            """live maps an architecture to the dstreamy-bin version its live database lists, or None for a 404."""
+            with tempfile.TemporaryDirectory(prefix="arch-live-fixture-") as directory:
+                base = Path(directory)
+                (base / "bin").mkdir()
+                for arch, version in live.items():
+                    if version is None:
+                        continue
+                    with tarfile.open(base / f"{arch}.db", "w:gz") as t:
+                        for name, ver in (("obs-dstreamy-bin", "99.0.0-1"), ("dstreamy-bin", version)):
+                            data = f"%FILENAME%\n{name}-{ver}-{arch}.pkg.tar.zst\n\n%NAME%\n{name}\n\n" \
+                                   f"%VERSION%\n{ver}\n\n".encode()
+                            info = tarfile.TarInfo(f"{name}-{ver}/desc")
+                            info.size = len(data)
+                            t.addfile(info, io.BytesIO(data))
+                (base / "bin/curl").write_text(f"""#!/bin/bash
+for a; do case $a in https://*) url=$a;; esac; done
+while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done
+arch=$(basename "$(dirname "$url")")
+if [ -f "{base}/$arch.db" ]; then cp "{base}/$arch.db" "$out"; printf 200; else printf 404; fi
+""")
+                (base / "bin/curl").chmod(0o755)
+                env = dict(os.environ, PATH=f"{base / 'bin'}:{os.environ['PATH']}", TMPDIR=directory)
+                return subprocess.run([str(ROOT / "scripts/check-arch-live.sh"), "2.0.10",
+                                       "https://example.invalid/arch"], env=env, text=True, capture_output=True)
+        for live, accepted in (({"x86_64": None, "aarch64": None}, True),
+                               ({"x86_64": "2.0.9-1", "aarch64": "2.0.9-1"}, True),
+                               ({"x86_64": "2.0.10-1", "aarch64": "2.0.10-1"}, True),
+                               ({"x86_64": "2.0.11-1", "aarch64": None}, False),
+                               ({"x86_64": "2.0.9-1", "aarch64": "2.1.0-1"}, False)):
+            with self.subTest(live=live):
+                result = run(live)
+                self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+                if not accepted:
+                    self.assertIn("refusing to replace it", result.stderr)
+
+    def test_pages_deploys_one_at_a_time_after_the_live_version_check(self):
+        pages = job_section("pages")
+        self.assertIn("    concurrency:\n      group: pages\n      cancel-in-progress: false\n", pages)
+        guard = pages.index('scripts/check-arch-live.sh "$VERSION" "$PACMAN_REPO_URL"')
+        self.assertLess(guard, pages.index("scripts/make-arch-repo.sh"))
+        self.assertLess(guard, pages.index("actions/deploy-pages@"))
+        self.assertIn("PACMAN_REPO_URL: https://lkshrk.github.io/d-streamy/arch\n", pages)
+        self.assertIn("Server = https://lkshrk.github.io/d-streamy/arch/$arch", (ROOT / "README.md").read_text())
+
     def assets(self, dist, version="0.1.0"):
         sums = {}
         for package, targets in self.PKGBUILDS.items():
