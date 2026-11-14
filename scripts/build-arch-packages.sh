@@ -26,6 +26,23 @@ elf_machine() {
   od -An -tx1 -j18 -N2 "$dir/$file" | tr -d ' \n'
 }
 
+licenses_match() {
+  local notices=$1 dir found declared
+  shift
+  dir=$(mktemp -d -p "$work")
+  for pkg in "$@"; do
+    mkdir "$dir/${pkg##*/}"
+    bsdtar -xf "$pkg" -C "$dir/${pkg##*/}" .PKGINFO "$notices"
+  done
+  found=$("$root/scripts/notice-licenses.sh" "$dir"/*/"$notices")
+  declared=$(sed -n 's/^license = //p' "$dir"/*/.PKGINFO | grep -vx GPL-3.0-or-later | sort -u)
+  if [ "$found" != "$declared" ]; then
+    echo "the license array of ${1##*/} differs from the crates in its notices (< array, > notices):" >&2
+    diff <(printf '%s\n' "$declared") <(printf '%s\n' "$found") >&2 || true
+    exit 1
+  fi
+}
+
 for dir in "$root"/packaging/arch/*/; do
   name=$(basename "$dir")
   mkdir -p "$work/$name/template"
@@ -61,7 +78,9 @@ for arch in x86_64 aarch64; do
     *) echo "${pkg##*/} holds a dstreamy for ELF machine $machine" >&2; exit 1 ;;
   esac
 done
+licenses_match usr/share/licenses/dstreamy-bin/THIRD_PARTY_NOTICES.txt "$out"/*/dstreamy-bin-*.pkg.tar.zst
 plugin="$out/x86_64/obs-dstreamy-bin-$version-1-x86_64.pkg.tar.zst"
+licenses_match usr/lib/obs-plugins/dstreamy-ui/THIRD_PARTY_NOTICES.txt "$plugin"
 contains "$plugin" usr/lib/obs-plugins/obs-dstreamy.so usr/lib/obs-plugins/dstreamy-ui/obs-dstreamy-ui.so \
   usr/lib/obs-plugins/dstreamy-ui/THIRD_PARTY_NOTICES.txt usr/share/licenses/obs-dstreamy-bin/LICENSE
 if bsdtar -tf "$plugin" | grep -E '^usr/lib/obs-plugins/[^/]+\.so$' | grep -vx usr/lib/obs-plugins/obs-dstreamy.so; then

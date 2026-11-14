@@ -6,7 +6,15 @@ pkgrel=1
 pkgdesc="OBS Studio plugin that streams OBS's output to Discord Go Live through D-Streamy"
 arch=(x86_64)
 url="https://github.com/lkshrk/d-streamy"
-license=(GPL-3.0-or-later)
+license=(
+  GPL-3.0-or-later
+  Apache-2.0
+  BSD-3-Clause
+  ISC
+  MIT
+  Unicode-3.0
+  Unlicense
+)
 depends=(
   dstreamy
   glibc

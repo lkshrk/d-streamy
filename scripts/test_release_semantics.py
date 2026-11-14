@@ -959,6 +959,37 @@ exit 0
         for plugin in ("gst-plugins-ugly", "gst-plugins-bad-libs", "gst-plugin-pipewire"):
             self.assertIn(f"\tdepends = {plugin}\n", cli, "a stream would fail on a fresh install without it")
 
+    @staticmethod
+    def license_array(package):
+        return subprocess.run(["bash", "-c", 'source PKGBUILD; printf "%s\\n" "${license[@]}"'],
+                              cwd=ROOT / "packaging/arch" / package, text=True, capture_output=True,
+                              check=True).stdout.splitlines()
+
+    @staticmethod
+    def notices(licenses):
+        bar = "=" * 78
+        return "Preamble (not a label)\n\n" + "".join(
+            f"{bar}\ncrate-{i} 1.0.{i} ({name})\n{bar}\n\nlicense text {i}\n\n" for i, name in enumerate(licenses))
+
+    def test_notice_licenses_lists_each_spdx_id_once(self):
+        with tempfile.TemporaryDirectory(prefix="notice-licenses-fixture-") as directory:
+            notices = Path(directory) / "notices.txt"
+            notices.write_text(self.notices(["MIT OR Apache-2.0", "MIT/Apache-2.0", "(MIT OR Apache-2.0) AND Unicode-3.0",
+                                             "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT", "Zlib"]) +
+                               "Copyright 2020 (someone) in a licence text\n")
+            run = lambda: subprocess.run([str(ROOT / "scripts/notice-licenses.sh"), str(notices)], text=True,
+                                         capture_output=True)
+            result = run()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(),
+                             ["Apache-2.0", "Apache-2.0 WITH LLVM-exception", "MIT", "Unicode-3.0", "Zlib"])
+            for bad in ("see below", "MIT, Apache-2.0"):
+                with self.subTest(bad=bad):
+                    notices.write_text(self.notices(["MIT", bad]))
+                    result = run()
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("crate-1", result.stderr)
+
     @unittest.skipUnless(shutil.which("makepkg") and shutil.which("bsdtar") and os.geteuid() != 0,
                          "needs makepkg as a non-root user")
     def test_built_packages_hold_the_assets_for_their_architecture(self):
@@ -966,6 +997,8 @@ exit 0
             base = Path(directory)
             dist, out = base / "dist", base / "out"
             dist.mkdir()
+            cli_notices = self.notices(l for l in self.license_array("dstreamy-bin") if l != "GPL-3.0-or-later")
+            plugin_notices = self.notices(l for l in self.license_array("obs-dstreamy-bin") if l != "GPL-3.0-or-later")
             def archive(name, files):
                 path = dist / name
                 with tarfile.open(path, "w:gz") as t:
@@ -974,20 +1007,25 @@ exit 0
                         info.size, info.mode, info.mtime = len(data), 0o755, 1700000000
                         t.addfile(info, io.BytesIO(data))
                 (dist / f"{name}.sha256").write_text(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {name}\n")
-            for target, machine in (("x86_64-unknown-linux-gnu", b"\x3e\x00"),
-                                    ("aarch64-unknown-linux-gnu", b"\xb7\x00")):
+            def cli(target, machine):
                 stem = f"dstreamy-0.1.0-{target}"
                 archive(f"{stem}.tar.gz", {f"{stem}/dstreamy": b"\x7fELF" + bytes(14) + machine,
-                                           **{f"{stem}/{e}": b"x" for e in ("README.md", "LICENSE",
-                                                                             "THIRD_PARTY_NOTICES.txt")}})
-            plugins = "./lib/x86_64-linux-gnu/obs-plugins"
-            archive("obs-dstreamy-0.1.0-linux-x86_64.tar.gz", {
-                "./LICENSE": b"x", f"{plugins}/obs-dstreamy.so": b"x",
-                f"{plugins}/dstreamy-ui/obs-dstreamy-ui.so": b"x",
-                f"{plugins}/dstreamy-ui/THIRD_PARTY_NOTICES.txt": b"x"})
+                                           f"{stem}/README.md": b"x", f"{stem}/LICENSE": b"x",
+                                           f"{stem}/THIRD_PARTY_NOTICES.txt": cli_notices.encode()})
+            def plugin(notices):
+                plugins = "./lib/x86_64-linux-gnu/obs-plugins"
+                archive("obs-dstreamy-0.1.0-linux-x86_64.tar.gz", {
+                    "./LICENSE": b"x", f"{plugins}/obs-dstreamy.so": b"x",
+                    f"{plugins}/dstreamy-ui/obs-dstreamy-ui.so": b"x",
+                    f"{plugins}/dstreamy-ui/THIRD_PARTY_NOTICES.txt": notices.encode()})
+            cli("x86_64-unknown-linux-gnu", b"\x3e\x00")
+            cli("aarch64-unknown-linux-gnu", b"\xb7\x00")
+            plugin(plugin_notices)
             env = dict(os.environ, SOURCE_DATE_EPOCH="1700000000")
-            build = lambda: subprocess.run([str(ROOT / "scripts/build-arch-packages.sh"), "0.1.0", str(dist), str(out)],
-                                           env=env, text=True, capture_output=True)
+            def build():
+                shutil.rmtree(out, ignore_errors=True)
+                return subprocess.run([str(ROOT / "scripts/build-arch-packages.sh"), "0.1.0", str(dist), str(out)],
+                                      env=env, text=True, capture_output=True)
             result = build()
             self.assertEqual(result.returncode, 0, result.stdout[-3000:] + result.stderr[-3000:])
             listing = lambda pkg: subprocess.run(["bsdtar", "-tf", str(out / pkg)], text=True, capture_output=True,
@@ -995,11 +1033,13 @@ exit 0
             self.assertIn("usr/bin/dstreamy", listing("aarch64/dstreamy-bin-0.1.0-1-aarch64.pkg.tar.zst"))
             self.assertIn("usr/lib/obs-plugins/dstreamy-ui/obs-dstreamy-ui.so",
                           listing("x86_64/obs-dstreamy-bin-0.1.0-1-x86_64.pkg.tar.zst"))
-            shutil.rmtree(out)
-            stem = "dstreamy-0.1.0-aarch64-unknown-linux-gnu"
-            archive(f"{stem}.tar.gz", {f"{stem}/dstreamy": b"\x7fELF" + bytes(14) + b"\x3e\x00",
-                                       **{f"{stem}/{e}": b"x" for e in ("README.md", "LICENSE",
-                                                                         "THIRD_PARTY_NOTICES.txt")}})
+            plugin(plugin_notices + self.notices(["LGPL-2.1-only"]))
+            result = build()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("license array of obs-dstreamy-bin-0.1.0-1-x86_64.pkg.tar.zst differs", result.stderr)
+            self.assertIn("> LGPL-2.1-only", result.stderr)
+            plugin(plugin_notices)
+            cli("aarch64-unknown-linux-gnu", b"\x3e\x00")
             result = build()
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("dstreamy-bin-0.1.0-1-aarch64.pkg.tar.zst holds a dstreamy for ELF machine 3e00",
