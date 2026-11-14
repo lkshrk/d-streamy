@@ -1,0 +1,815 @@
+name: OBS
+
+on:
+  push:
+    branches: [main, rust-rewrite, "ci/obs-**"]
+    paths:
+      - "obs/**"
+      - "rust/crates/**"
+      - "rust/vendor/**"
+      - "rust/Cargo.toml"
+      - "rust/Cargo.lock"
+      - "rust/rust-toolchain.toml"
+      - ".github/workflows/obs-ci.yml"
+      - ".github/actions/obs-prefix-*/**"
+      - ".github/actions/apt-archives-save/**"
+      - ".github/scripts/obs-*.sh"
+      - ".github/scripts/apt-install.sh"
+  pull_request:
+    branches: [main, rust-rewrite]
+    paths:
+      - "obs/**"
+      - "rust/crates/**"
+      - "rust/vendor/**"
+      - "rust/Cargo.toml"
+      - "rust/Cargo.lock"
+      - "rust/rust-toolchain.toml"
+      - ".github/workflows/obs-ci.yml"
+      - ".github/actions/obs-prefix-*/**"
+      - ".github/actions/apt-archives-save/**"
+      - ".github/scripts/obs-*.sh"
+      - ".github/scripts/apt-install.sh"
+  # Dispatching on the default branch re-publishes the OBS prefix artifacts, e.g. after a long gap without pushes.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: obs-ci-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  OBS_TAG: "32.2.2"
+  OBS_COMMIT: ba2f32bdf791005443988a4955e963663e16b1ed
+  OBS_BUILD_REV: "1"
+  # Line tables keep file:line in backtraces at a fraction of full debuginfo's size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  PUBLISH_OBS_PREFIX: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+
+jobs:
+  obs-linux-plugin:
+    name: obs-linux-plugin (OBS ${{ matrix.obs }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # OBS 33 needs FFmpeg 8 and MbedTLS 3 from the self-hosted ubuntu-26.04 runner, which never runs fork pull requests.
+        include: ${{ fromJSON(format('[{0}{1}]', '{"obs":"32.2.2","commit":"ba2f32bdf791005443988a4955e963663e16b1ed","os":"ubuntu-24.04","baseline":true}', (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ',{"obs":"33.0.1","commit":"65c320b46e1af5c7a555161aea6182cdf7a8c524","os":"ubuntu-26.04"}' || '')) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      APT_CACHE: apt-obs-linux-${{ matrix.os }}
+      OBS_TAG: ${{ matrix.obs }}
+      OBS_COMMIT: ${{ matrix.commit }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set paths
+        run: |
+          {
+            echo "OBS_PREFIX=$RUNNER_TEMP/obs-prefix"
+            echo "OBS_LOGS=$RUNNER_TEMP/obs-logs"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/obs-logs"
+
+      - name: OBS pin matches obs/buildspec.json
+        if: matrix.baseline
+        run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
+
+      - name: Restore apt archives
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/apt-archives
+          key: ${{ env.APT_CACHE }}-${{ github.run_id }}
+          restore-keys: ${{ env.APT_CACHE }}-
+      - name: Install system dependencies
+        timeout-minutes: 30
+        run: |
+          "$GITHUB_WORKSPACE/.github/scripts/obs-linux-deps.sh" xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils
+      - name: Save apt archives
+        if: always()
+        uses: ./.github/actions/apt-archives-save
+        with:
+          key-prefix: ${{ env.APT_CACHE }}
+
+      - name: Point bindgen at the packaged libclang
+        # Runner images preinstall older LLVMs; mixing their libclang with newer clang headers breaks bindgen.
+        run: |
+          v=$(dpkg-query -W -f='${Depends}' libclang-dev | grep -oE 'libclang-[0-9]+-dev' | grep -oE '[0-9]+' | head -n 1)
+          test -e "/usr/lib/llvm-$v/lib/libclang.so"
+          echo "LIBCLANG_PATH=/usr/lib/llvm-$v/lib" >> "$GITHUB_ENV"
+
+      - name: Restore OBS build
+        id: obs
+        uses: ./.github/actions/obs-prefix-fetch
+        with:
+          key: obs-${{ env.OBS_TAG }}-${{ matrix.os }}-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix
+
+      - name: Build OBS ${{ env.OBS_TAG }} with the frontend and obs-websocket
+        if: steps.obs.outputs.hit != 'true'
+        run: bash .github/scripts/obs-linux-build.sh
+
+      - name: Save OBS build
+        if: steps.obs.outputs.hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/obs-prefix
+          key: obs-${{ env.OBS_TAG }}-${{ matrix.os }}-r${{ env.OBS_BUILD_REV }}
+
+      - name: Publish OBS build
+        if: env.PUBLISH_OBS_PREFIX == 'true'
+        uses: ./.github/actions/obs-prefix-publish
+        with:
+          key: obs-${{ env.OBS_TAG }}-${{ matrix.os }}-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix
+
+      - name: Check the OBS install
+        run: bash .github/scripts/obs-linux-check-install.sh
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: rust
+
+      - name: Configure and build obs/
+        working-directory: obs
+        run: |
+          cmake --preset ubuntu-ci-x86_64 -DCMAKE_PREFIX_PATH="$OBS_PREFIX" -DDSTREAMY_PLUGIN_TEST_HOOKS=ON
+          cmake --build --preset ubuntu-ci-x86_64
+
+      - name: OBS through the plugin to serve and mock Discord
+        working-directory: rust
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          DSTREAMY_OBS_HARNESS: ${{ github.workspace }}/obs/build_x86_64/harness/obs-harness
+          DSTREAMY_OBS_PLUGIN_BIN: ${{ github.workspace }}/obs/build_x86_64/rundir
+          DSTREAMY_OBS_PLUGIN_DATA: ${{ github.workspace }}/obs/build_x86_64/harness/plugin-data
+          DSTREAMY_OBS_FRONTEND: ${{ runner.temp }}/obs-prefix/bin/obs
+        run: |
+          set -o pipefail
+          xvfb-run -a -s "-screen 0 1280x720x24" \
+            cargo test --locked -p dstreamy-cli --test obs_plugin -- --ignored --test-threads 1 \
+            2>&1 | tee "$OBS_LOGS/obs-plugin.log"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-logs-linux-plugin-obs-${{ matrix.obs }}
+          path: ${{ runner.temp }}/obs-logs
+
+  obs-linux-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      APT_CACHE: apt-obs-linux-ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set paths
+        run: |
+          {
+            echo "OBS_PREFIX=$RUNNER_TEMP/obs-prefix"
+            echo "OBS_LOGS=$RUNNER_TEMP/obs-logs"
+            echo "OBS_TRACES=$RUNNER_TEMP/traces"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/obs-logs"
+
+      - name: OBS pin matches obs/buildspec.json
+        run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
+
+      # obs-linux-plugin installs the same packages and saves the archives for both jobs.
+      - name: Restore apt archives
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/apt-archives
+          key: ${{ env.APT_CACHE }}-${{ github.run_id }}
+          restore-keys: ${{ env.APT_CACHE }}-
+      - name: Install system dependencies
+        timeout-minutes: 30
+        run: |
+          "$GITHUB_WORKSPACE/.github/scripts/obs-linux-deps.sh" xvfb xauth libegl-mesa0 libgl1-mesa-dri mesa-utils
+
+      - name: Restore OBS build
+        id: obs
+        uses: ./.github/actions/obs-prefix-fetch
+        with:
+          key: obs-${{ env.OBS_TAG }}-ubuntu-24.04-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix
+
+      - name: Build OBS ${{ env.OBS_TAG }} with the frontend and obs-websocket
+        if: steps.obs.outputs.hit != 'true'
+        run: bash .github/scripts/obs-linux-build.sh
+
+      - name: Check the OBS install
+        run: bash .github/scripts/obs-linux-check-install.sh
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: rust
+
+      - name: Build the trace checker
+        working-directory: rust
+        run: |
+          cargo build --release --locked -p dstreamy-test-producer --bin obs-trace-check
+          echo "TRACE_CHECK=$PWD/target/release/obs-trace-check" >> "$GITHUB_ENV"
+
+      - name: Configure, build and test obs/
+        working-directory: obs
+        run: |
+          cmake --preset ubuntu-ci-x86_64 -DCMAKE_PREFIX_PATH="$OBS_PREFIX" -DDSTREAMY_PLUGIN_TEST_HOOKS=ON
+          cmake --build --preset ubuntu-ci-x86_64
+          xvfb-run -a -s "-screen 0 1280x720x24" ctest --preset ubuntu-ci-x86_64
+          echo "HARNESS=$PWD/build_x86_64/harness/obs-harness" >> "$GITHUB_ENV"
+
+      - name: Install layout matches what the plugin looks for
+        working-directory: obs
+        run: |
+          stage="$RUNNER_TEMP/stage"
+          cmake --install build_x86_64 --prefix "$stage"
+          find "$stage" -print
+          plugins="$stage/lib/x86_64-linux-gnu/obs-plugins"
+          test -f "$plugins/obs-dstreamy.so"
+          test -f "$plugins/dstreamy-ui/obs-dstreamy-ui.so"
+          grep -q "Tabler Icons" "$plugins/dstreamy-ui/THIRD_PARTY_NOTICES.txt"
+          if find "$plugins" -maxdepth 1 -name '*.so' ! -name obs-dstreamy.so | grep .; then
+            echo "libobs would try these as modules: only obs-dstreamy.so may sit in the module folder"
+            exit 1
+          fi
+
+      # Qt is hidden from CMake, so ignoring DSTREAMY_UI=OFF fails the configure.
+      - name: obs/ builds without the status-bar panel and without Qt
+        working-directory: obs
+        run: |
+          cmake --preset ubuntu-ci-x86_64 -B build_no_ui -DCMAKE_PREFIX_PATH="$OBS_PREFIX" -DDSTREAMY_UI=OFF \
+            -DCMAKE_DISABLE_FIND_PACKAGE_Qt6=ON
+          cmake --build build_no_ui
+          test -f build_no_ui/rundir/obs-dstreamy.so
+          if find build_no_ui -name '*dstreamy-ui*' | grep .; then
+            echo "DSTREAMY_UI=OFF still configured or built the status-bar panel"
+            exit 1
+          fi
+
+      - name: Plugin workspace settings match rust/Cargo.toml
+        run: |
+          python3 - <<'PY'
+          import tomllib
+          main = tomllib.load(open("rust/Cargo.toml", "rb"))["workspace"]
+          plugin = tomllib.load(open("rust/crates/dstreamy-obs/Cargo.toml", "rb"))["workspace"]
+          for key in ("package", "lints"):
+              assert main[key] == plugin[key], f"[workspace.{key}] differs"
+          import json
+          build = json.load(open("obs/buildspec.json"))
+          assert build["version"] == plugin["package"]["version"], "plugin versions differ"
+          PY
+
+      - name: Plugin crate gates
+        working-directory: rust/crates/dstreamy-obs
+        env:
+          DSTREAMY_OBS_CONFIG: ${{ github.workspace }}/obs/build_x86_64/obs-config-RelWithDebInfo.txt
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy --workspace --all-targets --locked --features test-hooks -- -D warnings
+          # obs_startup's hotkeys open an X display.
+          xvfb-run -a -s "-screen 0 1280x720x24" cargo test --workspace --locked
+          cargo build --release --locked --target-dir "$RUNNER_TEMP/plugin-without-hooks"
+          cmake -DTEST_HOOKS=OFF -DLIBRARY="$RUNNER_TEMP/plugin-without-hooks/release/libdstreamy_obs.so" \
+            -P "$GITHUB_WORKSPACE/obs/cmake/common/check_test_hooks.cmake"
+
+      - name: Missing frontend headers fail a frontend-checked build
+        run: |
+          set -o pipefail
+          bash .github/scripts/obs-frontend-abi-check.sh obs/build_x86_64/obs-config-RelWithDebInfo.txt \
+            "$RUNNER_TEMP/frontend-abi-check" | tee "$OBS_LOGS/frontend-abi-check.log"
+
+      - name: Harness 5 s trace with A/V marker check
+        run: |
+          set -o pipefail
+          export LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a -s "-screen 0 1280x720x24" "$HARNESS" --seconds 5 \
+            --trace-dir "$RUNNER_TEMP/trace-5s" --profile main --bf 0 --keyint-sec 2 \
+            | tee "$OBS_LOGS/harness-5s.log"
+          "$TRACE_CHECK" "$RUNNER_TEMP/trace-5s" --fps 30 --seconds 5 | tee "$OBS_LOGS/trace-check-5s.log"
+
+      - name: Record traces
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -o pipefail
+          export LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a -s "-screen 0 1280x720x24" \
+            bash "$GITHUB_WORKSPACE/obs/tests/record-traces.sh" "$HARNESS" "$TRACE_CHECK" traces \
+            | tee "$OBS_LOGS/record-traces.log"
+
+      - name: Compare fresh trace metadata and packet counts with committed traces
+        run: python3 -I obs/tests/check-trace-drift.py obs/tests/traces "$OBS_TRACES"
+
+      - name: Check recorded traces against the specs
+        working-directory: rust
+        run: |
+          rm -rf ../obs/tests/traces
+          cp -R "$OBS_TRACES" ../obs/tests/traces
+          cargo test --release --locked -p dstreamy-media --test obs_traces
+
+      - name: Frontend with obs-websocket and the plugin's status-bar panel
+        run: |
+          set -o pipefail
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/obs-config" LIBGL_ALWAYS_SOFTWARE=1
+          plugin="$XDG_CONFIG_HOME/obs-studio/plugins/obs-dstreamy"
+          mkdir -p "$plugin/bin/64bit" "$plugin/data"
+          if find obs/build_x86_64/rundir -maxdepth 1 -name '*.so' ! -name obs-dstreamy.so | grep .; then
+            echo "libobs would try these as modules: only obs-dstreamy.so may sit in the module folder"
+            exit 1
+          fi
+          cp -R obs/build_x86_64/rundir/obs-dstreamy.so obs/build_x86_64/rundir/dstreamy-ui "$plugin/bin/64bit/"
+          # The test-hooks build clicks Tools > D-Streamy once this file exists.
+          touch "$RUNNER_TEMP/open-dialog"
+          export DSTREAMY_TEST_OPEN_DIALOG="$RUNNER_TEMP/open-dialog"
+          export EXPECT_LOG_LINE=$'[obs-dstreamy] added the D-Streamy status-bar panel\n[obs-dstreamy] added Tools > D-Streamy\n[obs-dstreamy] Tools > D-Streamy opened the status-bar panel\n[obs-dstreamy] unloaded'
+          xvfb-run -a -s "-screen 0 1920x1080x24" bash obs/tests/frontend/frontend-smoke.sh \
+            "$XDG_CONFIG_HOME/obs-studio" "$OBS_LOGS/frontend-stdout.log" "$OBS_PREFIX/bin/obs" \
+            | tee "$OBS_LOGS/frontend.log"
+
+      - name: Frontend without the UI library falls back to Tools > D-Streamy
+        run: |
+          set -o pipefail
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/obs-config-no-ui" LIBGL_ALWAYS_SOFTWARE=1
+          plugin="$XDG_CONFIG_HOME/obs-studio/plugins/obs-dstreamy"
+          mkdir -p "$plugin/bin/64bit" "$plugin/data"
+          cp obs/build_x86_64/rundir/obs-dstreamy.so "$plugin/bin/64bit/"
+          export EXPECT_LOG_LINE=$'[obs-dstreamy] added Tools > D-Streamy\n[obs-dstreamy] unloaded'
+          export EXPECT_ABSENT_LOG_LINE='[obs-dstreamy] added the D-Streamy status-bar panel'
+          xvfb-run -a -s "-screen 0 1920x1080x24" bash obs/tests/frontend/frontend-smoke.sh \
+            "$XDG_CONFIG_HOME/obs-studio" "$OBS_LOGS/frontend-no-ui-stdout.log" "$OBS_PREFIX/bin/obs" \
+            | tee "$OBS_LOGS/frontend-no-ui.log"
+
+      - name: H.264 encoder settings match obs/tests/encoder-settings
+        run: |
+          set -o pipefail
+          export LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a -s "-screen 0 1280x720x24" "$HARNESS" --modules image-source,obs-x264,obs-ffmpeg \
+            --dump-encoder-settings "$RUNNER_TEMP/encoder-settings" | tee "$OBS_LOGS/encoder-settings.log"
+          python3 obs/tests/check-encoder-settings.py "$RUNNER_TEMP/encoder-settings" obs/tests/encoder-settings \
+            "the obs-encoder-settings-linux artifact of this run" obs_x264
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-encoder-settings-linux
+          path: ${{ runner.temp }}/encoder-settings
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-traces-linux
+          path: ${{ runner.temp }}/traces
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-logs-linux
+          path: |
+            ${{ runner.temp }}/obs-logs
+            ${{ runner.temp }}/trace-5s
+            obs/build_x86_64/Testing/Temporary
+            obs/build_x86_64/harness/rust-plugin
+
+  obs-macos:
+    runs-on: xcode-27
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode 27.1
+        run: sudo xcode-select -s /Applications/Xcode_27.1.app
+
+      - name: OBS pin matches obs/buildspec.json
+        run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
+
+      - name: Install Rosetta
+        run: |
+          sudo softwareupdate --install-rosetta --agree-to-license
+          arch -x86_64 /usr/bin/true
+
+      - name: Set paths
+        run: |
+          echo "OBS_LOGS=$RUNNER_TEMP/obs-logs" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/obs-logs"
+
+      - name: Restore OBS build (arm64)
+        id: obs-arm64
+        uses: ./.github/actions/obs-prefix-fetch
+        with:
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-arm64-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix-arm64
+
+      - name: Build OBS ${{ env.OBS_TAG }} (arm64)
+        if: steps.obs-arm64.outputs.hit != 'true'
+        env:
+          ARCH: arm64
+          OBS_PREFIX: ${{ runner.temp }}/obs-prefix-arm64
+        run: bash .github/scripts/obs-macos-build.sh
+
+      - name: Save OBS build (arm64)
+        if: steps.obs-arm64.outputs.hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/obs-prefix-arm64
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-arm64-r${{ env.OBS_BUILD_REV }}
+
+      - name: Publish OBS build (arm64)
+        if: env.PUBLISH_OBS_PREFIX == 'true'
+        uses: ./.github/actions/obs-prefix-publish
+        with:
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-arm64-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix-arm64
+
+      - name: Restore OBS build (x86_64)
+        id: obs-x86_64
+        uses: ./.github/actions/obs-prefix-fetch
+        with:
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-x86_64-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix-x86_64
+
+      - name: Build OBS ${{ env.OBS_TAG }} (x86_64)
+        if: steps.obs-x86_64.outputs.hit != 'true'
+        env:
+          ARCH: x86_64
+          OBS_PREFIX: ${{ runner.temp }}/obs-prefix-x86_64
+        run: bash .github/scripts/obs-macos-build.sh
+
+      - name: Save OBS build (x86_64)
+        if: steps.obs-x86_64.outputs.hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/obs-prefix-x86_64
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-x86_64-r${{ env.OBS_BUILD_REV }}
+
+      - name: Publish OBS build (x86_64)
+        if: env.PUBLISH_OBS_PREFIX == 'true'
+        uses: ./.github/actions/obs-prefix-publish
+        with:
+          key: obs-${{ env.OBS_TAG }}-xcode-27.1-x86_64-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix-x86_64
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Configure and build obs/ (universal)
+        working-directory: obs
+        run: |
+          set -o pipefail
+          cat "$RUNNER_TEMP/obs-prefix-arm64/build-time.txt" "$RUNNER_TEMP/obs-prefix-x86_64/build-time.txt" || true
+          cmake --preset macos-ci -DDSTREAMY_PLUGIN_TEST_HOOKS=ON
+          cmake --build --preset macos-ci -- -quiet 2>&1 | xcbeautify --quiet --renderer github-actions
+
+      - name: Check the plugin bundle
+        working-directory: obs/build_macos/rundir/obs-dstreamy.plugin/Contents
+        run: |
+          set -o pipefail
+          {
+            find . -print
+            lipo -archs MacOS/obs-dstreamy
+            nm -gU -arch arm64 MacOS/obs-dstreamy | grep ' _obs_'
+            nm -gU -arch x86_64 MacOS/obs-dstreamy | grep ' _obs_'
+            otool -L -arch arm64 MacOS/obs-dstreamy
+            otool -l -arch arm64 MacOS/obs-dstreamy | grep -A2 LC_RPATH
+            vtool -arch arm64 -show-build MacOS/obs-dstreamy
+            vtool -arch x86_64 -show-build MacOS/obs-dstreamy
+            codesign -dv MacOS/obs-dstreamy 2>&1 || true
+          } | tee "$OBS_LOGS/plugin-bundle.log"
+          test "$(lipo -archs MacOS/obs-dstreamy)" = "x86_64 arm64"
+          test "$(otool -D -arch arm64 MacOS/obs-dstreamy | tail -n 1)" = "@rpath/obs-dstreamy"
+          # obs-frontend-api is looked up at runtime, so a libobs-only host still loads the plugin.
+          for a in arm64 x86_64; do
+            if otool -L -arch "$a" MacOS/obs-dstreamy | grep -q obs-frontend-api; then
+              echo "the $a slice links obs-frontend-api"
+              exit 1
+            fi
+          done
+          for a in arm64 x86_64; do
+            for lib in obs-dstreamy obs-dstreamy-ui.dylib; do
+              minos=$(vtool -arch "$a" -show-build "MacOS/$lib" | awk '$1 == "minos" {print $2}')
+              test "$minos" = 12.0 || { echo "$lib $a slice minos $minos, expected 12.0"; exit 1; }
+            done
+            lipo -archs ../../../harness/RelWithDebInfo/obs-harness | grep -qw "$a"
+          done
+          {
+            lipo -archs MacOS/obs-dstreamy-ui.dylib
+            otool -L -arch arm64 MacOS/obs-dstreamy-ui.dylib
+            otool -l -arch arm64 MacOS/obs-dstreamy-ui.dylib | grep -A2 LC_RPATH
+            nm -gU -arch arm64 MacOS/obs-dstreamy-ui.dylib | grep dstreamy_ui_
+          } | tee "$OBS_LOGS/ui-bundle.log"
+          test "$(lipo -archs MacOS/obs-dstreamy-ui.dylib)" = "x86_64 arm64"
+          test "$(otool -D -arch arm64 MacOS/obs-dstreamy-ui.dylib | tail -n 1)" = "@rpath/obs-dstreamy-ui.dylib"
+          grep -q "path @executable_path/../Frameworks" "$OBS_LOGS/ui-bundle.log"
+          # Every dependency must resolve inside OBS.app or the system, never in the build machine's deps folder.
+          if otool -L -arch arm64 MacOS/obs-dstreamy-ui.dylib | tail -n +2 | grep -vE '^[[:space:]]+(@rpath/|/usr/lib/|/System/)'; then
+            echo "obs-dstreamy-ui.dylib links a library outside OBS.app or the system"
+            exit 1
+          fi
+
+      - name: Install layout matches what the plugin looks for
+        working-directory: obs
+        run: |
+          stage="$RUNNER_TEMP/stage"
+          cmake --install build_macos --config RelWithDebInfo --prefix "$stage"
+          find "$stage" -print
+          test -f "$stage/obs-dstreamy.plugin/Contents/MacOS/obs-dstreamy"
+          test -f "$stage/obs-dstreamy.plugin/Contents/MacOS/obs-dstreamy-ui.dylib"
+          test -f "$stage/obs-dstreamy.plugin/Contents/Info.plist"
+          grep -q "Tabler Icons" "$stage/obs-dstreamy.plugin/Contents/Resources/THIRD_PARTY_NOTICES.txt"
+
+      - name: D-Streamy status-bar panel test
+        working-directory: obs
+        run: ctest --test-dir build_macos -C RelWithDebInfo -R dstreamy-ui --output-on-failure
+
+      - name: Plugin crate gates
+        id: gates
+        working-directory: rust/crates/dstreamy-obs
+        env:
+          DSTREAMY_OBS_CONFIG: ${{ github.workspace }}/obs/build_macos/obs-config-RelWithDebInfo.txt
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked --target aarch64-apple-darwin -- -D warnings
+          cargo clippy --workspace --all-targets --locked --target x86_64-apple-darwin -- -D warnings
+          cargo clippy --workspace --all-targets --locked --target aarch64-apple-darwin --features test-hooks -- -D warnings
+
+      - name: Load and panic tests (arm64 slice)
+        env:
+          ARCH: arm64
+          OBS_PREFIX: ${{ runner.temp }}/obs-prefix-arm64
+        run: bash .github/scripts/obs-macos-plugin-tests.sh
+
+      - name: H.264 encoder settings match obs/tests/encoder-settings (arm64 slice)
+        env:
+          ARCH: arm64
+          OBS_PREFIX: ${{ runner.temp }}/obs-prefix-arm64
+        run: bash .github/scripts/obs-macos-encoder-settings.sh
+
+      - name: OBS.app loads the plugin and shows Tools > D-Streamy (arm64)
+        run: |
+          set -o pipefail
+          cfg="$HOME/Library/Application Support/obs-studio"
+          mkdir -p "$cfg/plugins"
+          rm -rf "$cfg/plugins/obs-dstreamy.plugin"
+          cp -R obs/build_macos/rundir/obs-dstreamy.plugin "$cfg/plugins/"
+          export EXPECT_LOG_LINE=$'[obs-dstreamy] added the D-Streamy status-bar panel\n[obs-dstreamy] added Tools > D-Streamy\n[obs-dstreamy] unloaded'
+          bash obs/tests/frontend/frontend-smoke.sh "$cfg" "$OBS_LOGS/frontend-stdout.log" \
+            "$RUNNER_TEMP/obs-prefix-arm64/OBS.app/Contents/MacOS/OBS" | tee "$OBS_LOGS/frontend.log"
+
+      # Runs even when the arm64 slice failed, so one run reports both slices.
+      - name: Load and panic tests (x86_64 slice)
+        id: load-x86_64
+        if: ${{ !cancelled() && steps.gates.outcome == 'success' }}
+        env:
+          ARCH: x86_64
+          OBS_PREFIX: ${{ runner.temp }}/obs-prefix-x86_64
+        run: bash .github/scripts/obs-macos-plugin-tests.sh
+
+      - name: H.264 encoder settings match obs/tests/encoder-settings (x86_64 slice)
+        if: ${{ !cancelled() && steps.load-x86_64.outcome == 'success' }}
+        env:
+          ARCH: x86_64
+          OBS_PREFIX: ${{ runner.temp }}/obs-prefix-x86_64
+        run: bash .github/scripts/obs-macos-encoder-settings.sh
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-encoder-settings-macos-arm64
+          path: ${{ runner.temp }}/encoder-settings-arm64
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-encoder-settings-macos-x86_64
+          path: ${{ runner.temp }}/encoder-settings-x86_64
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-logs-macos
+          path: ${{ runner.temp }}/obs-logs
+
+  obs-windows:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: OBS pin matches obs/buildspec.json
+        shell: bash
+        run: test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
+
+      - name: Set paths
+        run: |
+          "OBS_PREFIX=$env:RUNNER_TEMP\obs-prefix" >> $env:GITHUB_ENV
+          "OBS_LOGS=$env:RUNNER_TEMP\obs-logs" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\obs-logs" | Out-Null
+
+      - name: Restore OBS build
+        id: obs
+        uses: ./.github/actions/obs-prefix-fetch
+        with:
+          key: obs-${{ env.OBS_TAG }}-windows-2025-x64-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}\obs-prefix
+
+      - name: Build OBS ${{ env.OBS_TAG }}
+        if: steps.obs.outputs.hit != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $start = Get-Date
+          git clone --depth 1 --branch $env:OBS_TAG --recurse-submodules --shallow-submodules `
+            https://github.com/obsproject/obs-studio.git "$env:RUNNER_TEMP\obs-src"
+          Set-Location "$env:RUNNER_TEMP\obs-src"
+          if ((git rev-parse HEAD) -ne $env:OBS_COMMIT) { throw "unexpected OBS commit" }
+          cmake --preset windows-x64 `
+            -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF `
+            -DENABLE_BROWSER=OFF -DENABLE_SCRIPTING=OFF -DENABLE_VIRTUALCAM=OFF -DENABLE_AJA=OFF
+          cmake --build --preset windows-x64 --parallel -- /consoleLoggerParameters:Summary /noLogo /verbosity:minimal
+          cmake --install build_x64 --config RelWithDebInfo --prefix $env:OBS_PREFIX
+          $secs = [int]((Get-Date) - $start).TotalSeconds
+          "OBS build took $secs s" | Tee-Object -FilePath "$env:OBS_PREFIX\build-time.txt"
+
+      - name: Save OBS build
+        if: steps.obs.outputs.hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}\obs-prefix
+          key: obs-${{ env.OBS_TAG }}-windows-2025-x64-r${{ env.OBS_BUILD_REV }}
+
+      - name: Publish OBS build
+        if: env.PUBLISH_OBS_PREFIX == 'true'
+        uses: ./.github/actions/obs-prefix-publish
+        with:
+          key: obs-${{ env.OBS_TAG }}-windows-2025-x64-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}\obs-prefix
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: rustup toolchain install
+
+      - name: Locate libclang for bindgen
+        run: |
+          $dll = Get-ChildItem "$env:ProgramFiles\LLVM\bin\libclang.dll" -ErrorAction Stop
+          "LIBCLANG_PATH=$($dll.DirectoryName)" >> $env:GITHUB_ENV
+
+      - name: Configure and build obs/
+        working-directory: obs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Get-Content "$env:OBS_PREFIX\build-time.txt" -ErrorAction SilentlyContinue
+          cmake --preset windows-ci-x64 -DDSTREAMY_PLUGIN_TEST_HOOKS=ON
+          cmake --build --preset windows-ci-x64 -- /consoleLoggerParameters:Summary /noLogo /verbosity:minimal
+
+      - name: Plugin crate gates
+        working-directory: rust/crates/dstreamy-obs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:DSTREAMY_OBS_CONFIG = "$env:GITHUB_WORKSPACE\obs\build_x64\obs-config-RelWithDebInfo.txt"
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy --workspace --all-targets --locked --features test-hooks -- -D warnings
+          # The test binary links obs.dll, like the Linux job's LD_LIBRARY_PATH.
+          $env:PATH = "$env:OBS_PREFIX\bin\64bit;$env:PATH"
+          cargo test --workspace --locked
+
+      - name: Locate dumpbin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "no Visual Studio with the x64 VC tools" }
+          $version = (Get-Content -Raw "$vs\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt").Trim()
+          $dumpbin = Get-Item "$vs\VC\Tools\MSVC\$version\bin\Hostx64\x64\dumpbin.exe" -ErrorAction Stop
+          "DUMPBIN=$($dumpbin.FullName -replace '\\', '/')" >> $env:GITHUB_ENV
+
+      - name: Check the plugin DLL
+        shell: bash
+        run: |
+          set -o pipefail
+          {
+            ls -l obs/build_x64/rundir
+            "$DUMPBIN" -nologo -exports obs/build_x64/rundir/obs-dstreamy.dll
+            "$DUMPBIN" -nologo -dependents obs/build_x64/rundir/obs-dstreamy.dll
+          } | tee "$OBS_LOGS/plugin-dll.log"
+          grep -qw obs_module_load "$OBS_LOGS/plugin-dll.log"
+          "$DUMPBIN" -nologo -exports -dependents obs/build_x64/rundir/dstreamy-ui/obs-dstreamy-ui.dll | tee "$OBS_LOGS/ui-dll.log"
+          if find obs/build_x64/rundir -maxdepth 1 -name '*.dll' ! -name obs-dstreamy.dll | grep .; then
+            echo "libobs would try these as modules: only obs-dstreamy.dll may sit in the module folder"
+            exit 1
+          fi
+          grep -qw dstreamy_ui_load "$OBS_LOGS/ui-dll.log"
+          grep -qw dstreamy_ui_unload "$OBS_LOGS/ui-dll.log"
+          # Imports are bare DLL names that resolve in OBS's folders, never a path on the build machine.
+          sed -n '/has the following dependencies/,/Section contains\|Summary/p' "$OBS_LOGS/ui-dll.log" |
+            grep -v -e 'has the following' -e 'Section contains' -e 'Summary' > "$OBS_LOGS/ui-imports.log"
+          grep -qi 'qt6widgets' "$OBS_LOGS/ui-imports.log"
+          if grep -E '[\\/:]' "$OBS_LOGS/ui-imports.log"; then
+            echo "obs-dstreamy-ui.dll imports a DLL by path"
+            exit 1
+          fi
+          # obs-frontend-api.dll is looked up at runtime, so a libobs-only host still loads the plugin.
+          if grep -qi obs-frontend-api "$OBS_LOGS/plugin-dll.log"; then
+            echo "the plugin DLL links obs-frontend-api.dll"
+            exit 1
+          fi
+
+      - name: Install layout matches what the plugin looks for
+        shell: bash
+        run: |
+          stage="$(cygpath -m "$RUNNER_TEMP")/stage"
+          cmake --install obs/build_x64 --config RelWithDebInfo --prefix "$stage"
+          find "$stage" -print
+          bin="$stage/obs-dstreamy/bin/64bit"
+          for f in obs-dstreamy.dll dstreamy_obs.pdb dstreamy-ui/obs-dstreamy-ui.dll dstreamy-ui/obs-dstreamy-ui.pdb \
+            dstreamy-ui/THIRD_PARTY_NOTICES.txt; do
+            test -f "$bin/$f" || { echo "the install lacks obs-dstreamy/bin/64bit/$f"; exit 1; }
+          done
+          grep -q "Tabler Icons" "$bin/dstreamy-ui/THIRD_PARTY_NOTICES.txt"
+          if find "$bin" -maxdepth 1 -name '*.dll' ! -name obs-dstreamy.dll | grep .; then
+            echo "libobs would try these as modules: only obs-dstreamy.dll may sit in the module folder"
+            exit 1
+          fi
+
+      - name: D-Streamy status-bar panel test
+        working-directory: obs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          ctest --test-dir build_x64 -C RelWithDebInfo -R dstreamy-ui --output-on-failure
+
+      - name: Load and panic tests
+        shell: bash
+        run: |
+          set -o pipefail
+          ws=$(cygpath -m "$GITHUB_WORKSPACE")
+          bindir="$(cygpath -u "$OBS_PREFIX")/bin/64bit"
+          cp obs/build_x64/harness/RelWithDebInfo/obs-harness.exe "$bindir/"
+          cd "$bindir"
+          bash "$ws/obs/tests/rust-plugin.sh" ./obs-harness.exe "$ws/obs/build_x64/rundir" \
+            "$ws/obs/build_x64/plugin-data" "$OBS_LOGS/rust-plugin" | tee "$OBS_LOGS/rust-plugin.log"
+
+      - name: obs64 loads the plugin and shows Tools > D-Streamy
+        shell: bash
+        run: |
+          set -o pipefail
+          ws="$GITHUB_WORKSPACE"
+          cfg="$(cygpath -u "$APPDATA")/obs-studio"
+          # Windows OBS looks for plugins under CSIDL_COMMON_APPDATA (35), not %APPDATA% (frontend/widgets/OBSBasic.cpp:149).
+          plugin="$(cygpath -u -F 35)/obs-studio/plugins/obs-dstreamy"
+          mkdir -p "$plugin/bin/64bit" "$plugin/data"
+          cp -R "$ws/obs/build_x64/rundir/obs-dstreamy.dll" "$ws/obs/build_x64/rundir/dstreamy-ui" "$plugin/bin/64bit/"
+          export EXPECT_LOG_LINE=$'[obs-dstreamy] added the D-Streamy status-bar panel\n[obs-dstreamy] added Tools > D-Streamy\n[obs-dstreamy] unloaded'
+          cd "$(cygpath -u "$OBS_PREFIX")/bin/64bit"
+          bash "$ws/obs/tests/frontend/frontend-smoke.sh" "$cfg" "$OBS_LOGS/frontend-stdout.log" ./obs64.exe \
+            | tee "$OBS_LOGS/frontend.log"
+
+      - name: obs64 starts the bundled serve, streams to mock Discord and ends serve on exit
+        shell: bash
+        working-directory: rust
+        env:
+          DSTREAMY_OBS_FRONTEND: ${{ runner.temp }}\obs-prefix\bin\64bit\obs64.exe
+          DSTREAMY_OBS_PLUGIN_STAGE: ${{ runner.temp }}\stage\obs-dstreamy
+        run: |
+          set -o pipefail
+          cargo test --locked -p dstreamy-cli --test obs_windows -- --ignored --nocapture --exact \
+            real_obs_starts_the_bundled_serve_streams_and_ends_it_on_exit 2>&1 | tee "$OBS_LOGS/obs-windows-e2e.log"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: obs-logs-windows
+          path: ${{ runner.temp }}\obs-logs

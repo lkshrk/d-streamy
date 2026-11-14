@@ -1,0 +1,135 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [main, rust-rewrite]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds to fuzz each target
+        default: "900"
+
+permissions:
+  contents: read
+
+# The event name keeps a push from cancelling the nightly run on the same ref.
+concurrency:
+  group: fuzz-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  rust-fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: rust/fuzz
+    env:
+      # Pinned in docs/specs.md (cargo-fuzz row).
+      FUZZ_TOOLCHAIN: nightly-2026-07-20
+      FUZZ_CLI_VERSION: 0.13.2
+      FUZZ_CLI_SHA256: b5b704018b63e0f151c17a057ac53b5111e1db545d1b9f72fee79f08a545931c
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Choose the run length
+        id: budget
+        env:
+          INPUT_SECONDS: ${{ inputs.seconds }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            schedule) seconds=900 ;;
+            workflow_dispatch) seconds="$INPUT_SECONDS" ;;
+            *) seconds=60 ;;
+          esac
+          echo "seconds=$seconds" >> "$GITHUB_OUTPUT"
+      - name: Install the pinned nightly
+        run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+      # cargo fuzz has no --locked and would rewrite a stale lockfile silently.
+      - name: Cargo.lock is current
+        run: cargo +"$FUZZ_TOOLCHAIN" metadata --locked --format-version 1 > /dev/null
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: rust/fuzz
+          key: fuzz
+      - name: Install cargo-fuzz
+        run: |
+          set -euo pipefail
+          host=$(rustc +"$FUZZ_TOOLCHAIN" -vV | sed -n 's/^host: //p')
+          case "$host" in
+            x86_64-*-linux-*) ;;
+            *) echo "cargo-fuzz is pinned to its x86_64 Linux musl build; this runner's host is ${host:-unknown}" >&2; exit 1 ;;
+          esac
+          # The release binary is musl-built and would otherwise default to its own musl target.
+          echo "FUZZ_TARGET=$host" >> "$GITHUB_ENV"
+          archive="cargo-fuzz-$FUZZ_CLI_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/rust-fuzz/cargo-fuzz/releases/download/$FUZZ_CLI_VERSION/$archive"
+          echo "$FUZZ_CLI_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          rm -f "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-fuzz"
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/bin" cargo-fuzz
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          PATH="$RUNNER_TEMP/bin:$PATH" cargo +"$FUZZ_TOOLCHAIN" fuzz --version | grep -Fw "$FUZZ_CLI_VERSION"
+      - name: Restore the corpus
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: rust/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: Seed the corpus from the protocol and ingest fixtures
+        run: |
+          set -euo pipefail
+          fixtures=../crates/dstreamy-ipc/tests/fixtures
+          mkdir -p corpus/control_line corpus/producer_frame corpus/ingest
+          for f in "$fixtures"/control/*.ndjson; do
+            # control_line reads its first byte as the chunk size for the rest.
+            { printf '\020'; cat "$f"; } > "corpus/control_line/fixture-$(basename "$f" .ndjson)"
+          done
+          for f in "$fixtures"/producer/*.bin; do
+            cp "$f" "corpus/producer_frame/fixture-$(basename "$f" .bin)"
+          done
+          for f in "$fixtures"/producer/av_stream.bin "$fixtures"/producer/pts_extremes.bin "$fixtures"/producer/ingest_*.bin; do
+            cp "$f" "corpus/ingest/fixture-$(basename "$f" .bin)"
+          done
+          echo "corpus: $(find corpus -type f | wc -l) inputs"
+      - name: Fuzz control_line
+        env:
+          SECONDS_PER_TARGET: ${{ steps.budget.outputs.seconds }}
+        run: cargo +"$FUZZ_TOOLCHAIN" fuzz run --target "$FUZZ_TARGET" control_line -- -max_total_time="$SECONDS_PER_TARGET"
+      - name: Fuzz producer_frame
+        if: ${{ !cancelled() }}
+        env:
+          SECONDS_PER_TARGET: ${{ steps.budget.outputs.seconds }}
+        run: cargo +"$FUZZ_TOOLCHAIN" fuzz run --target "$FUZZ_TARGET" producer_frame -- -max_total_time="$SECONDS_PER_TARGET"
+      - name: Fuzz ingest
+        if: ${{ !cancelled() }}
+        env:
+          SECONDS_PER_TARGET: ${{ steps.budget.outputs.seconds }}
+        run: cargo +"$FUZZ_TOOLCHAIN" fuzz run --target "$FUZZ_TARGET" ingest -- -max_total_time="$SECONDS_PER_TARGET"
+      - name: Keep the crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts-${{ github.run_id }}
+          path: rust/fuzz/artifacts
+          if-no-files-found: ignore
+      - name: Minimise the corpus
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          for target in control_line producer_frame ingest; do
+            cargo +"$FUZZ_TOOLCHAIN" fuzz cmin --target "$FUZZ_TARGET" "$target"
+          done
+          echo "corpus: $(find corpus -type f | wc -l) inputs"
+      - name: Save the corpus
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: rust/fuzz/corpus
+          key: fuzz-corpus-${{ hashFiles('rust/fuzz/corpus/**') }}

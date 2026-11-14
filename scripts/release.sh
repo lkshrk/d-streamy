@@ -3,7 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
-# Find signing identity
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then
     IDENTITY="$CODESIGN_IDENTITY"
 else
@@ -35,49 +34,19 @@ APP_NAME="D-Streamy"
 VERSION="${VERSION:-${TAG:-0.1.0}}"
 VERSION="${VERSION#v}"
 
+if [ -z "${DSTREAMY_DAEMON:-}" ] || ! "$SCRIPT_DIR/check-universal.sh" "$DSTREAMY_DAEMON"; then
+    echo "error: set DSTREAMY_DAEMON to a universal (arm64 + x86_64) dstreamy" >&2
+    exit 1
+fi
+export UNIVERSAL=1
+
 echo "==> Building release (version $VERSION)..."
-SKIP_SIGN=1 "$SCRIPT_DIR/build.sh"
+VERSION="$VERSION" SKIP_SIGN=1 "$SCRIPT_DIR/build.sh"
 
 APP="$ROOT/bin/$APP_NAME.app"
 
-# Generate Info.plist
-cat > "$APP/Contents/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleIdentifier</key>
-    <string>${BUNDLE_ID}</string>
-    <key>CFBundleName</key>
-    <string>${APP_NAME}</string>
-    <key>CFBundleDisplayName</key>
-    <string>${APP_NAME}</string>
-    <key>CFBundleExecutable</key>
-    <string>${APP_NAME}</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>CFBundleShortVersionString</key>
-    <string>${VERSION}</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>NSScreenCaptureUsageDescription</key>
-    <string>D-Streamy needs screen recording access to capture your window for streaming.</string>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>D-Streamy needs microphone access to capture audio for streaming.</string>
-    <key>NSAudioCaptureUsageDescription</key>
-    <string>D-Streamy needs system audio access to capture window audio for streaming.</string>
-</dict>
-</plist>
-EOF
-
-# Generate entitlements
 ENTITLEMENTS=$(mktemp)
+trap 'rm -f "$ENTITLEMENTS"' EXIT
 cat > "$ENTITLEMENTS" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -93,59 +62,24 @@ cat > "$ENTITLEMENTS" <<EOF
 </plist>
 EOF
 
-# Bun runs JavaScriptCore (JIT) and dlopens native .node addons; under a
-# hardened runtime it needs these entitlements or it crashes after notarization.
-BUN_ENTITLEMENTS=$(mktemp)
-cat > "$BUN_ENTITLEMENTS" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>com.apple.security.cs.allow-jit</key>
-    <true/>
-    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-    <true/>
-    <key>com.apple.security.cs.disable-library-validation</key>
-    <true/>
-</dict>
-</plist>
-EOF
-
 echo "==> Signing with: $IDENTITY"
 
-# Timestamp requires network; notarization requires a secure timestamp. Allow
-# local offline signing to skip it via NO_TIMESTAMP=1.
+# NO_TIMESTAMP=1 signs offline; notarization needs the secure timestamp.
 TS_FLAG="--timestamp"
 [ "${NO_TIMESTAMP:-0}" = "1" ] && TS_FLAG="--timestamp=none"
 
-# Sign nested Mach-O inside-out: the bundled bun runtime and every native
-# addon/binary under Resources (.node, .dylib, ffmpeg, etc.) must be signed
-# and hardened before the outer app, or notarization rejects them. The bun
-# binary gets the JIT/library-validation entitlements above.
-BUN_PATH="$APP/Contents/Resources/bun"
-echo "==> Signing nested Mach-O..."
-while IFS= read -r f; do
-    if file "$f" | grep -q "Mach-O"; then
-        if [ "$f" = "$BUN_PATH" ]; then
-            codesign --force --options runtime $TS_FLAG \
-                --entitlements "$BUN_ENTITLEMENTS" --sign "$IDENTITY" "$f"
-        else
-            codesign --force --options runtime $TS_FLAG --sign "$IDENTITY" "$f"
-        fi
-    fi
-done < <(find "$APP/Contents/Resources" -type f)
+# Nested code must be signed hardened and timestamped before the outer app, or notarization rejects it.
+echo "==> Signing nested dstreamy..."
+codesign --force --options runtime $TS_FLAG ${SIGNING_KEYCHAIN:+--keychain "$SIGNING_KEYCHAIN"} \
+    --identifier "$BUNDLE_ID.dstreamy" --sign "$IDENTITY" "$APP/Contents/MacOS/dstreamy"
 
-# Sign main app last
-codesign --force --sign "$IDENTITY" \
+codesign --force --sign "$IDENTITY" ${SIGNING_KEYCHAIN:+--keychain "$SIGNING_KEYCHAIN"} \
     --identifier "$BUNDLE_ID" \
     --entitlements "$ENTITLEMENTS" \
     --options runtime \
     $TS_FLAG \
     "$APP"
 
-rm "$ENTITLEMENTS" "$BUN_ENTITLEMENTS"
-
-# Verify
 echo "==> Verifying signature..."
 codesign --verify --deep --strict "$APP"
 echo "==> Signature valid"

@@ -1,0 +1,29 @@
+name: Publish the OBS prefix
+description: Upload a pinned OBS install prefix as the <key>.tar.gz artifact that obs-prefix-fetch looks for.
+inputs:
+  key:
+    description: Cache key of the prefix.
+    required: true
+  path:
+    description: Directory that holds the prefix.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Pack the prefix
+      shell: bash
+      env:
+        ARCHIVE: ${{ runner.temp }}/${{ inputs.key }}.tar.gz
+        PREFIX: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        unix() { if command -v cygpath >/dev/null; then cygpath -u "$1"; else printf '%s\n' "$1"; fi; }
+        tar -czf "$(unix "$ARCHIVE")" -C "$(unix "$PREFIX")" .
+
+    # A tarball, not the upload's zip, keeps symlinks and executable bits.
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        path: ${{ runner.temp }}/${{ inputs.key }}.tar.gz
+        archive: false
+        overwrite: true
+        if-no-files-found: error

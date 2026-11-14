@@ -1,0 +1,13 @@
+name: Import the Developer ID certificate
+description: Create a temporary keychain holding the Developer ID certificate and export its path as SIGNING_KEYCHAIN for codesign --keychain; deleted again when the job ends.
+inputs:
+  cert-p12:
+    description: Base64-encoded .p12 with the Developer ID Application certificate and key.
+    required: true
+  cert-password:
+    description: Password of the .p12.
+    required: true
+runs:
+  using: node24
+  main: main.cjs
+  post: post.cjs

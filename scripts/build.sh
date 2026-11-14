@@ -3,62 +3,43 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
+BUNDLE_ID="me.harke.d-streamy"
+APP_NAME="D-Streamy"
+VERSION="${VERSION:-0.0.0}"
+VERSION="${VERSION#v}"
 
-echo "==> Building CaptureLib + App (Swift)..."
-swift build -c release --package-path "$ROOT"
+SWIFT_FLAGS=(-c release --package-path "$ROOT")
+if [ "${UNIVERSAL:-0}" = "1" ]; then
+    SWIFT_FLAGS+=(--arch arm64 --arch x86_64)
+fi
 
-echo "==> Building daemon (Bun)..."
-cd "$ROOT"
-rm -rf .build/daemon-bundle
-bun build src/daemon/index.ts --outdir .build/daemon-bundle --target node \
-    --external ffmpeg-static \
-    --external ws \
-    --external @discordjs/opus \
-    --external opusscript \
-    --external @snazzah/davey-darwin-arm64 \
-    --external @seydx/node-av-darwin-arm64 \
-    --external @lng2004/node-datachannel
+echo "==> Building App (Swift)..."
+swift build "${SWIFT_FLAGS[@]}"
+
+# DSTREAMY_DAEMON points at a prebuilt (e.g. universal) dstreamy; otherwise build one for this Mac.
+if [ -z "${DSTREAMY_DAEMON:-}" ]; then
+    echo "==> Building dstreamy (Rust)..."
+    (cd "$ROOT/rust" && cargo build --release --locked -p dstreamy-cli)
+    DSTREAMY_DAEMON="$ROOT/rust/target/release/dstreamy"
+fi
 
 echo "==> Assembling D-Streamy.app..."
-APP="$ROOT/bin/D-Streamy.app"
+APP="$ROOT/bin/$APP_NAME.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-# Copy app binary
-cp "$(swift build -c release --package-path "$ROOT" --show-bin-path)/D-Streamy" "$APP/Contents/MacOS/D-Streamy"
+cp "$(swift build "${SWIFT_FLAGS[@]}" --show-bin-path)/$APP_NAME" "$APP/Contents/MacOS/$APP_NAME"
+cp "$DSTREAMY_DAEMON" "$APP/Contents/MacOS/dstreamy"
+chmod +x "$APP/Contents/MacOS/dstreamy"
 
-# Copy daemon bundle (JS + native .node addons)
-rm -rf "$APP/Contents/Resources/daemon"
-cp -R "$ROOT/.build/daemon-bundle/" "$APP/Contents/Resources/daemon/"
-
-# Copy native addons that can't be bundled
-copy_native_pkg() {
-    local pkg_path="$1"
-    if [ -d "$ROOT/node_modules/$pkg_path" ]; then
-        mkdir -p "$APP/Contents/Resources/daemon/node_modules/$pkg_path"
-        cp -R "$ROOT/node_modules/$pkg_path/" "$APP/Contents/Resources/daemon/node_modules/$pkg_path/"
-    fi
-}
-copy_native_pkg "@snazzah/davey-darwin-arm64"
-copy_native_pkg "@seydx/node-av-darwin-arm64"
-copy_native_pkg "@lng2004/node-datachannel"
-copy_native_pkg "ws"
-copy_native_pkg "@discordjs/opus"
-copy_native_pkg "opusscript"
-
-# Bundle the bun runtime so the app is self-contained (no external bun needed)
-BUN_BIN="${BUN_BIN:-$HOME/.bun/bin/bun}"
-if [ ! -x "$BUN_BIN" ]; then
-    BUN_BIN="$(command -v bun || true)"
+if [ "${UNIVERSAL:-0}" = "1" ]; then
+    NOTICE_TARGETS=(--target aarch64-apple-darwin --target x86_64-apple-darwin)
+else
+    NOTICE_TARGETS=(--target "$(rustc -vV | sed -n 's/^host: //p')")
 fi
-if [ -z "${BUN_BIN:-}" ] || [ ! -x "$BUN_BIN" ]; then
-    echo "error: bun binary not found (set BUN_BIN)" >&2
-    exit 1
-fi
-cp "$BUN_BIN" "$APP/Contents/Resources/bun"
-chmod +x "$APP/Contents/Resources/bun"
+cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE"
+python3 "$SCRIPT_DIR/third-party-notices.py" --manifest "$ROOT/rust/Cargo.toml" \
+    "${NOTICE_TARGETS[@]}" --output "$APP/Contents/Resources/THIRD_PARTY_NOTICES.txt"
 
-
-# Compile and copy app icon
 echo "==> Compiling asset catalog..."
 xcrun actool "$ROOT/App/Assets.xcassets" \
     --compile "$APP/Contents/Resources" \
@@ -67,12 +48,46 @@ xcrun actool "$ROOT/App/Assets.xcassets" \
     --app-icon AppIcon \
     --output-partial-info-plist /dev/null > /dev/null
 
-# Codesign (stable identity so macOS permissions persist across rebuilds).
-# Skipped for release builds (release.sh signs nested code inside-out with a
-# Developer ID identity). Override the dev identity via CODESIGN_IDENTITY.
+cat > "$APP/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>${BUNDLE_ID}</string>
+    <key>CFBundleName</key>
+    <string>${APP_NAME}</string>
+    <key>CFBundleDisplayName</key>
+    <string>${APP_NAME}</string>
+    <key>CFBundleExecutable</key>
+    <string>${APP_NAME}</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${VERSION}</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>D-Streamy needs screen recording access to capture your window for streaming.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>D-Streamy needs microphone access to capture audio for streaming.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>D-Streamy needs system audio access to capture window audio for streaming.</string>
+</dict>
+</plist>
+EOF
+
+# Dev builds sign with a stable identity so macOS keeps permissions; release.sh signs releases.
 if [ "${SKIP_SIGN:-0}" != "1" ]; then
     SIGN_IDENTITY="${CODESIGN_IDENTITY:-Apple Development: dev@harke.me (L2GZ9Q95QW)}"
-    codesign --force --sign "$SIGN_IDENTITY" --identifier me.harke.d-streamy "$APP"
+    codesign --force --sign "$SIGN_IDENTITY" --identifier "$BUNDLE_ID.dstreamy" "$APP/Contents/MacOS/dstreamy"
+    codesign --force --sign "$SIGN_IDENTITY" --identifier "$BUNDLE_ID" "$APP"
 fi
 
 echo "==> Done: $APP"

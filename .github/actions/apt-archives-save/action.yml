@@ -1,0 +1,29 @@
+name: Save the apt archives
+description: Save ~/apt-archives under a content-hashed key when apt-install.sh changed it.
+inputs:
+  key-prefix:
+    description: Cache key prefix; a hash of the archive listing is appended.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Check apt archives
+      id: apt-check
+      if: always()
+      shell: bash
+      env:
+        APT_CACHE: ${{ inputs.key-prefix }}
+      run: |
+        sudo chown -R "$USER" ~/apt-archives ~/apt-archives.manifest 2>/dev/null || true
+        listing="$RUNNER_TEMP/apt-listing"
+        find ~/apt-archives -type f ! -name lock ! -path '*/partial/*' -printf '%P %s\n' 2>/dev/null | sort >"$listing" || true
+        if [ -f ~/apt-archives.manifest ] && ! cmp -s "$listing" ~/apt-archives.manifest; then
+          echo changed=true >>"$GITHUB_OUTPUT"
+        fi
+        echo "key=$APT_CACHE-$(sha256sum <"$listing" | cut -c1-16)" >>"$GITHUB_OUTPUT"
+    - name: Save apt archives
+      if: always() && steps.apt-check.outputs.changed == 'true'
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ~/apt-archives
+        key: ${{ steps.apt-check.outputs.key }}

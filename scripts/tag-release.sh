@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# tag-release.sh — tag a new d-streamy release and push branch+tag for CI-gated release.
+# Bumps the version, tags and pushes; release.yml publishes the tag once CI passes its commit.
 # Usage: ./scripts/tag-release.sh major|minor|patch|v1.2.3
-# The release workflow publishes the pushed tag only after CI passes its commit.
 set -euo pipefail
 
 usage() {
@@ -116,8 +115,58 @@ case "${CONFIRM}" in
   *) echo "Aborted."; exit 0 ;;
 esac
 
+RELEASE_WORKSPACES=(rust rust/crates/dstreamy-obs)
+RELEASE_LOCKFILES=("${RELEASE_WORKSPACES[@]}" rust/fuzz)
+
+set_version() {
+  local version=$1 workspace spec
+  for workspace in "${RELEASE_WORKSPACES[@]}"; do
+    sed -i.bak -E '/^\[workspace\.package\]/,/^\[/ s/^version = "[^"]*"/version = "'"$version"'"/' "$workspace/Cargo.toml"
+    rm "$workspace/Cargo.toml.bak"
+    grep -q "^version = \"$version\"" "$workspace/Cargo.toml" || { echo "Error: could not set the version in $workspace/Cargo.toml" >&2; exit 1; }
+    git add "$workspace/Cargo.toml"
+  done
+  # The plugin and fuzz lockfiles also pin root workspace crates, so they update after both manifests.
+  for workspace in "${RELEASE_LOCKFILES[@]}"; do
+    (cd "$workspace" && cargo update --workspace --quiet)
+    git add "$workspace/Cargo.lock"
+  done
+  spec=$(jq --indent 4 --arg v "$version" '.version = $v' obs/buildspec.json)
+  printf '%s\n' "$spec" > obs/buildspec.json
+  git add obs/buildspec.json
+}
+
+# The release workflow publishes only when the tag equals dstreamy-cli's version and the plugin's.
+set_version "${VERSION#v}"
+if ! git diff --cached --quiet; then
+  git commit -m "chore: release ${VERSION}"
+fi
+
+pushed_already() {
+  local tag branch
+  tag=$(git ls-remote --exit-code origin "refs/tags/${VERSION}" | cut -f1) || return 1
+  branch=$(git ls-remote --exit-code origin "refs/heads/${BRANCH}" | cut -f1) || return 1
+  [[ $tag == "$(git rev-parse "refs/tags/${VERSION}")" && $branch == "$(git rev-parse HEAD)" ]]
+}
+
 git tag -a "${VERSION}" -m "Release ${VERSION}"
-git push origin "${BRANCH}" "${VERSION}"
+if ! git push --atomic origin "${BRANCH}" "${VERSION}"; then
+  echo >&2
+  if pushed_already; then
+    echo "git reported a failed push, but origin has ${BRANCH} and ${VERSION} at the release commit; treating it as pushed." >&2
+  elif ! git ls-remote origin >/dev/null 2>&1 || git ls-remote --exit-code origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
+    echo "Error: the push failed and origin's state is unclear; the local tag ${VERSION} is kept." >&2
+    echo "If origin has ${VERSION} on the release commit, the release is pushed. Otherwise run" >&2
+    echo "'git tag -d ${VERSION}' and rerun $0 ${INPUT}." >&2
+    exit 1
+  else
+    git tag -d "${VERSION}" >/dev/null
+    echo "Error: origin rejected the push of ${BRANCH} and ${VERSION}; neither ref was updated." >&2
+    echo "The local tag ${VERSION} was deleted. The release commit stays on ${BRANCH}." >&2
+    echo "${BRANCH} must accept a direct push from you. Fix the cause and rerun $0 ${INPUT}." >&2
+    exit 1
+  fi
+fi
 
 REPO=$(git remote get-url origin | sed -E 's#.*github\.com[:/](.*)$#\1#; s#\.git$##')
 echo

@@ -1,0 +1,9 @@
+[test-groups.trace-replay]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary_id(dstreamy-cli::trace_replay)'
+test-group = 'trace-replay'
+
+[profile.ci]
+fail-fast = false

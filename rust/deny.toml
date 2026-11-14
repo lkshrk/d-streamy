@@ -1,0 +1,68 @@
+# cargo deny check: advisories, licenses, bans, sources. Shared by the main
+# workspace and rust/crates/dstreamy-obs (passed with --config).
+
+[graph]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Transitive unmaintained crates are upstream's to replace; direct ones still fail.
+unmaintained = "workspace"
+ignore = [
+  { id = "RUSTSEC-2023-0071", reason = "rsa has no fixed release; QR login decrypts blinded, at most 3 ciphertexts per ephemeral key, residual risk accepted in ADR 0011" },
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 in DAVE's P256 signing via elliptic-curve 0.13; fix needs the 0.14 line upstream, residual risk accepted in ADR 0011" },
+  { id = "RUSTSEC-2026-0212", reason = "libcrux-secrets aarch64 Select/Swap is not on the P256 DAVE path; reachability exception in ADR 0011" },
+  { id = "RUSTSEC-2026-0207", reason = "libcrux-sha3 incremental squeeze is not used by the P256 DAVE suite; reachability exception in ADR 0011" },
+  { id = "RUSTSEC-2026-0208", reason = "libcrux-sha3 AVX2x4 SHAKE is not used by the P256 DAVE suite; reachability exception in ADR 0011" },
+]
+
+[licenses]
+# Everything here is compatible with the project's GPL-3.0-or-later.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0",
+  "GPL-3.0-or-later",
+  "ISC",
+  "LGPL-2.1-or-later",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Unlicense",
+  "WTFPL",
+  "Zlib",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+deny = [
+  # The CLI must not link OpenSSL: TLS goes through rustls everywhere.
+  { crate = "openssl-sys", reason = "rustls only" },
+  { crate = "native-tls", reason = "rustls only" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,204 +1,745 @@
 name: Release
 
 on:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
-  # CI listens only to branch pushes, so tags on tested tips need their own trigger.
   push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+    # Pushing any commit here rehearses the whole release; nothing is published.
+    branches: [release-rehearsal]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the release (the run must be on tag v<dstreamy-cli version>)
+        type: boolean
+        default: false
 
-# Serialize runs because annotated tag and commit SHAs cannot share a per-SHA race guard.
 concurrency:
-  group: release
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
-jobs:
-  # Cheap ubuntu gate so the macOS release job only starts for a CI-verified, unreleased vX.Y.Z tag.
-  gate:
-    if: github.event_name != 'workflow_run' || (github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success')
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          # Annotated tag pushes set github.sha to the tag object, not its commit.
-          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
-          fetch-depth: 0
+env:
+  # Line tables keep file:line in backtraces at a fraction of full debuginfo's size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  OBS_TAG: "32.2.2"
+  OBS_COMMIT: ba2f32bdf791005443988a4955e963663e16b1ed
+  OBS_BUILD_REV: "1"
 
-      - name: Verify latest CI passed
-        id: civerify
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: rustup toolchain install
+      - name: Resolve the version and whether this run publishes
+        id: check
         env:
-          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
         run: |
           set -euo pipefail
-
-          # Dereference through any annotated tag to the tested commit.
-          TARGET_SHA="$(git rev-parse 'HEAD^{commit}')"
-
-          # A failed rerun must supersede an older success for the same commit.
-          latest="$(gh api --method GET "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
-            -f head_sha="${TARGET_SHA}" \
-            -f event=push \
-            -f per_page=100 \
-            --jq '.workflow_runs | sort_by(.run_number) | last | [.status, (.conclusion // "")] | @tsv' 2>/dev/null || true)"
-
-          if [ -z "${latest}" ]; then
-            echo "::error::No CI run found for commit ${TARGET_SHA}."
+          crate="$(cargo metadata --manifest-path rust/Cargo.toml --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "dstreamy-cli") | .version')"
+          plugin="$(jq -r .version obs/buildspec.json)"
+          if [ "$plugin" != "$crate" ]; then
+            echo "::error::obs/buildspec.json has version $plugin but dstreamy-cli has $crate; scripts/tag-release.sh sets both"
             exit 1
           fi
-
-          IFS=$'\t' read -r ci_status ci_conclusion <<< "${latest}"
-          if [ "${ci_status}" = "completed" ] && [ "${ci_conclusion}" = "success" ]; then
-            echo "Latest CI run for ${TARGET_SHA} passed."
-            echo "approved=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          test "$(jq -r '.dependencies["obs-studio"].version' obs/buildspec.json)" = "$OBS_TAG"
+          if [[ ! $crate =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must be X.Y.Z, got '$crate'"
+            exit 1
           fi
-
-          # A tag or older workflow_run arriving mid-CI is deferred to the latest successful workflow_run trigger.
-          if [ "${ci_status}" != "completed" ] && [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]; then
-            echo "CI for ${TARGET_SHA} is still running; deferring to the workflow_run trigger."
-            exit 0
+          publish=false
+          if { [ "$GITHUB_EVENT_NAME" = push ] && [ "$REF_TYPE" = tag ]; } || [ "$INPUT_PUBLISH" = true ]; then
+            publish=true
+            if [ "$REF_TYPE" != tag ] || [ "$TAG" != "v$crate" ]; then
+              echo "::error::Publishing needs the run to be on tag v$crate (dstreamy-cli's version); this is $REF_TYPE $TAG"
+              exit 1
+            fi
           fi
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "D-Streamy $crate, publish: $publish" >> "$GITHUB_STEP_SUMMARY"
 
-          echo "::error::Latest CI run for ${TARGET_SHA} finished with ${ci_conclusion:-unknown}."
-          exit 1
-
-      - name: Check for release tag
-        id: tag
-        if: steps.civerify.outputs.approved == 'true'
+  ci-gate:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: needs.version.outputs.publish == 'true'
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Wait for CI on the tagged commit
+        if: needs.version.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          REF: ${{ github.ref }}
         run: |
-          git fetch --tags --force
-          TAG=$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
-          if [ -z "$TAG" ]; then
-            echo "tag=" >> "$GITHUB_OUTPUT"
-            echo "No vX.Y.Z tag points at this commit; skipping release."
-            exit 0
-          fi
-          # Tag-push and workflow_run can both pass the gate for the same tag.
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "tag=" >> "$GITHUB_OUTPUT"
-            echo "Release $TAG already exists; skipping duplicate publish."
-            exit 0
-          fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG"
+          set -euo pipefail
+          # An annotated tag's github.sha names the tag object; the ref resolves to the tested commit.
+          commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$REF" --jq .sha)
+          deadline=$(( $(date +%s) + 140 * 60 ))
+          runs() {
+            gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/$1/runs" -f event=push -f per_page=100 "${@:2}" \
+              --jq '.workflow_runs | sort_by(.run_number) | reverse | .[] | [.head_sha, .status, (.conclusion // ""), .html_url] | @tsv'
+          }
+          # OBS runs only for its push paths, so it goes last, once any run for this commit has been created.
+          for workflow in ci.yml rust-ci.yml fuzz.yml obs-ci.yml; do
+            while :; do
+              # The newest push run decides, so a failed rerun supersedes an older success.
+              IFS=$'\t' read -r _ status conclusion url < <(runs "$workflow" -f head_sha="$commit" | head -n 1) || status=
+              if [ -z "$status" ] && [ "$workflow" = obs-ci.yml ]; then
+                mapfile -t paths < <(awk '/^  push:/ { push = 1; next } /^  [a-z_]+:/ { push = 0 }
+                  push && /^    paths:/ { list = 1; next } list && /^      - / { gsub(/^      - "?|"$/, ""); print ":(glob)" $0; next }
+                  { list = 0 }' .github/workflows/obs-ci.yml)
+                [ "${#paths[@]}" -gt 0 ] || { echo "::error::no push paths found in obs-ci.yml"; exit 1; }
+                while IFS=$'\t' read -r sha status conclusion url; do
+                  [ "$status" = completed ] && [ "$conclusion" = success ] || continue
+                  git merge-base --is-ancestor "$sha" "$commit" 2>/dev/null || continue
+                  if git diff --quiet "$sha" "$commit" -- "${paths[@]}"; then
+                    echo "$workflow did not run for $commit; its paths are unchanged since $sha, which passed: $url"
+                    continue 3
+                  fi
+                done < <(runs "$workflow" -f status=success)
+                echo "::error::$workflow has no run for $commit and its paths changed since its last passing ancestor"
+                exit 1
+              fi
+              if [ "$status" = completed ]; then
+                [ "$conclusion" = success ] || { echo "::error::$workflow finished $conclusion on $commit: $url"; exit 1; }
+                echo "$workflow passed: $url"
+                break
+              fi
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::error::$workflow on $commit did not finish in time (${status:-no run})"
+                exit 1
+              fi
+              sleep 60
+            done
+          done
+      - name: Rehearsals build without a CI gate
+        if: needs.version.outputs.publish != 'true'
+        run: echo "Rehearsal; the CI gate applies only to publishing runs."
 
-  release:
-    needs: gate
-    if: needs.gate.outputs.tag != ''
-    runs-on: macos-26
+  cli:
+    needs: [version, ci-gate]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: xcode-27
+          - target: x86_64-apple-darwin
+            os: xcode-27
+            rosetta: true
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            container: debian:bookworm
+            rustup_sha256: b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            container: debian:bookworm
+            rustup_sha256: 9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+            exe: .exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    # Debian 12's glibc 2.36 sets the Linux floor; the host runner would set it at 2.39.
+    container: ${{ matrix.container }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
     env:
-      DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
-      SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
-      TAG: ${{ needs.gate.outputs.tag }}
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      ARCHIVE: dstreamy-${{ needs.version.outputs.version }}-${{ matrix.target }}
+      EXT: ${{ matrix.archive || 'tar.gz' }}
+      EXE: ${{ matrix.exe }}
+      TARGET: ${{ matrix.target }}
+      MACOS_SIGNING: ${{ secrets.SIGNING_IDENTITY != '' && secrets.DEVELOPER_ID_CERT_P12 != '' }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.gate.outputs.tag }}
-          fetch-depth: 0
-
-      - name: Select latest Xcode 26 (needs SDK >= 15.2 for SCContentFilter.includedWindows)
-        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Install daemon dependencies
-        run: bun install
-
-      - name: Import signing certificate
-        env:
-          CERT_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
-          CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      - name: Bootstrap the container
+        if: matrix.container
+        working-directory: /
         run: |
-          KEYCHAIN=$RUNNER_TEMP/signing.keychain-db
-          echo "$CERT_P12" | base64 --decode > $RUNNER_TEMP/cert.p12
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security import $RUNNER_TEMP/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
-            -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | tr -d '"')
+          set -euo pipefail
+          apt=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          apt-get "${apt[@]}" update
+          apt-get "${apt[@]}" install -y --no-install-recommends sudo ca-certificates curl git
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Select Xcode 27.1
+        if: runner.os == 'macOS'
+        run: sudo xcode-select -s /Applications/Xcode_27.1.app
+      - name: Publishing needs the macOS signing secrets
+        if: runner.os == 'macOS' && needs.version.outputs.publish == 'true' && env.MACOS_SIGNING != 'true'
+        run: |
+          echo "::error::SIGNING_IDENTITY and DEVELOPER_ID_CERT_P12 are not set; a published macOS binary must be signed"
+          exit 1
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        timeout-minutes: 30
+        run: |
+          "$GITHUB_WORKSPACE/.github/scripts/apt-install.sh" \
+            build-essential clang libclang-dev pkg-config nasm python3 \
+            libpipewire-0.3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev
+      - name: Install rustup
+        if: matrix.container
+        env:
+          RUSTUP_VERSION: 1.29.3
+          RUSTUP_SHA256: ${{ matrix.rustup_sha256 }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/rustup-init" \
+            "https://static.rust-lang.org/rustup/archive/$RUSTUP_VERSION/$TARGET/rustup-init"
+          echo "$RUSTUP_SHA256  $RUNNER_TEMP/rustup-init" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/rustup-init"
+          "$RUNNER_TEMP/rustup-init" -y --no-modify-path --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+      - name: Pin build paths and timestamps
+        run: |
+          set -euo pipefail
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+          cargo_home=${CARGO_HOME:-$HOME/.cargo}
+          if [ "$RUNNER_OS" = Windows ]; then cargo_home=$(cygpath -w "$cargo_home"); fi
+          echo "RUSTFLAGS=--remap-path-prefix=$GITHUB_WORKSPACE=/d-streamy --remap-path-prefix=$cargo_home=/cargo" >> "$GITHUB_ENV"
+      - name: Refuse test-only features in the release build
+        run: |
+          set -euo pipefail
+          out=$(for c in dstreamy-cli dstreamy-discord discord-stream-rs dstreamy-ipc dstreamy-media; do
+            cargo tree --locked -p dstreamy-cli --features browser-login -e features,normal --target "$TARGET" -i "$c"
+          done)
+          if grep -E 'feature "(test-hooks|test-rtp-start|test-support|test-pattern|openh264)"' <<<"$out"; then
+            echo "a test-only feature reaches the release binary" >&2
+            exit 1
+          fi
+      - run: cargo build --release --locked -p dstreamy-cli --features browser-login --target "$TARGET"
+      - name: Linux binary links WebKitGTK
+        if: runner.os == 'Linux'
+        run: ldd "target/$TARGET/release/dstreamy" | grep -F libwebkit2gtk-4.1
+      - name: Import the Developer ID certificate
+        if: runner.os == 'macOS' && env.MACOS_SIGNING == 'true'
+        uses: ./.github/actions/macos-signing-keychain
+        with:
+          cert-p12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+          cert-password: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+      - name: Sign dstreamy (Developer ID, hardened runtime)
+        if: runner.os == 'macOS' && env.MACOS_SIGNING == 'true'
+        env:
+          SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          codesign --force --options runtime --timestamp --keychain "$SIGNING_KEYCHAIN" --sign "$SIGNING_IDENTITY" "target/$TARGET/release/dstreamy"
+          codesign --verify --strict --verbose=2 "target/$TARGET/release/dstreamy"
+          ditto -c -k "target/$TARGET/release/dstreamy" "$RUNNER_TEMP/dstreamy-notarize.zip"
+      # A bare executable cannot be stapled; Gatekeeper checks the notarization ticket online.
+      - name: Notarize dstreamy
+        if: runner.os == 'macOS' && env.MACOS_SIGNING == 'true'
+        uses: ./.github/actions/macos-notarize
+        with:
+          path: ${{ runner.temp }}/dstreamy-notarize.zip
+          key-p8: ${{ secrets.NOTARY_KEY_P8 }}
+          key-id: ${{ secrets.NOTARY_KEY_ID }}
+          issuer-id: ${{ secrets.NOTARY_ISSUER_ID }}
+      - name: Install Rosetta
+        if: matrix.rosetta
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+      - name: Smoke test
+        run: ${{ matrix.rosetta && 'arch -x86_64' || '' }} "target/$TARGET/release/dstreamy$EXE" --version
+      - name: Package the CLI
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/$ARCHIVE"
+          cp "target/$TARGET/release/dstreamy$EXE" ../README.md ../LICENSE "dist/$ARCHIVE/"
+          python3 ../scripts/third-party-notices.py --manifest Cargo.toml \
+            --package dstreamy-cli --features browser-login \
+            --target "$TARGET" --output "dist/$ARCHIVE/THIRD_PARTY_NOTICES.txt"
+          if [ "$EXT" = zip ]; then
+            (cd dist && 7z a -tzip -mx=9 "$ARCHIVE.zip" "$ARCHIVE" >/dev/null)
+            (cd dist && sha256sum "$ARCHIVE.zip" > "$ARCHIVE.zip.sha256")
+            cat "dist/$ARCHIVE.zip.sha256"
+            exit 0
+          fi
+          tar=tar
+          if ! tar --version 2>/dev/null | grep -q 'GNU tar'; then
+            command -v gtar >/dev/null || brew install gnu-tar
+            tar=gtar
+          fi
+          # Sorted names, fixed mtime and owner, and no gzip header timestamp make the archive reproducible.
+          "$tar" --format=gnu --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+            -C dist -cf - "$ARCHIVE" | gzip -n -9 > "dist/$ARCHIVE.tar.gz"
+          sum() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+          (cd dist && sum "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256")
+          cat "dist/$ARCHIVE.tar.gz.sha256"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: |
+            rust/dist/${{ env.ARCHIVE }}.${{ env.EXT }}
+            rust/dist/${{ env.ARCHIVE }}.${{ env.EXT }}.sha256
+          if-no-files-found: error
 
+  app:
+    needs: [version, ci-gate]
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PACKAGE: D-Streamy-${{ needs.version.outputs.version }}-macos-universal
+      MACOS_SIGNING: ${{ secrets.SIGNING_IDENTITY != '' && secrets.DEVELOPER_ID_CERT_P12 != '' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Select Xcode 27.1
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.1.app
+          xcodebuild -version
+          swift --version
+      - name: Publishing needs the macOS signing secrets
+        if: needs.version.outputs.publish == 'true' && env.MACOS_SIGNING != 'true'
+        run: |
+          echo "::error::SIGNING_IDENTITY and DEVELOPER_ID_CERT_P12 are not set; a published app must be signed"
+          exit 1
+      - name: Install toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Refuse test-only features in the bundled daemon
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            out=$(for crate in dstreamy-cli dstreamy-discord discord-stream-rs dstreamy-ipc dstreamy-media; do
+              cargo tree --locked -p dstreamy-cli -e features,normal --target "$target" -i "$crate"
+            done)
+            if grep -E 'feature "(test-hooks|test-rtp-start|test-support|test-pattern|openh264)"' <<<"$out"; then
+              echo "a test-only feature reaches the bundled daemon" >&2
+              exit 1
+            fi
+          done
+      - name: Build universal dstreamy
+        working-directory: rust
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p dstreamy-cli --target aarch64-apple-darwin
+          cargo build --release --locked -p dstreamy-cli --target x86_64-apple-darwin
+          mkdir -p target/universal
+          lipo -create -output target/universal/dstreamy \
+            target/aarch64-apple-darwin/release/dstreamy \
+            target/x86_64-apple-darwin/release/dstreamy
+          ../scripts/check-universal.sh target/universal/dstreamy
+      - name: Install Rosetta
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+      - name: Run both slices of the universal dstreamy
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          for slice in arm64 x86_64; do
+            out=$(arch "-$slice" target/universal/dstreamy --version)
+            echo "$slice: $out"
+            test "$out" = "dstreamy $VERSION" || { echo "::error::$slice slice reports '$out', expected dstreamy $VERSION"; exit 1; }
+          done
+      - name: Import signing certificate
+        if: env.MACOS_SIGNING == 'true'
+        uses: ./.github/actions/macos-signing-keychain
+        with:
+          cert-p12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+          cert-password: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
       - name: Build & sign (Developer ID, hardened, nested)
+        if: env.MACOS_SIGNING == 'true'
         env:
           CODESIGN_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
         run: |
-          export VERSION="${TAG#v}"
-          export BUN_BIN="$(command -v bun)"
-          bash scripts/release.sh
-
-      - name: Notarize & staple
-        id: pkg
-        env:
-          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
-          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
-          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          set -euo pipefail
+          DSTREAMY_DAEMON="$PWD/rust/target/universal/dstreamy" bash scripts/release.sh
+          scripts/check-universal.sh bin/D-Streamy.app/Contents/MacOS/D-Streamy
+      - name: Build unsigned (rehearsal without signing secrets)
+        if: env.MACOS_SIGNING != 'true'
         run: |
-          APP="bin/D-Streamy.app"
-          echo "$NOTARY_KEY_P8" | base64 --decode > $RUNNER_TEMP/notary.p8
-          ditto -c -k --sequesterRsrc --keepParent "$APP" D-Streamy.zip
-          SUBMIT_JSON=$(xcrun notarytool submit D-Streamy.zip \
-            --key $RUNNER_TEMP/notary.p8 \
-            --key-id "$NOTARY_KEY_ID" \
-            --issuer "$NOTARY_ISSUER_ID" \
-            --output-format json --wait)
-          echo "$SUBMIT_JSON"
-          SUBMIT_ID=$(echo "$SUBMIT_JSON" | /usr/bin/python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
-          STATUS=$(echo "$SUBMIT_JSON" | /usr/bin/python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')
-          echo "Notarization status: $STATUS (id $SUBMIT_ID)"
-          xcrun notarytool log "$SUBMIT_ID" \
-            --key $RUNNER_TEMP/notary.p8 \
-            --key-id "$NOTARY_KEY_ID" \
-            --issuer "$NOTARY_ISSUER_ID" || true
-          if [ "$STATUS" != "Accepted" ]; then
-            echo "::error::Notarization not accepted (status $STATUS) — see log above."
+          set -euo pipefail
+          DSTREAMY_DAEMON="$PWD/rust/target/universal/dstreamy" UNIVERSAL=1 SKIP_SIGN=1 bash scripts/build.sh
+          scripts/check-universal.sh bin/D-Streamy.app/Contents/MacOS/D-Streamy
+      - name: Zip the app for notarization
+        if: env.MACOS_SIGNING == 'true'
+        run: ditto -c -k --sequesterRsrc --keepParent bin/D-Streamy.app "$RUNNER_TEMP/D-Streamy-notarize.zip"
+      - name: Notarize
+        if: env.MACOS_SIGNING == 'true'
+        uses: ./.github/actions/macos-notarize
+        with:
+          path: ${{ runner.temp }}/D-Streamy-notarize.zip
+          key-p8: ${{ secrets.NOTARY_KEY_P8 }}
+          key-id: ${{ secrets.NOTARY_KEY_ID }}
+          issuer-id: ${{ secrets.NOTARY_ISSUER_ID }}
+      - name: Staple the app
+        if: env.MACOS_SIGNING == 'true'
+        run: xcrun stapler staple bin/D-Streamy.app
+      - name: Package the app
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent bin/D-Streamy.app "dist/$PACKAGE.zip"
+          (cd dist && shasum -a 256 "$PACKAGE.zip" > "$PACKAGE.zip.sha256" && cat "$PACKAGE.zip.sha256")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PACKAGE }}
+          path: dist/${{ env.PACKAGE }}.zip*
+          if-no-files-found: error
+
+  obs-linux:
+    needs: [version, ci-gate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      APT_CACHE: apt-obs-linux-ubuntu-24.04
+      PACKAGE: obs-dstreamy-${{ needs.version.outputs.version }}-linux-x86_64
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Set paths
+        run: echo "OBS_PREFIX=$RUNNER_TEMP/obs-prefix" >> "$GITHUB_ENV"
+      - name: Restore apt archives
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/apt-archives
+          key: ${{ env.APT_CACHE }}-${{ github.run_id }}
+          restore-keys: ${{ env.APT_CACHE }}-
+      - name: Install system dependencies
+        timeout-minutes: 30
+        run: |
+          "$GITHUB_WORKSPACE/.github/scripts/obs-linux-deps.sh"
+      - name: Restore OBS build
+        id: obs
+        uses: ./.github/actions/obs-prefix-fetch
+        with:
+          key: obs-${{ env.OBS_TAG }}-ubuntu-24.04-r${{ env.OBS_BUILD_REV }}
+          path: ${{ runner.temp }}/obs-prefix
+      - name: Build OBS ${{ env.OBS_TAG }} with the frontend and obs-websocket
+        if: steps.obs.outputs.hit != 'true'
+        run: bash .github/scripts/obs-linux-build.sh
+      - name: Check the OBS install
+        run: bash .github/scripts/obs-linux-check-install.sh
+      - name: Install Rust toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: rustup toolchain install
+      - name: Configure, build and stage obs/
+        working-directory: obs
+        run: |
+          set -euo pipefail
+          cmake --preset ubuntu-x86_64 -DCMAKE_PREFIX_PATH="$OBS_PREFIX"
+          cmake --build --preset ubuntu-x86_64
+          cmake --install build_x86_64 --prefix "$RUNNER_TEMP/stage"
+          find "$RUNNER_TEMP/stage" -print
+          plugins="$RUNNER_TEMP/stage/lib/x86_64-linux-gnu/obs-plugins"
+          test -f "$plugins/obs-dstreamy.so"
+          test -f "$plugins/dstreamy-ui/obs-dstreamy-ui.so"
+          grep -q "Tabler Icons" "$plugins/dstreamy-ui/THIRD_PARTY_NOTICES.txt"
+          python3 "$GITHUB_WORKSPACE/scripts/third-party-notices.py" \
+            --manifest "$GITHUB_WORKSPACE/rust/crates/dstreamy-obs/Cargo.toml" --package dstreamy-obs \
+            --target x86_64-unknown-linux-gnu \
+            --append "$plugins/dstreamy-ui/THIRD_PARTY_NOTICES.txt" \
+            --output "$plugins/dstreamy-ui/THIRD_PARTY_NOTICES.txt"
+          if find "$plugins" -maxdepth 1 -name '*.so' ! -name obs-dstreamy.so | grep .; then
+            echo "libobs would try these as modules: only obs-dstreamy.so may sit in the module folder"
             exit 1
           fi
-          xcrun stapler staple "$APP"
-          rm D-Streamy.zip
-          ditto -c -k --sequesterRsrc --keepParent "$APP" D-Streamy.zip
-          echo "sha256=$(shasum -a 256 D-Streamy.zip | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
+          cmake -DTEST_HOOKS=OFF -DLIBRARY="$plugins/obs-dstreamy.so" -P cmake/common/check_test_hooks.cmake
+      - name: Package
         run: |
-          gh release create "$TAG" D-Streamy.zip \
-            --title "$TAG" \
-            --generate-notes \
-            --notes "sha256: \`${{ steps.pkg.outputs.sha256 }}\`"
+          set -euo pipefail
+          mkdir -p dist
+          cp LICENSE "$RUNNER_TEMP/stage/"
+          # The tree unpacks over /usr or ~/.local; sorted names and a fixed mtime make it reproducible.
+          tar --format=gnu --sort=name --mtime="@$(git log -1 --format=%ct)" --owner=0 --group=0 --numeric-owner \
+            -C "$RUNNER_TEMP/stage" -cf - . | gzip -n -9 > "dist/$PACKAGE.tar.gz"
+          (cd dist && sha256sum "$PACKAGE.tar.gz" > "$PACKAGE.tar.gz.sha256" && cat "$PACKAGE.tar.gz.sha256")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PACKAGE }}
+          path: dist/${{ env.PACKAGE }}.tar.gz*
+          if-no-files-found: error
 
-      - name: Bump Homebrew tap
-        env:
-          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+  obs-macos:
+    needs: [version, ci-gate]
+    runs-on: xcode-27
+    timeout-minutes: 120
+    env:
+      PACKAGE: obs-dstreamy-${{ needs.version.outputs.version }}-macos-universal
+      MACOS_SIGNING: ${{ secrets.SIGNING_IDENTITY != '' && secrets.DEVELOPER_ID_CERT_P12 != '' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Select Xcode 27.1
+        run: sudo xcode-select -s /Applications/Xcode_27.1.app
+      - name: Publishing needs the macOS signing secrets
+        if: needs.version.outputs.publish == 'true' && env.MACOS_SIGNING != 'true'
         run: |
-          VERSION="${TAG#v}"
-          SHA="${{ steps.pkg.outputs.sha256 }}"
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/lkshrk/homebrew-tap.git" tap
-          mkdir -p tap/Casks
-          cp Casks/d-streamy.rb tap/Casks/d-streamy.rb
-          sed -i '' -E "s/version \".*\"/version \"${VERSION}\"/" tap/Casks/d-streamy.rb
-          sed -i '' -E "s/sha256 \".*\"/sha256 \"${SHA}\"/" tap/Casks/d-streamy.rb
+          echo "::error::SIGNING_IDENTITY and DEVELOPER_ID_CERT_P12 are not set; a published plugin must be signed"
+          exit 1
+      - name: Install Rust toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Configure and build obs/ (universal)
+        working-directory: obs
+        run: |
+          set -o pipefail
+          cmake --preset macos
+          cmake --build --preset macos -- -quiet 2>&1 | xcbeautify --quiet --renderer github-actions
+      - name: Check the plugin bundle
+        working-directory: obs/build_macos/rundir/obs-dstreamy.plugin/Contents
+        run: |
+          set -euo pipefail
+          test "$(lipo -archs MacOS/obs-dstreamy)" = "x86_64 arm64"
+          test "$(lipo -archs MacOS/obs-dstreamy-ui.dylib)" = "x86_64 arm64"
+          test -f Info.plist
+          cp "$GITHUB_WORKSPACE/LICENSE" Resources/LICENSE
+          grep -q "Tabler Icons" Resources/THIRD_PARTY_NOTICES.txt
+          python3 "$GITHUB_WORKSPACE/scripts/third-party-notices.py" \
+            --manifest "$GITHUB_WORKSPACE/rust/crates/dstreamy-obs/Cargo.toml" --package dstreamy-obs \
+            --target aarch64-apple-darwin --target x86_64-apple-darwin \
+            --append "Resources/THIRD_PARTY_NOTICES.txt" --output Resources/THIRD_PARTY_NOTICES.txt
+          cmake -DTEST_HOOKS=OFF -DLIBRARY=MacOS/obs-dstreamy -P "$GITHUB_WORKSPACE/obs/cmake/common/check_test_hooks.cmake"
+      - name: Import the Developer ID certificate
+        if: env.MACOS_SIGNING == 'true'
+        uses: ./.github/actions/macos-signing-keychain
+        with:
+          cert-p12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+          cert-password: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+      - name: Sign the plugin (Developer ID, hardened runtime)
+        if: env.MACOS_SIGNING == 'true'
+        working-directory: obs/build_macos/rundir
+        env:
+          SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # Nested code first, then the bundle, so the bundle seal covers the signed dylib.
+          codesign --force --options runtime --timestamp --keychain "$SIGNING_KEYCHAIN" --sign "$SIGNING_IDENTITY" \
+            obs-dstreamy.plugin/Contents/MacOS/obs-dstreamy-ui.dylib
+          codesign --force --options runtime --timestamp --keychain "$SIGNING_KEYCHAIN" --sign "$SIGNING_IDENTITY" obs-dstreamy.plugin
+          codesign --verify --strict --deep --verbose=2 obs-dstreamy.plugin
+          ditto -c -k --keepParent obs-dstreamy.plugin "$RUNNER_TEMP/obs-dstreamy-notarize.zip"
+      - name: Notarize the plugin
+        if: env.MACOS_SIGNING == 'true'
+        uses: ./.github/actions/macos-notarize
+        with:
+          path: ${{ runner.temp }}/obs-dstreamy-notarize.zip
+          key-p8: ${{ secrets.NOTARY_KEY_P8 }}
+          key-id: ${{ secrets.NOTARY_KEY_ID }}
+          issuer-id: ${{ secrets.NOTARY_ISSUER_ID }}
+      - name: Staple the plugin
+        if: env.MACOS_SIGNING == 'true'
+        working-directory: obs/build_macos/rundir
+        run: xcrun stapler staple obs-dstreamy.plugin
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          (cd obs/build_macos/rundir && ditto -c -k --keepParent --sequesterRsrc obs-dstreamy.plugin "$GITHUB_WORKSPACE/dist/$PACKAGE.zip")
+          # The plugin goes into ~/Library/Application Support/obs-studio/plugins/.
+          (cd dist && shasum -a 256 "$PACKAGE.zip" > "$PACKAGE.zip.sha256" && cat "$PACKAGE.zip.sha256")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PACKAGE }}
+          path: dist/${{ env.PACKAGE }}.zip*
+          if-no-files-found: error
+
+  obs-windows:
+    needs: [version, ci-gate, cli]
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PACKAGE: obs-dstreamy-${{ needs.version.outputs.version }}-windows-x64
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain from rust-toolchain.toml
+        working-directory: rust
+        run: rustup toolchain install
+      - name: Locate libclang for bindgen
+        run: |
+          $dll = Get-ChildItem "$env:ProgramFiles\LLVM\bin\libclang.dll" -ErrorAction Stop
+          "LIBCLANG_PATH=$($dll.DirectoryName)" >> $env:GITHUB_ENV
+      - name: Configure, build and stage obs/
+        working-directory: obs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake --preset windows-x64
+          cmake --build --preset windows-x64 -- /consoleLoggerParameters:Summary /noLogo /verbosity:minimal
+          cmake --install build_x64 --config RelWithDebInfo --prefix "$env:RUNNER_TEMP\stage"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dstreamy-${{ needs.version.outputs.version }}-x86_64-pc-windows-msvc
+          path: ${{ runner.temp }}/cli
+      - name: Bundle dstreamy.exe
+        shell: bash
+        env:
+          ARCHIVE: dstreamy-${{ needs.version.outputs.version }}-x86_64-pc-windows-msvc
+        run: |
+          set -euo pipefail
+          cli="$(cygpath -u "$RUNNER_TEMP")/cli"
+          (cd "$cli" && sha256sum -c "$ARCHIVE.zip.sha256")
+          7z e -y "-o$(cygpath -w "$cli/out")" "$(cygpath -w "$cli/$ARCHIVE.zip")" \
+            "$ARCHIVE/dstreamy.exe" "$ARCHIVE/THIRD_PARTY_NOTICES.txt" >/dev/null
+          cp "$cli/out/dstreamy.exe" "$(cygpath -u "$RUNNER_TEMP")/stage/obs-dstreamy/bin/64bit/"
+      - name: Check the staged layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$(cygpath -u "$RUNNER_TEMP")/stage"
+          find "$stage" -print
+          bin="$stage/obs-dstreamy/bin/64bit"
+          "$bin/dstreamy.exe" --version
+          for f in obs-dstreamy.dll dstreamy.exe dstreamy-ui/obs-dstreamy-ui.dll dstreamy-ui/THIRD_PARTY_NOTICES.txt; do
+            test -f "$bin/$f" || { echo "the install lacks obs-dstreamy/bin/64bit/$f"; exit 1; }
+          done
+          python3 "$GITHUB_WORKSPACE/scripts/third-party-notices.py" \
+            --manifest "$GITHUB_WORKSPACE/rust/crates/dstreamy-obs/Cargo.toml" --package dstreamy-obs \
+            --target x86_64-pc-windows-msvc \
+            --append "$bin/dstreamy-ui/THIRD_PARTY_NOTICES.txt" \
+            --append "$(cygpath -u "$RUNNER_TEMP")/cli/out/THIRD_PARTY_NOTICES.txt" \
+            --output "$bin/dstreamy-ui/THIRD_PARTY_NOTICES.txt"
+          if find "$bin" -maxdepth 1 -name '*.dll' ! -name obs-dstreamy.dll | grep .; then
+            echo "libobs would try these as modules: only obs-dstreamy.dll may sit in the module folder"
+            exit 1
+          fi
+          cmake -DTEST_HOOKS=OFF -DWINDOWS=ON "-DLIBRARY=$(cygpath -m "$bin/obs-dstreamy.dll")" \
+            -P "$(cygpath -m "$GITHUB_WORKSPACE")/obs/cmake/common/check_test_hooks.cmake"
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$(cygpath -u "$RUNNER_TEMP")/stage"
+          mkdir -p dist
+          cp LICENSE "$stage/obs-dstreamy/"
+          # The obs-dstreamy folder goes into %ProgramData%\obs-studio\plugins\.
+          (cd "$stage" && 7z a -tzip -mx=9 "$(cygpath -w "$GITHUB_WORKSPACE/dist/$PACKAGE.zip")" obs-dstreamy >/dev/null)
+          (cd dist && sha256sum "$PACKAGE.zip" > "$PACKAGE.zip.sha256" && cat "$PACKAGE.zip.sha256")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PACKAGE }}
+          path: dist/${{ env.PACKAGE }}.zip*
+          if-no-files-found: error
+
+  rehearse:
+    needs: [version, cli, app, obs-linux, obs-macos, obs-windows]
+    if: needs.version.outputs.publish != 'true'
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check the assets the release job would upload
+        run: scripts/check-release-assets.sh "$VERSION" dist
+      - name: Fill the Homebrew formula and cask
+        run: |
+          set -euo pipefail
+          scripts/fill-formula.sh "$VERSION" dist Formula/dstreamy.rb > "$RUNNER_TEMP/dstreamy.rb"
+          scripts/fill-cask.sh "$VERSION" dist Casks/d-streamy.rb > "$RUNNER_TEMP/d-streamy.rb"
+          { echo "Rehearsal of D-Streamy $VERSION. No GitHub release or Homebrew update was published.";
+            echo 'Workflow artifacts were uploaded; signing and notarization may contact Apple when configured.';
+            echo; cat dist/*.sha256; echo
+            echo '### Formula/dstreamy.rb'; echo '```ruby'; cat "$RUNNER_TEMP/dstreamy.rb"; echo '```'
+            echo '### Casks/d-streamy.rb'; echo '```ruby'; cat "$RUNNER_TEMP/d-streamy.rb"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: [version, cli, app, obs-linux, obs-macos, obs-windows]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check the assets
+        run: scripts/check-release-assets.sh "$VERSION" dist
+      - name: Create or update the GitHub release
+        run: |
+          set -euo pipefail
+          cat dist/*.sha256 | tee -a "$GITHUB_STEP_SUMMARY"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "D-Streamy $VERSION" --generate-notes
+          fi
+          gh release upload "$TAG" dist/* --clobber
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+      - name: Fill the Homebrew formula and cask
+        run: |
+          set -euo pipefail
+          scripts/fill-formula.sh "$VERSION" dist Formula/dstreamy.rb > "$RUNNER_TEMP/dstreamy.rb"
+          scripts/fill-cask.sh "$VERSION" dist Casks/d-streamy.rb > "$RUNNER_TEMP/d-streamy.rb"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: lkshrk/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+          persist-credentials: false
+      - name: Push the formula and cask to the tap
+        env:
+          # gh's credential helper hands this to git for the push only; nothing lands in .git/config.
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          mkdir -p tap/Formula tap/Casks
+          cp "$RUNNER_TEMP/dstreamy.rb" tap/Formula/dstreamy.rb
+          cp "$RUNNER_TEMP/d-streamy.rb" tap/Casks/d-streamy.rb
           cd tap
-          git add Casks/d-streamy.rb
+          git add Formula/dstreamy.rb Casks/d-streamy.rb
           if ! git diff --cached --quiet; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git commit -m "d-streamy: bump to ${VERSION}"
+            git commit -m "d-streamy: bump to $VERSION"
             git push
           fi
