@@ -1,0 +1,30 @@
+[package]
+name = "dstreamy-test-producer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+dstreamy-ipc = { path = "../dstreamy-ipc" }
+dstreamy-media = { path = "../dstreamy-media", features = ["openh264"] }
+dstreamy-obs-packet = { path = "../dstreamy-obs-packet" }
+futures-util = { version = "0.3", features = ["sink"] }
+openh264 = "0.9"
+serde_json = "1"
+thiserror.workspace = true
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+unsafe-libopus = "0.2"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "obs-trace-check"
+path = "src/obs_trace_check.rs"
+
+[[bin]]
+name = "mock-producer"
+path = "src/mock_producer.rs"

@@ -1,0 +1,3 @@
+{"type":"event","event":{"event":"state","state":{"state":"stopped","reason":{"reason":"future_reason","detail":1}}}}
+{"type":"event","event":{"event":"state","state":{"state":"future_state","attempt":3}}}
+{"type":"event","event":{"event":"future_event","payload":{"x":1}}}

@@ -1,0 +1,1245 @@
+//! `dstreamy serve`: the command engine behind a local socket, for any number of control clients (ADR 0004).
+
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use dstreamy_core::{Config, lock};
+#[cfg(any(test, feature = "test-hooks"))]
+use dstreamy_discord::SessionEvent;
+use dstreamy_ipc::{ControlCodec, Endpoint, Listener, ProducerCodec, Stream};
+use dstreamy_media::ProducerInfo;
+use futures_util::{FutureExt, SinkExt, StreamExt};
+use serde::Serialize;
+use serde_json::{Value, json};
+use tokio::io::{ReadHalf, WriteHalf};
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
+use tokio::task::JoinSet;
+use tokio::time::timeout;
+use tokio_util::codec::{Encoder, FramedRead, FramedWrite};
+
+use crate::daemon::{COMMANDS, engine_command, id_and_cmd, malformed, request_id};
+use crate::engine::{self, Engine, EngineEvent, Failure, SourceView};
+use crate::output::Out;
+use crate::signals::Signals;
+use crate::stream::FORCED_EXIT;
+use crate::{CliError, Ctx};
+
+mod login;
+mod producer;
+
+pub const PROTOCOL: u64 = 2;
+/// How long a lagged subscriber gets to read its `lagged` error before the connection closes.
+const LAG_FLUSH: Duration = Duration::from_secs(10);
+const CLOSE_FLUSH: Duration = Duration::from_secs(2);
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+/// How often finished commands of disconnected clients are reaped while any are left.
+const ORPHAN_SWEEP: Duration = Duration::from_secs(1);
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `attached` waits for op 12 with the producer's video, which is rate limited to one a second.
+const ANNOUNCE_WAIT: Duration = Duration::from_secs(5);
+const MAX_CONNECTIONS: usize = 64;
+/// Over-cap connections still being told `busy`; beyond this they are dropped unanswered.
+const MAX_REFUSING: usize = 64;
+/// Queued messages plus running commands per connection; reading pauses at this.
+const MAX_IN_FLIGHT: usize = 64;
+pub const DEFAULT_EVENT_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone)]
+pub struct Options {
+    pub endpoint: Option<PathBuf>,
+    pub include_platform: bool,
+    pub event_capacity: usize,
+    /// Enables the hidden test commands; only honoured with the `test-hooks` feature.
+    pub test_hooks: bool,
+    /// Runs instead of this program's own browser login; only honoured with the `test-hooks` feature.
+    pub login_program: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Running,
+    Stopping,
+    Closed,
+}
+
+type TaskSet = JoinSet<()>;
+
+struct Orphan {
+    tasks: TaskSet,
+    _slot: Arc<OwnedSemaphorePermit>,
+}
+
+pub async fn run(ctx: &Ctx, out: &Out, opts: Options) -> Result<ExitCode, CliError> {
+    let config = Config::load(&ctx.paths.config_file)?;
+    engine::external_options(&config.serve)?;
+    let endpoint = match &opts.endpoint {
+        Some(path) => Endpoint::new(path),
+        None => Endpoint::default_for_user()?,
+    };
+    let listener = Listener::bind(&endpoint).await?;
+    out.note(format_args!("listening on {endpoint}"));
+    let engine = Engine::new(
+        ctx,
+        engine::Options {
+            include_platform: opts.include_platform,
+            event_capacity: opts.event_capacity,
+            allow_external: true,
+            ..engine::Options::default()
+        },
+    );
+    #[cfg(feature = "test-hooks")]
+    let login_program = opts.login_program.clone();
+    #[cfg(not(feature = "test-hooks"))]
+    let login_program = None;
+    let login = Arc::new(login::Login::new(ctx, login_program));
+    let (phase_tx, phase) = watch::channel(Phase::Running);
+    // One entry per shutdown command or disconnect, taken by the accept loop at once.
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
+    let (orphans_tx, mut orphans_rx) = mpsc::unbounded_channel::<Orphan>();
+    let (drained_tx, mut drained_rx) = mpsc::channel::<()>(1);
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let refusing = Arc::new(Semaphore::new(MAX_REFUSING));
+    let mut orphans: Vec<Orphan> = Vec::new();
+    let mut sweep = tokio::time::interval(ORPHAN_SWEEP);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut signals = Signals::new();
+    let mut connections = JoinSet::new();
+    let mut next_id = 0u64;
+    let caller = loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => match admit(&slots, &refusing) {
+                    Admit::Serve(slot) => {
+                        next_id += 1;
+                        let conn = Connection {
+                            id: next_id,
+                            engine: engine.clone(),
+                            login: login.clone(),
+                            phase: phase.clone(),
+                            shutdown: shutdown_tx.clone(),
+                            orphans: orphans_tx.clone(),
+                            drained: Some(drained_tx.clone()),
+                            capacity: opts.event_capacity,
+                            test_hooks: opts.test_hooks,
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            slots: slots.clone(),
+                            slot: Arc::new(slot),
+                        };
+                        connections.spawn(conn.run(stream));
+                    }
+                    Admit::Refuse(permit) => {
+                        connections.spawn(refuse(stream, permit));
+                    }
+                    Admit::Drop => drop(stream),
+                },
+                Err(e) => {
+                    tracing::warn!("accepting a connection: {e}");
+                    tokio::time::sleep(ACCEPT_RETRY).await;
+                }
+            },
+            Some(set) = orphans_rx.recv() => {
+                orphans.push(set);
+                reap(&mut orphans);
+            }
+            _ = sweep.tick(), if !orphans.is_empty() => reap(&mut orphans),
+            Some(done) = shutdown_rx.recv() => break Some(done),
+            () = signals.recv() => break None,
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+        }
+    };
+    phase_tx.send_replace(Phase::Stopping);
+    drop(drained_tx);
+    let stopped = async {
+        while drained_rx.recv().await.is_some() {}
+        while let Ok(set) = orphans_rx.try_recv() {
+            orphans.push(set);
+        }
+        for orphan in &mut orphans {
+            orphan.tasks.abort_all();
+            while orphan.tasks.join_next().await.is_some() {}
+        }
+        #[cfg(feature = "test-hooks")]
+        if let Some(gate) = std::env::var_os("DSTREAMY_TEST_SHUTDOWN_GATE").map(PathBuf::from) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while !gate.exists() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        engine.shutdown().await;
+    };
+    let forced = tokio::select! {
+        biased;
+        () = signals.recv() => true,
+        () = stopped => false,
+    };
+    if forced {
+        return Ok(ExitCode::from(FORCED_EXIT));
+    }
+    if let Err(e) = std::fs::remove_file(endpoint.as_path()) {
+        tracing::warn!("removing {endpoint}: {e}");
+    }
+    drop(listener);
+    if let Some(done) = caller {
+        let _ = done.send(());
+    }
+    phase_tx.send_replace(Phase::Closed);
+    let drained = timeout(CLOSE_FLUSH * 2, async {
+        while connections.join_next().await.is_some() {}
+    });
+    if drained.await.is_err() {
+        tracing::debug!("connections still open at exit");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn reap(orphans: &mut Vec<Orphan>) {
+    orphans.retain_mut(|orphan| {
+        while orphan.tasks.try_join_next().is_some() {}
+        !orphan.tasks.is_empty()
+    });
+}
+
+enum Admit {
+    Serve(OwnedSemaphorePermit),
+    Refuse(OwnedSemaphorePermit),
+    Drop,
+}
+
+fn admit(slots: &Arc<Semaphore>, refusing: &Arc<Semaphore>) -> Admit {
+    if let Ok(slot) = slots.clone().try_acquire_owned() {
+        return Admit::Serve(slot);
+    }
+    match refusing.clone().try_acquire_owned() {
+        Ok(permit) => Admit::Refuse(permit),
+        Err(_) => Admit::Drop,
+    }
+}
+
+/// Answers a connection over the cap with `busy` and closes it.
+async fn refuse(stream: Stream, _permit: OwnedSemaphorePermit) {
+    let mut writer = FramedWrite::new(stream, ControlCodec::new());
+    let busy = Message::Error {
+        id: None,
+        code: "busy",
+        message: format!("too many connections (at most {MAX_CONNECTIONS})"),
+    };
+    let _ = timeout(CLOSE_FLUSH, writer.send(&busy)).await;
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Message {
+    Result {
+        id: String,
+        data: Value,
+    },
+    Error {
+        id: Option<String>,
+        code: &'static str,
+        message: String,
+    },
+    Event {
+        event: Value,
+    },
+}
+
+impl Message {
+    fn reply(id: Option<String>, result: Result<Value, Failure>) -> Self {
+        match (id, result) {
+            (Some(id), Ok(data)) => Self::Result { id, data },
+            (id, Ok(_)) => unreachable!("a result always answers a request with id {id:?}"),
+            (id, Err(Failure { code, message })) => Self::Error { id, code, message },
+        }
+    }
+
+    fn event(event: &EngineEvent) -> Self {
+        let event = match event {
+            EngineEvent::Session(event) => serde_json::to_value(event),
+            EngineEvent::Source(state) => {
+                serde_json::to_value(SourceView::from(state)).map(|mut v| {
+                    v["event"] = json!("source");
+                    v
+                })
+            }
+        };
+        Self::Event {
+            event: event.unwrap_or_else(|e| json!({ "event": "error", "message": e.to_string() })),
+        }
+    }
+}
+
+enum Role {
+    Control,
+    Producer(ProducerInfo),
+}
+
+/// What this serve supports beyond protocol 2 as first released; every build reports the same `version`.
+const FEATURES: [&str; 2] = ["start_grace_secs", "status_place"];
+/// Offered only where `login` can open the browser login window.
+pub const BROWSER_LOGIN: &str = "browser_login";
+/// Offered unless the token comes from `DSTREAMY_TOKEN`, which leaves no accounts to manage.
+pub const ACCOUNTS: &str = "accounts";
+
+/// This serve run, for clients that cannot tell runs apart by the endpoint itself (a named pipe has no file).
+fn instance() -> Value {
+    static STARTED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let started = *STARTED.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+    });
+    json!({ "pid": std::process::id(), "started": started })
+}
+
+async fn hello_data(engine: &Engine, login: &login::Login, connection: u64) -> Value {
+    let mut features = FEATURES.to_vec();
+    if login.available() {
+        features.push(BROWSER_LOGIN);
+    }
+    if !Engine::env_token() {
+        features.push(ACCOUNTS);
+    }
+    json!({
+        "protocol": PROTOCOL,
+        "version": env!("CARGO_PKG_VERSION"),
+        "platform": std::env::consts::OS,
+        "connection": connection,
+        "instance": instance(),
+        "features": features,
+        "status": engine.status().await,
+    })
+}
+
+fn handshake(value: &Value) -> Result<(String, Role), (Option<String>, Failure)> {
+    let (fields, id) = request_id(value)?;
+    if fields.get("cmd").and_then(Value::as_str) != Some("hello") {
+        return Err(malformed(Some(id), "the first line must be hello"));
+    }
+    let Some(protocol) = fields.get("protocol").and_then(Value::as_u64) else {
+        return Err(malformed(Some(id), "missing integer field \"protocol\""));
+    };
+    if protocol == 0 || protocol > PROTOCOL {
+        let message =
+            format!("protocol {protocol} is not supported; this service speaks 1 to {PROTOCOL}");
+        return Err((Some(id), Failure::new("unsupported_protocol", message)));
+    }
+    match fields.get("role").and_then(Value::as_str) {
+        Some("control") => Ok((id, Role::Control)),
+        Some("producer") => match producer::hello(fields) {
+            Ok(info) => Ok((id, Role::Producer(info))),
+            Err(failure) => Err((Some(id), failure)),
+        },
+        Some(role) => Err(malformed(Some(id), &format!("unknown role {role:?}"))),
+        None => Err(malformed(Some(id), "missing string field \"role\"")),
+    }
+}
+
+type Reader = FramedRead<ReadHalf<Stream>, ControlCodec>;
+type Writer = FramedWrite<WriteHalf<Stream>, ControlCodec>;
+
+enum End {
+    Eof,
+    Gone,
+    Lagged,
+    Closed,
+}
+
+struct Connection {
+    id: u64,
+    engine: Arc<Engine>,
+    login: Arc<login::Login>,
+    phase: watch::Receiver<Phase>,
+    shutdown: mpsc::UnboundedSender<oneshot::Sender<()>>,
+    /// Commands still running when the client left; the service aborts and awaits them before its engine shuts down.
+    orphans: mpsc::UnboundedSender<Orphan>,
+    /// Dropped once this connection's commands are finished or aborted and awaited.
+    drained: Option<mpsc::Sender<()>>,
+    capacity: usize,
+    test_hooks: bool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    slots: Arc<Semaphore>,
+    slot: Arc<OwnedSemaphorePermit>,
+}
+
+/// Encodes `message` into the writer's buffer, or an `internal` error when it can't be encoded.
+fn queue(writer: &mut Writer, message: Message) {
+    let id = match &message {
+        Message::Result { id, .. } => Some(id.clone()),
+        Message::Error { id, .. } => id.clone(),
+        Message::Event { .. } => None,
+    };
+    if let Err(e) = ControlCodec::new().encode(&message, writer.write_buffer_mut()) {
+        tracing::error!("encoding a control message: {e}");
+        let fallback = Message::Error {
+            id,
+            code: "internal",
+            message: format!("the reply could not be encoded: {e}"),
+        };
+        let _ = ControlCodec::new().encode(&fallback, writer.write_buffer_mut());
+    }
+}
+
+async fn flush_within(writer: &mut Writer, limit: Duration) {
+    let _ = timeout(limit, SinkExt::<&Message>::flush(writer)).await;
+}
+
+impl Connection {
+    async fn run(mut self, stream: Stream) {
+        let (read, write) = tokio::io::split(stream);
+        let mut reader = FramedRead::new(read, ControlCodec::new());
+        let mut writer = FramedWrite::new(write, ControlCodec::new());
+        let first = tokio::select! {
+            first = timeout(HELLO_TIMEOUT, reader.next()) => first,
+            _ = self.phase.wait_for(|p| *p != Phase::Running) => return,
+        };
+        let Ok(Some(Ok(first))) = first else { return };
+        let hello = first
+            .map_err(|e| malformed(None, &e.to_string()))
+            .and_then(|value| handshake(&value));
+        match hello {
+            Ok((id, Role::Control)) => {
+                queue(
+                    &mut writer,
+                    Message::reply(
+                        Some(id),
+                        Ok(hello_data(&self.engine, &self.login, self.id).await),
+                    ),
+                );
+                self.control(reader, writer).await;
+            }
+            Ok((id, Role::Producer(info))) => self.producer(id, info, reader, writer).await,
+            Err((id, failure)) => {
+                queue(&mut writer, Message::reply(id, Err(failure)));
+                flush_within(&mut writer, CLOSE_FLUSH).await;
+            }
+        }
+    }
+
+    async fn producer(
+        mut self,
+        id: String,
+        info: ProducerInfo,
+        reader: Reader,
+        mut writer: Writer,
+    ) {
+        self.drained = None;
+        let declared = (info.width, info.height, info.fps);
+        let attached = self
+            .engine
+            .external()
+            .ok_or(dstreamy_media::AttachError::NoSession)
+            .and_then(|(handle, announced)| {
+                Ok((handle.attach_paused(info)?, handle.state(), announced))
+            });
+        let (attachment, states, mut announced) = match attached {
+            Ok(attached) => attached,
+            Err(e) => {
+                queue(
+                    &mut writer,
+                    Message::reply(Some(id), Err(producer::attach_failure(e))),
+                );
+                flush_within(&mut writer, CLOSE_FLUSH).await;
+                return;
+            }
+        };
+        let op12 = timeout(ANNOUNCE_WAIT, announced.wait_for(|a| *a == declared))
+            .await
+            .is_ok_and(|r| r.is_ok());
+        if !op12 {
+            tracing::warn!(?declared, "the producer's video was not announced in time");
+        }
+        attachment.start_stall_timer();
+        if let Err(e) = ControlCodec::new().encode(
+            &json!({ "attached": attachment.id() }),
+            writer.write_buffer_mut(),
+        ) {
+            tracing::error!("encoding the attached reply: {e}");
+        }
+        let reader = reader.map_decoder(|_| ProducerCodec::new());
+        producer::run(
+            attachment,
+            states,
+            producer::Reports {
+                viewers: self.engine.viewers(),
+                health: self.engine.health(),
+            },
+            reader,
+            writer,
+            self.phase.clone(),
+            CLOSE_FLUSH,
+        )
+        .await;
+    }
+
+    async fn control(&mut self, mut reader: Reader, mut writer: Writer) {
+        let mut events: Option<broadcast::Receiver<EngineEvent>> = None;
+        let mut pending: VecDeque<Message> = VecDeque::new();
+        let mut queued_events = 0usize;
+        // At most MAX_IN_FLIGHT entries: reading pauses at that many pending messages and running commands.
+        let (replies_tx, mut replies) = mpsc::unbounded_channel();
+        let mut inflight = Inflight {
+            next_key: 0,
+            unanswered: Arc::default(),
+            replies: replies_tx,
+        };
+        let mut tasks = JoinSet::new();
+        // A login window belongs to the client that asked for it, so it never outlives that client.
+        let mut logins = JoinSet::new();
+        let mut reading = true;
+        let mut stopping = *self.phase.borrow() != Phase::Running;
+        let mut shutdown: Option<(String, oneshot::Receiver<()>)> = None;
+        let mut late_shutdowns: Vec<String> = Vec::new();
+        #[cfg_attr(not(any(test, feature = "test-hooks")), allow(unused_mut))]
+        let mut muted = false;
+        let end = loop {
+            if writer.write_buffer().is_empty()
+                && let Some(message) = pending.pop_front()
+            {
+                if matches!(message, Message::Event { .. }) {
+                    queued_events -= 1;
+                }
+                queue(&mut writer, message);
+            }
+            let unflushed = !writer.write_buffer().is_empty();
+            if !reading
+                && tasks.is_empty()
+                && logins.is_empty()
+                && shutdown.is_none()
+                && late_shutdowns.is_empty()
+                && pending.is_empty()
+                && !unflushed
+            {
+                break End::Eof;
+            }
+            tokio::select! {
+                biased;
+                changed = self.phase.changed() => {
+                    let phase = if changed.is_ok() { *self.phase.borrow() } else { Phase::Closed };
+                    if phase == Phase::Closed {
+                        break End::Closed;
+                    }
+                    if !stopping {
+                        stopping = true;
+                        tasks.abort_all();
+                        logins.abort_all();
+                        while tasks.join_next().await.is_some() {}
+                        while logins.join_next().await.is_some() {}
+                        fail_unanswered(&mut replies, &inflight.unanswered, &mut pending);
+                        self.drained = None;
+                    }
+                }
+                flushed = SinkExt::<&Message>::flush(&mut writer), if unflushed => {
+                    if flushed.is_err() {
+                        break End::Gone;
+                    }
+                }
+                event = recv(&mut events), if events.is_some() => match event {
+                    Ok(event) => {
+                        if queued_events >= self.capacity {
+                            break End::Lagged;
+                        }
+                        pending.push_back(Message::event(&event));
+                        queued_events += 1;
+                    }
+                    Err(RecvError::Lagged(_)) => break End::Lagged,
+                    Err(RecvError::Closed) => events = None,
+                },
+                Some((id, result)) = replies.recv() => {
+                    pending.push_back(Message::reply(Some(id), result));
+                }
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+                Some(_) = logins.join_next(), if !logins.is_empty() => {}
+                _ = wait(&mut shutdown), if shutdown.is_some() => {
+                    if let Some((id, _)) = shutdown.take() {
+                        pending.push_back(Message::reply(Some(id), Ok(Value::Null)));
+                    }
+                }
+                line = reader.next(), if reading && !muted && pending.len() + tasks.len() + logins.len() < MAX_IN_FLIGHT => match line {
+                    None | Some(Err(_)) => {
+                        reading = false;
+                        logins.abort_all();
+                        if !dstreamy_ipc::HALF_CLOSE {
+                            break End::Gone;
+                        }
+                    }
+                    Some(Ok(Err(e))) => {
+                        let (id, failure) = malformed(None, &e.to_string());
+                        pending.push_back(Message::reply(id, Err(failure)));
+                    }
+                    Some(Ok(Ok(value))) => {
+                        let request = Request::parse(value, self.test_hooks);
+                        match request {
+                            Err((id, failure)) => pending.push_back(Message::reply(id, Err(failure))),
+                            Ok((id, Request::Shutdown)) if stopping => late_shutdowns.push(id),
+                            Ok((id, _)) if stopping => {
+                                pending.push_back(Message::reply(Some(id), Err(shutting_down())));
+                            }
+                            Ok((id, Request::Hello)) => {
+                                pending.push_back(Message::reply(Some(id), Ok(hello_data(&self.engine, &self.login, self.id).await)));
+                            }
+                            Ok((id, Request::Status)) => {
+                                let status = serde_json::to_value(self.engine.status().await)
+                                    .map_err(|e| Failure::new("internal", e.to_string()));
+                                pending.push_back(Message::reply(Some(id), status));
+                            }
+                            Ok((id, Request::Subscribe)) => {
+                                events.get_or_insert_with(|| self.engine.events());
+                                pending.push_back(Message::reply(Some(id), Ok(Value::Null)));
+                            }
+                            Ok((id, Request::Shutdown)) => {
+                                let (done, rx) = oneshot::channel();
+                                let _ = self.shutdown.send(done);
+                                if let Some((earlier, _)) = shutdown.replace((id, rx)) {
+                                    pending.push_back(Message::reply(Some(earlier), Ok(Value::Null)));
+                                }
+                            }
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            Ok((id, Request::Test(hooks::Hook::TestMute))) => {
+                                muted = true;
+                                pending.push_back(Message::reply(Some(id), Ok(Value::Null)));
+                            }
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            Ok((id, Request::Test(hooks::Hook::TestConnections))) => {
+                                let live = MAX_CONNECTIONS - self.slots.available_permits();
+                                pending.push_back(Message::reply(Some(id), Ok(json!({ "live": live }))));
+                            }
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            Ok((id, Request::Test(hook))) => {
+                                let ticket = inflight.track(id);
+                                let engine = self.engine.clone();
+                                tasks.spawn(async move {
+                                    hook.run(&engine).await;
+                                    ticket.answer(Ok(Value::Null));
+                                });
+                            }
+                            Ok((id, Request::Login(params))) => {
+                                let ticket = inflight.track(id);
+                                let engine = self.engine.clone();
+                                let login = self.login.clone();
+                                let slot = self.slot.clone();
+                                logins.spawn(async move {
+                                    ticket.answer(login.run(&engine, params, slot).await);
+                                });
+                            }
+                            Ok((id, Request::Account(request))) => {
+                                let ticket = inflight.track(id);
+                                let engine = self.engine.clone();
+                                tasks.spawn(async move {
+                                    ticket.answer(request.run(&engine).await);
+                                });
+                            }
+                            Ok((id, Request::Engine(command))) => {
+                                let ticket = inflight.track(id);
+                                let engine = self.engine.clone();
+                                let caller = self.id;
+                                let admitted = engine.admit(&command);
+                                tasks.spawn(async move {
+                                    let result = engine
+                                        .handle_admitted(command, Some(caller), admitted)
+                                        .await;
+                                    ticket.answer(result);
+                                });
+                            }
+                        }
+                    }
+                },
+            }
+        };
+        match end {
+            End::Eof | End::Gone | End::Lagged => {
+                drop(logins);
+                let _ = self.orphans.send(Orphan {
+                    tasks,
+                    _slot: self.slot.clone(),
+                });
+                self.drained = None;
+                if matches!(end, End::Lagged) {
+                    let failure =
+                        Failure::new("lagged", "events were not read in time; disconnecting");
+                    queue(&mut writer, Message::reply(None, Err(failure)));
+                    flush_within(&mut writer, LAG_FLUSH).await;
+                }
+            }
+            End::Closed => {
+                tasks.abort_all();
+                logins.abort_all();
+                // An aborted command can still answer until it is joined; joining first keeps its reply.
+                let _ = timeout(CLOSE_FLUSH / 2, async {
+                    while tasks.join_next().await.is_some() {}
+                    while logins.join_next().await.is_some() {}
+                })
+                .await;
+                if let Some(events) = events.as_mut() {
+                    while let Ok(event) = events.try_recv() {
+                        pending.push_back(Message::event(&event));
+                    }
+                }
+                fail_unanswered(&mut replies, &inflight.unanswered, &mut pending);
+                if let Some((id, _)) = shutdown.take() {
+                    pending.push_back(Message::reply(Some(id), Ok(Value::Null)));
+                }
+                for id in late_shutdowns {
+                    pending.push_back(Message::reply(Some(id), Ok(Value::Null)));
+                }
+                for _ in 0..MAX_IN_FLIGHT {
+                    let Some(Some(Ok(line))) = reader.next().now_or_never() else {
+                        break;
+                    };
+                    let (id, result) = match line.map_err(|e| malformed(None, &e.to_string())) {
+                        Err((id, failure)) => (id, Err(failure)),
+                        Ok(value) => match Request::parse(value, self.test_hooks) {
+                            Err((id, failure)) => (id, Err(failure)),
+                            Ok((id, Request::Shutdown)) => (Some(id), Ok(Value::Null)),
+                            Ok((id, _)) => (Some(id), Err(shutting_down())),
+                        },
+                    };
+                    pending.push_back(Message::reply(id, result));
+                }
+                for message in pending {
+                    queue(&mut writer, message);
+                }
+                flush_within(&mut writer, CLOSE_FLUSH).await;
+            }
+        }
+    }
+}
+
+type Answer = (String, Result<Value, Failure>);
+
+/// Commands running for a connection, by key; whoever removes an id answers it.
+struct Inflight {
+    next_key: u64,
+    unanswered: Arc<Mutex<HashMap<u64, String>>>,
+    replies: mpsc::UnboundedSender<Answer>,
+}
+
+impl Inflight {
+    fn track(&mut self, id: String) -> Ticket {
+        let key = self.next_key;
+        self.next_key += 1;
+        lock(&self.unanswered).insert(key, id);
+        Ticket {
+            key,
+            unanswered: self.unanswered.clone(),
+            replies: self.replies.clone(),
+        }
+    }
+}
+
+struct Ticket {
+    key: u64,
+    unanswered: Arc<Mutex<HashMap<u64, String>>>,
+    replies: mpsc::UnboundedSender<Answer>,
+}
+
+impl Ticket {
+    fn answer(self, result: Result<Value, Failure>) {
+        let id = lock(&self.unanswered).remove(&self.key);
+        if let Some(id) = id {
+            let _ = self.replies.send((id, result));
+        }
+    }
+}
+
+/// Queues the replies already sent, then fails every command still unanswered.
+fn fail_unanswered(
+    replies: &mut mpsc::UnboundedReceiver<Answer>,
+    unanswered: &Mutex<HashMap<u64, String>>,
+    pending: &mut VecDeque<Message>,
+) {
+    while let Ok((id, result)) = replies.try_recv() {
+        pending.push_back(Message::reply(Some(id), result));
+    }
+    for (_, id) in lock(unanswered).drain() {
+        pending.push_back(Message::reply(Some(id), Err(shutting_down())));
+    }
+}
+
+fn shutting_down() -> Failure {
+    Failure::new("shutting_down", "service shutting down")
+}
+
+async fn recv(
+    events: &mut Option<broadcast::Receiver<EngineEvent>>,
+) -> Result<EngineEvent, RecvError> {
+    match events {
+        Some(events) => events.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait(shutdown: &mut Option<(String, oneshot::Receiver<()>)>) {
+    match shutdown {
+        Some((_, rx)) => {
+            let _ = rx.await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+enum Request {
+    Hello,
+    Status,
+    Subscribe,
+    Shutdown,
+    Login(login::LoginParams),
+    Account(AccountRequest),
+    #[cfg(any(test, feature = "test-hooks"))]
+    Test(hooks::Hook),
+    Engine(engine::Command),
+}
+
+impl Request {
+    fn parse(value: Value, test_hooks: bool) -> Result<(String, Self), (Option<String>, Failure)> {
+        let mut known: Vec<&str> = COMMANDS.to_vec();
+        known.extend([
+            "status",
+            "subscribe",
+            "login",
+            "accounts",
+            "select_account",
+            "logout_account",
+        ]);
+        #[cfg(any(test, feature = "test-hooks"))]
+        if test_hooks {
+            known.extend(hooks::COMMANDS);
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = test_hooks;
+        let (id, cmd) = id_and_cmd(&value, &known)?;
+        let request = match cmd.as_str() {
+            "hello" => Self::Hello,
+            "status" => Self::Status,
+            "subscribe" => Self::Subscribe,
+            "shutdown" => Self::Shutdown,
+            "login" => match login::LoginParams::parse(value) {
+                Ok(params) => Self::Login(params),
+                Err(failure) => return Err((Some(id), failure)),
+            },
+            "accounts" | "select_account" | "logout_account" => {
+                match AccountRequest::parse(value) {
+                    Ok(request) => Self::Account(request),
+                    Err(failure) => return Err((Some(id), failure)),
+                }
+            }
+            #[cfg(any(test, feature = "test-hooks"))]
+            cmd if hooks::COMMANDS.contains(&cmd) => match hooks::Hook::parse(value) {
+                Ok(hook) => Self::Test(hook),
+                Err(failure) => return Err((Some(id), failure)),
+            },
+            _ => {
+                let (id, command) = engine_command(id, value)?;
+                return Ok((id, Self::Engine(command)));
+            }
+        };
+        Ok((id, request))
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+enum AccountRequest {
+    Accounts,
+    SelectAccount { account: String },
+    LogoutAccount { account: String },
+}
+
+impl AccountRequest {
+    fn parse(value: Value) -> Result<Self, Failure> {
+        let request: Self = serde_json::from_value(value).map_err(engine::invalid_params)?;
+        if let Self::SelectAccount { account } | Self::LogoutAccount { account } = &request {
+            dstreamy_core::accounts::validate_name(account).map_err(engine::invalid_params)?;
+        }
+        Ok(request)
+    }
+
+    async fn run(self, engine: &Engine) -> Result<Value, Failure> {
+        match self {
+            Self::Accounts => engine.accounts().await,
+            Self::SelectAccount { account } => engine.select_account(&account).await,
+            Self::LogoutAccount { account } => engine.logout_account(&account).await,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+mod hooks {
+    use super::*;
+
+    pub const COMMANDS: [&str; 4] = ["test_events", "test_hold", "test_connections", "test_mute"];
+    const MAX_COUNT: u32 = 10_000;
+    const MAX_BYTES: usize = 64 * 1024;
+    const MAX_HOLD_MS: u64 = 10_000;
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "cmd", rename_all = "snake_case")]
+    #[allow(clippy::enum_variant_names)]
+    pub enum Hook {
+        /// `count` non-fatal error events of about `bytes` each, `interval_ms` apart.
+        TestEvents {
+            count: u32,
+            #[serde(default)]
+            bytes: usize,
+            #[serde(default)]
+            interval_ms: u64,
+        },
+        /// Holds the Discord connection until aborted, after an event saying so; releasing it takes `ms`.
+        TestHold { ms: u64 },
+        /// Replies `{"live": n}`, the connections holding a slot.
+        TestConnections,
+        /// Stops reading this connection's lines until the service closes it.
+        TestMute,
+    }
+
+    impl Hook {
+        pub fn parse(value: Value) -> Result<Self, Failure> {
+            let hook: Self = serde_json::from_value(value).map_err(engine::invalid_params)?;
+            match &hook {
+                Self::TestEvents { count, bytes, .. }
+                    if *count > MAX_COUNT || *bytes > MAX_BYTES =>
+                {
+                    Err(engine::invalid_params(format!(
+                        "at most {MAX_COUNT} events of {MAX_BYTES} bytes"
+                    )))
+                }
+                Self::TestHold { ms } if *ms > MAX_HOLD_MS => {
+                    Err(engine::invalid_params(format!("at most {MAX_HOLD_MS} ms")))
+                }
+                _ => Ok(hook),
+            }
+        }
+
+        pub async fn run(self, engine: &Engine) {
+            match self {
+                Self::TestEvents {
+                    count,
+                    bytes,
+                    interval_ms,
+                } => {
+                    let padding = "x".repeat(bytes);
+                    for n in 0..count {
+                        engine.inject_for_tests(SessionEvent::Error {
+                            message: format!("test event {n} {padding}"),
+                            fatal: false,
+                        });
+                        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                    }
+                }
+                Self::TestHold { ms } => {
+                    let held = engine.hold_connection_for_tests(Duration::from_millis(ms));
+                    engine.inject_for_tests(SessionEvent::Error {
+                        message: format!("test hold {}", held.is_some()),
+                        fatal: false,
+                    });
+                    std::future::pending::<()>().await;
+                    drop(held);
+                }
+                Self::TestConnections | Self::TestMute => {}
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rejected(line: &str) -> (Option<String>, &'static str) {
+        match handshake(&serde_json::from_str(line).unwrap()) {
+            Err((id, f)) => (id, f.code),
+            Ok(_) => panic!("{line} was accepted"),
+        }
+    }
+
+    #[test]
+    fn the_handshake_checks_the_protocol_before_the_role() {
+        let ok = r#"{"id":"1","cmd":"hello","role":"control","protocol":2}"#;
+        assert!(handshake(&serde_json::from_str(ok).unwrap()).is_ok());
+        let older = r#"{"id":"1","cmd":"hello","role":"control","protocol":1}"#;
+        assert!(handshake(&serde_json::from_str(older).unwrap()).is_ok());
+        for (line, id, code) in [
+            (
+                r#"{"id":"1","cmd":"hello","role":"bogus","protocol":3}"#,
+                Some("1"),
+                "unsupported_protocol",
+            ),
+            (
+                r#"{"id":"1","cmd":"hello","protocol":2}"#,
+                Some("1"),
+                "malformed",
+            ),
+            (
+                r#"{"id":"1","cmd":"hello","role":"viewer","protocol":2}"#,
+                Some("1"),
+                "malformed",
+            ),
+            (
+                r#"{"id":"1","cmd":"hello","role":"control"}"#,
+                Some("1"),
+                "malformed",
+            ),
+            (
+                r#"{"id":"1","cmd":"status","role":"control","protocol":2}"#,
+                Some("1"),
+                "malformed",
+            ),
+            (
+                r#"{"cmd":"hello","role":"control","protocol":2}"#,
+                None,
+                "malformed",
+            ),
+            (r#"[]"#, None, "malformed"),
+            (
+                r#"{"id":"1","cmd":"hello","role":"control","protocol":0}"#,
+                Some("1"),
+                "unsupported_protocol",
+            ),
+            (
+                r#"{"id":"1","cmd":"hello","role":"producer","protocol":2}"#,
+                Some("1"),
+                "invalid_params",
+            ),
+            (
+                r#"{"id":"1","cmd":"hello","role":"producer","protocol":3}"#,
+                Some("1"),
+                "unsupported_protocol",
+            ),
+        ] {
+            let (got_id, got_code) = rejected(line);
+            assert_eq!((got_id.as_deref(), got_code), (id, code), "{line}");
+        }
+    }
+
+    #[test]
+    fn test_events_exist_only_with_the_hook() {
+        let line = json!({"id": "t", "cmd": "test_events", "count": 1});
+        assert!(matches!(
+            Request::parse(line.clone(), false),
+            Err((
+                Some(_),
+                Failure {
+                    code: "unknown_cmd",
+                    ..
+                }
+            ))
+        ));
+        assert!(matches!(
+            Request::parse(line, true),
+            Ok((_, Request::Test(_)))
+        ));
+    }
+
+    #[test]
+    fn connections_past_both_caps_are_dropped() {
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let refusing = Arc::new(Semaphore::new(MAX_REFUSING));
+        let served: Vec<_> = (0..MAX_CONNECTIONS)
+            .map(|_| match admit(&slots, &refusing) {
+                Admit::Serve(p) => p,
+                _ => panic!("refused below the cap"),
+            })
+            .collect();
+        let refused: Vec<_> = (0..MAX_REFUSING)
+            .map(|_| match admit(&slots, &refusing) {
+                Admit::Refuse(p) => p,
+                _ => panic!("not refused with busy"),
+            })
+            .collect();
+        assert!(matches!(admit(&slots, &refusing), Admit::Drop));
+        drop(refused);
+        assert!(matches!(admit(&slots, &refusing), Admit::Refuse(_)));
+        drop(served);
+        assert!(matches!(admit(&slots, &refusing), Admit::Serve(_)));
+    }
+
+    #[tokio::test]
+    async fn disconnected_commands_keep_their_connection_admission_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let endpoint = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            Endpoint::new(dir.path().join("control.sock"))
+        };
+        #[cfg(windows)]
+        let endpoint = Endpoint::new(format!(r"\\.\pipe\dstreamy-test-{}", std::process::id()));
+        let listener = Listener::bind(&endpoint).await.unwrap();
+        let client = dstreamy_ipc::connect(&endpoint).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let ctx = Ctx::new(
+            dstreamy_core::ConfigPaths::in_dir(dir.path()),
+            "ws://127.0.0.1:1".into(),
+            None,
+        );
+        let engine = Engine::new(
+            &ctx,
+            engine::Options {
+                include_platform: false,
+                ..engine::Options::default()
+            },
+        );
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let _reserved = slots
+            .clone()
+            .acquire_many_owned((MAX_CONNECTIONS - 1) as u32)
+            .await
+            .unwrap();
+        let slot = slots.clone().try_acquire_owned().unwrap();
+        let (_phase_tx, phase) = watch::channel(Phase::Running);
+        let (shutdown, _shutdown_rx) = mpsc::unbounded_channel();
+        let (orphans, mut orphaned) = mpsc::unbounded_channel();
+        let (drained, _drained_rx) = mpsc::channel(1);
+        let connection = Connection {
+            id: 1,
+            engine: engine.clone(),
+            login: Arc::new(login::Login::new(&ctx, None)),
+            phase,
+            shutdown,
+            orphans,
+            drained: Some(drained),
+            capacity: 8,
+            test_hooks: true,
+            slots: slots.clone(),
+            slot: Arc::new(slot),
+        };
+        let running = tokio::spawn(connection.run(stream));
+        let mut client = tokio_util::codec::Framed::new(client, ControlCodec::new());
+        client
+            .send(json!({"id":"hello","cmd":"hello","role":"control","protocol":2}))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap().unwrap()["id"],
+            "hello"
+        );
+        client
+            .send(json!({"id":"sub","cmd":"subscribe"}))
+            .await
+            .unwrap();
+        assert_eq!(client.next().await.unwrap().unwrap().unwrap()["id"], "sub");
+        client
+            .send(json!({"id":"hold","cmd":"test_hold","ms":0}))
+            .await
+            .unwrap();
+        let held = timeout(Duration::from_secs(2), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(held["event"]["message"], "test hold false");
+        drop(client);
+        engine.inject_for_tests(SessionEvent::Error {
+            message: "force a write after peer close".into(),
+            fatal: false,
+        });
+        let orphan = timeout(Duration::from_secs(2), orphaned.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "disconnected pending work released admission capacity"
+        );
+        assert!(matches!(
+            admit(&slots, &Arc::new(Semaphore::new(MAX_REFUSING))),
+            Admit::Refuse(_)
+        ));
+        let mut orphan = orphan;
+        orphan.tasks.abort_all();
+        while orphan.tasks.join_next().await.is_some() {}
+        assert_eq!(slots.available_permits(), 0);
+        let mut finished = vec![orphan];
+        reap(&mut finished);
+        assert!(finished.is_empty());
+        assert_eq!(slots.available_permits(), 1);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn orphan_groups_hold_the_global_cap_until_completion_or_awaited_cancellation() {
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let refusing = Arc::new(Semaphore::new(MAX_REFUSING));
+        let mut orphans = Vec::new();
+        let mut releases = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            let Admit::Serve(slot) = admit(&slots, &refusing) else {
+                panic!("below cap")
+            };
+            let (release, done) = oneshot::channel::<()>();
+            let mut tasks = JoinSet::new();
+            tasks.spawn(async move {
+                let _ = done.await;
+            });
+            orphans.push(Orphan {
+                tasks,
+                _slot: Arc::new(slot),
+            });
+            releases.push(release);
+        }
+        reap(&mut orphans);
+        assert_eq!(orphans.len(), MAX_CONNECTIONS);
+        for _ in 0..MAX_CONNECTIONS {
+            assert!(matches!(admit(&slots, &refusing), Admit::Refuse(_)));
+        }
+        releases.remove(0).send(()).unwrap();
+        orphans[0].tasks.join_next().await.unwrap().unwrap();
+        assert_eq!(slots.available_permits(), 0);
+        reap(&mut orphans);
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(orphans.len(), MAX_CONNECTIONS - 1);
+        for orphan in &mut orphans {
+            orphan.tasks.abort_all();
+            while orphan.tasks.join_next().await.is_some() {}
+        }
+        assert_eq!(slots.available_permits(), 1);
+        reap(&mut orphans);
+        assert!(orphans.is_empty());
+        assert_eq!(slots.available_permits(), MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn test_hooks_are_bounded() {
+        for line in [
+            json!({"id": "t", "cmd": "test_events", "count": 1, "bytes": usize::MAX}),
+            json!({"id": "t", "cmd": "test_events", "count": u32::MAX}),
+            json!({"id": "t", "cmd": "test_hold", "ms": u64::MAX}),
+        ] {
+            assert!(
+                matches!(
+                    Request::parse(line.clone(), true),
+                    Err((
+                        Some(_),
+                        Failure {
+                            code: "invalid_params",
+                            ..
+                        }
+                    ))
+                ),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_event_carries_its_state() {
+        let Message::Event { event } = Message::event(&EngineEvent::Source(
+            dstreamy_media::SourceState::Producing { attachment: 3 },
+        )) else {
+            panic!("not an event");
+        };
+        assert_eq!(
+            event,
+            json!({"event": "source", "state": "producing", "attachment": 3})
+        );
+    }
+}

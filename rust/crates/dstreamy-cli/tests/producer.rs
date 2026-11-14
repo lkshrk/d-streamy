@@ -1,0 +1,1001 @@
+//! `serve` + mock Discord + `mock-producer`, all real processes over the real socket.
+#![cfg(unix)]
+
+mod support;
+
+use std::time::{Duration, Instant};
+
+use dstreamy_cli::engine::ANNOUNCE_INTERVAL;
+use dstreamy_media::{OPUS_SILENCE_FRAME, QUEUE_MAX_BYTES};
+use dstreamy_mock_discord::opcodes::voice::OP_VIDEO;
+use dstreamy_mock_discord::{
+    MOCK_GUILD_ID, MOCK_VOICE_CHANNEL_ID, Recorded, RecordedVideoFrame, VoiceKind,
+};
+use serde_json::{Value, json};
+use support::*;
+
+#[test]
+fn a_producer_attaches_to_an_external_session_and_its_media_decodes() {
+    let h = Harness::new("");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let p = h.producer(&[]);
+    let id = p.attached();
+    c.source("producing", |e| {
+        e["state"] == "producing" && e["attachment"] == id
+    });
+    let recorded = h.stream_media(60, 100);
+    decodes(&stream_video(&recorded), &producer_audio(&recorded));
+    p.wait_line("source event", |v| v["event"]["type"] == "source");
+    p.wait_line("keyframe request", |v| {
+        v["event"]["type"] == "keyframe_request"
+    });
+}
+
+#[test]
+fn hello_errors_no_session_busy_incompatible_and_unsupported_protocol() {
+    let h = Harness::new("");
+    let _s = h.serve();
+    let (status, _) = h.producer(&[]).finish();
+    assert!(!status.success());
+
+    let hello = |line: Value| {
+        let mut c = Client::connect(&h.endpoint());
+        c.send(&line);
+        c.reply("1")
+    };
+    let producer = |protocol: u64, fps: u64| {
+        json!({
+            "id": "1", "cmd": "hello", "role": "producer", "protocol": protocol,
+            "video": {"codec": "h264", "width": 320, "height": 180, "fps": fps},
+            "audio": {"codec": "opus", "sample_rate": 48000, "channels": 2, "frame_ms": 20},
+        })
+    };
+    assert_eq!(hello(producer(2, 30))["code"], "no_session");
+
+    let _c = h.external_session();
+    let first = h.producer(&[]);
+    first.attached();
+    assert_eq!(hello(producer(2, 30))["code"], "busy");
+    let incompatible = hello(producer(2, 25));
+    assert_eq!(incompatible["code"], "incompatible", "{incompatible}");
+    assert!(
+        incompatible["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("video.fps"),
+        "{incompatible}"
+    );
+    assert_eq!(hello(producer(3, 30))["code"], "unsupported_protocol");
+    assert_eq!(hello(producer(0, 30))["code"], "unsupported_protocol");
+
+    let second = h.producer(&[]);
+    second.wait_line("busy", |v| v["hello"]["code"] == "busy");
+    let (status, stderr) = second.finish();
+    assert!(!status.success(), "{stderr}");
+}
+
+fn video_ops(r: &Recorded) -> Vec<(u64, u64, u64)> {
+    r.ops
+        .iter()
+        .filter(|o| o.is(Some(VoiceKind::Stream), OP_VIDEO))
+        .filter_map(|o| o.json())
+        .map(|d| {
+            let s = &d["streams"][0];
+            (
+                s["max_resolution"]["width"].as_u64().unwrap_or(0),
+                s["max_resolution"]["height"].as_u64().unwrap_or(0),
+                s["max_framerate"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect()
+}
+
+fn size_args(w: u64, hgt: u64, fps: u64) -> Vec<String> {
+    [
+        "--width",
+        &w.to_string(),
+        "--height",
+        &hgt.to_string(),
+        "--fps",
+        &fps.to_string(),
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+#[test]
+fn op_12_follows_each_producer_and_comes_before_its_media() {
+    let h = Harness::new("");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let mut seen = h.wait("the session's own op 12", |r| {
+        let ops = video_ops(r);
+        ops.contains(&(320, 180, u64::from(FPS)))
+            .then_some(ops.len())
+    });
+    let mut previous_spawn: Option<Instant> = None;
+    for want in [(640, 360, 15), (160, 90, 30), (640, 360, 15)] {
+        let args = size_args(want.0, want.1, want.2);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let spawned = Instant::now();
+        let mut p = h.producer(&args);
+        let id = p.attached();
+        c.source("producing", |e| e["attachment"] == id);
+        if let Some(previous) = previous_spawn {
+            let waited = previous.elapsed();
+            assert!(
+                waited >= ANNOUNCE_INTERVAL,
+                "attached {waited:?} after the previous producer, before its rate-limited op 12"
+            );
+        }
+        previous_spawn = Some(spawned);
+        // The mock records op 12 asynchronously, so it may land after `attached`.
+        seen = h.wait(&format!("op 12 {want:?}"), |r| {
+            let ops = video_ops(r);
+            ops[seen.min(ops.len())..]
+                .iter()
+                .position(|&op| op == want)
+                .map(|at| seen + at + 1)
+        });
+        p.kill();
+        c.source("detached", |e| e["reason"] == "detached");
+    }
+}
+
+fn paused_long_enough(producing: Instant, announced: Instant, stall: Duration) -> bool {
+    announced
+        .checked_duration_since(producing)
+        .is_some_and(|wait| wait > stall)
+}
+
+#[test]
+fn process_initialization_does_not_count_as_a_paused_attachment() {
+    let previous = Instant::now();
+    let spawned = previous + Duration::from_millis(100);
+    let producing = spawned + Duration::from_millis(800);
+    let announced = producing + Duration::from_millis(100);
+    let stall = Duration::from_millis(500);
+    assert!(paused_long_enough(spawned, announced, stall));
+    assert!(!paused_long_enough(producing, announced, stall));
+    assert!(paused_long_enough(
+        previous + Duration::from_millis(200),
+        announced,
+        stall
+    ));
+}
+
+#[test]
+fn waiting_for_a_rate_limited_op_12_does_not_count_as_a_stall() {
+    const STALL: Duration = Duration::from_millis(500);
+    let h = Harness::new("[serve]\nstall_ms = 500\n");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let mut announced = video_ops(&h.mock.recorded()).len();
+    let mut previous = None;
+    let mut previous_attachment = None;
+    for want in [(640, 360, 15), (160, 90, 30)] {
+        let args = size_args(want.0, want.1, want.2);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut p = h.producer(&args);
+        let source = c.source("paused producer", |e| {
+            e["state"] == "producing" && e["attachment"].as_u64() != previous_attachment
+        });
+        let producing = Instant::now();
+        let id = p.attached();
+        assert_eq!(source["event"]["attachment"], id);
+        previous_attachment = Some(id);
+        let (index, at) = h.wait(&format!("op 12 {want:?}"), |r| {
+            let ops: Vec<_> = r
+                .ops
+                .iter()
+                .filter(|o| o.is(Some(VoiceKind::Stream), OP_VIDEO))
+                .collect();
+            let sizes = video_ops(r);
+            sizes[announced.min(sizes.len())..]
+                .iter()
+                .position(|&op| op == want)
+                .map(|i| (announced + i + 1, ops[announced + i].received_at))
+        });
+        announced = index;
+        if let Some(before) = previous {
+            assert!(
+                producing.duration_since(before) < ANNOUNCE_INTERVAL - STALL,
+                "producer attached too late after the last op 12 to exercise the limiter"
+            );
+            assert!(
+                paused_long_enough(producing, at, STALL),
+                "actual paused attachment was not held longer than the stall limit"
+            );
+        }
+        previous = Some(at);
+        h.wait("media after the op 12", |r| {
+            stream_video(r)
+                .iter()
+                .any(|v| v.received_at >= at)
+                .then_some(())
+        });
+        p.kill();
+        c.source("detached", |e| e["reason"] == "detached");
+    }
+    c.drain();
+    let stalls: Vec<&Value> = c
+        .seen
+        .iter()
+        .filter(|m| m["event"]["event"] == "source" && m["event"]["reason"] == "stalled")
+        .collect();
+    assert!(stalls.is_empty(), "{stalls:?}");
+}
+
+#[test]
+fn producers_cycling_sizes_get_at_most_one_op_12_a_second_and_the_last_size_wins() {
+    let h = Harness::new("");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let before = h.wait("the session's own op 12", |r| {
+        let ops = video_ops(r);
+        ops.contains(&(320, 180, u64::from(FPS)))
+            .then_some(ops.len())
+    });
+    let started = Instant::now();
+    let sizes = [(640, 360, 15), (160, 90, 30)];
+    for i in 0..10 {
+        let (w, hgt, fps) = sizes[i % 2];
+        let args = size_args(w, hgt, fps);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut p = h.producer(&args);
+        p.attached();
+        p.kill();
+        c.source("detached", |e| e["reason"] == "detached");
+    }
+    let elapsed = started.elapsed();
+    let last = sizes[9 % 2];
+    h.wait("the last size announced", |r| {
+        (video_ops(r).last() == Some(&last)).then_some(())
+    });
+    let sent = video_ops(&h.mock.recorded()).len() - before;
+    let allowed = (started.elapsed().as_secs_f64() / 1.0).ceil() as usize + 1;
+    assert!(
+        sent <= allowed,
+        "{sent} op 12 in {elapsed:?} of producer churn; at most {allowed} allowed"
+    );
+}
+
+#[test]
+fn a_producer_restarted_within_grace_continues_the_stream() {
+    let h = Harness::new("[serve]\ngrace_secs = 30\n");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let mut first = h.producer(&[]);
+    let id = first.attached();
+    c.source("producing", |e| {
+        e["state"] == "producing" && e["attachment"] == id
+    });
+    let before = h.stream_media(45, 75);
+    first.kill();
+    c.source("interrupted", |e| {
+        e["state"] == "interrupted" && e["reason"] == "detached"
+    });
+    let silence_before = silence(&before);
+    h.wait("the documented idle silence", |r| {
+        (silence(r) >= silence_before + 5).then_some(())
+    });
+    let second = h.producer(&[]);
+    let id2 = second.attached();
+    assert_ne!(id, id2);
+    c.source("producing again", |e| {
+        e["state"] == "producing" && e["attachment"] == id2
+    });
+    let (v0, a0) = (stream_video(&before).len(), producer_audio(&before).len());
+    let recorded = h.stream_media(v0 + 45, a0 + 75);
+    let video = stream_video(&recorded);
+    let audio = stream_audio(&recorded);
+    increasing(
+        "video",
+        &video.iter().map(|v| v.rtp_timestamp).collect::<Vec<_>>(),
+    );
+    increasing(
+        "audio",
+        &audio.iter().map(|a| a.rtp_timestamp).collect::<Vec<_>>(),
+    );
+    let split = after_gap(&video);
+    assert!(
+        is_keyframe(&video[split].data),
+        "first video after the gap is not an IDR"
+    );
+    decodes(&video[split..], &producer_audio(&recorded)[a0..]);
+    assert_eq!(c.status()["session"]["state"], "streaming");
+}
+
+#[test]
+fn a_producer_that_disconnects_and_reconnects_attaches_again() {
+    let h = Harness::new("");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let p = h.producer(&[
+        "--disconnect-after",
+        "1500",
+        "--reconnect",
+        "1",
+        "--duration",
+        "4000",
+    ]);
+    let first = p.attached();
+    p.wait_line("disconnect", |v| v["fault"] == "disconnect");
+    c.source("interrupted", |e| {
+        e["state"] == "interrupted" && e["reason"] == "detached"
+    });
+    let second = c.source("producing again", |e| {
+        e["state"] == "producing" && e["attachment"] != first
+    });
+    assert!(second["event"]["attachment"].as_u64() > Some(first));
+    let (status, stderr) = p.finish();
+    assert!(status.success(), "{stderr}");
+}
+
+#[test]
+fn without_a_restart_the_session_stops_with_capture_ended_after_grace() {
+    let h = Harness::new("[serve]\ngrace_secs = 2\n");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let mut p = h.producer(&[]);
+    p.attached();
+    h.stream_media(15, 25);
+    // kill() also reaps and joins readers; serve's grace starts at the disconnect, before that returns.
+    let killed = Instant::now();
+    p.kill();
+    let stopped = c.until("stopped", |m| m["event"]["state"]["state"] == "stopped");
+    assert_eq!(
+        stopped["event"]["state"]["reason"],
+        json!({"reason": "capture_ended"})
+    );
+    assert!(
+        killed.elapsed() >= Duration::from_secs(2),
+        "{:?}",
+        killed.elapsed()
+    );
+}
+
+fn silence(r: &Recorded) -> usize {
+    r.audio
+        .iter()
+        .filter(|a| a.kind == VoiceKind::Stream && a.data == OPUS_SILENCE_FRAME)
+        .count()
+}
+
+/// Polls `status` until the source has been interrupted for at least `ms`.
+fn interrupted_for(c: &mut Client, ms: u64) {
+    let started = Instant::now();
+    loop {
+        let status = c.status();
+        if status["source"]["for_ms"].as_u64() >= Some(ms) {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "still not interrupted for {ms} ms: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn detached_reason(h: &Harness, kind: &str) -> Value {
+    let p = h.producer(&["--corrupt", kind, "--corrupt-after", "700"]);
+    p.attached();
+    let detached = p.wait_line("detached", |v| v["event"]["type"] == "detached");
+    let (status, stderr) = p.finish();
+    assert!(!status.success(), "{kind}: {stderr}");
+    detached["event"].clone()
+}
+
+#[test]
+fn each_corruption_detaches_with_its_reason_and_the_session_stays_in_grace() {
+    let h = Harness::new("[serve]\ngrace_secs = 30\n");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    for (kind, reason, message) in [
+        ("no-start-code", "incompatible", "not Annex B"),
+        (
+            "idr-without-flag",
+            "incompatible",
+            "not flagged as a keyframe",
+        ),
+        ("keyframe-without-sps", "incompatible", "no SPS"),
+        ("pts-ne-dts", "incompatible", "B-frames are enabled"),
+        ("opus-40ms", "incompatible", "not 20 ms"),
+        ("oversized", "oversized", "exceeds"),
+    ] {
+        let detached = detached_reason(&h, kind);
+        assert_eq!(detached["reason"], reason, "{kind}: {detached}");
+        assert!(
+            detached["message"].as_str().unwrap().contains(message),
+            "{kind}: {detached}"
+        );
+        c.source(&format!("interrupted after {kind}"), |e| {
+            e["state"] == "interrupted" && e["reason"] == "detached"
+        });
+        assert_eq!(c.status()["session"]["state"], "streaming", "{kind}");
+    }
+}
+
+#[test]
+fn a_session_stop_detaches_stopped_and_a_shutdown_detaches_shutdown() {
+    let h = Harness::new("");
+    let s = h.serve();
+    let mut c = h.external_session();
+    let p = h.producer(&[]);
+    p.attached();
+    c.send(&json!({"id": "stop", "cmd": "stop"}));
+    assert_eq!(c.reply("stop")["type"], "result");
+    let detached = p.wait_line("detached", |v| v["event"]["type"] == "detached");
+    assert_eq!(detached["event"]["reason"], "stopped", "{detached}");
+    let message = detached["event"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("another OBS") && !message.contains("dstreamy stop"),
+        "the producer learns who could have stopped the session: {detached}"
+    );
+    assert_eq!(detached["event"]["code"], "requested", "{detached}");
+    drop(p);
+
+    let mut c = h.external_session();
+    let p = h.producer(&[]);
+    p.attached();
+    c.send(&json!({"id": "bye", "cmd": "shutdown"}));
+    let detached = p.wait_line("detached", |v| v["event"]["type"] == "detached");
+    assert_eq!(detached["event"]["reason"], "shutdown", "{detached}");
+    let (status, stderr) = s.finish();
+    assert!(status.success(), "{stderr}");
+}
+
+#[test]
+fn a_session_that_stops_on_its_own_detaches_its_producer_stopped() {
+    let h = Harness::new("");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let p = h.producer(&[]);
+    p.attached();
+    h.stream_media(10, 15);
+    assert!(
+        h.mock
+            .voice_state_from_other_session(MOCK_GUILD_ID, Some(MOCK_VOICE_CHANNEL_ID))
+    );
+    c.until("stopped", |m| m["event"]["state"]["state"] == "stopped");
+    let detached = p.wait_line("detached", |v| v["event"]["type"] == "detached");
+    assert_eq!(detached["event"]["reason"], "stopped", "{detached}");
+    assert_eq!(
+        detached["event"]["message"], "another device of this account joined voice",
+        "the producer learns why the session stopped: {detached}"
+    );
+    assert_eq!(detached["event"]["code"], "voice_taken_over", "{detached}");
+    let again = h.producer(&[]);
+    let reply = again.wait_line("hello reply", |v| v.get("hello").is_some());
+    assert_eq!(reply["hello"]["code"], "no_session", "{reply}");
+}
+
+#[test]
+fn a_stalled_producer_shows_interrupted_stalled_then_producing() {
+    let h = Harness::new("[serve]\nstall_ms = 500\n");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let p = h.producer(&["--stall-after", "1500", "--stall-for", "1500"]);
+    let id = p.attached();
+    c.source("producing", |e| e["state"] == "producing");
+    p.wait_line("stall", |v| v["fault"] == "stall");
+    let stalled_at = Instant::now();
+    let stalled = c.source("stalled", |e| {
+        e["state"] == "interrupted" && e["reason"] == "stalled"
+    });
+    // The event's `for_ms` is the time from the last frame to the stall.
+    let for_ms = stalled["event"]["for_ms"].as_u64().unwrap();
+    assert!(
+        (400..1_500).contains(&for_ms),
+        "stalled {for_ms} ms after the last frame, expected about stall_ms = 500"
+    );
+    let status = c.status();
+    assert_eq!(status["source"]["state"], "interrupted", "{status}");
+    assert_eq!(status["source"]["reason"], "stalled", "{status}");
+    assert!(stalled_at.elapsed() < Duration::from_millis(1_500));
+    c.source("producing after the stall", |e| {
+        e["state"] == "producing" && e["attachment"] == id
+    });
+    p.wait_line("resume", |v| v["fault"] == "resume");
+    assert_eq!(c.status()["source"]["state"], "producing");
+}
+
+#[test]
+fn a_mock_pli_reaches_the_producer_as_a_keyframe_request() {
+    let h = Harness::new("");
+    let _s = h.serve();
+    let _c = h.external_session();
+    let p = h.producer(&[]);
+    p.attached();
+    h.stream_media(30, 50);
+    std::thread::sleep(Duration::from_millis(700));
+    let count = |p: &Proc| {
+        p.lines()
+            .iter()
+            .filter(|v| v["event"]["type"] == "keyframe_request")
+            .count()
+    };
+    let before = count(&p);
+    let sent = Instant::now();
+    assert!(h.rt.block_on(h.mock.send_pli(VoiceKind::Stream)));
+    let deadline = sent + Duration::from_secs(2);
+    while count(&p) == before {
+        assert!(
+            Instant::now() < deadline,
+            "no keyframe_request within 2 s of the PLI"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn audio_and_video_stay_aligned_across_a_producer_restart() {
+    let h = Harness::new("[serve]\nidle = \"none\"\n");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let mut recorded = None;
+    let mut sent = Vec::new();
+    for n in 0..3 {
+        let mut p = h.producer(&["--report-sent"]);
+        let id = p.attached();
+        c.source("producing", |e| e["attachment"] == id);
+        let (v0, a0) = recorded.as_ref().map_or((0, 0), |r: &Recorded| {
+            (stream_video(r).len(), producer_audio(r).len())
+        });
+        recorded = Some(h.stream_media(v0 + 45, a0 + 75));
+        if n < 2 {
+            p.kill();
+            c.source("interrupted", |e| e["state"] == "interrupted");
+            interrupted_for(&mut c, 600);
+        }
+        sent.push(p.lines());
+    }
+    let recorded = recorded.unwrap();
+    let video: Vec<&RecordedVideoFrame> = stream_video(&recorded);
+    let audio = producer_audio(&recorded);
+    let video_ts: Vec<u32> = video.iter().map(|v| v.rtp_timestamp).collect();
+    let audio_ts: Vec<u32> = audio.iter().map(|a| a.rtp_timestamp).collect();
+    let (vr, ar) = (
+        runs(&video_ts, 90_000, 500_000),
+        runs(&audio_ts, 48_000, 500_000),
+    );
+    assert_eq!(
+        (vr.len(), ar.len()),
+        (3, 3),
+        "attachments: video {vr:?}, audio {ar:?}"
+    );
+    for &v in &vr[1..] {
+        assert!(
+            is_keyframe(&video[v].data),
+            "video {v} after a restart is not an IDR"
+        );
+    }
+    let frame_us = 1_000_000 / i64::from(FPS);
+    let end = |r: &[usize], i: usize, len: usize| r.get(i + 1).copied().unwrap_or(len);
+    for (i, sent) in sent.iter().enumerate() {
+        let v = &video[vr[i]..end(&vr, i, video.len())];
+        let a = &audio[ar[i]..end(&ar, i, audio.len())];
+        let vs = shift_us(
+            v.iter().map(|f| (f.data.as_slice(), f.rtp_timestamp)),
+            sent,
+            true,
+            90_000,
+        );
+        let as_ = shift_us(
+            a.iter().map(|f| (f.data.as_slice(), f.rtp_timestamp)),
+            sent,
+            false,
+            48_000,
+        );
+        let (Some(vs), Some(as_)) = (vs, as_) else {
+            panic!("attachment {i}: too few recorded frames matched what was sent");
+        };
+        assert!(
+            (as_ - vs).abs() <= frame_us,
+            "attachment {i}: serve moved audio by {as_} µs and video by {vs} µs; one frame is {frame_us} µs"
+        );
+    }
+}
+
+/// Peak resident memory of `pid`, in KiB.
+#[cfg(target_os = "linux")]
+fn peak_rss_kib(pid: u32) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .expect("VmHWM in /proc/<pid>/status")
+}
+
+/// Peak physical footprint of `pid`, in KiB.
+#[cfg(target_os = "macos")]
+fn peak_rss_kib(pid: u32) -> u64 {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: `info` is a writable `rusage_info_v4`, the flavor asked for.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid as i32,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
+    };
+    assert_eq!(rc, 0, "proc_pid_rusage({pid})");
+    // SAFETY: filled by the successful call above.
+    unsafe { info.assume_init() }.ri_lifetime_max_phys_footprint / 1024
+}
+
+struct Overload {
+    peak_rss_kib: u64,
+    /// The session's `StreamStats`; the pump drops into these when it falls behind.
+    session: Value,
+    source: Value,
+    depths: Vec<u64>,
+    keyframe_requests: usize,
+    sent_bytes: u64,
+}
+
+impl Overload {
+    fn dropped(&self) -> u64 {
+        let sum =
+            |v: &Value, keys: &[&str]| keys.iter().map(|k| v[k].as_u64().unwrap()).sum::<u64>();
+        sum(
+            &self.session,
+            &["video_frames_dropped", "audio_frames_dropped"],
+        ) + sum(&self.source, &["dropped_video", "dropped_audio"])
+    }
+
+    /// Video frames serve took from the producer: sent, or dropped by the pump or the source.
+    fn video_received(&self) -> u64 {
+        ["video_frames_sent", "video_frames_dropped"]
+            .iter()
+            .map(|k| self.session[k].as_u64().unwrap())
+            .sum::<u64>()
+            + self.source["dropped_video"].as_u64().unwrap()
+    }
+}
+
+fn overload_run_with(burst: Option<u32>, secs: u64, extra: &[&str]) -> Overload {
+    let h = Harness::new("");
+    let s = h.serve();
+    let mut c = h.external_session();
+    let mut args = vec!["--duration".to_owned(), (secs * 1000).to_string()];
+    if let Some(factor) = burst {
+        args.extend(["--burst".to_owned(), factor.to_string()]);
+    }
+    let mut args: Vec<&str> = args.iter().map(String::as_str).collect();
+    args.extend(extra);
+    let p = h.producer(&args);
+    p.attached();
+    let mut depths = Vec::new();
+    let started = Instant::now();
+    let end = started + Duration::from_secs(secs);
+    let mut last = Value::Null;
+    while Instant::now() < end && !p.exited() {
+        let status = c.try_status().unwrap_or_else(|e| {
+            panic!(
+                "burst {burst:?}: status {} at {:?}: {e}; producer exited: {}; last status {last}",
+                depths.len() + 1,
+                started.elapsed(),
+                p.exited()
+            )
+        });
+        depths.push(status["source"]["stats"]["queued"].as_u64().unwrap());
+        last = status;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let lines = p.lines.clone();
+    let (status, stderr) = p.finish();
+    assert!(status.success(), "{stderr}");
+    let lines = lines.lock().unwrap().clone();
+    let keyframe_requests = lines
+        .iter()
+        .filter(|v| v["event"]["type"] == "keyframe_request")
+        .count();
+    let outcome = lines.iter().find_map(|v| v["outcome"].as_str());
+    assert_eq!(outcome, Some("Finished"), "{lines:?}");
+    let sent_bytes = lines
+        .iter()
+        .find_map(|v| v["sent_bytes"].as_u64())
+        .expect("mock-producer reports the bytes it sent");
+    let status = c.status();
+    c.drain();
+    let run = Overload {
+        keyframe_requests,
+        sent_bytes,
+        peak_rss_kib: peak_rss_kib(s.pid()),
+        session: status["stats"].clone(),
+        source: status["source"]["stats"].clone(),
+        depths,
+    };
+    eprintln!(
+        "burst {burst:?}: sent {} KiB, serve peak RSS {} KiB, session {}, source {}",
+        run.sent_bytes / 1024,
+        run.peak_rss_kib,
+        run.session,
+        run.source
+    );
+    run
+}
+
+fn assert_within_capacity(run: &Overload) {
+    let capacity = dstreamy_media::FRAME_CHANNEL_CAPACITY as u64;
+    assert!(
+        run.source["max_queued"].as_u64().unwrap() <= capacity,
+        "source queue reached {}",
+        run.source
+    );
+    assert!(
+        run.depths.iter().all(|&d| d <= capacity),
+        "{:?}",
+        run.depths
+    );
+}
+
+// Process code, stacks and allocator arenas account for up to 96 MiB beyond the queue and 40 in-flight frame copies.
+const RSS_PROCESS_SLACK_KIB: u64 = 96 * 1024;
+
+#[test]
+fn a_burst_10_producer_keeps_serve_memory_bounded() {
+    let pad = 2 << 20;
+    let bound_kib = (QUEUE_MAX_BYTES as u64 + 40 * pad) / 1024 + RSS_PROCESS_SLACK_KIB;
+    let target = (bound_kib + bound_kib / 2) * 1024;
+    let started = Instant::now();
+    let burst = overload_run_with(
+        Some(10),
+        60,
+        &[
+            "--pad-keyframes",
+            &pad.to_string(),
+            "--until-bytes",
+            &target.to_string(),
+        ],
+    );
+    assert_within_capacity(&burst);
+    let real_time = u64::from(FPS) * started.elapsed().as_secs();
+    assert!(
+        burst.video_received() > 5 * real_time,
+        "serve took {} video frames in {:?}, not 5x real time ({real_time}); session {}, source {}",
+        burst.video_received(),
+        started.elapsed(),
+        burst.session,
+        burst.source
+    );
+    assert!(
+        burst.sent_bytes >= target,
+        "sent {} of {target} bytes",
+        burst.sent_bytes
+    );
+    assert!(
+        burst.peak_rss_kib <= bound_kib,
+        "serve peak RSS {} KiB exceeds the fixed {bound_kib} KiB bound",
+        burst.peak_rss_kib
+    );
+}
+
+#[test]
+fn a_producer_faster_than_serve_can_send_is_dropped_not_buffered() {
+    let pad = 2 << 20;
+    let bound_kib = (QUEUE_MAX_BYTES as u64 + 40 * pad) / 1024 + RSS_PROCESS_SLACK_KIB;
+    let target = (bound_kib + bound_kib / 2) * 1024;
+    let flood = overload_run_with(
+        Some(200),
+        60,
+        &[
+            "--pad-keyframes",
+            &pad.to_string(),
+            "--until-bytes",
+            &target.to_string(),
+        ],
+    );
+    assert_within_capacity(&flood);
+    assert!(
+        flood.dropped() > 0,
+        "no drops: {} {}",
+        flood.session,
+        flood.source
+    );
+    assert!(
+        flood.sent_bytes >= target,
+        "sent {} of {target} bytes",
+        flood.sent_bytes
+    );
+    assert!(
+        flood.peak_rss_kib <= bound_kib,
+        "serve peak RSS {} KiB exceeds the fixed {bound_kib} KiB bound",
+        flood.peak_rss_kib
+    );
+}
+
+#[test]
+fn a_flood_of_8_mib_keyframes_keeps_serve_memory_bounded() {
+    let pad = (8 << 20) - 64;
+    let bound_kib = (QUEUE_MAX_BYTES as u64 + 40 * (8 << 20)) / 1024 + RSS_PROCESS_SLACK_KIB;
+    let target = (bound_kib + bound_kib / 2) * 1024 + (16 << 20);
+    let flood = overload_run_with(
+        Some(50),
+        120,
+        &[
+            "--pad-keyframes",
+            &pad.to_string(),
+            "--until-bytes",
+            &target.to_string(),
+        ],
+    );
+    assert_within_capacity(&flood);
+    let source_lost = flood.source["dropped_video"].as_u64().unwrap();
+    assert!(source_lost > 0, "source never overflowed: {}", flood.source);
+    let requested = flood.source["overflow_keyframe_requests"].as_u64().unwrap();
+    assert!(
+        requested > 0,
+        "no overflow keyframe request: {}",
+        flood.source
+    );
+    assert!(flood.keyframe_requests > 0, "no producer keyframe request");
+    assert!(
+        flood.sent_bytes >= target,
+        "sent {} of {target} bytes",
+        flood.sent_bytes
+    );
+    assert!(
+        flood.peak_rss_kib <= bound_kib,
+        "serve peak RSS {} KiB exceeds the fixed {bound_kib} KiB bound",
+        flood.peak_rss_kib
+    );
+}
+
+#[test]
+fn a_stalled_producer_is_replaced_by_the_next_hello() {
+    let h = Harness::new("[serve]\nstall_ms = 500\n");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let first = h.producer(&["--stall-after", "1000", "--stall-for", "4000"]);
+    let id = first.attached();
+    let before = h.stream_media(15, 25);
+    c.source("stalled", |e| {
+        e["state"] == "interrupted" && e["reason"] == "stalled"
+    });
+    let second = h.producer(&[]);
+    let id2 = second.attached();
+    assert_ne!(id, id2);
+    let detached = first.wait_line("detached", |v| v["event"]["type"] == "detached");
+    assert_eq!(detached["event"]["reason"], "replaced", "{detached}");
+    c.source("producing again", |e| {
+        e["state"] == "producing" && e["attachment"] == id2
+    });
+    let (v0, a0) = (stream_video(&before).len(), producer_audio(&before).len());
+    let recorded = h.stream_media(v0 + 30, a0 + 50);
+    let video = stream_video(&recorded);
+    assert!(is_keyframe(&video[after_gap(&video)].data));
+    assert_eq!(c.status()["source"]["attachment"], id2);
+}
+
+#[test]
+fn a_stop_publishes_source_detached_last() {
+    let h = Harness::new("");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let p = h.producer(&[]);
+    let id = p.attached();
+    c.source("producing", |e| {
+        e["state"] == "producing" && e["attachment"] == id
+    });
+    c.send(&json!({"id": "stop", "cmd": "stop"}));
+    assert_eq!(c.reply("stop")["type"], "result");
+    c.source("detached after stop", |e| e["state"] == "detached");
+    assert!(c.status()["source"].is_null());
+}
+
+#[test]
+fn health_follows_attached_and_grace_adds_no_audio_dropouts() {
+    let h = Harness::new("[serve]\ngrace_secs = 30\n");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let first = h.producer(&["--duration", "2500"]);
+    first.attached();
+    h.stream_media(30, 50);
+    let last = first.wait_line("health", |v| {
+        v["event"]["type"] == "health" && v["event"]["audio_dropouts"].is_number()
+    });
+    let dropouts = last["event"]["audio_dropouts"].as_u64().unwrap();
+    c.source("interrupted", |e| {
+        e["state"] == "interrupted" && e["reason"] == "detached"
+    });
+    for _ in 0..3 {
+        c.until("a health interval without a producer", |m| {
+            m["event"]["event"] == "health"
+        });
+    }
+    let second = h.producer(&[]);
+    second.attached();
+    let health = second.wait_line("health", |v| v["event"]["type"] == "health");
+    let lines = second.lines();
+    let at = |pred: &dyn Fn(&Value) -> bool| lines.iter().position(pred).unwrap();
+    assert!(
+        at(&|v| v.get("hello").is_some()) < at(&|v| v["event"]["type"] == "health"),
+        "{lines:?}"
+    );
+    assert_eq!(health["event"]["reconnecting"], false, "{health}");
+    assert_eq!(
+        health["event"]["audio_dropouts"], dropouts,
+        "intervals without a producer are not dropouts: {health}"
+    );
+}
+
+#[test]
+fn a_discord_reconnect_keeps_the_producer_and_loses_no_frames() {
+    let h = Harness::new("");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    let p = h.producer(&[]);
+    let id = p.attached();
+    let before = h.stream_media(30, 50);
+    // 4006 is not resumable, so the session reconnects the stream instead of resuming in place.
+    assert!(h.mock.drop_voice(VoiceKind::Stream, Some(4006)));
+    c.until("reconnecting", |m| {
+        m["event"]["state"]["state"] == "reconnecting"
+    });
+    c.until("streaming again", |m| {
+        m["event"]["state"]["state"] == "streaming"
+    });
+    let (v0, a0) = (stream_video(&before).len(), producer_audio(&before).len());
+    let recorded = h.stream_media(v0 + 30, a0 + 50);
+    let video = stream_video(&recorded);
+    let audio = stream_audio(&recorded);
+    increasing(
+        "video",
+        &video.iter().map(|v| v.rtp_timestamp).collect::<Vec<_>>(),
+    );
+    increasing(
+        "audio",
+        &audio.iter().map(|a| a.rtp_timestamp).collect::<Vec<_>>(),
+    );
+    let status = c.status();
+    assert_eq!(status["source"]["state"], "producing", "{status}");
+    assert_eq!(status["source"]["attachment"], id, "{status}");
+    let stats = &status["source"]["stats"];
+    assert_eq!(
+        (
+            stats["skipped"].as_u64(),
+            stats["dropped_video"].as_u64(),
+            stats["dropped_audio"].as_u64()
+        ),
+        (Some(0), Some(0), Some(0)),
+        "the source queue bridges the reconnect: {status}"
+    );
+    assert!(
+        !p.lines().iter().any(|v| v["event"]["type"] == "detached"),
+        "the producer was detached by the reconnect"
+    );
+}
+
+#[test]
+fn producer_health_reports_the_negotiated_encryption_state() {
+    for version in [0, 1] {
+        let h = Harness::with_mock(
+            "",
+            dstreamy_mock_discord::MockConfig {
+                dave_protocol_version: version,
+                ..dstreamy_mock_discord::MockConfig::default()
+            },
+        );
+        let _s = h.serve();
+        let _c = h.external_session();
+        let p = h.producer(&[]);
+        p.attached();
+        let health = p.wait_line("negotiated encryption health", |v| {
+            v["event"]["type"] == "health" && v["event"]["dave_protocol_version"] == version
+        });
+        assert_eq!(
+            health["event"]["e2ee"],
+            if version == 0 {
+                "unencrypted"
+            } else {
+                "encrypted"
+            },
+            "{health}"
+        );
+    }
+}

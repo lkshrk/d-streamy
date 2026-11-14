@@ -1,0 +1,173 @@
+//! One live session per account, held with an OS file lock that dies with the process.
+
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, thiserror::Error)]
+pub enum LockError {
+    #[error("another dstreamy session is live{}", pid.map(|p| format!(" (pid {p})")).unwrap_or_default())]
+    Held { pid: Option<u32> },
+    #[error("session lock {}: {source}", path.display())]
+    Io { path: PathBuf, source: io::Error },
+    #[error("account {0} was removed by another command; see `dstreamy account list`")]
+    AccountGone(String),
+}
+
+/// Released when dropped, or by the OS when the process dies.
+#[derive(Debug)]
+pub struct SessionLock {
+    file: File,
+    pid_file: PathBuf,
+}
+
+impl SessionLock {
+    /// `dir` is the account's directory, or the config directory for a token without an account.
+    pub fn acquire(dir: &Path) -> Result<Self, LockError> {
+        let lock_file = dir.join("session.lock");
+        let pid_file = dir.join("session.pid");
+        let io_err = |path: &Path| {
+            let path = path.to_owned();
+            move |source| LockError::Io { path, source }
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_file)
+            .map_err(io_err(&lock_file))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(LockError::Held {
+                    pid: read_pid(&pid_file),
+                });
+            }
+            Err(TryLockError::Error(e)) => return Err(io_err(&lock_file)(e)),
+        }
+        fs::write(&pid_file, format!("{}\n", std::process::id())).map_err(io_err(&pid_file))?;
+        Ok(Self { file, pid_file })
+    }
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        // Runs before the lock file closes, so it never deletes the next holder's PID.
+        let _ = fs::remove_file(&self.pid_file);
+        // Closing alone leaves it held while a child forked before its exec still has the descriptor.
+        let _ = self.file.unlock();
+    }
+}
+
+fn read_pid(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_acquire_is_refused_with_the_pid_until_the_first_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = dir.path().join("nested");
+        fs::create_dir(&paths).unwrap();
+        let first = SessionLock::acquire(&paths).unwrap();
+        let pid = read_pid(&dir.path().join("nested/session.pid"));
+        assert_eq!(pid, Some(std::process::id()));
+
+        let err = SessionLock::acquire(&paths).unwrap_err();
+        assert!(
+            matches!(err, LockError::Held { pid: Some(p) } if p == std::process::id()),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "another dstreamy session is live (pid {})",
+                std::process::id()
+            )
+        );
+
+        drop(first);
+        assert!(!dir.path().join("nested/session.pid").exists());
+        let again = SessionLock::acquire(&paths).unwrap();
+        drop(again);
+        SessionLock::acquire(&paths).unwrap();
+    }
+
+    #[test]
+    fn a_dropped_lock_is_free_while_a_copy_of_its_descriptor_lives() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = dir.path();
+        let held = SessionLock::acquire(paths).unwrap();
+        let forked_copy = held.file.try_clone().unwrap();
+        drop(held);
+        SessionLock::acquire(paths).unwrap();
+        drop(forked_copy);
+    }
+
+    #[test]
+    fn a_held_lock_without_a_pid_file_names_no_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = dir.path();
+        let _held = SessionLock::acquire(paths).unwrap();
+        fs::remove_file(dir.path().join("session.pid")).unwrap();
+        let err = SessionLock::acquire(paths).unwrap_err();
+        assert!(matches!(err, LockError::Held { pid: None }), "{err:?}");
+        assert_eq!(err.to_string(), "another dstreamy session is live");
+    }
+
+    #[test]
+    fn two_accounts_lock_apart_and_one_account_twice_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::Ctx {
+            paths: dstreamy_core::ConfigPaths::in_dir(dir.path()),
+            gateway_url: String::new(),
+            account: None,
+        };
+        let accounts = ctx.paths.accounts();
+        accounts.save("a", "tok-a", None).unwrap();
+        accounts.save("b", "tok-b", None).unwrap();
+        let a = dstreamy_core::TokenSource::Account("a".into());
+        let b = dstreamy_core::TokenSource::Account("b".into());
+        let held_a = crate::accounts::session_lock(&ctx, &a).unwrap();
+        let held_b = crate::accounts::session_lock(&ctx, &b).unwrap();
+        assert!(matches!(
+            crate::accounts::session_lock(&ctx, &a),
+            Err(LockError::Held { .. })
+        ));
+        let legacy = crate::accounts::session_lock(&ctx, &dstreamy_core::TokenSource::Env).unwrap();
+        assert!(matches!(
+            crate::accounts::session_lock(&ctx, &dstreamy_core::TokenSource::Legacy),
+            Err(LockError::Held { .. })
+        ));
+        assert!(dir.path().join("accounts/a/session.lock").exists());
+        drop((held_a, held_b, legacy));
+        crate::accounts::session_lock(&ctx, &a).unwrap();
+    }
+
+    #[test]
+    fn a_removed_account_is_not_recreated_by_its_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::Ctx {
+            paths: dstreamy_core::ConfigPaths::in_dir(&dir.path().join("cfg")),
+            gateway_url: String::new(),
+            account: None,
+        };
+        let accounts = ctx.paths.accounts();
+        accounts.save("a", "tok", None).unwrap();
+        accounts.remove("a").unwrap();
+        let a = dstreamy_core::TokenSource::Account("a".into());
+        let err = crate::accounts::session_lock(&ctx, &a).unwrap_err();
+        assert!(matches!(err, LockError::AccountGone(_)), "{err:?}");
+        assert!(!accounts.account_dir("a").exists());
+        accounts.save("a", "tok", None).unwrap();
+        fs::remove_file(accounts.token_file("a")).unwrap();
+        assert!(matches!(
+            crate::accounts::session_lock(&ctx, &a),
+            Err(LockError::AccountGone(_))
+        ));
+        crate::accounts::session_lock(&ctx, &dstreamy_core::TokenSource::Env).unwrap();
+    }
+}

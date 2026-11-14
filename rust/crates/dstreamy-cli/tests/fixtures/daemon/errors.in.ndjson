@@ -1,0 +1,14 @@
+not json
+{"id":"2","cmd":"bogus"}
+{"cmd":"hello"}
+{"id":"4","cmd":"channels"}
+{"id":"5","cmd":"stop"}
+{"id":"6","cmd":"update","fps":30}
+{"id":"7","cmd":"guilds"}
+{"id":"8","cmd":"set_token","token":"wrong-token"}
+{"id":"9","cmd":"set_token","token":"mock-user-token"}
+{"id":"10","cmd":"channels","guild_id":"999"}
+{"id":"11","cmd":"start","guild_id":"200000000000000001","channel_id":"300000000000000001","target":"test-pattern","fps":24}
+{"id":"12","cmd":"start","guild_id":"200000000000000001","channel_id":"999","target":"test-pattern"}
+{"id":"13","cmd":"start","guild_id":"200000000000000001","channel_id":"300000000000000001","target":"test-pattern","crop":{"x":0,"y":0,"width":0,"height":10}}
+{"id":"14","cmd":"shutdown"}

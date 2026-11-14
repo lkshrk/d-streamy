@@ -1,0 +1,1784 @@
+//! `serve` + mock Discord + `mock-producer --replay`: real OBS traces converted by `dstreamy-obs-packet`.
+//!
+//! `DSTREAMY_TRACE_REPLAY_STRICT=1` fails on the first inconclusive replay instead of retrying it.
+#![cfg(unix)]
+
+mod support;
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+use dstreamy_discord::stream::StreamOptions;
+use dstreamy_media::annexb;
+use dstreamy_mock_discord::{
+    FIRST_FRAME_DAVE_DROP, Recorded, RecordedAudioFrame, RecordedVideoFrame, VoiceKind,
+};
+use dstreamy_test_producer::sync::{
+    self, H264LumaDecoder, LumaFrame, MarkerPair, OpusMonoDecoder, SAMPLE_RATE, TONE_HZ,
+};
+use dstreamy_test_producer::trace::{Converted, Trace};
+use serde_json::Value;
+use support::*;
+
+const VIDEO_HZ: i64 = 90_000;
+const AUDIO_HZ: i64 = 48_000;
+const PACING_SLACK_US: i64 = 20_000;
+const JITTER_MARGIN_US: i64 = 10_000;
+const STALL_TICK: Duration = Duration::from_millis(2);
+const STALL_MIN: Duration = Duration::from_millis(10);
+// The restart trace repeats frames 9 and 11, so 15 frames leave MIN_MEDIAN_FRAMES + 3 unique payloads.
+const MIN_BASELINE_FRAMES: usize = 15;
+/// The fewest matched frames a median lag is taken from.
+const MIN_MEDIAN_FRAMES: usize = 10;
+const REPLAY_ATTEMPTS: usize = 3;
+/// The most frames serve's source queue may hold while a producer sends at a trace's own pace; a quiet run peaks at 2.
+const SOURCE_QUEUE_BOUND: u64 = 8;
+
+/// Held for the whole of each test that replays through serve, so replays never share the CPU.
+fn exclusive() -> MutexGuard<'static, ()> {
+    static ONE: Mutex<()> = Mutex::new(());
+    ONE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn strict() -> bool {
+    std::env::var_os("DSTREAMY_TRACE_REPLAY_STRICT").is_some_and(|v| v == "1")
+}
+
+fn traces_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../obs/tests/traces")
+}
+
+fn uses_b_frames(name: &str) -> bool {
+    name.contains("-bf2-") || name.contains("-bfunset-")
+}
+
+/// Every committed trace, read at test time so a new trace directory is covered without a code change.
+fn traces() -> Vec<(String, PathBuf, Trace)> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(traces_dir())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs.into_iter()
+        .map(|d| {
+            let name = d.file_name().unwrap().to_string_lossy().into_owned();
+            let trace = Trace::load(&d).unwrap();
+            (name, d, trace)
+        })
+        .collect()
+}
+
+fn positive(name: &str, trace: &Trace) -> bool {
+    !uses_b_frames(name) && trace.audio_codec() == "opus"
+}
+
+/// One frame the producer sends, as `dstreamy-obs-packet` converts it.
+struct Sent {
+    key: Vec<u8>,
+    pts_us: i64,
+    dts_usec: i64,
+}
+
+struct Expected {
+    fps: i64,
+    video: Vec<Sent>,
+    audio: Vec<Sent>,
+}
+
+/// The transport rewrites the SPS and start codes, so video frames are matched on their slice NAL units.
+fn slices(au: &[u8]) -> Vec<u8> {
+    annexb::nal_units(au)
+        .filter(|n| matches!(annexb::h264_nal_type(n), Some(1 | 5)))
+        .flatten()
+        .copied()
+        .collect()
+}
+
+fn expected(trace: &Trace) -> Expected {
+    let (mut video, mut audio) = (Vec::new(), Vec::new());
+    for r in trace.clone().replay() {
+        let r = r.expect("positive trace converts");
+        match r.frame {
+            Converted::Video { data, pts_us, .. } => video.push(Sent {
+                key: slices(&data),
+                pts_us,
+                dts_usec: r.dts_usec,
+            }),
+            Converted::Audio { data, pts_us } => audio.push(Sent {
+                key: data,
+                pts_us,
+                dts_usec: r.dts_usec,
+            }),
+        }
+    }
+    Expected {
+        fps: i64::from(trace.fps().unwrap()),
+        video,
+        audio,
+    }
+}
+
+/// Recorded frames paired with what was sent; payloads sent more than once are left out.
+fn matched<'a, F>(
+    recorded: &[&'a F],
+    key: impl Fn(&F) -> Vec<u8>,
+    sent: &'a [Sent],
+) -> Vec<(&'a F, &'a Sent)> {
+    let mut by_key: HashMap<&[u8], Option<&Sent>> = HashMap::new();
+    for s in sent {
+        by_key
+            .entry(&s.key)
+            .and_modify(|v| *v = None)
+            .or_insert(Some(s));
+    }
+    recorded
+        .iter()
+        .filter_map(|f| Some((*f, (*by_key.get(key(f).as_slice())?)?)))
+        .collect()
+}
+
+fn median(mut v: Vec<i64>) -> i64 {
+    assert!(
+        v.len() >= MIN_MEDIAN_FRAMES,
+        "only {} frames matched what was sent",
+        v.len()
+    );
+    v.sort_unstable();
+    v[v.len() / 2]
+}
+
+/// Output pts minus input pts per track: equal on both tracks when `serve` kept A/V alignment.
+fn shifts(
+    video: &[&RecordedVideoFrame],
+    audio: &[&RecordedAudioFrame],
+    want: &Expected,
+) -> (i64, i64) {
+    let v = matched(video, |f| slices(&f.data), &want.video);
+    let a = matched(audio, |f| f.data.clone(), &want.audio);
+    (
+        median(
+            v.iter()
+                .map(|(f, s)| rtp_us(f.rtp_timestamp, VIDEO_HZ) - s.pts_us)
+                .collect(),
+        ),
+        median(
+            a.iter()
+                .map(|(f, s)| rtp_us(f.rtp_timestamp, AUDIO_HZ) - s.pts_us)
+                .collect(),
+        ),
+    )
+}
+
+/// Catches `serve` moving one track against the other; a skew in the conversion itself only the markers can see.
+fn assert_av_aligned(
+    video: &[&RecordedVideoFrame],
+    audio: &[&RecordedAudioFrame],
+    want: &Expected,
+    what: &str,
+) {
+    let (v, a) = shifts(video, audio, want);
+    let frame_us = 1_000_000 / want.fps;
+    assert!(
+        (a - v).abs() <= frame_us,
+        "{what}: serve moved audio by {a} µs and video by {v} µs; one frame is {frame_us} µs"
+    );
+}
+
+type Stall = (Instant, Instant);
+
+/// Spans in which a `STALL_TICK` timer task on the mock's runtime, whose workers stamp `received_at`, woke over `STALL_MIN` late.
+struct StallCanary(Arc<Mutex<Vec<Stall>>>);
+
+impl StallCanary {
+    fn start(rt: &tokio::runtime::Runtime) -> Self {
+        let spans = Arc::new(Mutex::new(Vec::new()));
+        let sink = spans.clone();
+        rt.spawn(async move {
+            loop {
+                let before = Instant::now();
+                tokio::time::sleep(STALL_TICK).await;
+                let after = Instant::now();
+                if after - before > STALL_TICK + STALL_MIN {
+                    sink.lock().unwrap().push((before, after));
+                }
+            }
+        });
+        Self(spans)
+    }
+
+    fn stalls(&self) -> Vec<Stall> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// A replay that measured stalls of the runner made inconclusive, with why.
+#[derive(Debug)]
+struct Stalled(String);
+
+/// Arrival at the mock follows the trace's libobs dts, except during or just after a stall of the mock's runtime.
+fn assert_paced<F>(
+    recorded: &[&F],
+    key: impl Fn(&F) -> Vec<u8>,
+    at: impl Fn(&F) -> Instant,
+    sent: &[Sent],
+    frame_us: i64,
+    stalls: &[Stall],
+    what: &str,
+) {
+    paced(recorded, key, at, sent, frame_us, stalls, what)
+        .unwrap_or_else(|Stalled(e)| panic!("{e}"));
+}
+
+/// As `assert_paced`, but stalls that would excuse too much of the trace leave the check inconclusive.
+fn paced<F>(
+    recorded: &[&F],
+    key: impl Fn(&F) -> Vec<u8>,
+    at: impl Fn(&F) -> Instant,
+    sent: &[Sent],
+    frame_us: i64,
+    stalls: &[Stall],
+    what: &str,
+) -> Result<(), Stalled> {
+    let pairs = matched(recorded, key, sent);
+    let (f0, s0) = pairs[0];
+    let slack = PACING_SLACK_US.max(frame_us);
+    let (first, last) = (at(f0), at(pairs[pairs.len() - 1].0));
+    let clipped = |(from, to): Stall| (from.max(first), to.min(last));
+    let window = |(from, to): Stall| (from, to + (to - from) + Duration::from_micros(slack as u64));
+    let stalls: Vec<Stall> = stalls
+        .iter()
+        .copied()
+        .filter(|&s| window(s).1 >= first && s.0 <= last)
+        .collect();
+    let stalled: Duration = stalls
+        .iter()
+        .map(|&s| {
+            let (from, to) = clipped(s);
+            to.saturating_duration_since(from)
+        })
+        .sum();
+    let longest = stalls
+        .iter()
+        .map(|&(from, to)| to - from)
+        .max()
+        .unwrap_or_default();
+    let mut windows: Vec<Stall> = stalls.iter().copied().map(window).collect();
+    windows.sort();
+    let mut excused = Duration::ZERO;
+    let mut covered_to = first;
+    for &w in &windows {
+        let (from, to) = clipped(w);
+        excused += to.saturating_duration_since(from.max(covered_to));
+        covered_to = covered_to.max(to);
+    }
+    let after_stall = |t: Instant| windows.iter().any(|&(from, to)| t >= from && t <= to);
+    // The latest window end and the longest stall among the windows `t` falls in.
+    let stall_at = |t: Instant| {
+        stalls
+            .iter()
+            .filter(|&&s| {
+                let (from, to) = window(s);
+                t >= from && t <= to
+            })
+            .map(|&(from, to)| (window((from, to)).1, to - from))
+            .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)))
+    };
+    let lag = |(f, s): &(&F, &Sent)| {
+        let arrived = at(f).duration_since(at(f0)).as_micros() as i64;
+        arrived - (s.dts_usec - s0.dts_usec)
+    };
+    let unexcused: Vec<_> = pairs.iter().filter(|(f, _)| !after_stall(at(f))).collect();
+    if unexcused.len() < MIN_MEDIAN_FRAMES && pairs.len() >= MIN_MEDIAN_FRAMES {
+        return Err(Stalled(format!(
+            "{what}: only {} of {} frames arrived outside a stall of the mock's runtime, too few for a baseline; {}",
+            unexcused.len(),
+            pairs.len(),
+            stall_summary(&stalls, first)
+        )));
+    }
+    let mid = median(unexcused.iter().map(|p| lag(p)).collect());
+    // Late frames within one stall length after its window belong to that stall's backlog, bounded by the first.
+    let mut checked = Vec::new();
+    let mut tail: Option<(Instant, Duration, Option<i64>)> = None;
+    let mut previous = first;
+    for p in &pairs {
+        let t = at(p.0);
+        let deviation = lag(p) - mid;
+        if let Some((end, len)) = stall_at(t) {
+            tail = Some((end, len, None));
+        } else if let Some((end, len, ceiling)) = tail
+            && deviation > slack
+            && deviation <= ceiling.unwrap_or(len.as_micros() as i64)
+            && t <= end + len
+        {
+            excused += t.saturating_duration_since(previous);
+            tail = Some((end, len, ceiling.or(Some(deviation + JITTER_MARGIN_US))));
+        } else {
+            tail = None;
+            checked.push(p);
+        }
+        previous = t;
+    }
+    let span = last - first;
+    eprintln!(
+        "{what}: pace checked on {} of {} frames, {} left out after {} stalls of {stalled:?} in all, longest {longest:?}, excusing {excused:?} of {span:?}",
+        checked.len(),
+        pairs.len(),
+        pairs.len() - checked.len(),
+        stalls.len()
+    );
+    if excused * 4 > span {
+        return Err(Stalled(format!(
+            "{what}: stalls of the mock's runtime would excuse {excused:?} of the {span:?} trace, over a quarter; {}",
+            stall_summary(&stalls, first)
+        )));
+    }
+    assert!(
+        checked.len() * 2 >= pairs.len(),
+        "{what}: only {} of {} frames arrived outside a stall of the mock's runtime or its catch-up; {}",
+        checked.len(),
+        pairs.len(),
+        stall_summary(&stalls, first)
+    );
+    let off: Vec<i64> = checked
+        .iter()
+        // The reference frame's lag is 0 by construction, so a late reference would count as its own outlier.
+        .filter(|(f, _)| !std::ptr::eq(*f, f0))
+        .map(|p| lag(p))
+        .filter(|l| (l - mid).abs() > slack)
+        .collect();
+    let largest = checked
+        .iter()
+        .filter(|(f, _)| !std::ptr::eq(*f, f0))
+        .map(|p| (lag(p) - mid).abs())
+        .max()
+        .unwrap_or(0);
+    eprintln!("{what}: largest deviation from the median lag {largest} µs, slack {slack} µs");
+    let deviations: Vec<i64> = off.iter().map(|l| l - mid).collect();
+    assert!(
+        off.is_empty(),
+        "{what}: {} of {} checked frames off the trace's dts pace by more than {slack} µs from the median lag {mid} µs: lags {off:?}, deviations {deviations:?}",
+        off.len(),
+        checked.len()
+    );
+    Ok(())
+}
+
+fn luma_frames(video: &[&RecordedVideoFrame]) -> Vec<LumaFrame> {
+    let mut decoder = H264LumaDecoder::new().unwrap();
+    let mut frames = Vec::new();
+    for (i, v) in video.iter().enumerate() {
+        frames.extend(
+            decoder
+                .decode(&v.data, rtp_us(v.rtp_timestamp, VIDEO_HZ))
+                .unwrap_or_else(|e| panic!("video {i} does not decode: {e}")),
+        );
+    }
+    frames.extend(decoder.finish().unwrap());
+    frames
+}
+
+fn pcm(audio: &[&RecordedAudioFrame]) -> Vec<f32> {
+    let mut opus = OpusMonoDecoder::new().unwrap();
+    let mut pcm = Vec::new();
+    for (i, a) in audio.iter().enumerate() {
+        let samples = opus
+            .decode(&a.data)
+            .unwrap_or_else(|e| panic!("audio {i} does not decode: {e}"));
+        assert_eq!(samples.len(), 960, "audio {i}: 20 ms");
+        pcm.extend(samples);
+    }
+    pcm
+}
+
+fn consecutive(name: &str, ts: &[u32], step: u32) {
+    for (i, w) in ts.windows(2).enumerate() {
+        assert_eq!(
+            w[1].wrapping_sub(w[0]),
+            step,
+            "{name} RTP step at {i}: {} then {}",
+            w[0],
+            w[1]
+        );
+    }
+}
+
+fn tone_is_440(pcm: &[f32], beeps: &[i64], start_us: i64, what: &str) {
+    let quiet = sync::quiet_spans(pcm, start_us, beeps, SAMPLE_RATE);
+    let longest = quiet
+        .iter()
+        .max_by_key(|s| s.len())
+        .expect("audio outside the beeps");
+    let tone = sync::goertzel_amplitude(longest, TONE_HZ, SAMPLE_RATE);
+    let off: Vec<f32> = [220.0, 330.0, 660.0, 880.0]
+        .iter()
+        .map(|&f| sync::goertzel_amplitude(longest, f, SAMPLE_RATE))
+        .collect();
+    assert!(
+        tone > 0.02 && off.iter().all(|&o| o < tone / 4.0),
+        "{what}: 440 Hz amplitude {tone}, off-frequency {off:?}"
+    );
+}
+
+/// Flash/beep pairs on `serve`'s own timeline, each beep within a quarter frame of its flash.
+fn markers(
+    video: &[&RecordedVideoFrame],
+    audio: &[&RecordedAudioFrame],
+    fps: i64,
+    what: &str,
+) -> Vec<MarkerPair> {
+    if video.is_empty() || audio.is_empty() {
+        return Vec::new();
+    }
+    let frames = luma_frames(video);
+    let flashes = sync::flash_onsets(&frames);
+    let pcm = pcm(audio);
+    let start_us = rtp_us(audio[0].rtp_timestamp, AUDIO_HZ);
+    let beeps = sync::beep_onsets(&pcm, start_us, SAMPLE_RATE);
+    tone_is_440(&pcm, &beeps, start_us, what);
+    if flashes.is_empty() || beeps.is_empty() {
+        return Vec::new();
+    }
+    let frame_us = 1_000_000 / fps;
+    let video_span = (frames[0].pts_us, frames.last().unwrap().pts_us);
+    let audio_span = (
+        start_us,
+        start_us + sync::samples_to_us(pcm.len(), SAMPLE_RATE),
+    );
+    let pairs = sync::align(&flashes, &beeps, video_span, audio_span, frame_us)
+        .unwrap_or_else(|e| panic!("{what}: {e}; flashes {flashes:?}, beeps {beeps:?}"));
+    sync::check_offsets(&pairs, frame_us / 2, frame_us / 4)
+        .unwrap_or_else(|e| panic!("{what}: {e}; pairs {pairs:?}"));
+    pairs
+}
+
+/// Tolerates one first audio packet lost to receive-side track reordering, so only `dave_wire_order` guards the sender's nonce order.
+fn start_drops(recorded: &Recorded, what: &str) -> usize {
+    let tolerated = format!("{FIRST_FRAME_DAVE_DROP}audio");
+    let drops = &recorded.dropped_frames;
+    assert!(
+        drops.len() <= 1 && drops.iter().all(|d| d.starts_with(&tolerated)),
+        "{what}: {drops:?}"
+    );
+    drops.len()
+}
+
+/// One whole replay at the mock: frame and packet counts, decoding, RTP steps, pacing, A/V alignment and markers.
+fn check_replay(
+    video: &[&RecordedVideoFrame],
+    audio: &[&RecordedAudioFrame],
+    want: &Expected,
+    lost_audio: usize,
+    stalls: &[Stall],
+    what: &str,
+) -> Result<Vec<MarkerPair>, Stalled> {
+    assert_eq!(
+        video.len(),
+        want.video.len(),
+        "{what}: video frames at the mock"
+    );
+    assert_eq!(
+        audio.len(),
+        want.audio.len() - lost_audio,
+        "{what}: audio packets at the mock"
+    );
+    assert_eq!(
+        audio[0].data, want.audio[lost_audio].key,
+        "{what}: lost audio other than the first packet"
+    );
+    let video_ts: Vec<u32> = video.iter().map(|v| v.rtp_timestamp).collect();
+    let audio_ts: Vec<u32> = audio.iter().map(|a| a.rtp_timestamp).collect();
+    consecutive(
+        &format!("{what} video"),
+        &video_ts,
+        (VIDEO_HZ / want.fps) as u32,
+    );
+    consecutive(&format!("{what} audio"), &audio_ts, 960);
+    assert_eq!(
+        luma_frames(video).len(),
+        video.len(),
+        "{what}: decoded frames"
+    );
+    let frame_us = 1_000_000 / want.fps;
+    paced(
+        video,
+        |f| slices(&f.data),
+        |f| f.received_at,
+        &want.video,
+        frame_us,
+        stalls,
+        &format!("{what} video"),
+    )?;
+    paced(
+        audio,
+        |f| f.data.clone(),
+        |f| f.received_at,
+        &want.audio,
+        frame_us,
+        stalls,
+        &format!("{what} audio"),
+    )?;
+    assert_av_aligned(video, audio, want, what);
+    let pairs = markers(video, audio, want.fps, what);
+    assert!(
+        pairs.len() >= 4,
+        "{what}: only {} markers: {pairs:?}",
+        pairs.len()
+    );
+    Ok(pairs)
+}
+
+fn monotonic(recorded: &Recorded) {
+    increasing(
+        "video",
+        &stream_video(recorded)
+            .iter()
+            .map(|v| v.rtp_timestamp)
+            .collect::<Vec<_>>(),
+    );
+    increasing(
+        "audio",
+        &stream_audio(recorded)
+            .iter()
+            .map(|a| a.rtp_timestamp)
+            .collect::<Vec<_>>(),
+    );
+}
+
+fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Result<(), Stalled> {
+    let want = expected(trace);
+    let h = Harness::new("");
+    let canary = StallCanary::start(&h.rt);
+    let serve = h.serve();
+    let mut c = h.external_session();
+    let before_replay = Instant::now();
+    let p = h.replay(dir, &[]);
+    let id = p.attached();
+    let window = send_window(before_replay, Instant::now(), &want);
+    c.source("producing", |e| {
+        e["state"] == "producing" && e["attachment"] == id
+    });
+    let (frames, packets) = (want.video.len(), want.audio.len());
+    let deadline = Instant::now() + (window.1 - window.0) + T;
+    let mut sent_plis = 0;
+    let recorded = loop {
+        if plis && sent_plis < 40 && h.rt.block_on(h.mock.send_pli(VoiceKind::Stream)) {
+            sent_plis += 1;
+        }
+        let r = h.mock.recorded();
+        let lost = r
+            .dropped_frames
+            .iter()
+            .filter(|d| d.starts_with(&format!("{FIRST_FRAME_DAVE_DROP}audio")))
+            .count();
+        if stream_video(&r).len() >= frames && producer_audio(&r).len() + lost >= packets {
+            break r;
+        }
+        if Instant::now() >= deadline {
+            let counts = format!(
+                "{name}: {} of {frames} video and {} of {packets} audio frames arrived, dropped {:?}",
+                stream_video(&r).len(),
+                producer_audio(&r).len(),
+                r.dropped_frames
+            );
+            let stalls: Vec<Stall> = canary
+                .stalls()
+                .into_iter()
+                .filter(|&(from, to)| to > window.0 && from < window.1)
+                .collect();
+            match c.try_status() {
+                Ok(s) => {
+                    serve_kept_pace(&s, &stalls, window, want.fps, &counts)?;
+                    panic!(
+                        "{counts}; session {}; source {}",
+                        s["stats"], s["source"]["stats"]
+                    )
+                }
+                Err(e) => {
+                    let connection = c.connection_report();
+                    let exit = serve.exit_report();
+                    if exit.starts_with("exited") {
+                        // The stderr reader may still be copying a dying serve's last lines.
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                    let log = h.serve_log();
+                    let tail: Vec<&str> = log.lines().rev().take(30).collect();
+                    panic!(
+                        "{counts}; {e}; {connection}; serve {exit}; the end of serve's log:\n{}",
+                        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+                    )
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(if plis { 50 } else { 100 }));
+    };
+    let lines = p.lines.clone();
+    let (status, stderr) = p.finish();
+    assert!(status.success(), "{name}: {stderr}");
+    let lines = lines.lock().unwrap().clone();
+    let lost_audio = start_drops(&recorded, name);
+    if plis {
+        let requests = lines
+            .iter()
+            .filter(|v| v["event"]["type"] == "keyframe_request")
+            .count();
+        assert!(
+            sent_plis >= 20 && requests >= 3,
+            "{sent_plis} PLIs gave {requests} keyframe requests at the producer"
+        );
+    }
+    monotonic(&recorded);
+    serve_kept_pace(&c.status(), &canary.stalls(), window, want.fps, name)?;
+    check_replay(
+        &stream_video(&recorded),
+        &producer_audio(&recorded),
+        &want,
+        lost_audio,
+        &canary.stalls(),
+        name,
+    )
+    .map(drop)
+}
+
+/// From just before the producer starts until its last frame is due, at the trace's dts pace from its attachment.
+fn send_window(before_replay: Instant, attached: Instant, want: &Expected) -> (Instant, Instant) {
+    let dts = || want.video.iter().chain(&want.audio).map(|s| s.dts_usec);
+    let span = dts().max().unwrap_or(0) - dts().min().unwrap_or(0);
+    (
+        before_replay,
+        attached + Duration::from_micros(span.unsigned_abs()),
+    )
+}
+
+/// Serve's drops came from its video queue overflowing, not from send or transport errors, and stalls explain the overflow.
+fn overflow_explained(
+    status: &Value,
+    stalls: &[Stall],
+    window: (Instant, Instant),
+    fps: i64,
+) -> bool {
+    let stats = &status["stats"];
+    stats["last_error"].is_null()
+        && status["source"]["stats"]["dropped_video"]
+            .as_u64()
+            .unwrap_or(0)
+            == 0
+        && status["source"]["stats"]["dropped_audio"]
+            .as_u64()
+            .unwrap_or(0)
+            == 0
+        && stats["audio_frames_dropped"].as_u64().unwrap_or(0) == 0
+        && stats["video_queue_overflows"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+        && stalls_fill_queue(stalls, window, fps)
+}
+
+/// Whether stalls of at least a frame inside `window`, close enough together, add up to serve's video queue.
+fn stalls_fill_queue(stalls: &[Stall], (first, last): (Instant, Instant), fps: i64) -> bool {
+    let frame = Duration::from_micros((1_000_000 / fps.max(1)) as u64);
+    let queue = frame * StreamOptions::default().max_queued_video as u32;
+    let mut clipped: Vec<Stall> = stalls
+        .iter()
+        .filter(|&&(from, to)| to - from >= frame)
+        .map(|&(from, to)| (from.max(first), to.min(last)))
+        .filter(|&(from, to)| to > from)
+        .collect();
+    clipped.sort();
+    clipped.iter().any(|&(start, _)| {
+        let reach = start + queue * 2;
+        let stalled: Duration = clipped
+            .iter()
+            .filter(|&&(from, _)| from >= start && from < reach)
+            .map(|&(from, to)| to.min(reach) - from)
+            .sum();
+        stalled >= queue
+    })
+}
+
+fn annotation(line: &str) -> String {
+    let escaped = line
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A");
+    format!("::warning title=trace replay retried::{escaped}")
+}
+
+/// Prints past the test harness's output capture and, in CI, to the step summary; `annotate` also raises a GitHub warning.
+fn report(line: &str, annotate: bool) {
+    use std::io::Write;
+    static REPORTS: Mutex<()> = Mutex::new(());
+    let _one_at_a_time = REPORTS.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
+    if std::env::var_os("GITHUB_ACTIONS").is_none() {
+        return;
+    }
+    if annotate {
+        let _ = std::io::stdout().write_all(format!("{}\n", annotation(line)).as_bytes());
+    }
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY")
+        && let Ok(mut summary) = std::fs::OpenOptions::new().append(true).open(path)
+    {
+        let _ = summary.write_all(format!("- trace replay: {line}\n").as_bytes());
+    }
+}
+
+/// Replays each trace in turn until it passes once; an inconclusive replay is retried unless `strict`.
+fn replay_until_conclusive(traces: &[(String, PathBuf, Trace)], plis: bool) {
+    let attempts = if strict() { 1 } else { REPLAY_ATTEMPTS };
+    let mut failed = Vec::new();
+    for (name, dir, trace) in traces {
+        let mut reasons = Vec::new();
+        for attempt in 1..=attempts {
+            match replay_through_serve(name, dir, trace, plis) {
+                Ok(()) => {
+                    report(
+                        &format!("{name}: replay_retries_total={}", reasons.len()),
+                        false,
+                    );
+                    break;
+                }
+                Err(Stalled(why)) => {
+                    if attempt < attempts {
+                        report(
+                            &format!("{name}: attempt {attempt} of {attempts} inconclusive: {why}"),
+                            attempt == 1,
+                        );
+                    }
+                    reasons.push(why);
+                }
+            }
+        }
+        if reasons.len() == attempts {
+            failed.push(format!("{name}:\n  {}", reasons.join("\n  ")));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{}\nno attempt of these traces was conclusive in {attempts}{}. An attempt is inconclusive when \
+         stalls of the mock's runtime excuse too much of a trace or leave too few frames outside them \
+         for a baseline, or when serve drops video after stalls that fill its queue. The runner, serve \
+         or the producer using the CPU, or frames arriving late, all cause this.",
+        failed.join("\n"),
+        if strict() {
+            " (DSTREAMY_TRACE_REPLAY_STRICT=1 allows no retry)"
+        } else {
+            " tries"
+        }
+    );
+}
+
+#[test]
+fn every_positive_trace_replays_through_serve() {
+    let positives: Vec<_> = traces()
+        .into_iter()
+        .filter(|(n, _, t)| positive(n, t))
+        .collect();
+    assert!(positives.len() >= 6, "{} positive traces", positives.len());
+    let _one = exclusive();
+    replay_until_conclusive(&positives, false);
+}
+
+#[test]
+fn control_events_during_a_replay_lose_no_packet() {
+    let (name, dir, trace) = traces()
+        .into_iter()
+        .find(|(n, _, _)| n == "linux-x264-main-bf0-keyint2-30fps")
+        .unwrap();
+    let _one = exclusive();
+    replay_until_conclusive(&[(name, dir, trace)], true);
+}
+
+/// 150 frames sent at 30 fps; frames due inside `late_within` arrive `late` behind their dts.
+fn paced_arrivals(
+    start: Instant,
+    late_within: &[Stall],
+    late: Duration,
+) -> (Vec<Sent>, Vec<(Vec<u8>, Instant)>) {
+    let sent: Vec<Sent> = (0..150i64)
+        .map(|i| Sent {
+            key: i.to_le_bytes().to_vec(),
+            pts_us: i * 33_333,
+            dts_usec: i * 33_333,
+        })
+        .collect();
+    let arrived = sent
+        .iter()
+        .map(|s| {
+            let due = start + Duration::from_micros(s.dts_usec as u64);
+            let delayed = late_within
+                .iter()
+                .any(|&(from, to)| due >= from && due <= to);
+            (s.key.clone(), if delayed { due + late } else { due })
+        })
+        .collect();
+    (sent, arrived)
+}
+
+fn check_arrivals(sent: &[Sent], arrived: &[(Vec<u8>, Instant)], stalls: &[Stall]) {
+    let recorded: Vec<&(Vec<u8>, Instant)> = arrived.iter().collect();
+    assert_paced(
+        &recorded,
+        |a| a.0.clone(),
+        |a| a.1,
+        sent,
+        33_333,
+        stalls,
+        "synthetic",
+    );
+}
+
+#[test]
+fn a_few_stalls_excuse_the_frames_they_delay() {
+    let start = Instant::now();
+    let stalls: Vec<Stall> = [1_000u64, 3_000]
+        .iter()
+        .map(|&ms| {
+            let from = start + Duration::from_millis(ms);
+            (from, from + Duration::from_millis(80))
+        })
+        .collect();
+    let (sent, arrived) = paced_arrivals(start, &stalls, Duration::from_millis(70));
+    check_arrivals(&sent, &arrived, &stalls);
+}
+
+/// 40 unique frames at 60 fps, as many as a short 60 fps trace yields; `late` frames arrive that much behind their dts.
+fn check_sixty_fps(late: &[(i64, Duration)]) {
+    check_sixty_fps_with(Instant::now(), 40, late, &[]);
+}
+
+/// `frames` frames at 60 fps from `start`, with `late` frames behind their dts and the mock's runtime stalled in `stalls`.
+fn check_sixty_fps_with(start: Instant, frames: i64, late: &[(i64, Duration)], stalls: &[Stall]) {
+    let sent: Vec<Sent> = (0..frames)
+        .map(|i| Sent {
+            key: i.to_le_bytes().to_vec(),
+            pts_us: i * 16_667,
+            dts_usec: i * 16_667,
+        })
+        .collect();
+    let arrived: Vec<(Vec<u8>, Instant)> = sent
+        .iter()
+        .zip(0..)
+        .map(|(s, i)| {
+            let delay = late
+                .iter()
+                .find(|(n, _)| *n == i)
+                .map_or(Duration::ZERO, |l| l.1);
+            let due = start + Duration::from_micros(s.dts_usec as u64);
+            (s.key.clone(), due + delay)
+        })
+        .collect();
+    let recorded: Vec<&(Vec<u8>, Instant)> = arrived.iter().collect();
+    assert_paced(
+        &recorded,
+        |a| a.0.clone(),
+        |a| a.1,
+        &sent,
+        16_667,
+        stalls,
+        "synthetic 60 fps",
+    );
+}
+
+/// As on CI: a 122.7 ms stall ends 112.9 ms before the first frame, whose catch-up outlasts the stall's window.
+fn catch_up_after_a_stall(tail: &[(i64, Duration)]) {
+    catch_up_after_a_stall_in(41, tail);
+}
+
+fn catch_up_after_a_stall_in(frames: i64, tail: &[(i64, Duration)]) {
+    let start = Instant::now() + Duration::from_secs(1);
+    let stall_end = start + Duration::from_micros(22_900) - Duration::from_micros(112_900);
+    let stalls = [(stall_end - Duration::from_micros(122_700), stall_end)];
+    let mut late = vec![
+        (0, Duration::from_micros(22_900)),
+        (1, Duration::from_micros(13_300)),
+        (2, Duration::from_micros(6_700)),
+    ];
+    late.extend_from_slice(tail);
+    check_sixty_fps_with(start, frames, &late, &stalls);
+}
+
+fn ms(ms: u64) -> Duration {
+    Duration::from_millis(ms)
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn drift_right_after_a_stall_still_fails() {
+    catch_up_after_a_stall(&[(4, ms(30)), (5, ms(40)), (6, ms(50)), (7, ms(60))]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn a_staircase_of_late_frames_inside_the_stall_still_fails() {
+    catch_up_after_a_stall(&[(4, ms(30)), (5, ms(40)), (6, ms(50))]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn a_tail_growing_faster_than_jitter_inside_the_stall_still_fails() {
+    catch_up_after_a_stall(&[(4, ms(30)), (5, ms(45)), (6, ms(60))]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn a_plateau_after_a_stall_shorter_than_it_still_fails() {
+    let start = Instant::now() + Duration::from_secs(1);
+    let stall_end = start + ms(50) - ms(5);
+    let stalls = [(stall_end - ms(12), stall_end)];
+    check_sixty_fps_with(
+        start,
+        41,
+        &[(5, ms(40)), (6, ms(40)), (7, ms(40)), (8, ms(40))],
+        &stalls,
+    );
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn a_tail_longer_than_the_stall_still_fails() {
+    let draining: Vec<(i64, Duration)> = (4..14)
+        .map(|i| (i, Duration::from_micros(41_700 - 1_500 * (i as u64 - 4))))
+        .collect();
+    catch_up_after_a_stall_in(121, &draining);
+}
+
+#[test]
+fn the_catch_up_right_after_a_stall_is_excused_with_it() {
+    catch_up_after_a_stall(&[
+        (4, Duration::from_micros(41_700)),
+        (5, Duration::from_micros(25_200)),
+    ]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn late_frames_after_the_catch_up_has_ended_still_fail() {
+    catch_up_after_a_stall(&[
+        (4, Duration::from_micros(41_700)),
+        (20, Duration::from_micros(41_700)),
+        (30, Duration::from_micros(41_700)),
+    ]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn late_frames_without_a_stall_still_fail() {
+    check_sixty_fps(&[
+        (4, Duration::from_micros(41_700)),
+        (5, Duration::from_micros(25_200)),
+    ]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn one_frame_of_jitter_past_the_slack_fails_a_short_trace() {
+    check_sixty_fps(&[(20, Duration::from_millis(29))]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn two_late_frames_fail_a_short_trace() {
+    check_sixty_fps(&[
+        (10, Duration::from_millis(25)),
+        (30, Duration::from_millis(25)),
+    ]);
+}
+
+#[test]
+#[should_panic(expected = "checked frames off")]
+fn one_frame_late_past_the_jitter_margin_fails_a_short_trace() {
+    check_sixty_fps(&[(20, Duration::from_millis(31))]);
+}
+
+#[test]
+#[should_panic(expected = "over a quarter")]
+fn many_short_stalls_cannot_excuse_half_a_trace() {
+    let start = Instant::now();
+    let stalls: Vec<Stall> = (0..40u64)
+        .map(|i| {
+            let from = start + Duration::from_millis(60 + i * 125);
+            (from, from + Duration::from_millis(12))
+        })
+        .collect();
+    let (sent, arrived) = paced_arrivals(start, &[], Duration::ZERO);
+    check_arrivals(&sent, &arrived, &stalls);
+}
+
+#[test]
+fn overlapping_stalls_excuse_their_union_once() {
+    let start = Instant::now();
+    let stalls: Vec<Stall> = (0..30u64)
+        .map(|i| {
+            let from = start + Duration::from_millis(1_000 + i * 30);
+            (from, from + Duration::from_millis(12))
+        })
+        .collect();
+    let (sent, arrived) = paced_arrivals(start, &[], Duration::ZERO);
+    check_arrivals(&sent, &arrived, &stalls);
+}
+
+#[test]
+fn a_stall_before_the_first_frame_is_excused_only_inside_the_trace() {
+    let start = Instant::now() + Duration::from_secs(1);
+    let stalls = [(
+        start - Duration::from_millis(800),
+        start + Duration::from_millis(50),
+    )];
+    let (sent, arrived) = paced_arrivals(start, &[], Duration::ZERO);
+    check_arrivals(&sent, &arrived, &stalls);
+}
+
+#[test]
+fn a_stall_that_ends_before_the_first_frame_still_excuses_the_frames_behind_it() {
+    let start = Instant::now();
+    let stall = (start, start + Duration::from_millis(180));
+    let (sent, mut arrived) = paced_arrivals(start, &[], Duration::ZERO);
+    for (i, a) in arrived.iter_mut().take(6).enumerate() {
+        a.1 = stall.1 + Duration::from_micros(1_000 + 100 * i as u64);
+    }
+    check_arrivals(&sent, &arrived, &[stall]);
+}
+
+#[test]
+fn b_frame_traces_are_refused_at_conversion() {
+    let _one = exclusive();
+    let negatives: Vec<_> = traces()
+        .into_iter()
+        .filter(|(n, _, _)| uses_b_frames(n))
+        .collect();
+    assert!(negatives.len() >= 2, "{} B-frame traces", negatives.len());
+    let h = Harness::new("[serve]\ngrace_secs = 30\n");
+    let _s = h.serve();
+    let mut c = h.external_session();
+    for (name, dir, _) in &negatives {
+        let p = h.replay(dir, &[]);
+        p.attached();
+        let refused = p.wait_line("refusal", |v| v.get("refused").is_some());
+        assert!(
+            refused["refused"]
+                .as_str()
+                .unwrap()
+                .starts_with("B-frames are enabled"),
+            "{name}: {refused}"
+        );
+        let (status, stderr) = p.finish();
+        assert!(!status.success(), "{name}");
+        assert!(stderr.contains("B-frames are enabled"), "{name}: {stderr}");
+        c.source(&format!("{name} detached"), |e| {
+            e["state"] == "interrupted" && e["reason"] == "detached"
+        });
+    }
+    assert!(
+        stream_video(&h.mock.recorded()).is_empty(),
+        "B-frame video reached the mock"
+    );
+}
+
+#[test]
+fn non_opus_traces_are_refused_at_hello() {
+    let _one = exclusive();
+    let refused: Vec<_> = traces()
+        .into_iter()
+        .filter(|(_, _, t)| t.audio_codec() != "opus")
+        .collect();
+    assert!(!refused.is_empty());
+    let h = Harness::new("");
+    let _s = h.serve();
+    let _c = h.external_session();
+    for (name, dir, _) in &refused {
+        let p = h.replay(dir, &[]);
+        let reply = p.wait_line("hello reply", |v| v.get("hello").is_some());
+        assert_eq!(reply["hello"]["code"], "incompatible", "{name}: {reply}");
+        let message = reply["hello"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("audio encoder must be Opus"),
+            "{name}: {reply}"
+        );
+        let (status, _) = p.finish();
+        assert!(!status.success(), "{name}");
+    }
+}
+
+/// Count, total, longest and start offsets from `origin` of `stalls`, readable in a log line.
+fn stall_summary(stalls: &[Stall], origin: Instant) -> String {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let total: Duration = stalls.iter().map(|&(from, to)| to - from).sum();
+    let longest = stalls
+        .iter()
+        .map(|&(from, to)| to - from)
+        .max()
+        .unwrap_or_default();
+    let offsets: Vec<String> = stalls
+        .iter()
+        .take(12)
+        .map(|&(from, to)| {
+            let at = if from >= origin {
+                ms(from - origin)
+            } else {
+                -ms(origin - from)
+            };
+            format!("{at:+.0}/{:.0}", ms(to - from))
+        })
+        .collect();
+    let more = if stalls.len() > offsets.len() {
+        ", …"
+    } else {
+        ""
+    };
+    format!(
+        "{} stalls, {:.0} ms in all, longest {:.0} ms (start/length ms: {}{more})",
+        stalls.len(),
+        ms(total),
+        ms(longest),
+        offsets.join(", ")
+    )
+}
+
+/// What serve dropped, by counter; its video queue overflowing after a stall drops to a keyframe by design.
+fn serve_drops(status: &Value, stalls: &[Stall], origin: Instant) -> Option<String> {
+    let (session, source) = (&status["stats"], &status["source"]["stats"]);
+    let dropped: Vec<String> = [
+        ("video_frames_dropped", session),
+        ("audio_frames_dropped", session),
+        ("dropped_video", source),
+        ("dropped_audio", source),
+    ]
+    .into_iter()
+    .filter_map(|(key, stats)| {
+        let n = stats[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no {key} in {status}"));
+        (n > 0).then(|| format!("{key} {n}"))
+    })
+    .collect();
+    if dropped.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "serve dropped {} ({} queue overflows, {} keyframe requests, last error {}); {}",
+        dropped.join(", "),
+        session["video_queue_overflows"],
+        session["keyframe_requests"],
+        session["last_error"],
+        stall_summary(stalls, origin)
+    ))
+}
+
+// The mock's stall canary cannot excuse source loss, audio loss or a deep source queue.
+fn serve_kept_pace(
+    status: &Value,
+    stalls: &[Stall],
+    window: (Instant, Instant),
+    fps: i64,
+    what: &str,
+) -> Result<(), Stalled> {
+    if let Some(drops) = serve_drops(status, stalls, window.0) {
+        if overflow_explained(status, stalls, window, fps) {
+            return Err(Stalled(format!("{what}: {drops}")));
+        }
+        panic!("{what}: {drops}");
+    }
+    let queued = source_queue_peak(status, what);
+    eprintln!("{what}: serve dropped nothing; its source queue peaked at {queued} frames");
+    Ok(())
+}
+
+/// `max_queued` of serve's source, which stays under `SOURCE_QUEUE_BOUND` while serve keeps up with the producer.
+fn source_queue_peak(status: &Value, what: &str) -> u64 {
+    let now = status["source"]["stats"]["queued"].as_u64().unwrap();
+    let queued = status["source"]["stats"]["max_queued"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{what}: no source stats in {status}"));
+    assert!(
+        now <= queued && queued <= SOURCE_QUEUE_BOUND,
+        "{what}: serve's source queue reached {queued} frames, over {SOURCE_QUEUE_BOUND}: serve fell behind the producer; session {}, source {}",
+        status["stats"],
+        status["source"]["stats"]
+    );
+    queued
+}
+
+/// `Harness::wait`, failing with serve's drops when they explain the missing frames.
+fn wait_or_drops<V>(
+    h: &Harness,
+    c: &mut Client,
+    canary: &StallCanary,
+    what: &str,
+    f: impl FnMut(&Recorded) -> Option<V>,
+) -> V {
+    h.rt.block_on(h.mock.wait_for(T, f)).unwrap_or_else(|| {
+        let drops = c.try_status().ok().and_then(|s| {
+            let stalls = canary.stalls();
+            let origin = stalls.first().map_or_else(Instant::now, |s| s.0);
+            serve_drops(&s, &stalls, origin)
+        });
+        match drops {
+            Some(drops) => panic!("mock never saw {what}; {drops}"),
+            None => panic!("mock never saw {what}"),
+        }
+    })
+}
+
+/// Frames the mock received before `at` and after it.
+fn split<'a, T>(
+    frames: &[&'a T],
+    received: impl Fn(&T) -> Instant,
+    at: Instant,
+) -> (Vec<&'a T>, Vec<&'a T>) {
+    let i = frames.partition_point(|f| received(f) < at);
+    (frames[..i].to_vec(), frames[i..].to_vec())
+}
+
+fn restart_kept_pace(
+    status: &Value,
+    stalls: &[Stall],
+    window: (Instant, Instant),
+    fps: i64,
+    what: &str,
+    strict_mode: bool,
+) {
+    if let Err(Stalled(why)) = serve_kept_pace(status, stalls, window, fps, what) {
+        assert!(!strict_mode, "{why}");
+        eprintln!("{why}");
+    }
+    source_queue_peak(status, what);
+}
+
+fn check_restart_prefix(
+    v1: &[&RecordedVideoFrame],
+    a1: &[&RecordedAudioFrame],
+    want: &Expected,
+    lost_first: usize,
+    status: &Value,
+    stalls: &[Stall],
+    window: (Instant, Instant),
+) {
+    restart_kept_pace(
+        status,
+        stalls,
+        window,
+        want.fps,
+        "restarted replay",
+        strict(),
+    );
+    let drops = serve_drops(status, stalls, window.0);
+    assert_eq!(
+        a1[0].data, want.audio[lost_first].key,
+        "audio lost before the kill"
+    );
+    let fps = want.fps;
+    let step = (VIDEO_HZ / fps) as u32;
+    // Serve dropping video to a keyframe leaves an RTP jump inside the run.
+    let undropped = v1
+        .windows(2)
+        .position(|w| w[1].rtp_timestamp.wrapping_sub(w[0].rtp_timestamp) != step)
+        .map_or(v1.len(), |i| i + 1);
+    if undropped < v1.len() {
+        assert!(
+            is_keyframe(&v1[undropped].data),
+            "before the kill: video jumps after {undropped} of {} frames to a frame that is not an IDR; {drops:?}",
+            v1.len()
+        );
+    }
+    let dropped_in_v1 = drops.as_ref().filter(|_| undropped < v1.len());
+    if undropped < MIN_BASELINE_FRAMES {
+        let dropped = dropped_in_v1.unwrap_or_else(|| {
+            panic!(
+                "before the kill: video jumps after {undropped} of {} frames, but serve reports no drops",
+                v1.len()
+            )
+        });
+        eprintln!(
+            "before the kill: no baseline, serve dropped video after {undropped} frames; {dropped}"
+        );
+    } else {
+        let v1_kept = &v1[..undropped];
+        let kept_from = rtp_us(v1_kept[0].rtp_timestamp, VIDEO_HZ);
+        let kept_until = rtp_us(v1_kept[v1_kept.len() - 1].rtp_timestamp, VIDEO_HZ);
+        let a1_kept: Vec<_> = a1
+            .iter()
+            .copied()
+            .filter(|a| rtp_us(a.rtp_timestamp, AUDIO_HZ) <= kept_until)
+            .collect();
+        let before = markers(v1_kept, &a1_kept, fps, "before the kill");
+        let too_short = kept_until - kept_from < sync::FLASH_PERIOD_US;
+        assert!(
+            !before.is_empty() || (too_short && dropped_in_v1.is_some()),
+            "no markers before the kill in {} of {} frames, {} µs; {drops:?}",
+            v1_kept.len(),
+            v1.len(),
+            kept_until - kept_from
+        );
+        assert_av_aligned(v1_kept, &a1_kept, want, "before the kill");
+    }
+}
+
+fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
+    let _one = exclusive();
+    let (_, dir, trace) = traces()
+        .into_iter()
+        .find(|(n, _, _)| n == "linux-x264-main-bf0-keyint2-30fps")
+        .unwrap();
+    let want = expected(&trace);
+    let h = Harness::new(&format!("[serve]\ngrace_secs = {}\n", grace.as_secs()));
+    let canary = StallCanary::start(&h.rt);
+    let _s = h.serve();
+    let mut c = h.external_session();
+
+    let first_started = Instant::now();
+    let mut first = h.replay(&dir, &[]);
+    let id = first.attached();
+    c.source("producing", |e| {
+        e["state"] == "producing" && e["attachment"] == id
+    });
+    wait_or_drops(&h, &mut c, &canary, "75 video and 125 audio frames", |r| {
+        (stream_video(r).len() >= 75 && producer_audio(r).len() >= 125).then_some(())
+    });
+    let first_status = c.status();
+    let first_window = (first_started, Instant::now());
+    restart_kept_pace(
+        &first_status,
+        &canary.stalls(),
+        first_window,
+        want.fps,
+        "before the kill",
+        strict(),
+    );
+    first.kill();
+    let killed = Instant::now();
+    c.source("interrupted", |e| {
+        e["state"] == "interrupted" && e["reason"] == "detached"
+    });
+    std::thread::sleep(gap.saturating_sub(killed.elapsed()));
+    let reattached = Instant::now();
+    let second = h.replay(&dir, &[]);
+    let id2 = second.attached();
+    let detached_for = killed.elapsed();
+    assert!(
+        detached_for < grace,
+        "detached for {detached_for:?}, beyond the {grace:?} grace period"
+    );
+    c.source("producing again", |e| {
+        e["state"] == "producing" && e["attachment"] == id2
+    });
+    let (status, stderr) = second.finish();
+    assert!(status.success(), "{stderr}");
+    let (frames, packets) = (want.video.len(), want.audio.len());
+    let recorded = wait_or_drops(&h, &mut c, &canary, "the whole second replay", |r| {
+        let (_, v2) = split(&stream_video(r), |v| v.received_at, reattached);
+        let (_, a2) = split(&producer_audio(r), |a| a.received_at, reattached);
+        (v2.len() >= frames && a2.len() >= packets).then(|| r.clone())
+    });
+    let lost_first = start_drops(&recorded, "a restarted replay");
+    assert_eq!(c.status()["session"]["state"], "streaming");
+    monotonic(&recorded);
+
+    let (v1, v2) = split(&stream_video(&recorded), |v| v.received_at, reattached);
+    let (a1, a2) = split(&producer_audio(&recorded), |a| a.received_at, reattached);
+    let completed = Instant::now();
+    let stalls: Vec<_> = canary
+        .stalls()
+        .into_iter()
+        .flat_map(|(from, to)| {
+            [(first_started, killed), (reattached, completed)]
+                .into_iter()
+                .filter_map(move |(start, end)| {
+                    let clipped = (from.max(start), to.min(end));
+                    (clipped.1 > clipped.0).then_some(clipped)
+                })
+        })
+        .collect();
+    let origin = first_started;
+    let status = c.status();
+    let drops = serve_drops(&status, &stalls, origin);
+    assert!(
+        is_keyframe(&v2[0].data),
+        "first video after the gap is not an IDR; {drops:?}; stalls {:?}",
+        canary.stalls()
+    );
+    check_restart_prefix(
+        &v1,
+        &a1,
+        &want,
+        lost_first,
+        &status,
+        &stalls,
+        (origin, completed),
+    );
+    check_replay(&v2, &a2, &want, 0, &canary.stalls(), "after the restart")
+        .unwrap_or_else(|Stalled(e)| panic!("{e}"));
+
+    let last_before = rtp_us(v1.last().unwrap().rtp_timestamp, VIDEO_HZ);
+    let resumed = rtp_us(v2[0].rtp_timestamp, VIDEO_HZ) - last_before;
+    let frame_us = 1_000_000 / want.fps;
+    assert!(
+        resumed >= gap.as_micros() as i64 && resumed <= detached_for.as_micros() as i64 + 1_000_000,
+        "video resumed {resumed} µs after the last frame; detached for {detached_for:?}, gap {gap:?}, one frame {frame_us} µs"
+    );
+}
+
+#[test]
+fn a_replay_killed_and_restarted_after_1_s_stays_aligned() {
+    replay_killed_and_restarted(Duration::from_secs(30), Duration::from_secs(1));
+}
+
+#[test]
+fn a_replay_killed_and_restarted_after_grace_minus_1_s_stays_aligned() {
+    replay_killed_and_restarted(Duration::from_secs(10), Duration::from_secs(9));
+}
+
+#[test]
+fn serve_drops_make_a_replay_inconclusive_only_after_stalls_that_fill_its_queue() {
+    let start = Instant::now();
+    let origin = start + Duration::from_secs(1);
+    let stall = |at_ms: i64, ms: u64| {
+        let from = if at_ms >= 0 {
+            origin + Duration::from_millis(at_ms as u64)
+        } else {
+            origin - Duration::from_millis(at_ms.unsigned_abs())
+        };
+        (from, from + Duration::from_millis(ms))
+    };
+    let video = (origin, origin + Duration::from_secs(5));
+    let fills = |stalls: &[Stall], fps| stalls_fill_queue(stalls, video, fps);
+    assert_eq!(StreamOptions::default().max_queued_video, 8);
+    assert!(!fills(&[], 30));
+    assert!(!fills(&[stall(100, 260)], 30), "under 8 frames at 30 fps");
+    assert!(fills(&[stall(100, 270)], 30));
+    assert!(fills(&[stall(100, 140)], 60), "8 frames at 60 fps");
+    assert!(
+        !fills(
+            &(0..40)
+                .map(|i| stall(100 + i * 100, 30))
+                .collect::<Vec<_>>(),
+            30
+        ),
+        "stalls shorter than a frame cannot fill the queue however many"
+    );
+    assert!(
+        !fills(
+            &[
+                stall(100, 80),
+                stall(400, 115),
+                stall(900, 34),
+                stall(1500, 46)
+            ],
+            30
+        ),
+        "scattered stalls drain between each other"
+    );
+    assert!(
+        fills(&[stall(100, 150), stall(350, 150)], 30),
+        "two stalls within twice the queue's length add up"
+    );
+    assert!(
+        !fills(&[stall(100, 150), stall(1_000, 150)], 30),
+        "two stalls further apart do not"
+    );
+    assert!(
+        fills(&[stall(-100, 388)], 30),
+        "the part of a stall straddling the start counts"
+    );
+    assert!(
+        !fills(&[stall(5_100, 400), stall(-200, 250)], 30),
+        "stalls outside the time the trace was sent do not count"
+    );
+    assert!(
+        !fills(&[stall(4_800, 400)], 30),
+        "only the part within the trace's span counts"
+    );
+    assert!(
+        fills(&[stall(4_500, 288)], 30),
+        "a stall in the last second counts although no frame arrives after the drop it causes"
+    );
+    assert!(
+        fills(&[stall(0, 288)], 30),
+        "a stall before the first frame arrives counts"
+    );
+}
+
+#[test]
+fn stall_summaries_are_short_and_relative() {
+    let start = Instant::now();
+    let at = |ms: u64, len: u64| {
+        let from = start + Duration::from_millis(ms);
+        (from, from + Duration::from_millis(len))
+    };
+    let summary = stall_summary(
+        &[at(0, 50), at(1_200, 288)],
+        start + Duration::from_millis(100),
+    );
+    assert_eq!(
+        summary,
+        "2 stalls, 338 ms in all, longest 288 ms (start/length ms: -100/50, +1100/288)"
+    );
+    let many: Vec<Stall> = (0..20).map(|i| at(i * 100, 20)).collect();
+    assert!(stall_summary(&many, start).ends_with(", …)"));
+    let twelve: Vec<Stall> = (0..12).map(|i| at(i * 100, 20)).collect();
+    let all = stall_summary(&twelve, start);
+    assert!(all.ends_with("+1100/20)"), "{all}");
+}
+
+#[test]
+fn the_send_window_starts_before_the_replay_and_spans_the_trace() {
+    let sent = |dts_usec| Sent {
+        key: Vec::new(),
+        pts_us: dts_usec,
+        dts_usec,
+    };
+    let want = Expected {
+        fps: 30,
+        video: vec![sent(1_000), sent(2_000_000)],
+        audio: vec![sent(-20_000), sent(4_980_000)],
+    };
+    let before = Instant::now();
+    let attached = before + Duration::from_millis(300);
+    let (from, to) = send_window(before, attached, &want);
+    assert_eq!(from, before, "starts before the producer could send");
+    assert_eq!(
+        to - attached,
+        Duration::from_secs(5),
+        "ends a trace span after the attachment"
+    );
+}
+
+#[test]
+fn only_queue_overflow_without_errors_is_excused() {
+    let origin = Instant::now();
+    let window = (origin, origin + Duration::from_secs(5));
+    let long = [(
+        origin + Duration::from_secs(1),
+        origin + Duration::from_millis(1_300),
+    )];
+    // Every session has keyframe requests (attach, viewer PLIs, DAVE); only the overflow count tells an overflow.
+    let status = |last_error: Value, overflows: u64| serde_json::json!({"stats": {"last_error": last_error, "video_queue_overflows": overflows, "keyframe_requests": 5, "video_frames_dropped": 40}});
+    assert!(overflow_explained(
+        &status(Value::Null, 2),
+        &long,
+        window,
+        30
+    ));
+    assert!(
+        !overflow_explained(
+            &status(Value::String("write failed".into()), 2),
+            &long,
+            window,
+            30
+        ),
+        "drops with a send or transport error are not overflow"
+    );
+    assert!(
+        !overflow_explained(&status(Value::Null, 0), &long, window, 30),
+        "drops with keyframe requests but no overflow are not excused"
+    );
+    assert!(!overflow_explained(
+        &status(Value::Null, 2),
+        &[],
+        window,
+        30
+    ));
+}
+
+/// Serve's status with `dropped` video frames at the pump, `overflows` of its video queue and a source queue that peaked at `max_queued`.
+fn serve_status(dropped: u64, overflows: u64, max_queued: u64) -> Value {
+    serde_json::json!({
+        "stats": {"last_error": Value::Null, "video_queue_overflows": overflows, "keyframe_requests": 5,
+                  "video_frames_dropped": dropped, "audio_frames_dropped": 0},
+        "source": {"stats": {"dropped_video": 0, "dropped_audio": 0, "queued": 0, "max_queued": max_queued}},
+    })
+}
+
+fn five_seconds() -> (Instant, Instant) {
+    let origin = Instant::now();
+    (origin, origin + Duration::from_secs(5))
+}
+
+#[test]
+fn nothing_dropped_and_a_shallow_queue_is_serve_keeping_pace() {
+    let window = five_seconds();
+    serve_kept_pace(
+        &serve_status(0, 0, SOURCE_QUEUE_BOUND),
+        &[],
+        window,
+        30,
+        "synthetic",
+    )
+    .unwrap();
+}
+
+#[test]
+#[should_panic(expected = "synthetic: serve dropped video_frames_dropped 40")]
+fn serve_drops_without_a_stall_fail_a_replay() {
+    let window = five_seconds();
+    let _ = serve_kept_pace(&serve_status(40, 2, 1), &[], window, 30, "synthetic");
+}
+
+#[test]
+#[should_panic(expected = "synthetic: serve dropped dropped_audio 3")]
+fn serve_drops_of_audio_fail_a_replay_whatever_the_stalls() {
+    let window = five_seconds();
+    let long = [(
+        window.0 + Duration::from_secs(1),
+        window.0 + Duration::from_millis(1_300),
+    )];
+    let mut status = serve_status(0, 0, 1);
+    status["source"]["stats"]["dropped_audio"] = 3.into();
+    let _ = serve_kept_pace(&status, &long, window, 30, "synthetic");
+}
+
+#[test]
+fn serve_drops_after_stalls_that_fill_its_queue_are_inconclusive() {
+    let window = five_seconds();
+    let long = [(
+        window.0 + Duration::from_secs(1),
+        window.0 + Duration::from_millis(1_300),
+    )];
+    let verdict = serve_kept_pace(&serve_status(40, 2, 1), &long, window, 30, "synthetic");
+    let Err(Stalled(why)) = verdict else {
+        panic!("{verdict:?}")
+    };
+    assert!(
+        why.contains("video_frames_dropped 40") && why.contains("2 queue overflows"),
+        "{why}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "source queue reached 9 frames")]
+fn a_deep_source_queue_fails_a_replay_without_any_drop() {
+    let window = five_seconds();
+    let _ = serve_kept_pace(
+        &serve_status(0, 0, SOURCE_QUEUE_BOUND + 1),
+        &[],
+        window,
+        30,
+        "synthetic",
+    );
+}
+
+#[test]
+fn stalls_over_a_quarter_of_the_trace_are_inconclusive_not_passed() {
+    let start = Instant::now();
+    let stalls: Vec<Stall> = (0..20u64)
+        .map(|i| {
+            let from = start + Duration::from_millis(200 + i * 240);
+            (from, from + Duration::from_millis(40))
+        })
+        .collect();
+    let (sent, arrived) = paced_arrivals(start, &stalls, Duration::from_millis(30));
+    let recorded: Vec<&(Vec<u8>, Instant)> = arrived.iter().collect();
+    let verdict = paced(
+        &recorded,
+        |a| a.0.clone(),
+        |a| a.1,
+        &sent,
+        33_333,
+        &stalls,
+        "synthetic",
+    );
+    let Err(Stalled(why)) = verdict else {
+        panic!("{verdict:?}")
+    };
+    assert!(why.contains("over a quarter"), "{why}");
+}
+
+#[test]
+fn retry_annotations_stay_on_one_line() {
+    assert_eq!(
+        annotation("a: 50% late\nb"),
+        "::warning title=trace replay retried::a: 50%25 late%0Ab"
+    );
+}
+
+#[test]
+fn a_trace_mostly_inside_stalls_is_inconclusive_not_a_baseline_failure() {
+    let start = Instant::now();
+    let stalls: Vec<Stall> = (0..15u64)
+        .map(|i| {
+            let from = start + Duration::from_millis(i * 330);
+            (from, from + Duration::from_millis(300))
+        })
+        .collect();
+    let (sent, arrived) = paced_arrivals(start, &[], Duration::ZERO);
+    let recorded: Vec<&(Vec<u8>, Instant)> = arrived.iter().collect();
+    let verdict = paced(
+        &recorded,
+        |a| a.0.clone(),
+        |a| a.1,
+        &sent,
+        33_333,
+        &stalls,
+        "synthetic",
+    );
+    let Err(Stalled(why)) = verdict else {
+        panic!("{verdict:?}")
+    };
+    assert!(why.contains("too few for a baseline"), "{why}");
+}
+
+#[test]
+#[should_panic(expected = "restarted replay: serve dropped video_frames_dropped 40")]
+fn early_restart_loss_followed_by_an_idr_cannot_skip_alignment_without_a_stall() {
+    let origin = Instant::now();
+    let first = RecordedVideoFrame {
+        kind: VoiceKind::Stream,
+        server_id: String::new(),
+        ssrc: 1,
+        payload_type: 101,
+        codec: dstreamy_mock_discord::VideoCodec::H264,
+        rtp_timestamp: 0,
+        data: vec![0, 0, 0, 1, 0x65, 0x88],
+        e2ee: false,
+        playout_delay: None,
+        received_at: origin,
+    };
+    let mut idr = first.clone();
+    idr.rtp_timestamp = 6000;
+    let audio = RecordedAudioFrame {
+        kind: VoiceKind::Stream,
+        server_id: String::new(),
+        ssrc: 2,
+        payload_type: 120,
+        rtp_timestamp: 0,
+        data: vec![0xf8, 0xff, 0xfe],
+        e2ee: false,
+        received_at: origin,
+    };
+    let want = Expected {
+        fps: 30,
+        video: Vec::new(),
+        audio: vec![Sent {
+            key: audio.data.clone(),
+            pts_us: 0,
+            dts_usec: 0,
+        }],
+    };
+    check_restart_prefix(
+        &[&first, &idr],
+        &[&audio],
+        &want,
+        0,
+        &serve_status(40, 1, 1),
+        &[],
+        (origin, origin + Duration::from_secs(3)),
+    );
+}
+
+#[test]
+fn measured_restart_overflow_is_inconclusive_only_outside_strict_mode() {
+    let window = five_seconds();
+    let stalls = [(
+        window.0 + Duration::from_secs(1),
+        window.0 + Duration::from_millis(1_300),
+    )];
+    let status = serve_status(40, 2, 1);
+    restart_kept_pace(&status, &stalls, window, 30, "restart", false);
+    let failed = std::panic::catch_unwind(|| {
+        restart_kept_pace(&status, &stalls, window, 30, "restart", true)
+    });
+    assert!(failed.is_err(), "strict replay accepted measured overflow");
+}
