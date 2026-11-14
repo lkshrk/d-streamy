@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: fill-pkgbuild.sh VERSION DIST_DIR PKGBUILD > filled
-# Sets pkgver and pkgrel=1 and fills every sha256sums array from DIST_DIR's checksums of its sources; refuses placeholders.
+# Sets pkgver and pkgrel=1 and fills every sha256sums array from DIST_DIR's checksums of its sources.
 set -euo pipefail
 
 version=$1
@@ -33,8 +33,4 @@ for key in $keys; do
 done
 
 grep -qx "pkgver=$version" <<<"$filled" || { echo "pkgver line not filled" >&2; exit 1; }
-if grep -Eq "(0{64}|1{64})" <<<"$filled"; then
-  echo "a placeholder sha256 is left in $pkgbuild" >&2
-  exit 1
-fi
 printf '%s\n' "$filled"

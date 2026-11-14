@@ -822,6 +822,65 @@ if [ -f "{base}/$arch.db" ]; then cp "{base}/$arch.db" "$out"; printf 200; else 
                 if not accepted:
                     self.assertIn("refusing to replace it", result.stderr)
 
+    def check_repo(self, *args):
+        """Runs check-arch-repo.sh with pacman, pacman-key, gpg and gpgconf stubbed; returns the result and configs."""
+        directory = tempfile.TemporaryDirectory(prefix="arch-check-fixture-")
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name)
+        stubs, log, repo = base / "bin", base / "log", base / "repo"
+        for path in (stubs, log, repo / "x86_64", repo / "aarch64"):
+            path.mkdir(parents=True)
+        (base / "key.asc").write_text("PUBLIC KEY\n")
+        (stubs / "pacman").write_text(f"""#!/bin/bash
+echo "pacman $*" >> {log}/argv
+while [ $# -gt 0 ]; do case $1 in --config) conf=$2;; -S*) op=$1;; esac; last=$1; shift; done
+arch=$(sed -n 's/^Architecture = //p' "$conf")
+cp "$conf" {log}/$arch.conf
+case $op in
+  -Sl) echo "d-streamy dstreamy-bin 0.1.0-1"; [ "$arch" = x86_64 ] && echo "d-streamy obs-dstreamy-bin 0.1.0-1";;
+  -Sddp) echo "$last-bin 0.1.0-1";;
+esac
+exit 0
+""")
+        for name in ("pacman-key", "gpgconf"):
+            (stubs / name).write_text(f'#!/bin/bash\necho "{name} $*" >> {log}/argv\n')
+        (stubs / "gpg").write_text("#!/bin/bash\necho fpr:::::::::0123456789ABCDEF0123456789ABCDEF01234567:\n")
+        for name in ("pacman", "pacman-key", "gpgconf", "gpg"):
+            (stubs / name).chmod(0o755)
+        env = dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}")
+        args = [a.replace("@REPO@", str(repo)).replace("@KEY@", str(base / "key.asc")) for a in args]
+        result = subprocess.run([str(ROOT / "scripts/check-arch-repo.sh"), *args], env=env, text=True,
+                                capture_output=True)
+        confs = {arch: (log / f"{arch}.conf").read_text() for arch in ("x86_64", "aarch64")
+                 if (log / f"{arch}.conf").exists()}
+        return result, confs, log
+
+    def test_check_arch_repo_requires_signatures_exactly_when_given_a_key(self):
+        for args, siglevel in ((("0.1.0", "@REPO@", "@KEY@"), "Required"), (("0.1.0", "@REPO@"), "Never")):
+            with self.subTest(siglevel=siglevel):
+                result, confs, log = self.check_repo(*args)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(set(confs), {"x86_64", "aarch64"})
+                for arch, conf in confs.items():
+                    self.assertIn(f"\nSigLevel = {siglevel}\n", conf)
+                    self.assertRegex(conf, rf"\nServer = file://.*/repo/{arch}\n")
+                self.assertEqual("pacman-key --gpgdir" in (log / "argv").read_text(), siglevel == "Required")
+        for args, message in ((("0.1.0", "@REPO@", "/nonexistent.asc"), "does not exist"),
+                              (("0.1.0", "/nonexistent-repo"), ""), (("0.1.0",), "usage"), ((), "usage")):
+            with self.subTest(args=args):
+                result, confs, _ = self.check_repo(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(confs, {})
+
+    def test_pages_verifies_signatures_against_the_committed_key(self):
+        pages = job_section("pages")
+        self.assertIn('run: scripts/check-arch-repo.sh "$VERSION" site/arch packaging/arch/d-streamy.asc\n', pages)
+        self.assertLess(pages.index("scripts/check-arch-repo.sh"), pages.index("actions/upload-pages-artifact@"))
+        for job in ("arch", "pages"):
+            with self.subTest(job=job):
+                self.assertRegex(job_section(job), r"\n    container: archlinux:base-devel@sha256:[0-9a-f]{64}\n")
+
     def test_pages_deploys_one_at_a_time_after_the_live_version_check(self):
         pages = job_section("pages")
         self.assertIn("    concurrency:\n      group: pages\n      cancel-in-progress: false\n", pages)

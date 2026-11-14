@@ -4,9 +4,11 @@
 # With PUBLIC_KEY, pacman requires and verifies the signatures of the databases and the packages.
 set -euo pipefail
 
-version=$1
-repo=$(realpath "$2")
+usage="usage: check-arch-repo.sh VERSION REPO_DIR [PUBLIC_KEY]"
+version=${1:?$usage}
+repo=$(realpath -e "${2:?$usage}")
 key=${3:-}
+[ -z "$key" ] || [ -f "$key" ] || { echo "public key $key does not exist" >&2; exit 1; }
 tmp=$(mktemp -d)
 trap 'gpgconf --homedir "$tmp/gpg" --kill all >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
 

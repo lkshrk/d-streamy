@@ -671,7 +671,7 @@ jobs:
   arch:
     needs: [version, cli, obs-linux]
     runs-on: ubuntu-24.04
-    container: archlinux:base-devel
+    container: archlinux:base-devel@sha256:fa2d4ce3310ddd90a4208e5168be8ad367da5129af1245f38fd2d803bcbe3239
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.version.outputs.version }}
@@ -805,7 +805,7 @@ jobs:
     needs: [version, arch, release]
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-24.04
-    container: archlinux:base-devel
+    container: archlinux:base-devel@sha256:fa2d4ce3310ddd90a4208e5168be8ad367da5129af1245f38fd2d803bcbe3239
     timeout-minutes: 20
     concurrency:
       group: pages
@@ -835,7 +835,7 @@ jobs:
           PACMAN_SIGNING_KEY: ${{ secrets.PACMAN_SIGNING_KEY }}
         run: scripts/make-arch-repo.sh site/arch --sign packaging/arch/d-streamy.asc
       - name: Check the signed repository with pacman
-        run: scripts/check-arch-repo.sh "$VERSION" site/arch site/arch/d-streamy.asc
+        run: scripts/check-arch-repo.sh "$VERSION" site/arch packaging/arch/d-streamy.asc
       - name: Write the install page
         run: |
           set -euo pipefail
