@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: check-release-assets.sh VERSION DIST_DIR
-# Verifies every checksum and that each asset a release needs is present with its expected contents.
+# Verifies every checksum, that each asset a release needs is present with its expected contents, and that nothing else is.
 set -euo pipefail
 
 version=$1
@@ -9,7 +9,12 @@ cd "$dist"
 ls -l
 sha256sum -c -- *.sha256
 
-need() { test -f "$1" || { echo "missing $1" >&2; exit 1; }; test -f "$1.sha256" || { echo "missing $1.sha256" >&2; exit 1; }; }
+expected=()
+need() {
+  test -f "$1" || { echo "missing $1" >&2; exit 1; }
+  test -f "$1.sha256" || { echo "missing $1.sha256" >&2; exit 1; }
+  expected+=("$1" "$1.sha256")
+}
 
 for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
   archive="dstreamy-$version-$target.tar.gz"
@@ -41,3 +46,9 @@ for entry in obs-dstreamy.dll dstreamy.exe dstreamy-ui/obs-dstreamy-ui.dll dstre
   unzip -Z1 "$plugin" | grep -x "obs-dstreamy/bin/64bit/$entry" >/dev/null \
     || { echo "$plugin lacks $entry" >&2; exit 1; }
 done
+
+unexpected=$(comm -13 <(printf '%s\n' "${expected[@]}" | sort) <(find . -mindepth 1 -maxdepth 1 -printf '%P\n' | sort))
+if [ -n "$unexpected" ]; then
+  printf 'the release would upload unexpected entries:\n%s\n' "$unexpected" >&2
+  exit 1
+fi

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import contextlib
+import fnmatch
 import hashlib
 import importlib.util
 import io
@@ -321,6 +322,34 @@ class WorkflowTests(unittest.TestCase):
             result = self.assets(directory, plugin_exe=False)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("lacks dstreamy.exe", result.stderr)
+
+    def test_release_uploads_exactly_the_checked_assets(self):
+        with tempfile.TemporaryDirectory(prefix="assets-fixture-") as directory:
+            (Path(directory) / "x86_64").mkdir()
+            (Path(directory) / "x86_64/dstreamy-bin-0.1.0-1-x86_64.pkg.tar.zst").write_text("x")
+            result = self.assets(directory)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unexpected entries:\nx86_64\n", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="assets-fixture-") as directory:
+            (Path(directory) / "notes.txt").write_text("x")
+            result = self.assets(directory)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("notes.txt", result.stderr)
+        pattern = "          pattern: '*-${{ needs.version.outputs.version }}-*'\n"
+        for job in ("rehearse", "release"):
+            with self.subTest(job=job):
+                section = job_section(job)
+                download = section.split("actions/download-artifact@", 1)[1].split("\n      - ", 1)[0]
+                self.assertIn(pattern, download)
+                self.assertIn("scripts/check-release-assets.sh \"$VERSION\" dist", section)
+        glob = "*-0.1.0-*"
+        self.assertFalse(fnmatch.fnmatch("arch-packages", glob))
+        for name in ("dstreamy-0.1.0-x86_64-unknown-linux-gnu", "D-Streamy-0.1.0-macos-universal",
+                     "obs-dstreamy-0.1.0-windows-x64"):
+            self.assertTrue(fnmatch.fnmatch(name, glob), name)
+        release = job_section("release")
+        self.assertIn('gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 --clobber', release)
+        self.assertNotIn("dist/* ", release)
 
     def test_windows_plugin_ships_the_released_cli(self):
         source = workflow("release.yml")
