@@ -305,7 +305,7 @@ jobs:
           sum() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
           (cd dist && sum "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256")
           cat "dist/$ARCHIVE.tar.gz.sha256"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.ARCHIVE }}
           path: |
@@ -417,7 +417,7 @@ jobs:
           mkdir -p dist
           ditto -c -k --sequesterRsrc --keepParent bin/D-Streamy.app "dist/$PACKAGE.zip"
           (cd dist && shasum -a 256 "$PACKAGE.zip" > "$PACKAGE.zip.sha256" && cat "$PACKAGE.zip.sha256")
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.PACKAGE }}
           path: dist/${{ env.PACKAGE }}.zip*
@@ -437,7 +437,7 @@ jobs:
       - name: Set paths
         run: echo "OBS_PREFIX=$RUNNER_TEMP/obs-prefix" >> "$GITHUB_ENV"
       - name: Restore apt archives
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/apt-archives
           key: ${{ env.APT_CACHE }}-${{ github.run_id }}
@@ -493,7 +493,7 @@ jobs:
           tar --format=gnu --sort=name --mtime="@${SOURCE_DATE_EPOCH:?}" --owner=0 --group=0 --numeric-owner \
             -C "$RUNNER_TEMP/stage" -cf - . | gzip -n -9 > "dist/$PACKAGE.tar.gz"
           (cd dist && sha256sum "$PACKAGE.tar.gz" > "$PACKAGE.tar.gz.sha256" && cat "$PACKAGE.tar.gz.sha256")
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.PACKAGE }}
           path: dist/${{ env.PACKAGE }}.tar.gz*
@@ -580,7 +580,7 @@ jobs:
           (cd obs/build_macos/rundir && ditto -c -k --keepParent --sequesterRsrc obs-dstreamy.plugin "$GITHUB_WORKSPACE/dist/$PACKAGE.zip")
           # The plugin goes into ~/Library/Application Support/obs-studio/plugins/.
           (cd dist && shasum -a 256 "$PACKAGE.zip" > "$PACKAGE.zip.sha256" && cat "$PACKAGE.zip.sha256")
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.PACKAGE }}
           path: dist/${{ env.PACKAGE }}.zip*
@@ -662,7 +662,7 @@ jobs:
           # The obs-dstreamy folder goes into %ProgramData%\obs-studio\plugins\.
           (cd "$stage" && 7z a -tzip -mx=9 "$(cygpath -w "$GITHUB_WORKSPACE/dist/$PACKAGE.zip")" obs-dstreamy >/dev/null)
           (cd dist && sha256sum "$PACKAGE.zip" > "$PACKAGE.zip.sha256" && cat "$PACKAGE.zip.sha256")
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.PACKAGE }}
           path: dist/${{ env.PACKAGE }}.zip*
@@ -699,7 +699,7 @@ jobs:
           cp -a arch-repo "$RUNNER_TEMP/arch-check"
           scripts/make-arch-repo.sh "$RUNNER_TEMP/arch-check"
           scripts/check-arch-repo.sh "$VERSION" "$RUNNER_TEMP/arch-check" | tee -a "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: arch-packages
           path: arch-repo
