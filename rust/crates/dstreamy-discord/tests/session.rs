@@ -1048,7 +1048,10 @@ async fn gateway_drop_resumes_and_leaves_the_stream_alone() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invalid_session_rejoins_and_recovers() {
-    let mut f = Fixture::streaming().await;
+    let mut options = options();
+    // A peer connection that never connects is retried after the step timeout, which must come within the wait below.
+    options.stream.step_timeout = Duration::from_secs(5);
+    let mut f = Fixture::streaming_with(options).await;
     f.states_seen();
     assert!(f.mock.invalidate_session(false));
     f.mock
@@ -1069,9 +1072,10 @@ async fn invalid_session_rejoins_and_recovers() {
         .await;
     f.video_flowing().await;
 
-    assert_eq!(
-        f.voice_joins(),
-        [MOCK_VOICE_CHANNEL_ID, MOCK_VOICE_CHANNEL_ID]
+    let joins = f.voice_joins();
+    assert!(
+        joins.len() >= 2 && joins.iter().all(|c| c == MOCK_VOICE_CHANNEL_ID),
+        "{joins:?}"
     );
     assert_eq!(f.starts(), 1);
     f.finish().await;
