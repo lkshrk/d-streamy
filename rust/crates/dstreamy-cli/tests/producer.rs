@@ -854,9 +854,13 @@ fn a_stalled_producer_is_replaced_by_the_next_hello() {
     let first = h.producer(&["--stall-after", "1000", "--stall-for", "4000"]);
     let id = first.attached();
     let before = h.stream_media(15, 25);
-    c.source("stalled", |e| {
-        e["state"] == "interrupted" && e["reason"] == "stalled"
-    });
+    first.wait_line("stall", |v| v["fault"] == "stall");
+    // A loaded serve can flag a stall before the real one and clear it on the next frame, so poll the current state.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while c.status()["source"]["reason"] != "stalled" {
+        assert!(Instant::now() < deadline, "serve never showed the stall");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let second = h.producer(&[]);
     let id2 = second.attached();
     assert_ne!(id, id2);
