@@ -953,6 +953,17 @@ fn first_picture_size(video: &[&RecordedVideoFrame]) -> (usize, usize) {
         .expect("a picture decodes")
 }
 
+/// Steps at the expected 90 kHz `step`, where serve's drops to a keyframe leave only whole multiples of it.
+fn assert_frame_rate(recorded: &dstreamy_mock_discord::Recorded, step: u32) {
+    let steps = rtp_steps(&stream_video(recorded));
+    let exact = steps.iter().filter(|&&s| s == step).count();
+    let multiples = steps.iter().filter(|&&s| s > 0 && s % step == 0).count();
+    assert!(
+        multiples * 10 >= steps.len() * 9 && exact * 2 >= steps.len(),
+        "RTP steps at 90 kHz: {steps:?}"
+    );
+}
+
 fn rtp_steps(video: &[&RecordedVideoFrame]) -> Vec<u32> {
     video
         .windows(2)
@@ -991,20 +1002,37 @@ fn stream(
     (lines, recorded)
 }
 
-/// The mock's recording once serve's health stats cover every frame it sent, and the video serve dropped to stay live.
+/// The mock's recording once serve's health stats matched it across a refresh, and the video serve dropped to stay live.
 fn settled_video(h: &Harness, c: &mut Client) -> (dstreamy_mock_discord::Recorded, u64) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut steady: Option<(u64, u64, Instant)> = None;
     loop {
         let stats = c.status()["stats"].clone();
         let recorded = h.mock.recorded();
         let sent = stats["video_frames_sent"].as_u64();
-        if sent == Some(stream_video(&recorded).len() as u64) || Instant::now() >= deadline {
-            let dropped = ["video_frames_dropped", "source_video_frames_dropped"]
-                .iter()
-                .map(|key| stats[*key].as_u64().unwrap_or(0))
-                .sum();
-            return (recorded, dropped);
+        let dropped: u64 = ["video_frames_dropped", "source_video_frames_dropped"]
+            .iter()
+            .map(|key| stats[*key].as_u64().unwrap_or(0))
+            .sum();
+        let now = Instant::now();
+        if sent == Some(stream_video(&recorded).len() as u64) {
+            let key = (sent.unwrap_or(0), dropped);
+            match steady {
+                Some((s, d, since)) if (s, d) == key => {
+                    if now.duration_since(since) > Duration::from_millis(1500) {
+                        return (recorded, dropped);
+                    }
+                }
+                _ => steady = Some((key.0, key.1, now)),
+            }
+        } else {
+            steady = None;
         }
+        assert!(
+            now < deadline,
+            "serve's stats never settled: sent {sent:?}, {} video frames at the mock, dropped {dropped}",
+            stream_video(&recorded).len()
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
 }
@@ -1113,12 +1141,7 @@ fn the_own_encoder_divides_a_90_fps_canvas_down_to_30() {
         ),
         "{lines:#?}"
     );
-    let steps = rtp_steps(&stream_video(&recorded));
-    let at_30 = steps.iter().filter(|&&s| s == 3000).count();
-    assert!(
-        at_30 * 10 >= steps.len() * 9,
-        "RTP steps at 90 kHz: {steps:?}"
-    );
+    assert_frame_rate(&recorded, 3000);
 }
 
 #[test]
@@ -1137,12 +1160,7 @@ fn the_own_encoder_runs_at_60_fps_on_a_60_fps_canvas() {
         ),
         "{lines:#?}"
     );
-    let steps = rtp_steps(&stream_video(&recorded));
-    let at_60 = steps.iter().filter(|&&s| s == 1500).count();
-    assert!(
-        at_60 * 10 >= steps.len() * 9,
-        "RTP steps at 90 kHz: {steps:?}"
-    );
+    assert_frame_rate(&recorded, 1500);
 }
 
 /// Audio is always D-Streamy's own Opus, even when the stream's AAC encoder is attached.
