@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "vendor/discord-stream-rs"]
 exclude = ["fuzz", "vendor/webrtc", "crates/dstreamy-obs", "crates/dstreamy-obs-sys"]
 
 [workspace.package]
@@ -23,6 +23,8 @@ unsafe_op_in_unsafe_fn = "deny"
 dbg_macro = "warn"
 todo = "warn"
 
+[patch.crates-io]
+webrtc = { path = "vendor/webrtc" }
 
 [profile.release]
 lto = "thin"

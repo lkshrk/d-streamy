@@ -1,0 +1,45 @@
+[package]
+name = "dstreamy-discord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+discord-stream-rs = { path = "../../vendor/discord-stream-rs", default-features = false }
+dstreamy-core = { path = "../dstreamy-core" }
+dstreamy-media = { path = "../dstreamy-media" }
+base64 = "0.22"
+flate2 = "1"
+futures-util = "0.3"
+rand = "0.9"
+rsa = { version = "0.9", features = ["sha2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+secrecy = "0.10"
+serde.workspace = true
+serde_json = "1"
+sha2 = "0.10"
+thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+ureq = "3"
+uuid = { version = "1", features = ["v4"] }
+webpki-roots = "0.26"
+
+[dev-dependencies]
+tempfile.workspace = true
+async-trait = "0.1"
+dstreamy-media = { path = "../dstreamy-media", features = ["openh264"] }
+openh264 = "0.9"
+unsafe-libopus = "0.2"
+dstreamy-mock-discord = { path = "../dstreamy-mock-discord" }
+dstreamy-discord = { path = ".", features = ["test-hooks"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[features]
+test-rtp-start = ["discord-stream-rs/test-rtp-start"]
+test-hooks = ["discord-stream-rs/test-hooks"]
+
+[lints]
+workspace = true

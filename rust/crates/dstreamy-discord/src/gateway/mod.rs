@@ -1,0 +1,272 @@
+mod cache;
+mod connection;
+mod event;
+mod inflate;
+mod ledger;
+mod options;
+
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use thiserror::Error;
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio_tungstenite::Connector;
+
+pub use cache::{Guild, VoiceChannel, VoiceChannelKind};
+pub use event::{CurrentUser, Dispatch, GatewayEvent, VoiceState};
+pub(crate) use options::USER_AGENT;
+pub use options::{
+    DEFAULT_GATEWAY_URL, GATEWAY_VERSION, GatewayOptions, IdentifyLedger, IdentifyProperties,
+};
+
+const EVENT_CAPACITY: usize = 256;
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Earlier session ids remembered for late voice states of this client; one READY adds one.
+const MAX_PAST_SESSIONS: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum GatewayError {
+    /// Close codes 4004 (authentication failed) and 4010–4014 cannot be retried.
+    #[error("gateway rejected the session with close code {0}")]
+    Rejected(u16),
+    #[error("gave up after {0} failed gateway connection attempts")]
+    Exhausted(u32),
+    /// Never reached READY; `cause` is why the last attempt failed.
+    #[error(
+        "can't reach Discord ({cause}) after {attempts} attempts: check the network connection, and any firewall, proxy or VPN"
+    )]
+    Unreachable { attempts: u32, cause: String },
+    #[error(
+        "Discord kept ending the session; stopped logging in again after {limit} logins in 24 hours to protect the account. Try again in {}.",
+        about(*retry_after_secs)
+    )]
+    IdentifyLimit { limit: u32, retry_after_secs: u64 },
+    #[error("gateway client is closed")]
+    Closed,
+    #[error("TLS setup failed: {0}")]
+    Tls(String),
+}
+
+impl GatewayError {
+    /// Close 4004: Discord no longer accepts the token, so only a new login helps.
+    pub fn is_rejected_token(&self) -> bool {
+        *self == Self::Rejected(4004)
+    }
+}
+
+/// A coarse wait such as "about 3 h 12 min", for messages.
+pub fn about(secs: u64) -> String {
+    let minutes = secs.div_ceil(60);
+    match (minutes / 60, minutes % 60) {
+        (0, 0) => "less than a minute".to_owned(),
+        (0, m) => format!("about {m} min"),
+        (h, 0) => format!("about {h} h"),
+        (h, m) => format!("about {h} h {m} min"),
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Shared {
+    cache: RwLock<cache::Cache>,
+    lossless: Mutex<Vec<mpsc::UnboundedSender<GatewayEvent>>>,
+    session_id: RwLock<Option<String>>,
+    past_sessions: RwLock<Vec<String>>,
+}
+
+impl Shared {
+    pub(crate) fn session_id(&self) -> Option<String> {
+        self.session_id
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_session_id(&self, id: String) {
+        let mut current = self
+            .session_id
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(old) = current.replace(id) {
+            let mut past = self
+                .past_sessions
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            past.push(old);
+            let excess = past.len().saturating_sub(MAX_PAST_SESSIONS);
+            past.drain(..excess);
+        }
+    }
+
+    fn was_session(&self, id: &str) -> bool {
+        self.session_id().as_deref() == Some(id)
+            || self
+                .past_sessions
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|s| s == id)
+    }
+}
+
+/// User-account main gateway connection; reconnects and resumes on its own until closed.
+pub struct GatewayClient {
+    commands: mpsc::UnboundedSender<Value>,
+    events: broadcast::Sender<GatewayEvent>,
+    shared: Arc<Shared>,
+    user: CurrentUser,
+    shutdown: watch::Sender<()>,
+    task: JoinHandle<()>,
+}
+
+impl GatewayClient {
+    /// Connects, identifies and waits for READY.
+    pub async fn connect(opts: GatewayOptions) -> Result<Self, GatewayError> {
+        let connector = rustls_connector()?;
+        let shared = Arc::new(Shared::default());
+        let (events, _) = broadcast::channel(EVENT_CAPACITY);
+        let (commands, commands_rx) = mpsc::unbounded_channel();
+        let (shutdown, shutdown_rx) = watch::channel(());
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let runner = connection::Runner::new(
+            opts,
+            connector,
+            shared.clone(),
+            events.clone(),
+            commands_rx,
+            shutdown_rx,
+            ready_tx,
+        );
+        // Dropping this future drops `shutdown`, which makes the runner close the socket and exit.
+        let task = tokio::spawn(runner.run());
+        let user = ready_rx.await.unwrap_or(Err(GatewayError::Closed))?;
+        Ok(Self {
+            commands,
+            events,
+            shared,
+            user,
+            shutdown,
+            task,
+        })
+    }
+
+    /// The account from the first READY.
+    pub fn user(&self) -> &CurrentUser {
+        &self.user
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<GatewayEvent> {
+        self.events.subscribe()
+    }
+
+    /// The session id of the latest READY, which Discord also puts on this client's voice states.
+    pub fn session_id(&self) -> Option<String> {
+        self.shared.session_id()
+    }
+
+    /// Whether `id` is this client's current or an earlier gateway session (not another device's).
+    pub fn is_own_session(&self, id: &str) -> bool {
+        self.shared.was_session(id)
+    }
+
+    /// Like `subscribe`, but never lags: for consumers that must see every voice state and READY.
+    pub fn subscribe_unbounded(&self) -> mpsc::UnboundedReceiver<GatewayEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.shared
+            .lossless
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(tx);
+        rx
+    }
+
+    pub fn guilds(&self) -> Vec<Guild> {
+        self.shared
+            .cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .guilds()
+    }
+
+    /// Voice and stage channels of a guild, in Discord's display order.
+    pub fn voice_channels(&self, guild_id: &str) -> Vec<VoiceChannel> {
+        self.shared
+            .cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .voice_channels(guild_id)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    /// Queues a payload; it is written once the session is READY or RESUMED.
+    pub fn send(&self, op: u8, d: Value) -> Result<(), GatewayError> {
+        self.commands
+            .send(json!({ "op": op, "d": d }))
+            .map_err(|_| GatewayError::Closed)
+    }
+
+    /// Closes the socket with 1000 (ending the session) and waits for the task.
+    pub async fn close(mut self) {
+        let _ = self.shutdown.send(());
+        if tokio::time::timeout(CLOSE_TIMEOUT, &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+        }
+    }
+
+    pub(crate) fn shared(&self) -> Arc<Shared> {
+        self.shared.clone()
+    }
+
+    pub(crate) fn command_sender(&self) -> mpsc::UnboundedSender<Value> {
+        self.commands.clone()
+    }
+}
+
+pub(crate) fn rustls_connector() -> Result<Connector, GatewayError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| GatewayError::Tls(e.to_string()))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Connector::Rustls(Arc::new(config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn aborting_connect_before_ready_closes_the_gateway_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let mut opts = GatewayOptions::new(secrecy::SecretString::from("test")).with_url(url);
+        opts.compress = false;
+        let connect = tokio::spawn(GatewayClient::connect(opts));
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        connect.abort();
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            use futures_util::StreamExt;
+            loop {
+                match ws.next().await {
+                    None
+                    | Some(Err(_))
+                    | Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok());
+    }
+}

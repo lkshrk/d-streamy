@@ -1,0 +1,22 @@
+pub use discord_stream_rs as transport;
+
+mod client;
+pub mod gateway;
+pub mod remote_auth;
+pub mod session;
+pub mod stream;
+mod viewers;
+
+pub use client::DiscordClient;
+pub use gateway::{
+    CurrentUser, DEFAULT_GATEWAY_URL, Dispatch, GatewayClient, GatewayError, GatewayEvent,
+    GatewayOptions, Guild, IdentifyLedger, IdentifyProperties, VoiceChannel, VoiceChannelKind,
+    VoiceState,
+};
+pub use session::{
+    Backoff, HealthSnapshot, Session, SessionError, SessionEvent, SessionOptions, SessionState,
+    StartError, StopReason,
+};
+pub use stream::{
+    E2ee, StreamError, StreamHandle, StreamOptions, StreamStartError, StreamStats, start_stream,
+};
