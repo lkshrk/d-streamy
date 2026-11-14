@@ -1,43 +1,54 @@
+import AppKit
 import Foundation
-import ScreenCaptureKit
-import Combine
-import CaptureLib
 import os
 
 private let log = Logger(subsystem: "me.harke.d-streamy", category: "app")
 
-/// Single source of truth for the app.
+func normalizeDiscordToken(_ value: String) -> String {
+    let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard value.lowercased().hasPrefix("authorization:") else { return value }
+    return String(value.dropFirst("authorization:".count))
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
 @MainActor
 final class AppState: ObservableObject {
-    // Connection
-    @Published var token: String = ""
+    @Published var daemonError: String?
+    @Published var isAuthenticated = false
+    @Published private(set) var authNotice: AuthNotice?
+    var authError: String? { authNotice?.text }
+
     @Published var guilds: [GuildInfo] = []
     @Published var channels: [ChannelInfo] = []
     @Published var selectedGuild: GuildInfo?
     @Published var selectedChannel: ChannelInfo?
 
-    // Capture (set by SCContentSharingPicker)
-    @Published var captureFilter: SCContentFilter?
-    @Published var captureLabel: String = ""   // display name for selected content
-    @Published var captureKind: CaptureKind = .window
-    @Published var username: String = ""
+    @Published var targets: [CaptureTarget] = []
+    @Published var selectedTarget: CaptureTarget?
+    @Published var targetsError: String?
+    @Published var targetsCaptureFailed = false
 
-    // Crop
-    @Published var cropRect: CGRect? = nil
+    // Overlay points, bottom-left origin, over a window `cropViewSize` points large.
+    @Published var cropRect: CGRect?
+    private var cropViewSize: CGSize?
     @Published var isCropOverlayVisible = false
 
-    // Stream state
     @Published var streamState: StreamState = .idle
-    @Published var stats = StatsPayload(uptime: 0, fps: 0, bitrate: 0, droppedFrames: 0)
-    @Published var metricsHistory: [MetricsPayload] = []
-    private let metricsHistoryCap = 60
+    @Published var health: HealthSnapshot?
+    @Published var encryption = EncryptionStatus()
+    @Published var streamStartedAt: Date?
+    @Published var connectError: String?
+    @Published var isLoggingIn = false
+    @Published var isLoadingGuilds = false
+    @Published var isLoadingChannels = false
 
-    // Menubar health indicator
+    /// Longer than the daemon's 45 s budget for a first Discord login, so its own error arrives first.
+    static let loginRequestTimeout: Duration = .seconds(55)
+
     @Published var healthLevel: HealthLevel = .good
     @Published var menuDotVisible = true
     private var blinkTimer: Timer?
 
-    // Settings (persisted via UserDefaults)
     @Published var maxWidth: Int { didSet { defaults.set(maxWidth, forKey: "maxWidth") } }
     @Published var maxHeight: Int { didSet { defaults.set(maxHeight, forKey: "maxHeight") } }
     @Published var fps: Int { didSet { defaults.set(fps, forKey: "fps") } }
@@ -45,21 +56,67 @@ final class AppState: ObservableObject {
     @Published var audioGain: Float { didSet { defaults.set(audioGain, forKey: "audioGain") } }
     @Published var videoCodec: String { didSet { defaults.set(videoCodec, forKey: "videoCodec") } }
 
-    // Components
-    let daemon = DaemonController()
-    private var captureSession = CaptureSession()
+    private var daemon: DaemonClient?
+    private let daemonFactory: (() -> DaemonClient)?
+    private var launching: Task<DaemonClient?, Never>?
+    private var startPhase: StartPhase = .idle
+    private var abandonment: Abandonment = .notAbandoned
+    private var stopInFlight = false
+    private var unconfirmedStops = 0
+    private var sessionScopedError: String?
+    private var channelFetch = 0
+
+    private enum StartPhase {
+        /// No startStream call is running and no Start awaits confirmation.
+        case idle
+        /// startStream is running; no Start request awaits confirmation.
+        case starting
+        /// startStream is awaiting the reply to a Start no session event has confirmed.
+        case awaitingReply
+        /// startStream returned, but its Start is neither confirmed nor refused.
+        case unresolved
+
+        var callReturned: StartPhase {
+            switch self {
+            case .starting: return .idle
+            case .awaitingReply: return .unresolved
+            case .idle, .unresolved: return self
+            }
+        }
+
+        var confirmed: StartPhase {
+            switch self {
+            case .awaitingReply: return .starting
+            case .unresolved: return .idle
+            case .idle, .starting: return self
+            }
+        }
+    }
+
+    /// Whether session events are dropped because the session was stopped, cancelled or ended.
+    private enum Abandonment {
+        case notAbandoned
+        case abandoned
+        /// A cancelled Start went live while a Stop was in flight; that Stop must stop it.
+        case abandonedButWentLive
+    }
+
+    enum AuthNotice {
+        case message(String)
+        case notLoggedIn(String)
+        case otherAccount(String)
+
+        var text: String {
+            switch self {
+            case .message(let text), .notLoggedIn(let text), .otherAccount(let text): return text
+            }
+        }
+    }
+
+    private var cropSentForStart = false
     private let defaults = UserDefaults.standard
     let cropOverlayController = CropOverlayController()
-    private var captureStartTask: Task<Void, Never>?
-    private var captureStartWatchdogTask: Task<Void, Never>?
-    private var connectWatchdogTask: Task<Void, Never>?
-    private let streamLog = StreamFileLogger.shared
-    private let captureMetricsLog = Logger(subsystem: "me.harke.d-streamy", category: "capture")
-    private let streamMetricsLog = Logger(subsystem: "me.harke.d-streamy", category: "stream")
-    private let healthLog = Logger(subsystem: "me.harke.d-streamy", category: "health")
-    private var sessionId = ""
-    private var metricsTimer: Timer?
-    private var metricsStart = Date()
+    private var cropUpdateTask: Task<Void, Never>?
 
     enum StreamState: Equatable {
         case idle
@@ -75,6 +132,11 @@ final class AppState: ObservableObject {
             }
         }
 
+        var isReconnecting: Bool {
+            if case .reconnecting = self { return true }
+            return false
+        }
+
         var canStop: Bool {
             switch self {
             case .connecting, .streaming, .reconnecting: return true
@@ -83,8 +145,9 @@ final class AppState: ObservableObject {
         }
     }
 
-    init() {
-        // Load persisted settings
+    init(bootstrapOnLaunch: Bool = true, daemon: DaemonClient? = nil, daemonFactory: (() -> DaemonClient)? = nil) {
+        self.daemon = daemon
+        self.daemonFactory = daemonFactory
         maxWidth = defaults.object(forKey: "maxWidth") as? Int ?? 1920
         maxHeight = defaults.object(forKey: "maxHeight") as? Int ?? 1080
         fps = defaults.object(forKey: "fps") as? Int ?? 30
@@ -92,7 +155,6 @@ final class AppState: ObservableObject {
         audioGain = defaults.object(forKey: "audioGain") as? Float ?? 1.0
         videoCodec = defaults.string(forKey: "videoCodec") ?? "H264"
 
-        // Load saved guild/channel selection
         if let gId = defaults.string(forKey: "lastGuildId"),
            let gName = defaults.string(forKey: "lastGuildName") {
             selectedGuild = GuildInfo(id: gId, name: gName)
@@ -102,510 +164,210 @@ final class AppState: ObservableObject {
             selectedChannel = ChannelInfo(id: cId, name: cName)
         }
 
-        loadToken()
-        daemon.onEvent = { [weak self] type, payload in
-            self?.handleDaemonEvent(type, payload)
-        }
-
-        cropOverlayController.onCropChanged = { [weak self] rect in
-            guard let self else { return }
-            self.cropRect = rect
-            self.persistCrop()
-            // Live-update crop on running stream
-            if self.streamState.isActive, let filter = self.captureFilter {
-                let scale = filter.pointPixelScale
-                let sourceH = filter.contentRect.height * CGFloat(scale)
-                // NSView coords are bottom-left origin; pixel buffer is top-left origin
-                let pixelY = Int(sourceH - (rect.origin.y + rect.height) * CGFloat(scale))
-                let crop = CropFilter(
-                    x: Int(rect.origin.x * CGFloat(scale)),
-                    y: max(0, pixelY),
-                    width: Int(rect.width * CGFloat(scale)),
-                    height: Int(rect.height * CGFloat(scale))
-                )
-                if let newDims = self.captureSession.updateCrop(crop) {
-                    // Encoder reinitialized with new dimensions — tell Discord
-                    self.daemon.send(.updateVideo(.init(
-                        width: newDims.0,
-                        height: newDims.1,
-                        fps: self.fps
-                    )))
-                }
-            }
+        cropOverlayController.onCropChanged = { [weak self] rect, size in
+            self?.cropChanged(rect, viewSize: size)
         }
         cropOverlayController.onApply = { [weak self] in
-            self?.cropOverlayController.hide()
-            self?.isCropOverlayVisible = false
+            self?.hideCropOverlay()
         }
 
-        if !token.isEmpty {
-            Task { await loginAndFetch() }
-        }
+        if let daemon { observe(daemon) }
 
-        // Auto-restore last selected window
-        Task { await restoreCaptureSelection() }
+        if bootstrapOnLaunch {
+            Task { await bootstrap() }
+        }
     }
 
     var canCropSelectedContent: Bool {
-        guard captureFilter != nil else { return false }
-        return captureKind == .window
+        selectedTarget?.windowID != nil
     }
 
-    private func restoreCaptureSelection() async {
-        if defaults.string(forKey: "lastCaptureKind") == CaptureKind.display.rawValue,
-           await restoreDisplay() {
-            return
-        }
-
-        await restoreWindow()
-    }
-
-    private func restoreDisplay() async -> Bool {
-        let savedDisplayID = CGDirectDisplayID(defaults.integer(forKey: "lastDisplayID"))
-        guard savedDisplayID != 0 else { return false }
-
+    func bootstrap() async {
+        guard let daemon = await ensureDaemon() else { return }
         do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            guard let display = content.displays.first(where: { $0.displayID == savedDisplayID }) else {
-                log.info("restoreDisplay: no match for \(savedDisplayID)")
-                return false
+            let status: LoggedInInfo = try await daemon.request(.loggedIn, timeout: .seconds(10))
+            isAuthenticated = status.loggedIn
+            if !isAuthenticated, let legacy = await Task.detached(operation: LegacyKeychainToken.read).value {
+                log.info("migrating the Keychain token to the daemon")
+                try await daemon.request(.setToken(legacy), as: Empty.self, timeout: Self.loginRequestTimeout)
+                await Task.detached(operation: LegacyKeychainToken.delete).value
+                isAuthenticated = true
             }
-
-            let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-            captureFilter = filter
-            captureKind = .display
-            cropRect = nil
-            captureLabel = displayCaptureLabel(for: display, filter: filter)
-            log.info("restoreDisplay: auto-selected \(self.captureLabel)")
-            streamLog.write(component: "app", "restore display: \(captureLabel)")
-            return true
         } catch {
-            log.error("restoreDisplay failed: \(error.localizedDescription)")
-            return false
+            report(error)
         }
+        await refreshTargets()
+        if isAuthenticated { await fetchGuilds() }
     }
 
-    private func restoreWindow() async {
-        guard let bundleId = defaults.string(forKey: "lastWindowBundleId"),
-              !bundleId.isEmpty else { return }
-        let savedTitle = defaults.string(forKey: "lastWindowTitle") ?? ""
-        let savedApp = defaults.string(forKey: "lastWindowApp") ?? ""
-        let savedFrame = defaults.array(forKey: "lastWindowFrame") as? [CGFloat]
-
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            let candidates = content.windows.filter {
-                $0.owningApplication?.bundleIdentifier == bundleId
-                && $0.frame.width > 100 && $0.frame.height > 100
-            }
-
-            // Best match: exact title > contains title > closest frame position+size
-            let match: SCWindow?
-            if let exact = candidates.first(where: { $0.title == savedTitle }) {
-                match = exact
-            } else if let partial = candidates.first(where: { ($0.title ?? "").contains(savedTitle) }) {
-                match = partial
-            } else if let sf = savedFrame, sf.count == 4 {
-                let saved = CGRect(x: sf[0], y: sf[1], width: sf[2], height: sf[3])
-                match = candidates.min(by: { frameDist($0.frame, saved) < frameDist($1.frame, saved) })
+    private func report(_ error: Error) {
+        if let failure = error as? DaemonError, failure.isAuthFailure {
+            isAuthenticated = false
+            guilds = []
+            channels = []
+            if failure.code == "not_logged_in" {
+                authNotice = .notLoggedIn(Self.notLoggedInGuidance(failure.message, cli: cliPath))
             } else {
-                match = candidates.first
+                authNotice = .message(failure.message)
             }
-
-            guard let window = match else {
-                log.info("restoreWindow: no match for \(bundleId)/\(savedTitle)")
-                return
-            }
-
-            let filter = SCContentFilter(desktopIndependentWindow: window)
-            captureFilter = filter
-            captureKind = .window
-            let app = window.owningApplication?.applicationName ?? savedApp
-            let title = window.title ?? savedTitle
-            captureLabel = app.isEmpty ? title : "\(app) — \(title)"
-            loadCropForCurrentWindow()
-            log.info("restoreWindow: auto-selected \(app) — \(title)")
-            streamLog.write(component: "app", "restore window: \(captureLabel)")
-        } catch {
-            log.error("restoreWindow failed: \(error.localizedDescription)")
+        } else {
+            daemonError = error.localizedDescription
         }
     }
 
-    // MARK: - Actions
-
-    func loginAndFetch() async {
-        await fetchUser()
-        await fetchGuilds()
+    private func ensureDaemon() async -> DaemonClient? {
+        if let daemon, daemon.isRunning { return daemon }
+        if let launching { return await launching.value }
+        let task = Task { await launchDaemon() }
+        launching = task
+        let client = await task.value
+        launching = nil
+        return client
     }
 
-    func fetchUser() async {
-        guard !token.isEmpty else { return }
-        guard let (data, _) = try? await discordAPI("users/@me") else { return }
-        struct User: Decodable { let username: String }
-        if let user = try? JSONDecoder().decode(User.self, from: data) {
-            username = user.username
+    private func launchDaemon() async -> DaemonClient? {
+        let client: DaemonClient
+        if let daemonFactory {
+            client = daemonFactory()
+        } else {
+            guard let url = DaemonBinary.locate() else {
+                daemonError = "dstreamy not found. Build it with `cargo build -p dstreamy-cli` or set DSTREAMY_BIN."
+                return nil
+            }
+            client = DaemonClient(executableURL: url)
+        }
+        observe(client)
+        do {
+            try client.launch()
+            try await client.handshake()
+        } catch {
+            client.terminate()
+            daemonError = "Could not start dstreamy: \(error.localizedDescription)"
+            return nil
+        }
+        daemon = client
+        daemonError = nil
+        return client
+    }
+
+    private func observe(_ client: DaemonClient) {
+        client.onEvent = { [weak self, weak client] event in
+            DispatchQueue.main.async { MainActor.assumeIsolated {
+                guard let self, let client, client === self.daemon else { return }
+                self.handle(event)
+            } }
+        }
+        client.onExit = { [weak self, weak client] status in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.daemonExited(client, status: status) } }
+        }
+    }
+
+    private func daemonExited(_ client: DaemonClient?, status: Int32) {
+        guard let client, client === daemon else { return }
+        daemon = nil
+        if streamState.canStop {
+            streamState = .error("dstreamy exited (status \(status))")
+            endStream()
+        }
+        if status != 0 {
+            daemonError = "dstreamy exited unexpectedly (status \(status)). It restarts with the next action."
         }
     }
 
     func fetchGuilds() async {
-        guard !token.isEmpty else { return }
-        guard let (data, _) = try? await discordAPI("users/@me/guilds") else { return }
-        if let g = try? JSONDecoder().decode([GuildInfo].self, from: data) {
-            guilds = g
-            if let saved = selectedGuild, g.contains(where: { $0.id == saved.id }) {
+        guard isAuthenticated, let daemon = await ensureDaemon() else { return }
+        isLoadingGuilds = true
+        defer { isLoadingGuilds = false }
+        do {
+            guilds = try await daemon.request(.guilds, timeout: Self.loginRequestTimeout)
+            daemonError = nil
+            if let saved = selectedGuild, guilds.contains(where: { $0.id == saved.id }) {
                 await fetchChannels(guildId: saved.id)
             }
+        } catch {
+            report(error)
         }
     }
 
     func fetchChannels(guildId: String) async {
-        guard !token.isEmpty else { return }
-        guard let (data, _) = try? await discordAPI("guilds/\(guildId)/channels") else { return }
-        struct DiscordChannel: Decodable { let id: String; let name: String; let type: Int }
-        if let all = try? JSONDecoder().decode([DiscordChannel].self, from: data) {
-            channels = all
-                .filter { $0.type == 2 }
-                .map { ChannelInfo(id: $0.id, name: $0.name) }
-                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-        }
-    }
-
-    func startStream() async {
-        guard let filter = captureFilter,
-              let guild = selectedGuild,
-              let channel = selectedChannel,
-              !token.isEmpty else {
-            log.warning("startStream guard failed: filter=\(self.captureFilter != nil) guild=\(self.selectedGuild != nil) channel=\(self.selectedChannel != nil) token=\(!self.token.isEmpty)")
-            streamLog.write(component: "app", "start guard failed filter=\(captureFilter != nil) guild=\(selectedGuild != nil) channel=\(selectedChannel != nil) token=\(!token.isEmpty)")
-            return
-        }
-
-        log.info("startStream: resetting stale sharing session")
-        streamLog.write(component: "app", "start: reset stale sharing session")
-        cancelStreamTasks()
-        await resetSharingSessionBeforeStart()
-
-        streamState = .connecting
-        log.info("startStream: connecting")
-        streamLog.write(component: "app", "start: connecting source=\(captureLabel) kind=\(captureKind.rawValue)")
-
-        // Start daemon if needed
-        if !daemon.isConnected {
-            do {
-                try daemon.start()
-                for _ in 0..<50 {
-                    try await Task.sleep(for: .milliseconds(100))
-                    if daemon.isConnected { break }
-                }
-                guard daemon.isConnected else {
-                    streamState = .error("Daemon failed to connect")
-                    streamLog.write(component: "app", "start: daemon failed to connect")
-                    return
-                }
-            } catch {
-                streamState = .error("Failed to start daemon: \(error.localizedDescription)")
-                streamLog.write(component: "app", "start: daemon start failed: \(error.localizedDescription)")
-                return
-            }
-        }
-        log.info("startStream: daemon connected")
-        streamLog.write(component: "app", "start: daemon connected")
-
-        guard let mediaFd = daemon.mediaFd else {
-            streamState = .error("No media pipe available")
-            streamLog.write(component: "app", "start: no media pipe")
-            return
-        }
-
-        let rect = filter.contentRect
-        let scale = filter.pointPixelScale
-        let sourceW = Int(rect.width * CGFloat(scale))
-        let sourceH = Int(rect.height * CGFloat(scale))
-        log.debug("startStream: contentRect=\(rect.debugDescription) scale=\(scale) source=\(sourceW)x\(sourceH)")
-        streamLog.write(component: "app", "start: source=\(sourceW)x\(sourceH) max=\(maxWidth)x\(maxHeight) fps=\(fps) bitrate=\(bitrateMbps)")
-
-        var pixelCrop: CropFilter? = nil
-        if let crop = cropRect {
-            let sourceH = rect.height * CGFloat(scale)
-            // NSView coords are bottom-left origin; pixel buffer is top-left origin
-            let pixelY = Int(sourceH - (crop.origin.y + crop.height) * CGFloat(scale))
-            pixelCrop = CropFilter(
-                x: Int(crop.origin.x * CGFloat(scale)),
-                y: max(0, pixelY),
-                width: Int(crop.width * CGFloat(scale)),
-                height: Int(crop.height * CGFloat(scale))
-            )
-        }
-
-        sessionId = UUID().uuidString
-        metricsStart = Date()
-        metricsHistory = []
-        healthLog.info("session start session=\(self.sessionId, privacy: .public)")
-
-        let config = CaptureConfig(
-            filter: filter,
-            sourceWidth: sourceW > 0 ? sourceW : maxWidth,
-            sourceHeight: sourceH > 0 ? sourceH : maxHeight,
-            maxWidth: maxWidth,
-            maxHeight: maxHeight,
-            fps: fps,
-            bitrateMbps: bitrateMbps,
-            crop: pixelCrop,
-            audioGain: audioGain,
-            codec: VideoCodec(rawValue: videoCodec) ?? .h264,
-            outputFd: mediaFd
-        )
-
-        startCaptureThenConnect(
-            config: config,
-            token: token,
-            guildId: guild.id,
-            channelId: channel.id,
-            fps: fps
-        )
-    }
-
-    private func resetSharingSessionBeforeStart() async {
-        // Keep the picker active here: the selected SCContentFilter can rely on
-        // picker-backed authorization, especially for system audio.
-        await captureSession.stop()
-
-        if daemon.isConnected {
-            daemon.send(.disconnect)
-            try? await Task.sleep(for: .milliseconds(500))
-        }
-        daemon.stop()
-    }
-
-    private func startCaptureThenConnect(
-        config: CaptureConfig,
-        token: String,
-        guildId: String,
-        channelId: String,
-        fps: Int
-    ) {
-        captureStartTask?.cancel()
-        captureStartWatchdogTask?.cancel()
-
-        log.info("startStream: starting capture")
-
-        captureStartTask = Task { [weak self] in
-            guard let self else { return }
-
-            do {
-                try await self.captureSession.start(config: config)
-            } catch {
-                guard !Task.isCancelled else { return }
-                log.error("startStream: capture failed: \(error.localizedDescription)")
-                self.streamLog.write(component: "app", "start: capture failed: \(error.localizedDescription)")
-                await self.failStart("Capture failed: \(error.localizedDescription)")
-                return
-            }
-
-            guard !Task.isCancelled else { return }
-            guard self.streamState == .connecting, self.daemon.isConnected else { return }
-
-            self.captureStartWatchdogTask?.cancel()
-            log.info("startStream: capture started \(self.captureSession.captureWidth)x\(self.captureSession.captureHeight)")
-            self.streamLog.write(component: "app", "start: capture started \(self.captureSession.captureWidth)x\(self.captureSession.captureHeight)")
-
-            self.daemon.send(.connect(.init(
-                token: token,
-                guildId: guildId,
-                channelId: channelId,
-                width: self.captureSession.captureWidth,
-                height: self.captureSession.captureHeight,
-                fps: fps,
-                codec: self.videoCodec,
-                session: self.sessionId
-            )))
-            log.info("startStream: connect command sent")
-            self.streamLog.write(component: "app", "start: connect command sent")
-            self.startConnectWatchdog()
-        }
-
-        captureStartWatchdogTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(12))
-            guard !Task.isCancelled else { return }
-            await self?.failStartIfStillConnecting("Timed out starting screen capture")
-        }
-    }
-
-    private func startConnectWatchdog() {
-        connectWatchdogTask?.cancel()
-        connectWatchdogTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(35))
-            guard !Task.isCancelled else { return }
-            await self?.failStartIfStillConnecting("Timed out connecting to Discord")
-        }
-    }
-
-    private func failStartIfStillConnecting(_ message: String) async {
-        guard streamState == .connecting else { return }
-        log.error("startStream: \(message)")
-        streamLog.write(component: "app", "start failed: \(message)")
-        await failStart(message)
-    }
-
-    private func failStart(_ message: String) async {
-        cancelStreamTasks()
-        SCContentSharingPicker.shared.isActive = false
-        daemon.send(.disconnect)
-        await captureSession.stop()
-        try? await Task.sleep(for: .milliseconds(250))
-        daemon.stop()
-        streamState = .error(message)
-    }
-
-    private func cancelStreamTasks() {
-        captureStartTask?.cancel()
-        captureStartTask = nil
-        captureStartWatchdogTask?.cancel()
-        captureStartWatchdogTask = nil
-        connectWatchdogTask?.cancel()
-        connectWatchdogTask = nil
-    }
-
-    // MARK: - Crop overlay
-
-    func toggleCropOverlay() {
-        if isCropOverlayVisible {
-            cropOverlayController.hide()
-            isCropOverlayVisible = false
-        } else {
-            guard canCropSelectedContent, let filter = captureFilter else { return }
-            // Bring target window to front so it's fully visible
-            if #available(macOS 15.2, *), let window = filter.includedWindows.first {
-                let pid = window.owningApplication?.processID ?? 0
-                if pid > 0, let app = NSRunningApplication(processIdentifier: pid) {
-                    app.activate()
-                }
-            }
-            cropOverlayController.show(for: filter, currentCrop: cropRect)
-            isCropOverlayVisible = true
-        }
-    }
-
-    /// Switch capture source while streaming (new window selected live).
-    func switchCaptureSource() async {
-        guard let filter = captureFilter,
-              let mediaFd = daemon.mediaFd else { return }
-
-        // Stop current capture
-        await captureSession.stop()
-
-        let rect = filter.contentRect
-        let scale = filter.pointPixelScale
-        let sourceW = Int(rect.width * CGFloat(scale))
-        let sourceH = Int(rect.height * CGFloat(scale))
-
-        var cropFilter: CropFilter? = nil
-        if let crop = cropRect {
-            let sourceH = rect.height * CGFloat(scale)
-            let pixelY = Int(sourceH - (crop.origin.y + crop.height) * CGFloat(scale))
-            cropFilter = CropFilter(
-                x: Int(crop.origin.x * CGFloat(scale)),
-                y: max(0, pixelY),
-                width: Int(crop.width * CGFloat(scale)),
-                height: Int(crop.height * CGFloat(scale))
-            )
-        }
-
-        let config = CaptureConfig(
-            filter: filter,
-            sourceWidth: sourceW > 0 ? sourceW : maxWidth,
-            sourceHeight: sourceH > 0 ? sourceH : maxHeight,
-            maxWidth: maxWidth,
-            maxHeight: maxHeight,
-            fps: fps,
-            bitrateMbps: bitrateMbps,
-            crop: cropFilter,
-            audioGain: audioGain,
-            codec: VideoCodec(rawValue: videoCodec) ?? .h264,
-            outputFd: mediaFd
-        )
-
+        guard isAuthenticated else { return }
+        channelFetch += 1
+        let fetch = channelFetch
+        guard let daemon = await ensureDaemon() else { return }
+        isLoadingChannels = true
+        defer { if fetch == channelFetch { isLoadingChannels = false } }
         do {
-            try await captureSession.start(config: config)
-            // Update Discord video attributes if dimensions changed
-            daemon.send(.updateVideo(.init(
-                width: captureSession.captureWidth,
-                height: captureSession.captureHeight,
-                fps: fps
-            )))
-            log.info("switchCaptureSource: now capturing \(self.captureSession.captureWidth)x\(self.captureSession.captureHeight)")
-            streamLog.write(component: "app", "switch source: \(captureLabel) \(captureSession.captureWidth)x\(captureSession.captureHeight)")
+            let all: [ChannelInfo] = try await daemon.request(.channels(guildId: guildId), timeout: Self.loginRequestTimeout)
+            guard fetch == channelFetch, selectedGuild?.id == guildId else { return }
+            channels = all.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            daemonError = nil
         } catch {
-            log.error("switchCaptureSource failed: \(error.localizedDescription)")
-            streamLog.write(component: "app", "switch source failed: \(error.localizedDescription)")
+            guard fetch == channelFetch, selectedGuild?.id == guildId else { return }
+            channels = []
+            report(error)
         }
     }
 
-    func stopStream() async {
-        streamLog.write(component: "app", "stop requested")
-        cancelStreamTasks()
-        SCContentSharingPicker.shared.isActive = false
-        daemon.send(.disconnect)
-        await captureSession.stop()
-        // Wait for leave opcode to flush over WS before killing daemon
-        try? await Task.sleep(for: .milliseconds(1000))
-        daemon.stop()
-        streamState = .idle
-        stats = StatsPayload(uptime: 0, fps: 0, bitrate: 0, droppedFrames: 0)
-        metricsHistory = []
-        resetHealth()
-    }
-
-    func shutdownForQuit() async {
-        streamLog.write(component: "app", "quit cleanup requested")
-        cancelStreamTasks()
-        SCContentSharingPicker.shared.isActive = false
-        if isCropOverlayVisible {
-            cropOverlayController.hide()
-            isCropOverlayVisible = false
+    func saveToken(_ newToken: String) async {
+        let token = normalizeDiscordToken(newToken)
+        guard !token.isEmpty else {
+            authNotice = .message("Paste an Authorization header value.")
+            return
         }
-
-        daemon.send(.disconnect)
-        await captureSession.stop()
-        try? await Task.sleep(for: .milliseconds(1000))
-        daemon.stop()
-        streamState = .idle
-        stats = StatsPayload(uptime: 0, fps: 0, bitrate: 0, droppedFrames: 0)
-        metricsHistory = []
-        resetHealth()
+        guard let daemon = await ensureDaemon() else { return }
+        isLoggingIn = true
+        defer { isLoggingIn = false }
+        do {
+            try await daemon.request(.setToken(token), as: Empty.self, timeout: Self.loginRequestTimeout)
+            isAuthenticated = true
+            authNotice = nil
+            daemonError = nil
+            await fetchGuilds()
+        } catch let failure as DaemonError where failure.code == "account_mismatch" {
+            authNotice = .otherAccount(Self.otherAccountGuidance(cli: cliPath))
+        } catch {
+            report(error)
+        }
     }
 
-    // MARK: - Token management
+    private var cliPath: String { DaemonBinary.locate()?.path ?? "dstreamy" }
 
-    func saveToken(_ newToken: String) {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        proc.arguments = ["add-generic-password", "-U", "-s", "dstreamy", "-a", "discord-token", "-w", newToken]
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
-        try? proc.run()
-        proc.waitUntilExit()
-        token = newToken
-        Task { await loginAndFetch() }
+    static func otherAccountGuidance(cli: String) -> String {
+        "This token belongs to a different Discord account than the one D-Streamy uses. To keep that account, paste its token. "
+            + "To switch, run \"\(cli)\" login --token in Terminal; it prints the new account's name. "
+            + "Then run \"\(cli)\" account use NAME with that name, and reopen D-Streamy."
     }
 
-    func clearToken() {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        proc.arguments = ["delete-generic-password", "-s", "dstreamy", "-a", "discord-token"]
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
-        try? proc.run()
-        proc.waitUntilExit()
-        token = ""
-        username = ""
-        guilds = []
-        channels = []
-        selectedGuild = nil
-        selectedChannel = nil
+    /// Rewrites the daemon's `dstreamy …` hints to the bundled binary and names the popover's button.
+    static func notLoggedInGuidance(_ message: String, cli: String) -> String {
+        var text = message.replacingOccurrences(of: "use Log in", with: "use Edit token")
+        text = text.replacingOccurrences(
+            of: "`dstreamy ([^`]*)`",
+            with: "\"\(NSRegularExpression.escapedTemplate(for: cli))\" $1 in Terminal",
+            options: .regularExpression
+        )
+        return sentence(text) + " After logging in from Terminal, open the D-Streamy menu again."
     }
 
-    // MARK: - Config persistence
+    private func clearOtherAccountGuidance() {
+        guard case .otherAccount? = authNotice else { return }
+        authNotice = nil
+    }
+
+    /// Picks up a login made with the CLI while the app was running.
+    func recheckLogin() async {
+        switch authNotice {
+        case .none, .notLoggedIn?: break
+        case .message?, .otherAccount?: return
+        }
+        guard !isAuthenticated,
+              let daemon = await ensureDaemon(),
+              let status = try? await daemon.request(.loggedIn, as: LoggedInInfo.self, timeout: .seconds(10)),
+              status.loggedIn, !isAuthenticated else { return }
+        isAuthenticated = true
+        authNotice = nil
+        await fetchGuilds()
+    }
 
     func persistConfig() {
         if let guild = selectedGuild {
@@ -618,28 +380,375 @@ final class AppState: ObservableObject {
         }
     }
 
-    // MARK: - Private
-
-    private func startMetricsTimer() {
-        metricsTimer?.invalidate()
-        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in
-                let s = self.captureSession.metrics.snapshot()
-                let t = Int(Date().timeIntervalSince(self.metricsStart))
-                self.captureMetricsLog.info(
-                    "session=\(self.sessionId, privacy: .public) t=\(t, privacy: .public) delivered=\(s.delivered, privacy: .public) encSubmit=\(s.encSubmit, privacy: .public) encDrop=\(s.encDrop, privacy: .public) audioBuf=\(s.audioBuf, privacy: .public) audioConvFail=\(s.audioConvFail, privacy: .public)"
-                )
-            }
+    func refreshTargets() async {
+        guard let daemon = await ensureDaemon() else { return }
+        do {
+            targets = try await daemon.request(.targets, timeout: .seconds(15))
+            targetsError = nil
+            targetsCaptureFailed = false
+        } catch {
+            log.error("targets failed: \(error.localizedDescription, privacy: .public)")
+            targetsError = error.localizedDescription
+            targetsCaptureFailed = (error as? DaemonError)?.code == "capture"
+            return
         }
-        RunLoop.main.add(timer, forMode: .common)
-        metricsTimer = timer
+        if let current = selectedTarget {
+            if let fresh = targets.first(where: { $0.id == current.id }) { selectedTarget = fresh }
+        } else if let restored = restoredTarget(from: targets) {
+            selectTarget(restored)
+        }
     }
 
-    private func stopMetricsTimer() {
-        metricsTimer?.invalidate()
-        metricsTimer = nil
+    /// A daemon that was denied Screen Recording keeps failing after the grant until it is relaunched.
+    func retryTargets() async {
+        if targetsCaptureFailed, !streamState.canStop, let daemon {
+            self.daemon = nil
+            await daemon.shutdown()
+        }
+        await refreshTargets()
+    }
+
+    func selectTarget(_ target: CaptureTarget) {
+        if isCropOverlayVisible { hideCropOverlay() }
+        selectedTarget = target
+        defaults.set(target.id, forKey: "lastTargetId")
+        defaults.set(target.app ?? "", forKey: "lastTargetApp")
+        defaults.set(target.title, forKey: "lastTargetTitle")
+        loadCrop()
+    }
+
+    private func restoredTarget(from targets: [CaptureTarget]) -> CaptureTarget? {
+        guard let id = defaults.string(forKey: "lastTargetId") else { return nil }
+        if let exact = targets.first(where: { $0.id == id }) { return exact }
+        guard id.hasPrefix("window:"), let app = defaults.string(forKey: "lastTargetApp"), !app.isEmpty else { return nil }
+        let title = defaults.string(forKey: "lastTargetTitle") ?? ""
+        return targets.first { $0.kind == .window && $0.app == app && $0.title == title }
+    }
+
+    func startStream(timeout: Duration = .seconds(90)) async {
+        guard startPhase == .idle, !stopInFlight, !streamState.canStop,
+              selectedTarget != nil,
+              let guild = selectedGuild,
+              let channel = selectedChannel,
+              isAuthenticated else { return }
+        startPhase = .starting
+        defer { startPhase = startPhase.callReturned }
+        abandonment = .notAbandoned
+        unconfirmedStops = 0
+        daemonError = nil
+        clearOtherAccountGuidance()
+        streamState = .connecting
+        encryption = EncryptionStatus()
+        health = nil
+        streamStartedAt = nil
+        connectError = nil
+        cropSentForStart = true
+        guard let daemon = await ensureDaemon() else {
+            streamState = .error(daemonError ?? "dstreamy is not running")
+            return
+        }
+        guard abandonment == .notAbandoned else { return endStreamAsIdle() }
+        await refreshTargets()
+        guard abandonment == .notAbandoned else { return endStreamAsIdle() }
+        guard let target = selectedTarget else {
+            streamState = .error("No source selected")
+            return
+        }
+        let request = StartRequest(
+            guildId: guild.id,
+            channelId: channel.id,
+            target: target.id,
+            crop: pixelCrop(for: target),
+            codec: videoCodec.lowercased(),
+            fps: fps,
+            resolution: "\(maxWidth)x\(maxHeight)",
+            bitrateKbps: Int((bitrateMbps * 1000).rounded()),
+            gain: Double(audioGain)
+        )
+        log.info("start target=\(target.id, privacy: .public) guild=\(guild.id, privacy: .public) channel=\(channel.id, privacy: .public)")
+        startPhase = .awaitingReply
+        do {
+            try await daemon.request(.start(request), as: Empty.self, timeout: timeout)
+            guard daemon === self.daemon else { return }
+            guard abandonment == .notAbandoned else {
+                // The start went live after it was cancelled; a Stop still in flight is told to stop it.
+                if stopInFlight {
+                    abandonment = .abandonedButWentLive
+                } else {
+                    await stopCancelledStart(daemon)
+                }
+                return
+            }
+            startPhase = startPhase.confirmed
+        } catch {
+            guard daemon === self.daemon else { return }
+            if let failure = error as? DaemonError, failure.code == "cancelled" {
+                endStreamAsIdle()
+            } else if let failure = error as? DaemonError {
+                report(failure)
+                if Self.refusalsThatKeepDaemon.contains(failure.code) {
+                    await keepDaemonAfterRefusedStart(daemon, failure: failure)
+                } else {
+                    await terminateStoppedDaemon(daemon, message: "Start was rejected: \(Self.sentence(failure.message)) dstreamy was terminated before retrying.")
+                }
+            } else if !daemon.isRunning {
+                streamState = .error(error.localizedDescription)
+                endStream()
+            } else if abandonment != .notAbandoned || !streamState.canStop {
+                await terminateStoppedDaemon(daemon, message: "Start has not been confirmed. dstreamy was terminated before retrying. \(error.localizedDescription)")
+            } else {
+                setSessionScopedError("Start has not been confirmed. It may still complete. Cancel before retrying. \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Refusals for which this Start began no session; the daemon is fine, so relaunching it would be wasted.
+    static let refusalsThatKeepDaemon: Set<String> = [
+        "identify_limit", "invalid_params", "unknown_guild", "unknown_channel", "guild_unavailable",
+        "already_running", "busy", "not_logged_in", "invalid_token", "gateway",
+    ]
+
+    private func endStreamAsIdle() {
+        if streamState.canStop { streamState = .idle }
+        endStream()
+    }
+
+    private func stopCancelledStart(_ daemon: DaemonClient) async {
+        if abandonment == .abandonedButWentLive { abandonment = .abandoned }
+        do {
+            try await daemon.request(.stop, as: StreamStats.self, timeout: .seconds(15))
+            guard daemon === self.daemon else { return }
+            endStreamAsIdle()
+        } catch {
+            guard daemon === self.daemon else { return }
+            if (error as? DaemonError)?.code == "not_running" || !streamState.canStop {
+                endStreamAsIdle()
+            } else {
+                await terminateStoppedDaemon(daemon)
+            }
+        }
+    }
+
+    private func keepDaemonAfterRefusedStart(_ daemon: DaemonClient, failure: DaemonError) async {
+        var message = "Start was rejected: \(Self.sentence(failure.message))"
+        if failure.code == "already_running" {
+            // Only a session in our own daemon answers Stop; `not_running` means another process holds the account.
+            do {
+                try await daemon.request(.stop, as: StreamStats.self, timeout: .seconds(5))
+                guard daemon === self.daemon else { return }
+                message += " A stream left running in dstreamy was stopped. Press Start again."
+            } catch let stop as DaemonError where stop.code == "not_running" {
+                guard daemon === self.daemon else { return }
+                message += " Stop the other stream on this Discord account (OBS or the dstreamy command) first."
+            } catch {
+                guard daemon === self.daemon else { return }
+                if streamState.canStop {
+                    keepOwnSessionStoppable(message + " dstreamy is still running a stream and did not confirm stopping it (\(error.localizedDescription)). Press Stop again to end it.")
+                    return
+                }
+                message += " A stream left running in dstreamy was stopped. Press Start again."
+            }
+        }
+        endStreamAsIdle()
+        if !failure.isAuthFailure { daemonError = message }
+    }
+
+    private func keepOwnSessionStoppable(_ message: String) {
+        startPhase = startPhase.confirmed
+        abandonment = .notAbandoned
+        unconfirmedStops = 1
+        daemonError = message
+    }
+
+    private static func sentence(_ text: String) -> String {
+        text.hasSuffix(".") ? text : text + "."
+    }
+
+    private func setSessionScopedError(_ text: String) {
+        daemonError = text
+        sessionScopedError = text
+    }
+
+    private func clearSessionScopedError() {
+        if let text = sessionScopedError, daemonError == text { daemonError = nil }
+        sessionScopedError = nil
+    }
+
+    func stopStream(timeout: Duration = .seconds(15)) async {
+        guard !stopInFlight else { return }
+        stopInFlight = true
+        defer { stopInFlight = false }
+        let mustTerminate = startPhase != .idle
+        if mustTerminate, abandonment == .notAbandoned { abandonment = .abandoned }
+        guard let daemon, daemon.isRunning else {
+            streamState = .idle
+            endStream()
+            return
+        }
+        do {
+            let timeout = unconfirmedStops > 0 ? min(timeout, .seconds(5)) : timeout
+            let stats: StreamStats = try await daemon.request(.stop, timeout: timeout)
+            log.info("stopped sent=\(stats.videoFramesSent) dropped=\(stats.videoFramesDropped)")
+        } catch DaemonClientError.timedOut {
+            guard daemon === self.daemon else { return }
+            if mustTerminate { return await terminateStoppedDaemon(daemon) }
+            guard streamState.canStop else { return }
+            log.error("stop timed out (\(self.unconfirmedStops + 1))")
+            await noteUnconfirmedStop(daemon, warning: "dstreamy has not confirmed the stop yet. Stopping again will terminate it.")
+            return
+        } catch {
+            guard daemon === self.daemon else { return }
+            log.error("stop failed: \(error.localizedDescription, privacy: .public)")
+            if mustTerminate, (error as? DaemonError)?.code == "not_running" {
+                // A start still awaiting its reply settles itself; one that went live meanwhile is stopped.
+                if abandonment == .abandonedButWentLive {
+                    await stopCancelledStart(daemon)
+                } else if startPhase != .awaitingReply {
+                    endStreamAsIdle()
+                }
+                return
+            }
+            if mustTerminate { return await terminateStoppedDaemon(daemon) }
+            if daemon.isRunning, streamState.canStop {
+                await noteUnconfirmedStop(daemon, warning: "dstreamy has not confirmed the stop. Stopping again will terminate it. \(error.localizedDescription)")
+            } else if streamState.canStop {
+                endStreamAsIdle()
+            }
+            return
+        }
+        guard daemon === self.daemon else { return }
+        if mustTerminate { return await terminateStoppedDaemon(daemon) }
+        guard streamState.canStop else { return }
+        await noteUnconfirmedStop(daemon, warning: "dstreamy replied to Stop, but its stopped state has not been confirmed. Stopping again will terminate it.")
+    }
+
+    /// The second unconfirmed Stop in a row terminates the daemon; the first only warns.
+    private func noteUnconfirmedStop(_ daemon: DaemonClient, warning: String) async {
+        unconfirmedStops += 1
+        if unconfirmedStops >= 2 {
+            await terminateStoppedDaemon(daemon)
+        } else {
+            daemonError = warning
+        }
+    }
+
+    private func terminateStoppedDaemon(_ daemon: DaemonClient, message: String? = nil) async {
+        guard daemon === self.daemon else { return }
+        self.daemon = nil
+        await daemon.shutdown(grace: .seconds(1))
+        guard self.daemon == nil else { return }
+        guard !daemon.isRunning else {
+            self.daemon = daemon
+            streamState = .connecting
+            connectError = nil
+            daemonError = "dstreamy is still running. Try Stop again before starting another stream."
+            return
+        }
+        streamState = .idle
+        endStream()
+        daemonError = message ?? "dstreamy was terminated to confirm the pending stop. It restarts with the next action."
+    }
+
+    func shutdownForQuit() async {
+        if isCropOverlayVisible { hideCropOverlay() }
+        if streamState.canStop { await stopStream(timeout: .seconds(5)) }
+        await daemon?.shutdown()
+        daemon = nil
+    }
+
+    private func endStream() {
+        abandonment = .abandoned
+        startPhase = startPhase.confirmed
+        cropUpdateTask?.cancel()
+        if unconfirmedStops > 0 {
+            unconfirmedStops = 0
+            daemonError = nil
+        }
+        clearSessionScopedError()
+        health = nil
+        encryption = EncryptionStatus()
+        streamStartedAt = nil
+        connectError = nil
         resetHealth()
+    }
+
+    func handle(_ event: SessionEvent) {
+        switch event {
+        case .state(let state):
+            log.info("session state \(String(describing: state), privacy: .public)")
+            switch state {
+            case .idle:
+                if streamState.canStop { streamState = .idle; endStream() }
+            case .connecting:
+                guard abandonment == .notAbandoned else { return }
+                streamState = .connecting
+                connectError = nil
+                encryption = EncryptionStatus()
+            case .streaming:
+                guard abandonment == .notAbandoned else { return }
+                streamState = .streaming
+                connectError = nil
+                startPhase = startPhase.confirmed
+                clearSessionScopedError()
+                if streamStartedAt == nil { streamStartedAt = Date() }
+                if !cropSentForStart {
+                    cropSentForStart = true
+                    sendCropUpdate()
+                }
+            case .reconnecting(let attempt):
+                guard abandonment == .notAbandoned else { return }
+                streamState = .reconnecting(attempt)
+                encryption = EncryptionStatus()
+            case .stopped(.requested):
+                streamState = .idle
+                endStream()
+            case .stopped(.invalidToken):
+                streamState = .idle
+                endStream()
+                report(DaemonError(code: "invalid_token", message: StopReason.invalidToken.message))
+            case .stopped(let reason):
+                streamState = .error(reason.message)
+                endStream()
+            case .unknown(let state):
+                log.error("ignoring unknown session state \(state, privacy: .public)")
+            }
+        case .health(let snapshot):
+            guard abandonment == .notAbandoned, streamState.canStop else { return }
+            health = snapshot
+            if let state = snapshot.stats.e2ee {
+                encryption = EncryptionStatus(state: state, daveProtocolVersion: snapshot.stats.daveProtocolVersion)
+            } else if let version = snapshot.stats.daveProtocolVersion {
+                encryption.daveProtocolVersion = version
+            }
+            healthLevel = snapshot.health.overallLevel
+            updateBlink()
+        case .channelMoved(let guildId, let channelId):
+            log.info("moved to channel \(channelId, privacy: .public)")
+            if let moved = channels.first(where: { $0.id == channelId }), guildId == nil || guildId == selectedGuild?.id {
+                selectedChannel = moved
+                persistConfig()
+            }
+        case .resumed:
+            log.info("connection resumed")
+        case .e2ee(let state, let version):
+            guard abandonment == .notAbandoned, streamState.canStop else { return }
+            encryption = EncryptionStatus(state: state, daveProtocolVersion: version)
+        case .error(let message, let fatal):
+            log.error("session error fatal=\(fatal) \(message, privacy: .public)")
+            if !fatal, abandonment == .notAbandoned, streamState == .connecting || streamState.isReconnecting {
+                connectError = message
+            }
+            if fatal {
+                if streamState.canStop || startPhase != .idle {
+                    setSessionScopedError("\(Self.sentence(message)) Stop before starting another stream.")
+                } else {
+                    streamState = .error(message)
+                    endStream()
+                }
+            }
+        case .unknown(let event):
+            log.error("ignoring unknown event \(event, privacy: .public)")
+        }
     }
 
     private func updateBlink() {
@@ -664,119 +773,103 @@ final class AppState: ObservableObject {
         menuDotVisible = true
     }
 
-    private func handleDaemonEvent(_ type: String, _ payload: Data?) {
-        if type != "stats" && type != "metrics" { log.debug("daemon event: \(type)") }
-        switch type {
-        case "connected":
-            cancelStreamTasks()
-            streamState = .streaming
-            streamLog.write(component: "app", "stream connected")
-            healthLog.info("connected session=\(self.sessionId, privacy: .public)")
-            startMetricsTimer()
-        case "disconnected":
-            cancelStreamTasks()
-            streamState = .idle
-            streamLog.write(component: "app", "stream disconnected")
-            healthLog.info("disconnected session=\(self.sessionId, privacy: .public)")
-            stopMetricsTimer()
-            Task { await captureSession.stop() }
-        case "reconnecting":
-            if let data = payload,
-               let obj = try? JSONDecoder().decode([String: Int].self, from: data),
-               let attempt = obj["attempt"] {
-                streamState = .reconnecting(attempt)
-                streamLog.write(component: "app", "stream reconnecting attempt=\(attempt)")
-                healthLog.info("reconnecting session=\(self.sessionId, privacy: .public) attempt=\(attempt, privacy: .public)")
+    func toggleCropOverlay() {
+        if isCropOverlayVisible { return hideCropOverlay() }
+        guard let target = selectedTarget, let windowID = target.windowID else { return }
+        if let pid = windowOwnerPID(windowID), let app = NSRunningApplication(processIdentifier: pid) {
+            app.activate()
+        }
+        isCropOverlayVisible = cropOverlayController.show(windowID: windowID, currentCrop: cropRect)
+    }
+
+    private func hideCropOverlay() {
+        cropOverlayController.hide()
+        isCropOverlayVisible = false
+    }
+
+    private func cropChanged(_ rect: CGRect, viewSize: CGSize) {
+        cropRect = rect
+        cropViewSize = viewSize
+        persistCrop()
+        if streamState == .connecting { cropSentForStart = false }
+        guard streamState.isActive else { return }
+        sendCropUpdate()
+    }
+
+    private func sendCropUpdate() {
+        cropUpdateTask?.cancel()
+        cropUpdateTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled, let self, let daemon = self.daemon else { return }
+            await self.refreshTargets()
+            guard !Task.isCancelled, let target = self.selectedTarget, let crop = self.pixelCrop(for: target) else { return }
+            do {
+                try await daemon.request(.update(UpdateRequest(crop: crop)), as: Empty.self, timeout: .seconds(10))
+            } catch {
+                log.error("crop update failed: \(error.localizedDescription, privacy: .public)")
             }
-        case "stats":
-            if let data = payload, let s = try? JSONDecoder().decode(StatsPayload.self, from: data) {
-                stats = s
-            }
-        case "metrics":
-            if let data = payload, let m = try? JSONDecoder().decode(MetricsPayload.self, from: data) {
-                metricsHistory.append(m)
-                if metricsHistory.count > metricsHistoryCap {
-                    metricsHistory.removeFirst(metricsHistory.count - metricsHistoryCap)
-                }
-                healthLevel = StreamHealth.compute(history: metricsHistory, targetFps: fps).overallLevel
-                updateBlink()
-                streamMetricsLog.info(
-                    "session=\(m.session, privacy: .public) t=\(m.t, privacy: .public) fps=\(m.fps, privacy: .public) gapP95=\(m.gapP95Ms, privacy: .public)ms gapMax=\(m.gapMaxMs, privacy: .public)ms gapTrunc=\(m.gapTrunc, privacy: .public) bitrate=\(m.bitrateKbps, privacy: .public)kbps vDrop=\(m.vDrop, privacy: .public) aEnc=\(m.aEnc, privacy: .public) aSent=\(m.aSent, privacy: .public) aDropNotReady=\(m.aDropNotReady, privacy: .public) aEncErr=\(m.aEncErr, privacy: .public) pipeBuf=\(m.pipeBuf, privacy: .public)B audioBuf=\(m.audioBuf, privacy: .public)B rss=\(m.rssMb, privacy: .public)MB"
-                )
-            }
-        case "error":
-            cancelStreamTasks()
-            if let data = payload, let msg = String(data: data, encoding: .utf8) {
-                let clean = msg.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-                streamState = .error(clean)
-                streamLog.write(component: "app", "stream error: \(clean)")
-                healthLog.error("error session=\(self.sessionId, privacy: .public) msg=\(clean, privacy: .public)")
-                stopMetricsTimer()
-            }
-        default:
-            break
         }
     }
 
-    private func frameDist(_ a: CGRect, _ b: CGRect) -> CGFloat {
-        let dx = a.origin.x - b.origin.x
-        let dy = a.origin.y - b.origin.y
-        let dw = a.width - b.width
-        let dh = a.height - b.height
-        return dx*dx + dy*dy + dw*dw + dh*dh
+    private func pixelCrop(for target: CaptureTarget) -> CropRect? {
+        guard target.kind == .window, let rect = cropRect, let size = cropViewSize else { return nil }
+        return sourcePixelCrop(viewRect: rect, viewSize: size, sourceWidth: target.width, sourceHeight: target.height)
     }
-
-    private func discordAPI(_ path: String) async throws -> (Data, URLResponse) {
-        let url = URL(string: "https://discord.com/api/v9/\(path)")!
-        var req = URLRequest(url: url)
-        req.setValue(token, forHTTPHeaderField: "Authorization")
-        return try await URLSession.shared.data(for: req)
-    }
-
-    // MARK: - Crop persistence
 
     private func cropKey() -> String? {
-        guard captureKind == .window, let filter = captureFilter else { return nil }
-        if #available(macOS 15.2, *), let window = filter.includedWindows.first {
-            let bundleId = window.owningApplication?.bundleIdentifier ?? "unknown"
-            let title = window.title ?? ""
-            return "crop_\(bundleId)_\(title)"
-        }
-        return nil
+        guard let target = selectedTarget, target.kind == .window else { return nil }
+        return "crop_\(target.app ?? "unknown")_\(target.title)"
     }
 
-    func persistCrop() {
+    private func persistCrop() {
         guard let key = cropKey() else { return }
-        if let rect = cropRect {
-            let arr = [rect.origin.x, rect.origin.y, rect.width, rect.height]
-            defaults.set(arr, forKey: key)
+        if let rect = cropRect, let size = cropViewSize {
+            defaults.set([rect.origin.x, rect.origin.y, rect.width, rect.height, size.width, size.height], forKey: key)
         } else {
             defaults.removeObject(forKey: key)
         }
     }
 
-    func loadCropForCurrentWindow() {
-        guard let key = cropKey() else { cropRect = nil; return }
-        if let arr = defaults.array(forKey: key) as? [CGFloat], arr.count == 4 {
-            cropRect = CGRect(x: arr[0], y: arr[1], width: arr[2], height: arr[3])
-        } else {
+    private func loadCrop() {
+        guard let key = cropKey(),
+              let arr = defaults.array(forKey: key) as? [CGFloat], arr.count == 6 else {
             cropRect = nil
+            cropViewSize = nil
+            return
         }
+        cropRect = CGRect(x: arr[0], y: arr[1], width: arr[2], height: arr[3])
+        cropViewSize = CGSize(width: arr[4], height: arr[5])
     }
 
-    private func loadToken() {
-        let query = Process()
-        query.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        query.arguments = ["find-generic-password", "-s", "dstreamy", "-a", "discord-token", "-w"]
+    private func windowOwnerPID(_ windowID: CGWindowID) -> pid_t? {
+        (windowInfo(windowID)?[kCGWindowOwnerPID as String] as? NSNumber).map { pid_t($0.int32Value) }
+    }
+}
+
+/// The token older app versions kept in the Keychain; moved to the daemon once, then deleted.
+enum LegacyKeychainToken {
+    static func read() -> String? {
+        guard let result = security(["find-generic-password", "-s", "dstreamy", "-a", "discord-token", "-w"]),
+              result.status == 0 else { return nil }
+        let token = String(decoding: result.output, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return token.isEmpty ? nil : token
+    }
+
+    static func delete() {
+        _ = security(["delete-generic-password", "-s", "dstreamy", "-a", "discord-token"])
+    }
+
+    private static func security(_ arguments: [String]) -> (status: Int32, output: Data)? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        proc.arguments = arguments
         let pipe = Pipe()
-        query.standardOutput = pipe
-        query.standardError = Pipe()
-        try? query.run()
-        query.waitUntilExit()
-        if query.terminationStatus == 0 {
-            token = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        }
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        guard (try? proc.run()) != nil else { return nil }
+        let output = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        return (proc.terminationStatus, output)
     }
-
 }

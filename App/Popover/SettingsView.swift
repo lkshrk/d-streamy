@@ -14,11 +14,7 @@ struct SettingsView: View {
             Label("Settings", systemImage: "gearshape")
                 .font(.subheadline.bold())
 
-            // Resolution
-            HStack {
-                Text("Resolution")
-                    .font(.caption)
-                    .frame(width: 70, alignment: .leading)
+            row("Resolution") {
                 Picker("", selection: resolutionBinding) {
                     ForEach(resolutionPresets, id: \.0) { preset in
                         Text(preset.0).tag(preset.0)
@@ -28,11 +24,7 @@ struct SettingsView: View {
                 .controlSize(.small)
             }
 
-            // FPS
-            HStack {
-                Text("FPS")
-                    .font(.caption)
-                    .frame(width: 70, alignment: .leading)
+            row("FPS") {
                 Picker("", selection: $state.fps) {
                     Text("15").tag(15)
                     Text("30").tag(30)
@@ -43,11 +35,7 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
             }
 
-            // Codec
-            HStack {
-                Text("Codec")
-                    .font(.caption)
-                    .frame(width: 70, alignment: .leading)
+            row("Codec") {
                 Picker("", selection: $state.videoCodec) {
                     Text("H.264").tag("H264")
                     Text("H.265").tag("H265")
@@ -57,11 +45,7 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
             }
 
-            // Bitrate
-            HStack {
-                Text("Bitrate")
-                    .font(.caption)
-                    .frame(width: 70, alignment: .leading)
+            row("Bitrate") {
                 Slider(value: $state.bitrateMbps, in: 1...15, step: 0.5)
                     .controlSize(.small)
                 Text("\(state.bitrateMbps, specifier: "%.1f") Mbps")
@@ -69,11 +53,7 @@ struct SettingsView: View {
                     .frame(width: 55, alignment: .trailing)
             }
 
-            // Audio gain
-            HStack {
-                Text("Volume")
-                    .font(.caption)
-                    .frame(width: 70, alignment: .leading)
+            row("Volume") {
                 Slider(value: $state.audioGain, in: 0...3, step: 0.1)
                     .controlSize(.small)
                 Text("\(Int(state.audioGain * 100))%")
@@ -82,6 +62,15 @@ struct SettingsView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func row<Content: View>(_ label: String, @ViewBuilder _ content: () -> Content) -> some View {
+        HStack {
+            Text(label)
+                .font(.caption)
+                .frame(width: 70, alignment: .leading)
+            content()
+        }
     }
 
     private var resolutionBinding: Binding<String> {

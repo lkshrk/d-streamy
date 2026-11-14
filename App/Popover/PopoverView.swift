@@ -8,19 +8,18 @@ struct PopoverView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header with login status
             HStack(spacing: 6) {
                 Text("D-Streamy")
                     .font(.headline)
                 Spacer()
-                if state.token.isEmpty {
+                if !state.isAuthenticated {
                     Image(systemName: "circle.fill")
                         .font(.system(size: 8))
                         .foregroundStyle(.red)
-                    Text("Not logged in")
+                    Text(state.authError == nil ? "Not logged in" : "Login failed")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Button("Login") { showTokenInput = true }
+                    Button(state.authError == nil ? "Login" : "Edit token") { showTokenInput = true }
                         .font(.caption)
                         .buttonStyle(.bordered)
                         .controlSize(.small)
@@ -31,7 +30,7 @@ struct PopoverView: View {
                         Text("Connecting")
                             .font(.caption)
                             .foregroundStyle(.orange)
-                    } else if case .reconnecting = state.streamState {
+                    } else if state.streamState.isReconnecting {
                         ProgressView()
                             .controlSize(.mini)
                         Text("Reconnecting")
@@ -46,12 +45,9 @@ struct PopoverView: View {
                             .foregroundStyle(.green)
                     }
                     Menu {
-                        Button("Logout", role: .destructive) {
-                            state.clearToken()
-                            showTokenInput = false
-                        }
+                        Button("Change token") { showTokenInput = true }
                     } label: {
-                        Text(state.username.isEmpty ? "Logged in" : state.username)
+                        Text("Logged in")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -61,6 +57,56 @@ struct PopoverView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
+
+            if state.isLoggingIn {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Logging in to Discord...")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
+            }
+
+            if let daemonError = state.daemonError {
+                Text(daemonError)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            }
+
+            if state.streamState.isReconnecting || state.streamState == .connecting, let cause = state.connectError {
+                Text("Last attempt failed: \(cause)")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            }
+
+            if state.streamState.canStop, let warning = state.encryption.warning {
+                Label(warning, systemImage: "lock.open.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            }
+
+            if let authError = state.authError {
+                Text(authError)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            }
 
             if showTokenInput {
                 VStack(alignment: .leading, spacing: 4) {
@@ -73,9 +119,10 @@ struct PopoverView: View {
                             .controlSize(.small)
                         Button("Save") {
                             if !tokenInput.isEmpty {
-                                state.saveToken(tokenInput)
+                                let token = tokenInput
                                 tokenInput = ""
                                 showTokenInput = false
+                                Task { await state.saveToken(token) }
                             }
                         }
                         .buttonStyle(.borderedProminent)
@@ -109,7 +156,7 @@ struct PopoverView: View {
                 if state.streamState.isActive {
                     WindowPickerView()
                     StatsView()
-                } else if !state.token.isEmpty {
+                } else if state.isAuthenticated {
                     WindowPickerView()
                     GuildChannelView()
 
@@ -123,7 +170,6 @@ struct PopoverView: View {
 
             Divider()
 
-            // Footer: Settings + Start/Stop
             HStack(spacing: 12) {
                 Button {
                     withAnimation(.easeInOut(duration: 0.15)) { showSettings.toggle() }
@@ -139,6 +185,13 @@ struct PopoverView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
+        }
+        .onAppear {
+            guard !state.streamState.canStop else { return }
+            Task {
+                await state.refreshTargets()
+                await state.recheckLogin()
+            }
         }
     }
 
@@ -173,14 +226,14 @@ struct StreamButton: View {
     }
 
     private var canStart: Bool {
-        state.streamState.canStop ||
-        (state.captureFilter != nil && state.selectedGuild != nil && state.selectedChannel != nil)
+        state.isAuthenticated && state.selectedTarget != nil && state.selectedGuild != nil && state.selectedChannel != nil
     }
 
     private var missingInfo: String {
         if state.streamState.canStop { return "Stop streaming" }
         var missing: [String] = []
-        if state.captureFilter == nil { missing.append("source") }
+        if !state.isAuthenticated { missing.append("login") }
+        if state.selectedTarget == nil { missing.append("source") }
         if state.selectedGuild == nil { missing.append("server") }
         if state.selectedChannel == nil { missing.append("channel") }
         if missing.isEmpty { return "Start streaming" }

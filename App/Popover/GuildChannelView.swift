@@ -10,12 +10,13 @@ struct GuildChannelView: View {
 
             FullWidthPicker(
                 items: state.guilds,
-                placeholder: "Select server...",
+                placeholder: state.isLoadingGuilds ? "Loading servers..." : "Select server...",
                 title: { $0.name },
                 selection: $state.selectedGuild
             )
             .onChange(of: state.selectedGuild) { _, guild in
                 if let guild {
+                    state.channels = []
                     Task { await state.fetchChannels(guildId: guild.id) }
                     state.selectedChannel = nil
                     state.persistConfig()
@@ -24,7 +25,7 @@ struct GuildChannelView: View {
 
             FullWidthPicker(
                 items: state.channels,
-                placeholder: "Select channel...",
+                placeholder: state.isLoadingChannels ? "Loading channels..." : "Select channel...",
                 title: { $0.name },
                 selection: $state.selectedChannel,
                 isEnabled: state.selectedGuild != nil
