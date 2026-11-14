@@ -40,14 +40,15 @@ On macOS, Homebrew installs the CLI and the app from the `lkshrk/tap` tap: `brew
 
 ### pacman
 
-A signed pacman repository has `dstreamy` for x86_64 and aarch64 and the OBS plugin `obs-dstreamy` for x86_64. It holds only the latest release. Import the signing key, check that its fingerprint matches the one on [the repository page](https://lkshrk.github.io/d-streamy/arch/), and sign it locally:
+A signed pacman repository has `dstreamy` for x86_64 and aarch64 and the OBS plugin `obs-dstreamy` for x86_64. It holds only the latest release. Its signing key, `EC734FF47451BFB406E2E0D6178E6B5FE25AD3BF`, is on no keyserver, so `pacman-key --recv-keys` won't find it. Download it, add it and sign it locally:
 
 ```bash
 curl -fsSLO https://lkshrk.github.io/d-streamy/arch/d-streamy.asc
-gpg --show-keys d-streamy.asc
 sudo pacman-key --add d-streamy.asc
-sudo pacman-key --lsign-key <FINGERPRINT>
+sudo pacman-key --lsign-key EC734FF47451BFB406E2E0D6178E6B5FE25AD3BF
 ```
+
+The key is also in this repository as [`packaging/arch/d-streamy.asc`](packaging/arch/d-streamy.asc).
 
 Add the repository to `/etc/pacman.conf`:
 

@@ -637,6 +637,7 @@ printf '%s\n' "$GNUPGHOME" >> "$STUB_LOG/gnupghome"
 case "$(basename "$0") $*" in
   "gpg --batch --quiet --import") cat > "$STUB_LOG/imported" ;;
   "gpg --batch --with-colons --list-secret-keys") echo "fpr:::::::::$STUB_FINGERPRINT:" ;;
+  *--show-keys*) echo "fpr:::::::::$STUB_PUBLIC_FINGERPRINT:" ;;
   *--export*) echo "PUBLIC KEY" ;;
   *--detach-sign*) touch "${@: -1}.sig" ;;
   repo-add*) exit "${STUB_REPO_ADD_STATUS:-0}" ;;
@@ -650,7 +651,7 @@ class ArchRepoTests(unittest.TestCase):
     PKGBUILDS = {"dstreamy-bin": {"x86_64": "x86_64-unknown-linux-gnu", "aarch64": "aarch64-unknown-linux-gnu"},
                  "obs-dstreamy-bin": {"": "linux-x86_64"}}
 
-    def sign(self, repo_add_status=0, key=KEY):
+    def sign(self, repo_add_status=0, key=KEY, public=FINGERPRINT):
         """Runs make-arch-repo.sh --sign on a two-architecture repo with gpg, gpgconf and repo-add stubbed."""
         directory = tempfile.TemporaryDirectory(prefix="arch-repo-fixture-")
         self.addCleanup(directory.cleanup)
@@ -663,10 +664,11 @@ class ArchRepoTests(unittest.TestCase):
             (stubs / name).chmod(0o755)
         (repo / "x86_64/dstreamy-bin-0.1.0-1-x86_64.pkg.tar.zst").write_text("x")
         (repo / "aarch64/dstreamy-bin-0.1.0-1-aarch64.pkg.tar.zst").write_text("a")
+        (base / "public.asc").write_text("PUBLIC KEY\n")
         env = dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}", TMPDIR=str(tmp), STUB_LOG=str(log),
-                   STUB_FINGERPRINT=self.FINGERPRINT, STUB_REPO_ADD_STATUS=str(repo_add_status),
+                   STUB_FINGERPRINT=self.FINGERPRINT, STUB_PUBLIC_FINGERPRINT=public, STUB_REPO_ADD_STATUS=str(repo_add_status),
                    PACMAN_SIGNING_KEY=key)
-        result = subprocess.run([str(ROOT / "scripts/make-arch-repo.sh"), str(repo), "--sign"], env=env, text=True,
+        result = subprocess.run([str(ROOT / "scripts/make-arch-repo.sh"), str(repo), "--sign", str(base / "public.asc")], env=env, text=True,
                                 capture_output=True)
         return result, base
 
@@ -695,6 +697,29 @@ class ArchRepoTests(unittest.TestCase):
                 self.assertTrue(homes.pop().startswith(str(base / "tmp") + "/"), "GNUPGHOME is not a fresh temp dir")
                 self.assertEqual(list((base / "tmp").iterdir()), [], "GNUPGHOME survived the run")
 
+    def test_a_secret_key_other_than_the_published_one_fails(self):
+        result, base = self.sign(public="F" * 40)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"PACMAN_SIGNING_KEY is key {self.FINGERPRINT}, but", result.stderr)
+        self.assertNotIn("repo-add", (base / "log/argv").read_text())
+        self.assertFalse((base / "repo/d-streamy.asc").exists())
+        self.assertEqual(list((base / "tmp").iterdir()), [])
+
+    def test_published_key_is_the_committed_one(self):
+        key = (ROOT / "packaging/arch/d-streamy.asc").read_text()
+        self.assertTrue(key.startswith("-----BEGIN PGP PUBLIC KEY BLOCK-----\n"))
+        self.assertNotIn("PRIVATE", key)
+        self.assertIn("run: scripts/make-arch-repo.sh site/arch --sign packaging/arch/d-streamy.asc\n",
+                      job_section("pages"))
+        readme = (ROOT / "README.md").read_text()
+        if shutil.which("gpg"):
+            with tempfile.TemporaryDirectory(prefix="gpg-fixture-") as home:
+                listing = subprocess.run(["gpg", "--homedir", home, "--batch", "--with-colons", "--show-keys",
+                                          str(ROOT / "packaging/arch/d-streamy.asc")], text=True,
+                                         capture_output=True, check=True).stdout
+            fingerprint = next(line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:"))
+            self.assertIn(f"pacman-key --lsign-key {fingerprint}", readme)
+
     def test_signing_without_a_key_fails_before_gpg_runs(self):
         result, base = self.sign(key="")
         self.assertNotEqual(result.returncode, 0)
@@ -706,7 +731,7 @@ class ArchRepoTests(unittest.TestCase):
         self.assertEqual(source.count("secrets.PACMAN_SIGNING_KEY"), 1)
         pages = job_section("pages")
         self.assertIn("        env:\n          PACMAN_SIGNING_KEY: ${{ secrets.PACMAN_SIGNING_KEY }}\n"
-                      "        run: scripts/make-arch-repo.sh site/arch --sign\n", pages)
+                      "        run: scripts/make-arch-repo.sh site/arch --sign packaging/arch/d-streamy.asc\n", pages)
         self.assertNotIn("PACMAN_SIGNING_KEY", job_section("arch"))
 
     def test_rehearsals_never_deploy_pages(self):

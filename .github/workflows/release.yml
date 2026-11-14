@@ -825,7 +825,7 @@ jobs:
       - name: Sign the packages and the repository databases
         env:
           PACMAN_SIGNING_KEY: ${{ secrets.PACMAN_SIGNING_KEY }}
-        run: scripts/make-arch-repo.sh site/arch --sign
+        run: scripts/make-arch-repo.sh site/arch --sign packaging/arch/d-streamy.asc
       - name: Check the signed repository with pacman
         run: scripts/check-arch-repo.sh "$VERSION" site/arch site/arch/d-streamy.asc
       - name: Write the install page
