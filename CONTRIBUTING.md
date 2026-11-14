@@ -62,7 +62,7 @@ The workflows in `.github/workflows/` have the exact steps per platform, includi
 
 ## Releasing
 
-One `vX.Y.Z` tag releases everything: the CLI for macOS, Linux and Windows, the signed macOS app, and the OBS plugin for Linux, macOS and Windows, all on one GitHub release, plus the Homebrew formula and cask in `lkshrk/homebrew-tap`.
+One `vX.Y.Z` tag releases everything: the CLI for macOS, Linux and Windows, the signed macOS app, and the OBS plugin for Linux, macOS and Windows, all on one GitHub release, plus the Homebrew formula and cask in `lkshrk/homebrew-tap` and the signed pacman repository on GitHub Pages.
 
 - `scripts/tag-release.sh major|minor|patch|vX.Y.Z` sets the version in both Cargo workspaces (`rust/` and `rust/crates/dstreamy-obs/`), their `Cargo.lock` files, `rust/fuzz/Cargo.lock` and `obs/buildspec.json`, commits, tags and pushes.
 - Publishing waits for CI, Rust CI, OBS and Fuzz to pass on the tagged commit.

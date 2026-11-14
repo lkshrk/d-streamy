@@ -36,7 +36,33 @@ No release of this version has been published yet. Until then, [build from sourc
 | `obs-dstreamy-<version>-windows-x64.zip` | The OBS plugin for Windows, with `dstreamy.exe` |
 | `D-Streamy-<version>-macos-universal.zip` | The macOS menu bar app |
 
-On macOS, Homebrew installs the CLI and the app from the `lkshrk/tap` tap: `brew install lkshrk/tap/dstreamy` and `brew install --cask lkshrk/tap/d-streamy`.
+On macOS, Homebrew installs the CLI and the app from the `lkshrk/tap` tap: `brew install lkshrk/tap/dstreamy` and `brew install --cask lkshrk/tap/d-streamy`. On Arch Linux, use the [pacman repository](#pacman).
+
+### pacman
+
+A signed pacman repository has `dstreamy` for x86_64 and aarch64 and the OBS plugin `obs-dstreamy` for x86_64. It holds only the latest release. Import the signing key, check that its fingerprint matches the one on [the repository page](https://lkshrk.github.io/d-streamy/arch/), and sign it locally:
+
+```bash
+curl -fsSLO https://lkshrk.github.io/d-streamy/arch/d-streamy.asc
+gpg --show-keys d-streamy.asc
+sudo pacman-key --add d-streamy.asc
+sudo pacman-key --lsign-key <FINGERPRINT>
+```
+
+Add the repository to `/etc/pacman.conf`:
+
+```ini
+[d-streamy]
+Server = https://lkshrk.github.io/d-streamy/arch/$arch
+```
+
+Then install the CLI, and the plugin if you use OBS:
+
+```bash
+sudo pacman -Syu dstreamy obs-dstreamy
+```
+
+The packages are named `dstreamy-bin` and `obs-dstreamy-bin` and provide `dstreamy` and `obs-dstreamy`. Screen capture needs your desktop's portal backend (`xdg-desktop-portal-impl`, for example `xdg-desktop-portal-gnome`, `-kde` or `-hyprland`). For encoding, install `gst-plugin-va` for VA-API hardware encoding, or `gst-plugins-ugly` for software x264; NVIDIA's encoder comes with `gst-plugins-bad-libs`. The plugin goes into `/usr/lib/obs-plugins/`; run `dstreamy service install` once for the service it talks to.
 
 ### Command line
 

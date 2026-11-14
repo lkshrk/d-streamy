@@ -295,21 +295,27 @@ flowchart TD
   gate --> app["app: universal, signed, notarized"]
   gate --> obsux["obs-linux, obs-macos"]
   cli --> obswin["obs-windows: bundles dstreamy.exe"]
+  cli --> arch["arch: pacman packages, unsigned check"]
+  obsux --> arch
   cli --> pub{"publish?"}
   app --> pub
   obsux --> pub
   obswin --> pub
+  arch --> rehearse
   pub -->|no| rehearse["rehearse: check assets, show formula and cask"]
   pub -->|yes| release["release: upload, attest, push tap"]
+  release --> pages["pages: sign, repo-add, deploy to GitHub Pages"]
+  arch --> pages
 ```
 
 Triggers (`release.yml`): a tag matching `v[0-9]+.[0-9]+.[0-9]+`, any push to `release-rehearsal`, or a dispatch with a `publish` input.
 
-1. `version` reads `dstreamy-cli`'s version with `cargo metadata`. It fails when `obs/buildspec.json` has another version, when the buildspec's OBS version is not `OBS_TAG`, or when the version is not `X.Y.Z`. A run publishes on a tag push or with `publish: true`, and then the ref must be exactly `v<version>`.
+1. `version` reads `dstreamy-cli`'s version with `cargo metadata`. It fails when `obs/buildspec.json` has another version, when the buildspec's OBS version is not `OBS_TAG`, or when the version is not `X.Y.Z`. A run publishes on a tag push or with `publish: true`, and then the ref must be exactly `v<version>`. It also outputs the commit timestamp as `source_date_epoch` for the build jobs; it fails when `git log` gives none.
 2. `ci-gate`, only when publishing, resolves the tag to its commit and waits up to 140 minutes for `ci.yml`, `rust-ci.yml`, `fuzz.yml` and `obs-ci.yml`. The newest push run for the commit decides, so a failed rerun overrides an older success. When OBS did not run for the commit, the gate accepts a passing ancestor run whose OBS push paths are unchanged since then. Rehearsals skip the gate.
-3. Build jobs (below) run in parallel. `obs-windows` waits for `cli` because it bundles the Windows `dstreamy.exe`.
-4. `rehearse` (not publishing) downloads all artifacts, runs `scripts/check-release-assets.sh` and writes the filled formula and cask to the step summary. It publishes nothing.
+3. Build jobs (below) run in parallel. `obs-windows` waits for `cli` because it bundles the Windows `dstreamy.exe`. `arch` waits for `cli` and `obs-linux` and repackages their Linux assets ([pacman repository](#pacman-repository)).
+4. `rehearse` (not publishing) waits for `arch` too, downloads all artifacts, runs `scripts/check-release-assets.sh` and writes the filled formula and cask to the step summary. It publishes nothing.
 5. `release` (publishing) runs the same asset check, creates the GitHub release with generated notes if missing, uploads all assets with `--clobber`, attests build provenance for every `.tar.gz` and `.zip` (`actions/attest-build-provenance`), fills the formula and cask, and pushes them to `lkshrk/homebrew-tap` with the commit message `d-streamy: bump to <version>`.
+6. `pages` (publishing, after `release` and `arch`) signs the pacman packages and databases and deploys the repository to GitHub Pages.
 
 ### Build jobs
 
@@ -320,6 +326,7 @@ Triggers (`release.yml`): a tag matching `v[0-9]+.[0-9]+.[0-9]+`, any push to `r
 | `obs-linux` | `ubuntu-24.04` | Builds with `ubuntu-x86_64` against the cached OBS prefix; stages the install; appends Rust notices; checks only `obs-dstreamy.so` sits in the module folder; checks no test hooks |
 | `obs-macos` | `xcode-27` | Universal `macos` preset; checks both slices; appends notices; checks no test hooks; signs the UI dylib then the bundle; notarizes and staples |
 | `obs-windows` | `windows-2025` | `windows-x64` preset; verifies and unpacks the Windows CLI zip; copies `dstreamy.exe` next to `obs-dstreamy.dll`; merges plugin, panel and CLI notices; checks layout and no test hooks |
+| `arch` | `ubuntu-24.04` in an `archlinux:base-devel` container | Verifies the Linux assets' checksums; builds the pacman packages with makepkg as a non-root user; checks their contents; syncs an unsigned repository of them with pacman |
 
 The Linux CLI builds in Debian 12 so glibc 2.36 sets the floor, not the runner's 2.39. Its rustup-init download is checked by SHA-256. macOS builds target `MACOSX_DEPLOYMENT_TARGET=14.0`.
 
@@ -344,6 +351,8 @@ The Linux CLI builds in Debian 12 so glibc 2.36 sets the floor, not the runner's
 - `--locked` everywhere; toolchain from `rust-toolchain.toml`.
 - CLI archives only (`cli` job): `SOURCE_DATE_EPOCH` is the last commit's timestamp, and `RUSTFLAGS` remaps the workspace to `/d-streamy` and the Cargo home to `/cargo`.
 - Tarballs (the Linux and macOS CLI and the Linux plugin) use GNU tar with sorted names, the last commit's timestamp as mtime, owner and group 0, and `gzip -n -9` (no gzip timestamp).
+- The timestamp comes from the `version` job, not from `git log` in each build job: git in the root-run Debian containers refuses the runner-owned checkout as dubious ownership. That left it empty for v2.0.0, whose Linux CLI tarballs carry mtime −2^63. The `cli` job and the plugin's packaging step fail on an empty or non-numeric `SOURCE_DATE_EPOCH`.
+- The pacman packages are built with the same `SOURCE_DATE_EPOCH`.
 
 The app's bundled daemon and the three OBS plugin builds get no path remap, so they embed the runner's workspace and Cargo home paths. The zip assets (Windows CLI, app, macOS and Windows plugin) keep file mtimes. Signed macOS binaries also carry a signing timestamp. None of these are byte-for-byte reproducible.
 
@@ -379,6 +388,7 @@ Secrets, by name:
 | `DEVELOPER_ID_CERT_P12`, `DEVELOPER_ID_CERT_PASSWORD` | The certificate, imported by `.github/actions/macos-signing-keychain` |
 | `NOTARY_KEY_P8`, `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID` | App Store Connect API key for `xcrun notarytool` (`.github/actions/macos-notarize`) |
 | `TAP_TOKEN` | Push to `lkshrk/homebrew-tap` |
+| `PACMAN_SIGNING_KEY` | The ASCII-armoured secret key, without a passphrase, that signs the pacman packages and databases |
 
 `.github/actions/macos-signing-keychain` creates a keychain under `$RUNNER_TEMP` with a random password, imports the certificate and exports the keychain's path as `SIGNING_KEYCHAIN`. Every `codesign --sign` passes `--keychain "$SIGNING_KEYCHAIN"` (`scripts/release.sh` does when the variable is set), so the action never changes the user's keychain search list and concurrent signing jobs under one macOS user can't drop each other's keychain. codesign still builds the certificate chain from the search list, so the runner must have Apple's Developer ID G2 intermediate; the action fails early when it is missing. Commands that carry a password go to `security -i` on stdin, so they never show in the process list; a certificate password containing a line break is refused. Its post step runs even when the job fails: it locks the keychain and deletes it with the decoded files. `macos-notarize` deletes the decoded `.p8` on every exit.
 
@@ -393,9 +403,29 @@ A publishing run fails on macOS when `SIGNING_IDENTITY` or `DEVELOPER_ID_CERT_P1
 
 The filled files go only to the tap. The copies in this repository stay templates.
 
+### pacman repository
+
+`packaging/arch/` holds two PKGBUILDs that repackage the release assets and build nothing. Both stay submittable to the AUR: each has a `.SRCINFO`, and `provides` and `conflicts` name the package without `-bin`.
+
+| Package | Architectures | Installs | Depends on |
+|---|---|---|---|
+| `dstreamy-bin` | x86_64, aarch64 | `/usr/bin/dstreamy`, README, `LICENSE` and `THIRD_PARTY_NOTICES.txt` | The providers of the binary's `NEEDED` libraries (`gstreamer`, `gst-plugins-base-libs`, `glib2`, `gtk3`, `cairo`, `gdk-pixbuf2`, `webkit2gtk-4.1`, `libsoup3`, `dbus`, `libgcc`, `glibc`) and the GStreamer plugins every pipeline builds: `gst-plugin-pipewire` (`pipewiresrc`), `gst-plugins-bad-libs` (`h264parse`, `h265parse`, and `nvh264enc`), `gst-plugins-good` (`videocrop`, `pulsesrc`) |
+| `obs-dstreamy-bin` | x86_64 | `obs-dstreamy.so` and `dstreamy-ui/` in `/usr/lib/obs-plugins/` (the tarball's Debian `lib/x86_64-linux-gnu/obs-plugins/`), `LICENSE`, notices | `obs-studio>=32.2`, `dstreamy`, `qt6-base`, `qt6-svg`, `libstdc++`, `libgcc`, `glibc` |
+
+Optional dependencies of `dstreamy-bin`: `xdg-desktop-portal-impl` for window and display capture (a desktop's portal backend; `xdg-desktop-portal` alone does nothing, and OBS-only use needs no portal), `gst-plugin-va` for VA-API encoding, `gst-plugins-ugly` for `x264enc` and `gst-plugins-bad` for `x265enc` ([ADR 0006](../adr/0006-gstreamer-element-selection.md)). Arch has no `gstreamer-vaapi`, so `vaapih264enc` is never available.
+
+- `scripts/fill-pkgbuild.sh <v> <dist> <PKGBUILD>` sets `pkgver`, `pkgrel=1` and every `sha256sums` array from the `.sha256` of the matching `source` entry. It refuses a missing or malformed checksum and a placeholder left in the output. The committed sums are placeholders.
+- `scripts/build-arch-packages.sh <v> <dist> <out>` runs as a non-root user. It fails when a committed `.SRCINFO` differs from `makepkg --printsrcinfo`, fills each PKGBUILD and runs makepkg once per architecture, with `CARCH` set for aarch64 since nothing is compiled. It checks the package names, their files, the ELF machine of each `dstreamy`, and that only `obs-dstreamy.so` sits in the module folder.
+- `scripts/make-arch-repo.sh <dir> [--sign]` runs `repo-add` for each `<dir>/<arch>/`, into the database `d-streamy`. With `--sign` it imports `PACMAN_SIGNING_KEY` from the environment on gpg's stdin into a temporary `GNUPGHOME` that is removed on every exit, signs each package, runs `repo-add --sign` and exports the public key to `<dir>/d-streamy.asc`.
+- `scripts/check-arch-repo.sh <v> <dir> [key]` syncs each architecture's database with a throwaway pacman configuration, database path and keyring, as root, and checks that it lists exactly the expected packages at `<v>-1`, that `dstreamy` and `obs-dstreamy` resolve to the `-bin` packages, and that they download. With a key, pacman requires and verifies every signature.
+
+The `pages` job runs only when publishing, after `release`, so a rehearsal never signs or deploys. It is the only job with `pages: write` and `id-token: write`, and it deploys to the `github-pages` environment. The site holds `arch/x86_64/`, `arch/aarch64/`, `arch/d-streamy.asc` and an install page at `arch/index.html` with the key's fingerprint. Each release replaces the whole site, so the repository holds only the current version.
+
+One-time setup: a dedicated signing key in the `PACMAN_SIGNING_KEY` secret; Pages with the source "GitHub Actions"; and a deployment rule on the `github-pages` environment that allows tags `v*`, since releases run on tags.
+
 ### Release script tests
 
-`scripts/test_release_semantics.py` checks `release.yml` and the scripts by reading or running them. It covers exact publication refs, that rehearsals never publish, the plugin and CLI version match, that the release script's version bump relocks every lockfile and passes OBS CI's workspace checks, that a rejected branch push leaves no tag on origin and a rerun succeeds, that a push git reported as failed but that landed counts as pushed, that the signing keychain keeps passwords off argv, is passed to every `codesign`, never touches the search list, refuses a password with a line break, fails early without the Developer ID intermediate and is deleted after success and failure, that the notary key is removed on every exit, that fork pull requests reach neither `xcode-27` nor a self-hosted matrix runner, the CI gate's decisions, the universal-binary check, the test-only feature guards, the OBS release layout, the Windows CLI bundled in the plugin, that the CI runs `ci-gate` waits for are never cancelled on `main`, that `scripts/install.sh` always runs the build before installing and stops only the installed app (also with a relative install directory), and the notice generator's graph selection and failure modes.
+`scripts/test_release_semantics.py` checks `release.yml` and the scripts by reading or running them. It covers exact publication refs, that rehearsals never publish, the plugin and CLI version match, that the release script's version bump relocks every lockfile and passes OBS CI's workspace checks, that a rejected branch push leaves no tag on origin and a rerun succeeds, that a push git reported as failed but that landed counts as pushed, that the signing keychain keeps passwords off argv, is passed to every `codesign`, never touches the search list, refuses a password with a line break, fails early without the Developer ID intermediate and is deleted after success and failure, that the notary key is removed on every exit, that fork pull requests reach neither `xcode-27` nor a self-hosted matrix runner, the CI gate's decisions, the universal-binary check, the test-only feature guards, the OBS release layout, the Windows CLI bundled in the plugin, that the CI runs `ci-gate` waits for are never cancelled on `main`, that `scripts/install.sh` always runs the build before installing and stops only the installed app (also with a relative install directory), the notice generator's graph selection and failure modes, that the source timestamp is read once and never empty, and for the pacman repository: that only the publishing `pages` job can deploy Pages, that the signing key reaches gpg only on stdin and only through the signing step's env, that the temporary `GNUPGHOME` is removed after success and failure, that `fill-pkgbuild.sh` fills the right sha256 into each array and refuses bad checksums, that each `.SRCINFO` matches its PKGBUILD, and, where makepkg exists, that the built packages hold the right files for their architecture.
 
 ## Dependency and licence policy
 

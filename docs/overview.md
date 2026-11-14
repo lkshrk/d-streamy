@@ -62,6 +62,7 @@ obs/                        CMake project for the plugin, the Qt panel, the harn
 App/, AppTests/             the macOS menu bar app and its tests
 scripts/                    app build, release helpers, licence notices
 Formula/, Casks/            Homebrew templates filled at release
+packaging/arch/             PKGBUILDs for the pacman repository, filled at release
 docs/                       this documentation, ADRs and specs
 ```
 
