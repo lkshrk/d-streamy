@@ -10,7 +10,7 @@ trap 'rm -rf "$tmp"' EXIT
 
 for arch in x86_64 aarch64; do
   url="$base/$arch/d-streamy.db"
-  status=$(curl -sS --retry 3 -o "$tmp/$arch.db" -w '%{http_code}' "$url") || { echo "cannot fetch $url" >&2; exit 1; }
+  status=$(curl -sS --retry 3 --connect-timeout 20 --max-time 120 -o "$tmp/$arch.db" -w '%{http_code}' "$url") || { echo "cannot fetch $url" >&2; exit 1; }
   case $status in
     404) echo "$arch: no live repository yet"; continue ;;
     200) ;;
