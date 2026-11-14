@@ -820,6 +820,9 @@ class ArchRepoTests(unittest.TestCase):
                 self.assertIn(f"provides = {name}=", "\n".join(srcinfo))
                 self.assertIn(f"conflicts = {name}", srcinfo)
         self.assertIn("depends = dstreamy", (ROOT / "packaging/arch/obs-dstreamy-bin/.SRCINFO").read_text())
+        cli = (ROOT / "packaging/arch/dstreamy-bin/.SRCINFO").read_text()
+        for plugin in ("gst-plugins-ugly", "gst-plugins-bad-libs", "gst-plugin-pipewire"):
+            self.assertIn(f"\tdepends = {plugin}\n", cli, "a stream would fail on a fresh install without it")
 
     @unittest.skipUnless(shutil.which("makepkg") and shutil.which("bsdtar") and os.geteuid() != 0,
                          "needs makepkg as a non-root user")

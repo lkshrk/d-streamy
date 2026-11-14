@@ -17,6 +17,7 @@ depends=(
   gst-plugins-bad-libs
   gst-plugins-base-libs
   gst-plugins-good
+  gst-plugins-ugly
   gstreamer
   gtk3
   libgcc
@@ -26,7 +27,6 @@ depends=(
 optdepends=(
   'xdg-desktop-portal-impl: window and display capture through the desktop sharing dialog'
   'gst-plugin-va: VA-API hardware encoding (vah264enc, vah265enc)'
-  'gst-plugins-ugly: software H.264 encoding (x264enc) when no hardware encoder works'
   'gst-plugins-bad: software H.265 encoding (x265enc)'
 )
 provides=("$_pkgname=$pkgver")

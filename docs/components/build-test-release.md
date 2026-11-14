@@ -409,10 +409,10 @@ The filled files go only to the tap. The copies in this repository stay template
 
 | Package | Architectures | Installs | Depends on |
 |---|---|---|---|
-| `dstreamy-bin` | x86_64, aarch64 | `/usr/bin/dstreamy`, README, `LICENSE` and `THIRD_PARTY_NOTICES.txt` | The providers of the binary's `NEEDED` libraries (`gstreamer`, `gst-plugins-base-libs`, `glib2`, `gtk3`, `cairo`, `gdk-pixbuf2`, `webkit2gtk-4.1`, `libsoup3`, `dbus`, `libgcc`, `glibc`) and the GStreamer plugins every pipeline builds: `gst-plugin-pipewire` (`pipewiresrc`), `gst-plugins-bad-libs` (`h264parse`, `h265parse`, and `nvh264enc`), `gst-plugins-good` (`videocrop`, `pulsesrc`) |
+| `dstreamy-bin` | x86_64, aarch64 | `/usr/bin/dstreamy`, README, `LICENSE` and `THIRD_PARTY_NOTICES.txt` | The providers of the binary's `NEEDED` libraries (`gstreamer`, `gst-plugins-base-libs`, `glib2`, `gtk3`, `cairo`, `gdk-pixbuf2`, `webkit2gtk-4.1`, `libsoup3`, `dbus`, `libgcc`, `glibc`) and the GStreamer plugins every pipeline builds: `gst-plugin-pipewire` (`pipewiresrc`), `gst-plugins-bad-libs` (`h264parse`, `h265parse`, and `nvh264enc`), `gst-plugins-good` (`videocrop`, `pulsesrc`), `gst-plugins-ugly` (`x264enc`, the fallback when no hardware encoder works) |
 | `obs-dstreamy-bin` | x86_64 | `obs-dstreamy.so` and `dstreamy-ui/` in `/usr/lib/obs-plugins/` (the tarball's Debian `lib/x86_64-linux-gnu/obs-plugins/`), `LICENSE`, notices | `obs-studio>=32.2`, `dstreamy`, `qt6-base`, `qt6-svg`, `libstdc++`, `libgcc`, `glibc` |
 
-Optional dependencies of `dstreamy-bin`: `xdg-desktop-portal-impl` for window and display capture (a desktop's portal backend; `xdg-desktop-portal` alone does nothing, and OBS-only use needs no portal), `gst-plugin-va` for VA-API encoding, `gst-plugins-ugly` for `x264enc` and `gst-plugins-bad` for `x265enc` ([ADR 0006](../adr/0006-gstreamer-element-selection.md)). Arch has no `gstreamer-vaapi`, so `vaapih264enc` is never available.
+Optional dependencies of `dstreamy-bin`: `xdg-desktop-portal-impl` for window and display capture (a desktop's portal backend; `xdg-desktop-portal` alone does nothing, and OBS-only use needs no portal), `gst-plugin-va` for VA-API encoding and `gst-plugins-bad` for `x265enc` ([ADR 0006](../adr/0006-gstreamer-element-selection.md)). Arch has no `gstreamer-vaapi`, so `vaapih264enc` is never available.
 
 - `scripts/fill-pkgbuild.sh <v> <dist> <PKGBUILD>` sets `pkgver`, `pkgrel=1` and every `sha256sums` array from the `.sha256` of the matching `source` entry. It refuses a missing or malformed checksum and a placeholder left in the output. The committed sums are placeholders.
 - `scripts/build-arch-packages.sh <v> <dist> <out>` runs as a non-root user. It fails when a committed `.SRCINFO` differs from `makepkg --printsrcinfo`, fills each PKGBUILD and runs makepkg once per architecture, with `CARCH` set for aarch64 since nothing is compiled. It checks the package names, their files, the ELF machine of each `dstreamy`, and that only `obs-dstreamy.so` sits in the module folder.
@@ -421,7 +421,7 @@ Optional dependencies of `dstreamy-bin`: `xdg-desktop-portal-impl` for window an
 
 The `pages` job runs only when publishing, after `release`, so a rehearsal never signs or deploys. It is the only job with `pages: write` and `id-token: write`, and it deploys to the `github-pages` environment. The site holds `arch/x86_64/`, `arch/aarch64/`, `arch/d-streamy.asc` and an install page at `arch/index.html` with the key's fingerprint. Each release replaces the whole site, so the repository holds only the current version.
 
-One-time setup: a dedicated signing key in the `PACMAN_SIGNING_KEY` secret, its public key committed as `packaging/arch/d-streamy.asc`; Pages with the source "GitHub Actions"; and a deployment rule on the `github-pages` environment that allows tags `v*`, since releases run on tags.
+One-time setup: a dedicated signing key in the `PACMAN_SIGNING_KEY` secret, its public key committed as `packaging/arch/d-streamy.asc`; Pages with the source "GitHub Actions". Releases run on tags, so the `github-pages` environment must allow deployments from `v*` tags.
 
 ### Release script tests
 

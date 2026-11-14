@@ -63,7 +63,7 @@ Then install the CLI, and the plugin if you use OBS:
 sudo pacman -Syu dstreamy obs-dstreamy
 ```
 
-The packages are named `dstreamy-bin` and `obs-dstreamy-bin` and provide `dstreamy` and `obs-dstreamy`. Screen capture needs your desktop's portal backend (`xdg-desktop-portal-impl`, for example `xdg-desktop-portal-gnome`, `-kde` or `-hyprland`). For encoding, install `gst-plugin-va` for VA-API hardware encoding, or `gst-plugins-ugly` for software x264; NVIDIA's encoder comes with `gst-plugins-bad-libs`. The plugin goes into `/usr/lib/obs-plugins/`; run `dstreamy service install` once for the service it talks to.
+The packages are named `dstreamy-bin` and `obs-dstreamy-bin` and provide `dstreamy` and `obs-dstreamy`. Screen capture needs your desktop's portal backend (`xdg-desktop-portal-impl`, for example `xdg-desktop-portal-gnome`, `-kde` or `-hyprland`). Software x264 encoding always works; install `gst-plugin-va` for VA-API hardware encoding. NVIDIA's encoder comes with `gst-plugins-bad-libs`. The plugin goes into `/usr/lib/obs-plugins/`; run `dstreamy service install` once for the service it talks to.
 
 ### Command line
 
