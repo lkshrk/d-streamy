@@ -1211,11 +1211,15 @@ fn wait_or_drops<V>(
     f: impl FnMut(&Recorded) -> Option<V>,
 ) -> V {
     h.rt.block_on(h.mock.wait_for(T, f)).unwrap_or_else(|| {
-        let drops = c.try_status().ok().and_then(|s| {
-            let stalls = canary.stalls();
-            let origin = stalls.first().map_or_else(Instant::now, |s| s.0);
-            serve_drops(&s, &stalls, origin)
-        });
+        let drops = c
+            .try_status()
+            .ok()
+            .filter(|s| s["source"]["stats"].is_object())
+            .and_then(|s| {
+                let stalls = canary.stalls();
+                let origin = stalls.first().map_or_else(Instant::now, |s| s.0);
+                serve_drops(&s, &stalls, origin)
+            });
         let r = h.mock.recorded();
         let mock = format!(
             "the mock has {} video and {} audio frames and dropped {:?}",

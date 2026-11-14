@@ -851,14 +851,20 @@ fn a_stalled_producer_is_replaced_by_the_next_hello() {
     let h = Harness::new("[serve]\nstall_ms = 500\n");
     let _s = h.serve();
     let mut c = h.external_session();
-    let first = h.producer(&["--stall-after", "1000", "--stall-for", "4000"]);
+    let first = h.producer(&["--stall-after", "1000", "--stall-for", "8000"]);
     let id = first.attached();
     let before = h.stream_media(15, 25);
     first.wait_line("stall", |v| v["fault"] == "stall");
-    // A loaded serve can flag a stall before the real one and clear it on the next frame, so poll the current state.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while c.status()["source"]["reason"] != "stalled" {
-        assert!(Instant::now() < deadline, "serve never showed the stall");
+    // A loaded serve can flag a stall early and clear it on a late frame, so the stall must outlast stall_ms.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stalled_since = None;
+    while stalled_since.is_none_or(|t: Instant| t.elapsed() < Duration::from_millis(800)) {
+        assert!(Instant::now() < deadline, "serve never held the stall");
+        if c.status()["source"]["reason"] == "stalled" {
+            stalled_since.get_or_insert_with(Instant::now);
+        } else {
+            stalled_since = None;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     let second = h.producer(&[]);

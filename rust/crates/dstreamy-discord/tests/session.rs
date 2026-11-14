@@ -1074,7 +1074,7 @@ async fn invalid_session_rejoins_and_recovers() {
 
     let joins = f.voice_joins();
     assert!(
-        joins.len() >= 2 && joins.iter().all(|c| c == MOCK_VOICE_CHANNEL_ID),
+        (2..=4).contains(&joins.len()) && joins.iter().all(|c| c == MOCK_VOICE_CHANNEL_ID),
         "{joins:?}"
     );
     assert_eq!(f.starts(), 1);
