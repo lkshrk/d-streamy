@@ -1216,10 +1216,10 @@ async fn dave_guest_present(f: &Fixture, want: bool) {
     .unwrap_or_else(|_| panic!("the mock's DAVE guest never became {want}"));
 }
 
-fn tagged_first_frame_drops(r: &dstreamy_mock_discord::Recorded) -> usize {
+fn reordered_drops(r: &dstreamy_mock_discord::Recorded) -> usize {
     r.dropped_frames
         .iter()
-        .filter(|d| d.starts_with(dstreamy_mock_discord::FIRST_FRAME_DAVE_DROP))
+        .filter(|d| d.starts_with(dstreamy_mock_discord::REORDERED_DAVE_DROP))
         .count()
 }
 
@@ -1237,7 +1237,7 @@ async fn a_member_joining_and_leaving_the_call_rekeys_dave_without_losing_frames
     })
     .await;
     let before = f.mock.recorded();
-    let drops_before = before.dropped_frames.len() - tagged_first_frame_drops(&before);
+    let drops_before = before.dropped_frames.len() - reordered_drops(&before);
 
     assert!(f.mock.join_dave_guest(VoiceKind::Stream, GUEST).await);
     dave_guest_present(&f, true).await;
@@ -1256,7 +1256,7 @@ async fn a_member_joining_and_leaving_the_call_rekeys_dave_without_losing_frames
     f.video_flowing().await;
 
     let after = f.mock.recorded();
-    let drops_after = after.dropped_frames.len() - tagged_first_frame_drops(&after);
+    let drops_after = after.dropped_frames.len() - reordered_drops(&after);
     assert_eq!(drops_after, drops_before, "{:?}", after.dropped_frames);
     assert!(after.video.iter().rev().take(10).all(|v| v.e2ee));
     assert_eq!(*f.state.borrow(), SessionState::Streaming);
@@ -1277,7 +1277,7 @@ async fn a_dave_downgrade_and_upgrade_are_followed_and_reported() {
     })
     .await;
     let before = f.mock.recorded();
-    let drops_before = before.dropped_frames.len() - tagged_first_frame_drops(&before);
+    let drops_before = before.dropped_frames.len() - reordered_drops(&before);
 
     assert!(f.mock.downgrade_dave(VoiceKind::Stream).await);
     f.wait_event(|e| {
@@ -1309,7 +1309,7 @@ async fn a_dave_downgrade_and_upgrade_are_followed_and_reported() {
 
     let after = f.mock.recorded();
     assert!(after.video.iter().rev().take(10).all(|v| v.e2ee));
-    let drops_after = after.dropped_frames.len() - tagged_first_frame_drops(&after);
+    let drops_after = after.dropped_frames.len() - reordered_drops(&after);
     assert_eq!(drops_after, drops_before, "{:?}", after.dropped_frames);
     assert_eq!(*f.state.borrow(), SessionState::Streaming);
     f.finish().await;

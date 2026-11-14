@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use dstreamy_discord::stream::StreamOptions;
 use dstreamy_media::annexb;
 use dstreamy_mock_discord::{
-    FIRST_FRAME_DAVE_DROP, Recorded, RecordedAudioFrame, RecordedVideoFrame, VoiceKind,
+    REORDERED_DAVE_DROP, Recorded, RecordedAudioFrame, RecordedVideoFrame, VoiceKind,
 };
 use dstreamy_test_producer::sync::{
     self, H264LumaDecoder, LumaFrame, MarkerPair, OpusMonoDecoder, SAMPLE_RATE, TONE_HZ,
@@ -457,7 +457,7 @@ fn markers(
 
 /// Tolerates one first audio packet lost to receive-side track reordering, so only `dave_wire_order` guards the sender's nonce order.
 fn start_drops(recorded: &Recorded, what: &str) -> usize {
-    let tolerated = format!("{FIRST_FRAME_DAVE_DROP}audio");
+    let tolerated = format!("{REORDERED_DAVE_DROP}audio");
     let drops = &recorded.dropped_frames;
     assert!(
         drops.len() <= 1 && drops.iter().all(|d| d.starts_with(&tolerated)),
@@ -572,7 +572,7 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
         let lost = r
             .dropped_frames
             .iter()
-            .filter(|d| d.starts_with(&format!("{FIRST_FRAME_DAVE_DROP}audio")))
+            .filter(|d| d.starts_with(&format!("{REORDERED_DAVE_DROP}audio")))
             .count();
         if stream_video(&r).len() >= frames && producer_audio(&r).len() + lost >= packets {
             break r;

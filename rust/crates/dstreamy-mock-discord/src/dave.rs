@@ -12,6 +12,8 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use thiserror::Error;
 
+use crate::dave_frame::{self, MEDIA_KEY_LABEL};
+
 pub const DAVE_MAGIC: [u8; 2] = [0xFA, 0xFA];
 
 /// How long receivers still accept plaintext after a transition to E2EE (davey's default).
@@ -57,7 +59,12 @@ pub struct DaveServer {
     pub(crate) downgraded: bool,
     /// Bumped for every new participant session and epoch; davey's decryptor starts each without a nonce baseline.
     key_generation: u64,
+    /// The client's media key per key generation, newest last, for opening frames without davey's nonce state.
+    client_keys: Vec<(u64, Vec<u8>)>,
 }
+
+/// Generations a receiver still holds keys for; davey keeps a replaced key for `RATCHET_EXPIRY`.
+const KEPT_CLIENT_KEYS: usize = 4;
 
 impl DaveServer {
     pub fn new(
@@ -86,6 +93,7 @@ impl DaveServer {
             plaintext_until: None,
             downgraded: false,
             key_generation: 0,
+            client_keys: Vec::new(),
         })
     }
 
@@ -105,6 +113,7 @@ impl DaveServer {
         }
         // The client starts a fresh group with every key package, so the member and the epoch start over.
         self.guest = None;
+        self.client_keys.clear();
         let (participant, proposal) =
             self.member_add_proposal(self.participant_id, GroupEpoch::from(0))?;
         self.participant = Some(participant);
@@ -217,6 +226,19 @@ impl DaveServer {
             }
         }
         self.key_generation += 1;
+        if let Some(group) = self.participant.as_ref().and_then(DaveSession::group) {
+            let key = group
+                .export_secret(
+                    self.provider.crypto(),
+                    MEDIA_KEY_LABEL,
+                    &self.client_user_id.to_le_bytes(),
+                    16,
+                )
+                .map_err(mls)?;
+            self.client_keys.push((self.key_generation, key));
+            let excess = self.client_keys.len().saturating_sub(KEPT_CLIENT_KEYS);
+            self.client_keys.drain(..excess);
+        }
         self.next_transition = self.next_transition.wrapping_add(1).max(1);
         let transition_id = self.next_transition;
         let mut out = transition_id.to_be_bytes().to_vec();
@@ -234,6 +256,7 @@ impl DaveServer {
     pub fn reset_group(&mut self) {
         self.participant = None;
         self.guest = None;
+        self.client_keys.clear();
         self.plaintext_until = None;
         self.downgraded = false;
     }
@@ -263,6 +286,18 @@ impl DaveServer {
         self.participant
             .as_ref()
             .and_then(|p| p.voice_privacy_code().map(str::to_owned))
+    }
+
+    /// The key generation and nonce of a client frame that authenticates under one of the client's media keys.
+    pub fn open(&self, frame: &[u8]) -> Option<(u64, u32)> {
+        self.client_keys
+            .iter()
+            .rev()
+            .find_map(|(generation, key)| Some((*generation, dave_frame::open(key, frame)?)))
+    }
+
+    pub fn holds_client_key(&self, generation: u64) -> bool {
+        self.client_keys.iter().any(|(g, _)| *g == generation)
     }
 
     pub fn decrypt(

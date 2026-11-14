@@ -1,5 +1,6 @@
 //! Reassembles received RTP into frames, removes DAVE and records them.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -38,20 +39,15 @@ struct Assembly {
     broken: bool,
 }
 
-/// Prefix of the one DAVE drop per track and key that can come from receive-side reordering, once the other track decrypted under that key.
-pub const FIRST_FRAME_DAVE_DROP: &str = "DAVE decrypt before the first frame: ";
+/// Prefix of a drop proven to be receive-side reordering: the frame authenticates under the client's key, and its nonce is below the frame from the other track that set davey's baseline for that key.
+pub const REORDERED_DAVE_DROP: &str = "DAVE frame overtaken by the other track at a key's start: ";
 
-#[derive(Default, Clone, Copy)]
-struct TrackDecrypt {
-    succeeded: bool,
-    tagged: bool,
-}
-
+/// What davey's decryptor has seen of one client key, from frames that authenticated under it.
 #[derive(Default)]
-struct Decrypted {
-    audio: TrackDecrypt,
-    video: TrackDecrypt,
-    key_generation: u64,
+struct KeyOrder {
+    /// The track and nonce of the first frame davey decrypted under this key, which set its nonce baseline.
+    baseline: Option<(usize, u32)>,
+    newest: [Option<u32>; 2],
 }
 
 pub(crate) struct Sink {
@@ -61,7 +57,7 @@ pub(crate) struct Sink {
     dave: SharedDave,
     negotiated: Negotiated,
     video: Assembly,
-    decrypted: Decrypted,
+    key_orders: HashMap<u64, KeyOrder>,
 }
 
 /// davey reports a nonce below its baseline and a failed authentication alike (`cryptor/decryptor.rs:130,159`).
@@ -95,7 +91,7 @@ impl Sink {
                 next_seq: None,
                 broken: false,
             },
-            decrypted: Decrypted::default(),
+            key_orders: HashMap::new(),
         };
         tokio::spawn(async move {
             while let Some(packet) = rx.recv().await {
@@ -196,7 +192,6 @@ impl Sink {
         frame: Vec<u8>,
     ) -> Result<(Vec<u8>, bool), String> {
         let mut dave = lock_dave(&self.dave);
-        let decrypted = &mut self.decrypted;
         if !is_dave_frame(&frame) {
             let rejected = dave
                 .as_ref()
@@ -209,27 +204,33 @@ impl Sink {
         let server = dave
             .as_mut()
             .ok_or_else(|| "DAVE frame without a DAVE session".to_owned())?;
-        if decrypted.key_generation != server.key_generation() {
-            *decrypted = Decrypted {
-                key_generation: server.key_generation(),
-                ..Decrypted::default()
-            };
-        }
-        let (name, this, other) = if media_type == MediaType::VIDEO {
-            ("video", &mut decrypted.video, decrypted.audio)
+        let (name, track) = if media_type == MediaType::VIDEO {
+            ("video", 1)
         } else {
-            ("audio", &mut decrypted.audio, decrypted.video)
+            ("audio", 0)
         };
-        // Old-key frames can still decrypt after the server's re-key, so this track's own successes do not end the window.
-        let first_failure = !this.tagged && other.succeeded;
-        match server.decrypt(media_type, &frame) {
+        let opened = server.open(&frame);
+        let result = server.decrypt(media_type, &frame);
+        self.key_orders.retain(|&g, _| server.holds_client_key(g));
+        let Some((generation, nonce)) = opened else {
+            return result
+                .map(|plain| (plain, true))
+                .map_err(|e| format!("DAVE decrypt ({name}): {e}"));
+        };
+        let order = self.key_orders.entry(generation).or_default();
+        let in_track_order = order.newest[track].is_none_or(|n| nonce > n);
+        order.newest[track] = order.newest[track].max(Some(nonce));
+        match result {
             Ok(plain) => {
-                this.succeeded = true;
+                order.baseline.get_or_insert((track, nonce));
                 Ok((plain, true))
             }
-            Err(e) if first_failure && could_be_reordered(&e) => {
-                this.tagged = true;
-                Err(format!("{FIRST_FRAME_DAVE_DROP}{name}: {e}"))
+            Err(e)
+                if could_be_reordered(&e)
+                    && in_track_order
+                    && order.baseline.is_some_and(|(t, b)| t != track && nonce < b) =>
+            {
+                Err(format!("{REORDERED_DAVE_DROP}{name}: {e}"))
             }
             Err(e) => Err(format!("DAVE decrypt ({name}): {e}")),
         }
@@ -278,7 +279,7 @@ mod tests {
                 next_seq: None,
                 broken: false,
             },
-            decrypted: Decrypted::default(),
+            key_orders: HashMap::new(),
         }
     }
 
@@ -364,155 +365,202 @@ mod tests {
         assert_eq!(r.dropped_frames.len(), 1, "{:?}", r.dropped_frames);
     }
 
-    #[test]
-    fn only_a_drop_after_the_other_track_set_the_nonce_baseline_is_tagged_as_first_frame() {
-        let (server, mut client) = dave_pair();
-        let mut sink = sink(Some(server));
-        lock_dave(&sink.dave).as_mut().unwrap().execute_transition();
-        let opus = [0xFC, 0xFF, 0xFE, 0x01];
-        let idr = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33, 0xFF];
-        let audio = client
-            .encrypt(MediaType::AUDIO, Codec::OPUS, &opus)
-            .unwrap()
-            .to_vec();
-        let video = client
-            .encrypt(MediaType::VIDEO, Codec::H264, &idr)
-            .unwrap()
-            .to_vec();
-        let later = client
-            .encrypt(MediaType::AUDIO, Codec::OPUS, &opus)
-            .unwrap()
-            .to_vec();
-        let mut forged = audio.clone();
-        forged[0] ^= 0xff;
-        let early = sink.decrypt(MediaType::AUDIO, forged).unwrap_err();
-        assert!(!early.starts_with(FIRST_FRAME_DAVE_DROP), "{early}");
-        assert!(sink.decrypt(MediaType::VIDEO, video).is_ok());
-        let first = sink.decrypt(MediaType::AUDIO, audio.clone()).unwrap_err();
-        assert!(first.starts_with(FIRST_FRAME_DAVE_DROP), "{first}");
-        let again = sink.decrypt(MediaType::AUDIO, audio.clone()).unwrap_err();
-        assert!(!again.starts_with(FIRST_FRAME_DAVE_DROP), "{again}");
-        assert!(sink.decrypt(MediaType::AUDIO, later).is_ok());
-        let replayed = sink.decrypt(MediaType::AUDIO, audio).unwrap_err();
-        assert!(!replayed.starts_with(FIRST_FRAME_DAVE_DROP), "{replayed}");
-    }
+    const OPUS: [u8; 4] = [0xFC, 0xFF, 0xFE, 0x01];
+    const IDR: [u8; 10] = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33, 0xFF];
 
-    #[test]
-    fn a_new_participant_session_starts_first_frame_tagging_over() {
-        let (server, mut client) = dave_pair();
-        let mut sink = sink(Some(server));
-        let opus = [0xFC, 0xFF, 0xFE, 0x01];
-        let idr = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33, 0xFF];
-        for (media, codec, frame) in [
-            (MediaType::AUDIO, Codec::OPUS, &opus[..]),
-            (MediaType::VIDEO, Codec::H264, &idr[..]),
-        ] {
-            let sealed = client.encrypt(media, codec, frame).unwrap().to_vec();
-            assert!(sink.decrypt(media, sealed).is_ok());
-        }
-        let mut client = join(lock_dave(&sink.dave).as_mut().unwrap());
-        let audio = client
-            .encrypt(MediaType::AUDIO, Codec::OPUS, &opus)
-            .unwrap()
-            .to_vec();
-        let video = client
-            .encrypt(MediaType::VIDEO, Codec::H264, &idr)
-            .unwrap()
-            .to_vec();
-        assert!(sink.decrypt(MediaType::VIDEO, video).is_ok());
-        let first = sink.decrypt(MediaType::AUDIO, audio).unwrap_err();
-        assert!(first.starts_with(FIRST_FRAME_DAVE_DROP), "{first}");
-    }
-
-    #[test]
-    fn a_new_epoch_starts_first_frame_tagging_over() {
-        let (server, mut client) = dave_pair();
-        let mut sink = sink(Some(server));
-        let opus = [0xFC, 0xFF, 0xFE, 0x01];
-        let idr = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33, 0xFF];
-        for (media, codec, frame) in [
-            (MediaType::AUDIO, Codec::OPUS, &opus[..]),
-            (MediaType::VIDEO, Codec::H264, &idr[..]),
-        ] {
-            let sealed = client.encrypt(media, codec, frame).unwrap().to_vec();
-            assert!(sink.decrypt(media, sealed).is_ok());
-        }
-        let announce = {
-            let mut dave = lock_dave(&sink.dave);
-            let server = dave.as_mut().unwrap();
-            let proposals = server.add_guest_proposal(8888).unwrap();
-            let cw = client
-                .process_proposals(
-                    ProposalsOperationType::APPEND,
-                    &proposals[1..],
-                    Some(&[9999, 8888]),
-                )
-                .unwrap()
-                .unwrap();
-            let mut payload = cw.commit.clone();
-            payload.extend(cw.welcome.unwrap());
-            server.on_commit_welcome(&payload).unwrap().1
+    fn seal(client: &mut DaveSession, media: MediaType) -> Vec<u8> {
+        let (codec, frame) = if media == MediaType::VIDEO {
+            (Codec::H264, &IDR[..])
+        } else {
+            (Codec::OPUS, &OPUS[..])
         };
-        let old_key = client
-            .encrypt(MediaType::AUDIO, Codec::OPUS, &opus)
-            .unwrap()
-            .to_vec();
-        assert!(sink.decrypt(MediaType::AUDIO, old_key).is_ok());
-        client.process_commit(&announce[2..]).unwrap();
-        let audio = client
-            .encrypt(MediaType::AUDIO, Codec::OPUS, &opus)
-            .unwrap()
-            .to_vec();
-        let video = client
-            .encrypt(MediaType::VIDEO, Codec::H264, &idr)
-            .unwrap()
-            .to_vec();
-        assert!(sink.decrypt(MediaType::VIDEO, video).is_ok());
-        let first = sink.decrypt(MediaType::AUDIO, audio).unwrap_err();
-        assert!(first.starts_with(FIRST_FRAME_DAVE_DROP), "{first}");
+        client.encrypt(media, codec, frame).unwrap().to_vec()
     }
 
-    #[test]
-    fn a_first_video_frame_behind_decrypted_audio_is_tagged_too() {
-        let (server, mut client) = dave_pair();
-        let mut sink = sink(Some(server));
-        lock_dave(&sink.dave).as_mut().unwrap().execute_transition();
-        let idr = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33, 0xFF];
-        let video = client
-            .encrypt(MediaType::VIDEO, Codec::H264, &idr)
-            .unwrap()
-            .to_vec();
-        let audio = client
-            .encrypt(MediaType::AUDIO, Codec::OPUS, &[0xFC, 0xFF, 0xFE, 0x01])
-            .unwrap()
-            .to_vec();
-        assert!(sink.decrypt(MediaType::AUDIO, audio).is_ok());
-        let first = sink.decrypt(MediaType::VIDEO, video.clone()).unwrap_err();
-        assert!(
-            first.starts_with(&format!("{FIRST_FRAME_DAVE_DROP}video")),
-            "{first}"
-        );
-        let again = sink.decrypt(MediaType::VIDEO, video).unwrap_err();
-        assert!(!again.starts_with(FIRST_FRAME_DAVE_DROP), "{again}");
+    fn excused(e: &str, track: &str) -> bool {
+        e.starts_with(&format!("{REORDERED_DAVE_DROP}{track}"))
     }
 
-    #[test]
-    fn a_drop_while_neither_track_decrypted_is_not_tagged() {
-        let (server, mut client) = dave_pair();
-        let mut sink = sink(Some(server));
-        lock_dave(&sink.dave).as_mut().unwrap().execute_transition();
-        let mut forged = client
-            .encrypt(
-                MediaType::VIDEO,
-                Codec::H264,
-                &[0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00],
+    fn rekey(sink: &Sink, client: &mut DaveSession) -> Vec<u8> {
+        let mut dave = lock_dave(&sink.dave);
+        let server = dave.as_mut().unwrap();
+        let proposals = server.add_guest_proposal(8888).unwrap();
+        let cw = client
+            .process_proposals(
+                ProposalsOperationType::APPEND,
+                &proposals[1..],
+                Some(&[9999, 8888]),
             )
             .unwrap()
-            .to_vec();
+            .unwrap();
+        let mut payload = cw.commit.clone();
+        payload.extend(cw.welcome.unwrap());
+        server.on_commit_welcome(&payload).unwrap().1
+    }
+
+    #[test]
+    fn the_server_opens_only_authentic_client_frames() {
+        let (server, mut client) = dave_pair();
+        for (i, media) in [MediaType::AUDIO, MediaType::VIDEO]
+            .repeat(100)
+            .into_iter()
+            .enumerate()
+        {
+            let sealed = seal(&mut client, media);
+            let nonce = u32::try_from(i + 1).unwrap();
+            assert_eq!(server.open(&sealed), Some((server.key_generation(), nonce)));
+            for at in [0, sealed.len() - 4, sealed.len() - 12] {
+                let mut corrupted = sealed.clone();
+                corrupted[at] ^= 0x01;
+                assert_eq!(
+                    server.open(&corrupted),
+                    None,
+                    "byte {at} of {}",
+                    sealed.len()
+                );
+            }
+        }
+        let (_, mut stranger) = dave_pair();
+        assert_eq!(server.open(&seal(&mut stranger, MediaType::AUDIO)), None);
+    }
+
+    #[test]
+    fn every_frame_a_new_key_frame_on_the_other_track_overtook_is_excused() {
+        let (server, mut client) = dave_pair();
+        let mut sink = sink(Some(server));
+        let audio = [
+            seal(&mut client, MediaType::AUDIO),
+            seal(&mut client, MediaType::AUDIO),
+        ];
+        let video = seal(&mut client, MediaType::VIDEO);
+        let late_video = seal(&mut client, MediaType::VIDEO);
+        let later_audio = seal(&mut client, MediaType::AUDIO);
+        assert!(sink.decrypt(MediaType::VIDEO, video).is_ok());
+        for packet in audio.clone() {
+            let e = sink.decrypt(MediaType::AUDIO, packet).unwrap_err();
+            assert!(excused(&e, "audio"), "{e}");
+        }
+        assert!(sink.decrypt(MediaType::AUDIO, later_audio).is_ok());
+        assert!(sink.decrypt(MediaType::VIDEO, late_video).is_ok());
+        let e = sink
+            .decrypt(MediaType::AUDIO, audio[0].clone())
+            .unwrap_err();
+        assert!(!excused(&e, ""), "a replay: {e}");
+    }
+
+    #[test]
+    fn a_video_frame_behind_decrypted_audio_is_excused_too() {
+        let (server, mut client) = dave_pair();
+        let mut sink = sink(Some(server));
+        let video = seal(&mut client, MediaType::VIDEO);
+        assert!(
+            sink.decrypt(MediaType::AUDIO, seal(&mut client, MediaType::AUDIO))
+                .is_ok()
+        );
+        let e = sink.decrypt(MediaType::VIDEO, video).unwrap_err();
+        assert!(excused(&e, "video"), "{e}");
+    }
+
+    #[test]
+    fn a_corrupted_frame_below_the_baseline_is_a_real_loss() {
+        let (server, mut client) = dave_pair();
+        let mut sink = sink(Some(server));
+        let audio = seal(&mut client, MediaType::AUDIO);
+        assert!(
+            sink.decrypt(MediaType::VIDEO, seal(&mut client, MediaType::VIDEO))
+                .is_ok()
+        );
+        for at in [0, audio.len() - 12] {
+            let mut corrupted = audio.clone();
+            corrupted[at] ^= 0x01;
+            let e = sink.decrypt(MediaType::AUDIO, corrupted).unwrap_err();
+            assert!(!excused(&e, ""), "byte {at}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_frame_overtaken_on_its_own_track_is_a_real_loss() {
+        let (server, mut client) = dave_pair();
+        let mut sink = sink(Some(server));
+        let first = seal(&mut client, MediaType::AUDIO);
+        assert!(
+            sink.decrypt(MediaType::AUDIO, seal(&mut client, MediaType::AUDIO))
+                .is_ok()
+        );
+        assert!(
+            sink.decrypt(MediaType::VIDEO, seal(&mut client, MediaType::VIDEO))
+                .is_ok()
+        );
+        let e = sink.decrypt(MediaType::AUDIO, first).unwrap_err();
+        assert!(!excused(&e, ""), "{e}");
+    }
+
+    #[test]
+    fn a_frame_under_a_key_the_receiver_lacks_is_a_real_loss() {
+        let (server, mut client) = dave_pair();
+        let (_, mut stranger) = dave_pair();
+        let mut sink = sink(Some(server));
+        let foreign = seal(&mut stranger, MediaType::AUDIO);
+        seal(&mut client, MediaType::AUDIO);
+        assert!(
+            sink.decrypt(MediaType::VIDEO, seal(&mut client, MediaType::VIDEO))
+                .is_ok()
+        );
+        let e = sink.decrypt(MediaType::AUDIO, foreign).unwrap_err();
+        assert!(!excused(&e, ""), "{e}");
+    }
+
+    #[test]
+    fn a_new_participant_session_starts_its_own_baseline() {
+        let (server, mut client) = dave_pair();
+        let mut sink = sink(Some(server));
+        for media in [MediaType::AUDIO, MediaType::VIDEO] {
+            assert!(sink.decrypt(media, seal(&mut client, media)).is_ok());
+        }
+        let mut client = join(lock_dave(&sink.dave).as_mut().unwrap());
+        let audio = seal(&mut client, MediaType::AUDIO);
+        assert!(
+            sink.decrypt(MediaType::VIDEO, seal(&mut client, MediaType::VIDEO))
+                .is_ok()
+        );
+        let e = sink.decrypt(MediaType::AUDIO, audio).unwrap_err();
+        assert!(excused(&e, "audio"), "{e}");
+    }
+
+    #[test]
+    fn old_key_frames_after_a_rekey_count_toward_the_old_key_only() {
+        let (server, mut client) = dave_pair();
+        let mut sink = sink(Some(server));
+        let replayed = seal(&mut client, MediaType::AUDIO);
+        assert!(sink.decrypt(MediaType::AUDIO, replayed.clone()).is_ok());
+        assert!(
+            sink.decrypt(MediaType::VIDEO, seal(&mut client, MediaType::VIDEO))
+                .is_ok()
+        );
+        let announce = rekey(&sink, &mut client);
+        let old_key = seal(&mut client, MediaType::AUDIO);
+        assert!(sink.decrypt(MediaType::AUDIO, old_key).is_ok());
+        client.process_commit(&announce[2..]).unwrap();
+        let audio = seal(&mut client, MediaType::AUDIO);
+        assert!(
+            sink.decrypt(MediaType::VIDEO, seal(&mut client, MediaType::VIDEO))
+                .is_ok()
+        );
+        let e = sink.decrypt(MediaType::AUDIO, audio).unwrap_err();
+        assert!(excused(&e, "audio"), "{e}");
+        let e = sink.decrypt(MediaType::AUDIO, replayed).unwrap_err();
+        assert!(!excused(&e, ""), "an old-key replay: {e}");
+    }
+
+    #[test]
+    fn a_drop_while_neither_track_decrypted_is_a_real_loss() {
+        let (server, mut client) = dave_pair();
+        let mut sink = sink(Some(server));
+        let mut forged = seal(&mut client, MediaType::VIDEO);
         forged[5] ^= 0xff;
         for _ in 0..2 {
             let e = sink.decrypt(MediaType::VIDEO, forged.clone()).unwrap_err();
-            assert!(!e.starts_with(FIRST_FRAME_DAVE_DROP), "{e}");
+            assert!(!excused(&e, ""), "{e}");
         }
     }
 
@@ -543,7 +591,6 @@ mod tests {
         let (_, mut client) = dave_pair();
         let server = DaveServer::new(NonZeroU16::new(1).unwrap(), CLIENT, 7, 9999).unwrap();
         let mut sink = sink(Some(server));
-        sink.decrypted.audio.succeeded = true;
         let video = client
             .encrypt(
                 MediaType::VIDEO,
@@ -553,6 +600,6 @@ mod tests {
             .unwrap()
             .to_vec();
         let e = sink.decrypt(MediaType::VIDEO, video).unwrap_err();
-        assert!(!e.starts_with(FIRST_FRAME_DAVE_DROP), "{e}");
+        assert!(!excused(&e, ""), "{e}");
     }
 }
