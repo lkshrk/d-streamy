@@ -33,6 +33,7 @@ jobs:
     outputs:
       version: ${{ steps.check.outputs.version }}
       publish: ${{ steps.check.outputs.publish }}
+      source_date_epoch: ${{ steps.epoch.outputs.source_date_epoch }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -70,6 +71,17 @@ jobs:
           echo "version=$crate" >> "$GITHUB_OUTPUT"
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
           echo "D-Streamy $crate, publish: $publish" >> "$GITHUB_STEP_SUMMARY"
+      - name: Read the commit timestamp for reproducible archives
+        id: epoch
+        run: |
+          set -euo pipefail
+          # Build jobs take it from here: git in the root-run Debian containers refuses the runner-owned checkout.
+          epoch=$(git log -1 --format=%ct)
+          if [[ ! $epoch =~ ^[0-9]+$ ]]; then
+            echo "::error::git log gave no commit timestamp: '$epoch'"
+            exit 1
+          fi
+          echo "source_date_epoch=$epoch" >> "$GITHUB_OUTPUT"
 
   ci-gate:
     needs: version
@@ -168,6 +180,7 @@ jobs:
       EXT: ${{ matrix.archive || 'tar.gz' }}
       EXE: ${{ matrix.exe }}
       TARGET: ${{ matrix.target }}
+      SOURCE_DATE_EPOCH: ${{ needs.version.outputs.source_date_epoch }}
       MACOS_SIGNING: ${{ secrets.SIGNING_IDENTITY != '' && secrets.DEVELOPER_ID_CERT_P12 != '' }}
     steps:
       - name: Bootstrap the container
@@ -217,7 +230,10 @@ jobs:
       - name: Pin build paths and timestamps
         run: |
           set -euo pipefail
-          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+          if [[ ! ${SOURCE_DATE_EPOCH:-} =~ ^[0-9]+$ ]]; then
+            echo "::error::SOURCE_DATE_EPOCH is '${SOURCE_DATE_EPOCH:-}', not a Unix timestamp"
+            exit 1
+          fi
           cargo_home=${CARGO_HOME:-$HOME/.cargo}
           if [ "$RUNNER_OS" = Windows ]; then cargo_home=$(cygpath -w "$cargo_home"); fi
           echo "RUSTFLAGS=--remap-path-prefix=$GITHUB_WORKSPACE=/d-streamy --remap-path-prefix=$cargo_home=/cargo" >> "$GITHUB_ENV"
@@ -284,7 +300,7 @@ jobs:
             tar=gtar
           fi
           # Sorted names, fixed mtime and owner, and no gzip header timestamp make the archive reproducible.
-          "$tar" --format=gnu --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+          "$tar" --format=gnu --sort=name --mtime="@${SOURCE_DATE_EPOCH:?}" --owner=0 --group=0 --numeric-owner \
             -C dist -cf - "$ARCHIVE" | gzip -n -9 > "dist/$ARCHIVE.tar.gz"
           sum() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
           (cd dist && sum "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256")
@@ -467,12 +483,14 @@ jobs:
           fi
           cmake -DTEST_HOOKS=OFF -DLIBRARY="$plugins/obs-dstreamy.so" -P cmake/common/check_test_hooks.cmake
       - name: Package
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.version.outputs.source_date_epoch }}
         run: |
           set -euo pipefail
           mkdir -p dist
           cp LICENSE "$RUNNER_TEMP/stage/"
           # The tree unpacks over /usr or ~/.local; sorted names and a fixed mtime make it reproducible.
-          tar --format=gnu --sort=name --mtime="@$(git log -1 --format=%ct)" --owner=0 --group=0 --numeric-owner \
+          tar --format=gnu --sort=name --mtime="@${SOURCE_DATE_EPOCH:?}" --owner=0 --group=0 --numeric-owner \
             -C "$RUNNER_TEMP/stage" -cf - . | gzip -n -9 > "dist/$PACKAGE.tar.gz"
           (cd dist && sha256sum "$PACKAGE.tar.gz" > "$PACKAGE.tar.gz.sha256" && cat "$PACKAGE.tar.gz.sha256")
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

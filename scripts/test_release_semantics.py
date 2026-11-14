@@ -138,6 +138,32 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("obs/buildspec.json has version 0.2.0", result.stdout + result.stderr)
 
+    def test_source_date_epoch_is_read_once_and_never_empty(self):
+        script = step("release.yml", "Read the commit timestamp for reproducible archives")
+        with tempfile.TemporaryDirectory(prefix="epoch-fixture-") as directory:
+            env = dict(os.environ, **ISOLATED_GIT, GITHUB_OUTPUT=str(Path(directory) / "output"))
+            result = subprocess.run(["bash", "-c", script], cwd=directory, env=env, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0, "an unreadable repository gave an epoch")
+            git = lambda *args: subprocess.run(["git", "-C", directory, *args], check=True, capture_output=True,
+                                               env=env)
+            env["GIT_COMMITTER_DATE"] = "@1700000000"
+            git("init", "-q")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base")
+            result = subprocess.run(["bash", "-c", script], cwd=directory, env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual((Path(directory) / "output").read_text(), "source_date_epoch=1700000000\n")
+        pin = step("release.yml", "Pin build paths and timestamps")
+        for epoch, accepted in (("", False), ("@", False), ("17000x", False), ("1700000000", True)):
+            with self.subTest(epoch=epoch), tempfile.TemporaryDirectory(prefix="epoch-fixture-") as directory:
+                env = dict(os.environ, SOURCE_DATE_EPOCH=epoch, RUNNER_OS="Linux", GITHUB_WORKSPACE=directory,
+                           GITHUB_ENV=str(Path(directory) / "env"))
+                result = subprocess.run(["bash", "-c", pin], env=env, text=True, capture_output=True)
+                self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+        source = workflow("release.yml")
+        self.assertNotIn("git log", source.split("\n  ci-gate:\n", 1)[1])
+        self.assertEqual(source.count("SOURCE_DATE_EPOCH: ${{ needs.version.outputs.source_date_epoch }}"), 2)
+        self.assertEqual(source.count('--mtime="@${SOURCE_DATE_EPOCH:?}"'), 2)
+
     def gate(self, obs_runs, change_obs, failed=""):
         """Runs the CI gate against a two-commit repo; obs_runs maps 'base'/'tip' to whether OBS ran there."""
         script = step("release.yml", "Wait for CI on the tagged commit")
