@@ -1317,7 +1317,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "dstreamy-capture-linux"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "ashpd",
  "async-trait",
@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-capture-macos"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "dstreamy-media",
@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-cli"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -1392,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "directories",
  "serde",
@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-discord"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1437,7 +1437,7 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-ipc"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "dstreamy-ipc",
  "futures-util",
@@ -1454,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-media"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "dstreamy-core",
@@ -1470,7 +1470,7 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-mock-discord"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "davey",
  "discord-stream-rs",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-obs-packet"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "openh264",
  "proptest",
@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-obs-producer"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "dstreamy-core",
  "dstreamy-ipc",
@@ -1520,7 +1520,7 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-test-producer"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "clap",
  "dstreamy-ipc",

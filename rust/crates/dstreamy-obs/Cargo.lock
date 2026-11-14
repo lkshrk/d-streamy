@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-ipc"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "libc",
  "serde",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-obs"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "dstreamy-obs-producer",
  "dstreamy-obs-sys",
@@ -96,11 +96,11 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-obs-packet"
-version = "2.0.0"
+version = "2.0.1"
 
 [[package]]
 name = "dstreamy-obs-producer"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "dstreamy-ipc",
  "dstreamy-obs-packet",
@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "dstreamy-obs-sys"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "bindgen",
 ]
