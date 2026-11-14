@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>D-Streamy pacman repository</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; color: #1b1b1b; background: #fff; }
+  pre, code { font-family: ui-monospace, monospace; font-size: 0.9em; }
+  pre { background: #f3f3f3; padding: 0.75rem 1rem; overflow-x: auto; }
+  @media (prefers-color-scheme: dark) { body { color: #e6e6e6; background: #161616; } pre { background: #262626; } }
+</style>
+</head>
+<body>
+<h1>D-Streamy pacman repository</h1>
+<p>Signed Arch Linux packages of <a href="https://github.com/lkshrk/d-streamy">D-Streamy</a> @VERSION@:
+<code>dstreamy</code> for x86_64 and aarch64, and the OBS plugin <code>obs-dstreamy</code> for x86_64.</p>
+<p>The packages are signed with the key <code>@FINGERPRINT@</code>. Import it and sign it locally:</p>
+<pre>curl -fsSLO https://lkshrk.github.io/d-streamy/arch/d-streamy.asc
+sudo pacman-key --add d-streamy.asc
+sudo pacman-key --lsign-key @FINGERPRINT@</pre>
+<p>Add the repository to <code>/etc/pacman.conf</code>:</p>
+<pre>[d-streamy]
+Server = https://lkshrk.github.io/d-streamy/arch/$arch</pre>
+<p>Then install:</p>
+<pre>sudo pacman -Syu dstreamy obs-dstreamy</pre>
+<p>Each release replaces the repository; only the current version is available.</p>
+</body>
+</html>

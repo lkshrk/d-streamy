@@ -39,6 +39,11 @@ def step(name, title):
     return "\n".join(line[10:] for line in body.splitlines()) + "\n"
 
 
+def job_section(name, source=None):
+    source = source or workflow("release.yml")
+    return re.split(r"\n  [a-z-]+:\n", source.split(f"\n  {name}:\n", 1)[1], maxsplit=1)[0]
+
+
 class MetadataPackage(TypedDict):
     id: str
     name: str
@@ -105,7 +110,7 @@ class WorkflowTests(unittest.TestCase):
     def test_rehearsal_describes_external_effects(self):
         source = workflow("release.yml")
         self.assertNotIn("nothing was published", source)
-        self.assertIn("No GitHub release or Homebrew update was published", source)
+        self.assertIn("No GitHub release, Homebrew update or pacman repository was published", source)
         self.assertIn("Workflow artifacts were uploaded", source)
         self.assertIn("signing and notarization may contact Apple", source)
 
@@ -161,8 +166,12 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
         source = workflow("release.yml")
         self.assertNotIn("git log", source.split("\n  ci-gate:\n", 1)[1])
-        self.assertEqual(source.count("SOURCE_DATE_EPOCH: ${{ needs.version.outputs.source_date_epoch }}"), 2)
-        self.assertEqual(source.count('--mtime="@${SOURCE_DATE_EPOCH:?}"'), 2)
+        for job in ("cli", "obs-linux", "arch"):
+            with self.subTest(job=job):
+                self.assertIn("SOURCE_DATE_EPOCH: ${{ needs.version.outputs.source_date_epoch }}", job_section(job))
+        for job in ("cli", "obs-linux"):
+            with self.subTest(job=job):
+                self.assertIn('--mtime="@${SOURCE_DATE_EPOCH:?}"', job_section(job))
 
     def gate(self, obs_runs, change_obs, failed=""):
         """Runs the CI gate against a two-commit repo; obs_runs maps 'base'/'tip' to whether OBS ran there."""
