@@ -631,6 +631,218 @@ class SigningKeychainTests(unittest.TestCase):
         self.assertRegex(script, r"key=\"\$RUNNER_TEMP/notary.p8\"\n\s+trap 'rm -f \"\$key\"' EXIT\n")
 
 
+FAKE_GPG = r"""#!/bin/bash
+printf '%s\n' "$(basename "$0") $*" >> "$STUB_LOG/argv"
+printf '%s\n' "$GNUPGHOME" >> "$STUB_LOG/gnupghome"
+case "$(basename "$0") $*" in
+  "gpg --batch --quiet --import") cat > "$STUB_LOG/imported" ;;
+  "gpg --batch --with-colons --list-secret-keys") echo "fpr:::::::::$STUB_FINGERPRINT:" ;;
+  *--export*) echo "PUBLIC KEY" ;;
+  *--detach-sign*) touch "${@: -1}.sig" ;;
+  repo-add*) exit "${STUB_REPO_ADD_STATUS:-0}" ;;
+esac
+"""
+
+
+class ArchRepoTests(unittest.TestCase):
+    KEY = "-----BEGIN PGP PRIVATE KEY BLOCK-----\nsecret key material\n-----END PGP PRIVATE KEY BLOCK-----"
+    FINGERPRINT = "0123456789ABCDEF0123456789ABCDEF01234567"
+    PKGBUILDS = {"dstreamy-bin": {"x86_64": "x86_64-unknown-linux-gnu", "aarch64": "aarch64-unknown-linux-gnu"},
+                 "obs-dstreamy-bin": {"": "linux-x86_64"}}
+
+    def sign(self, repo_add_status=0, key=KEY):
+        """Runs make-arch-repo.sh --sign on a two-architecture repo with gpg, gpgconf and repo-add stubbed."""
+        directory = tempfile.TemporaryDirectory(prefix="arch-repo-fixture-")
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name)
+        stubs, log, tmp, repo = base / "bin", base / "log", base / "tmp", base / "repo"
+        for path in (stubs, log, tmp, repo / "x86_64", repo / "aarch64"):
+            path.mkdir(parents=True)
+        for name in ("gpg", "gpgconf", "repo-add"):
+            (stubs / name).write_text(FAKE_GPG)
+            (stubs / name).chmod(0o755)
+        (repo / "x86_64/dstreamy-bin-0.1.0-1-x86_64.pkg.tar.zst").write_text("x")
+        (repo / "aarch64/dstreamy-bin-0.1.0-1-aarch64.pkg.tar.zst").write_text("a")
+        env = dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}", TMPDIR=str(tmp), STUB_LOG=str(log),
+                   STUB_FINGERPRINT=self.FINGERPRINT, STUB_REPO_ADD_STATUS=str(repo_add_status),
+                   PACMAN_SIGNING_KEY=key)
+        result = subprocess.run([str(ROOT / "scripts/make-arch-repo.sh"), str(repo), "--sign"], env=env, text=True,
+                                capture_output=True)
+        return result, base
+
+    def test_signing_key_reaches_gpg_only_on_stdin(self):
+        result, base = self.sign()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((base / "log/imported").read_text(), self.KEY + "\n")
+        argv = (base / "log/argv").read_text()
+        self.assertNotIn("secret key material", argv)
+        self.assertNotIn("PRIVATE KEY", argv)
+        self.assertNotIn("secret key material", result.stdout + result.stderr)
+        for arch in ("x86_64", "aarch64"):
+            with self.subTest(arch=arch):
+                self.assertIn(f"--detach-sign --no-armor --local-user {self.FINGERPRINT} {base}/repo/{arch}/", argv)
+                self.assertIn(f"repo-add --sign --key {self.FINGERPRINT} {base}/repo/{arch}/d-streamy.db.tar.zst", argv)
+                self.assertTrue((base / f"repo/{arch}/dstreamy-bin-0.1.0-1-{arch}.pkg.tar.zst.sig").exists())
+        self.assertEqual((base / "repo/d-streamy.asc").read_text(), "PUBLIC KEY\n")
+
+    def test_gnupghome_is_removed_after_success_and_failure(self):
+        for status in (0, 1):
+            with self.subTest(repo_add_status=status):
+                result, base = self.sign(repo_add_status=status)
+                self.assertEqual(result.returncode == 0, status == 0, result.stdout + result.stderr)
+                homes = set((base / "log/gnupghome").read_text().split())
+                self.assertEqual(len(homes), 1, homes)
+                self.assertTrue(homes.pop().startswith(str(base / "tmp") + "/"), "GNUPGHOME is not a fresh temp dir")
+                self.assertEqual(list((base / "tmp").iterdir()), [], "GNUPGHOME survived the run")
+
+    def test_signing_without_a_key_fails_before_gpg_runs(self):
+        result, base = self.sign(key="")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PACMAN_SIGNING_KEY is not set", result.stderr)
+        self.assertFalse((base / "log/argv").exists())
+
+    def test_workflow_hands_the_key_to_the_script_only_through_env(self):
+        source = workflow("release.yml")
+        self.assertEqual(source.count("secrets.PACMAN_SIGNING_KEY"), 1)
+        pages = job_section("pages")
+        self.assertIn("        env:\n          PACMAN_SIGNING_KEY: ${{ secrets.PACMAN_SIGNING_KEY }}\n"
+                      "        run: scripts/make-arch-repo.sh site/arch --sign\n", pages)
+        self.assertNotIn("PACMAN_SIGNING_KEY", job_section("arch"))
+
+    def test_rehearsals_never_deploy_pages(self):
+        source = workflow("release.yml")
+        top = source.split("\njobs:\n", 1)[0]
+        self.assertNotIn("pages:", top)
+        jobs = re.findall(r"\n  ([a-z][a-z-]*):\n", source.split("\njobs:\n", 1)[1])
+        for job in jobs:
+            section = job_section(job)
+            if job == "pages":
+                continue
+            with self.subTest(job=job):
+                for marker in ("deploy-pages", "upload-pages-artifact", "pages: write", "github-pages"):
+                    self.assertNotIn(marker, section)
+        pages = job_section("pages")
+        self.assertRegex(pages, r"^    needs: \[[^\]]*\brelease\b")
+        self.assertIn("\n    if: needs.version.outputs.publish == 'true'\n", pages)
+        self.assertIn("\n      pages: write\n", pages)
+        self.assertIn("actions/deploy-pages@", pages)
+        self.assertRegex(job_section("rehearse"), r"needs: \[[^\]]*\barch\b")
+        self.assertNotIn("\n    if:", job_section("arch"))
+        self.assertNotIn("--sign", job_section("arch"))
+
+    def assets(self, dist, version="0.1.0"):
+        sums = {}
+        for package, targets in self.PKGBUILDS.items():
+            for arch, target in targets.items():
+                name = f"{package.removesuffix('-bin')}-{version}-{target}.tar.gz"
+                sums[package, arch] = hashlib.sha256(name.encode()).hexdigest()
+                (dist / f"{name}.sha256").write_text(f"{sums[package, arch]}  {name}\n")
+        return sums
+
+    def fill(self, package, dist, version="0.1.0"):
+        return subprocess.run([str(ROOT / "scripts/fill-pkgbuild.sh"), version, str(dist),
+                               str(ROOT / "packaging/arch" / package / "PKGBUILD")], text=True, capture_output=True)
+
+    def test_fill_pkgbuild_puts_each_assets_sha256_in_its_array(self):
+        with tempfile.TemporaryDirectory(prefix="pkgbuild-fixture-") as directory:
+            dist = Path(directory)
+            sums = self.assets(dist)
+            for package, targets in self.PKGBUILDS.items():
+                with self.subTest(package=package):
+                    result = self.fill(package, dist)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    filled = result.stdout
+                    self.assertIn("\npkgver=0.1.0\n", filled)
+                    self.assertIn("\npkgrel=1\n", filled)
+                    for arch in targets:
+                        key = f"sha256sums_{arch}" if arch else "sha256sums"
+                        self.assertIn(f"\n{key}=('{sums[package, arch]}')\n", filled)
+                    self.assertNotRegex(filled, r"0{64}|1{64}")
+                    template = (ROOT / "packaging/arch" / package / "PKGBUILD").read_text()
+                    changed = [line for line in filled.splitlines() if line not in template.splitlines()]
+                    self.assertEqual(len(changed), 1 + len(targets), changed)
+
+    def test_fill_pkgbuild_refuses_missing_or_bad_checksums(self):
+        with tempfile.TemporaryDirectory(prefix="pkgbuild-fixture-") as directory:
+            dist = Path(directory)
+            self.assets(dist)
+            (dist / "dstreamy-0.1.0-aarch64-unknown-linux-gnu.tar.gz.sha256").unlink()
+            result = self.fill("dstreamy-bin", dist)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("aarch64-unknown-linux-gnu.tar.gz.sha256", result.stderr)
+            self.assertEqual(result.stdout, "")
+            (dist / "obs-dstreamy-0.1.0-linux-x86_64.tar.gz.sha256").write_text("nope  obs\n")
+            result = self.fill("obs-dstreamy-bin", dist)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("holds no sha256", result.stderr)
+            result = self.fill("obs-dstreamy-bin", dist, version="v0.1.0")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("X.Y.Z", result.stderr)
+
+    def test_srcinfo_matches_its_pkgbuild(self):
+        for package in self.PKGBUILDS:
+            with self.subTest(package=package):
+                directory = ROOT / "packaging/arch" / package
+                fields = subprocess.run(["bash", "-c", 'source PKGBUILD; printf "pkgver = %s\\n" "$pkgver"; '
+                                         'for d in "${depends[@]}"; do printf "depends = %s\\n" "$d"; done; '
+                                         'for p in "${provides[@]}"; do printf "provides = %s\\n" "$p"; done; '
+                                         'for c in "${conflicts[@]}"; do printf "conflicts = %s\\n" "$c"; done'],
+                                        cwd=directory, text=True, capture_output=True, check=True).stdout
+                srcinfo = [line.strip() for line in (directory / ".SRCINFO").read_text().splitlines()]
+                for line in fields.splitlines():
+                    self.assertIn(line, srcinfo)
+                name = package.removesuffix("-bin")
+                self.assertIn(f"provides = {name}=", "\n".join(srcinfo))
+                self.assertIn(f"conflicts = {name}", srcinfo)
+        self.assertIn("depends = dstreamy", (ROOT / "packaging/arch/obs-dstreamy-bin/.SRCINFO").read_text())
+
+    @unittest.skipUnless(shutil.which("makepkg") and shutil.which("bsdtar") and os.geteuid() != 0,
+                         "needs makepkg as a non-root user")
+    def test_built_packages_hold_the_assets_for_their_architecture(self):
+        with tempfile.TemporaryDirectory(prefix="arch-build-fixture-") as directory:
+            base = Path(directory)
+            dist, out = base / "dist", base / "out"
+            dist.mkdir()
+            def archive(name, files):
+                path = dist / name
+                with tarfile.open(path, "w:gz") as t:
+                    for entry, data in files.items():
+                        info = tarfile.TarInfo(entry)
+                        info.size, info.mode, info.mtime = len(data), 0o755, 1700000000
+                        t.addfile(info, io.BytesIO(data))
+                (dist / f"{name}.sha256").write_text(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {name}\n")
+            for target, machine in (("x86_64-unknown-linux-gnu", b"\x3e\x00"),
+                                    ("aarch64-unknown-linux-gnu", b"\xb7\x00")):
+                stem = f"dstreamy-0.1.0-{target}"
+                archive(f"{stem}.tar.gz", {f"{stem}/dstreamy": b"\x7fELF" + bytes(14) + machine,
+                                           **{f"{stem}/{e}": b"x" for e in ("README.md", "LICENSE",
+                                                                             "THIRD_PARTY_NOTICES.txt")}})
+            plugins = "./lib/x86_64-linux-gnu/obs-plugins"
+            archive("obs-dstreamy-0.1.0-linux-x86_64.tar.gz", {
+                "./LICENSE": b"x", f"{plugins}/obs-dstreamy.so": b"x",
+                f"{plugins}/dstreamy-ui/obs-dstreamy-ui.so": b"x",
+                f"{plugins}/dstreamy-ui/THIRD_PARTY_NOTICES.txt": b"x"})
+            env = dict(os.environ, SOURCE_DATE_EPOCH="1700000000")
+            build = lambda: subprocess.run([str(ROOT / "scripts/build-arch-packages.sh"), "0.1.0", str(dist), str(out)],
+                                           env=env, text=True, capture_output=True)
+            result = build()
+            self.assertEqual(result.returncode, 0, result.stdout[-3000:] + result.stderr[-3000:])
+            listing = lambda pkg: subprocess.run(["bsdtar", "-tf", str(out / pkg)], text=True, capture_output=True,
+                                                 check=True).stdout.split()
+            self.assertIn("usr/bin/dstreamy", listing("aarch64/dstreamy-bin-0.1.0-1-aarch64.pkg.tar.zst"))
+            self.assertIn("usr/lib/obs-plugins/dstreamy-ui/obs-dstreamy-ui.so",
+                          listing("x86_64/obs-dstreamy-bin-0.1.0-1-x86_64.pkg.tar.zst"))
+            shutil.rmtree(out)
+            stem = "dstreamy-0.1.0-aarch64-unknown-linux-gnu"
+            archive(f"{stem}.tar.gz", {f"{stem}/dstreamy": b"\x7fELF" + bytes(14) + b"\x3e\x00",
+                                       **{f"{stem}/{e}": b"x" for e in ("README.md", "LICENSE",
+                                                                         "THIRD_PARTY_NOTICES.txt")}})
+            result = build()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("dstreamy-bin-0.1.0-1-aarch64.pkg.tar.zst holds a dstreamy for ELF machine 3e00",
+                          result.stderr)
+
+
 class InstallTests(unittest.TestCase):
     TOOLS = ("bash", "dirname", "basename", "sed")
     CONFINED_TOOLS = ("cp", "rm")
