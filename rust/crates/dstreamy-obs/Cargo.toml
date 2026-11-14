@@ -30,7 +30,7 @@ members = ["."]
 
 # Keep in step with [workspace.package] and [workspace.lints] in rust/Cargo.toml; cargo cannot inherit across workspaces.
 [workspace.package]
-version = "0.1.0"
+version = "2.0.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false
