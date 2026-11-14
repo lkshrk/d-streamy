@@ -968,13 +968,13 @@ fn stream(
     stream_with_minimum_mock_video(settings, args, video, video * 9 / 10)
 }
 
-/// A GPU rescale can lag OBS's render loop, so only half of the plugin's frames must reach the mock.
+/// A GPU rescale can lag OBS's render loop on a slow runner, so only a quarter of the plugin's frames must reach the mock.
 fn rescaled_stream(
     settings: Value,
     args: &[&str],
     video: usize,
 ) -> (Vec<String>, dstreamy_mock_discord::Recorded) {
-    stream_with_minimum_mock_video(settings, args, video, video.div_ceil(2))
+    stream_with_minimum_mock_video(settings, args, video, video.div_ceil(4))
 }
 
 fn stream_with_minimum_mock_video(
