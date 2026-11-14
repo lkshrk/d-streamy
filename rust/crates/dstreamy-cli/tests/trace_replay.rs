@@ -1216,9 +1216,16 @@ fn wait_or_drops<V>(
             let origin = stalls.first().map_or_else(Instant::now, |s| s.0);
             serve_drops(&s, &stalls, origin)
         });
+        let r = h.mock.recorded();
+        let mock = format!(
+            "the mock has {} video and {} audio frames and dropped {:?}",
+            stream_video(&r).len(),
+            producer_audio(&r).len(),
+            r.dropped_frames
+        );
         match drops {
-            Some(drops) => panic!("mock never saw {what}; {drops}"),
-            None => panic!("mock never saw {what}"),
+            Some(drops) => panic!("mock never saw {what}; {drops}; {mock}"),
+            None => panic!("mock never saw {what}; {mock}"),
         }
     })
 }
