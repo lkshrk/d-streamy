@@ -1,0 +1,22 @@
+pkgbase = obs-dstreamy-bin
+	pkgdesc = OBS Studio plugin that streams OBS's output to Discord Go Live through D-Streamy
+	pkgver = 2.0.0
+	pkgrel = 1
+	url = https://github.com/lkshrk/d-streamy
+	arch = x86_64
+	license = GPL-3.0-or-later
+	depends = dstreamy
+	depends = glibc
+	depends = libgcc
+	depends = libstdc++
+	depends = obs-studio>=32.2
+	depends = qt6-base
+	depends = qt6-svg
+	provides = obs-dstreamy=2.0.0
+	conflicts = obs-dstreamy
+	options = !strip
+	options = !debug
+	source = https://github.com/lkshrk/d-streamy/releases/download/v2.0.0/obs-dstreamy-2.0.0-linux-x86_64.tar.gz
+	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
+
+pkgname = obs-dstreamy-bin

@@ -1,0 +1,45 @@
+# Maintainer: lkshrk <https://github.com/lkshrk>
+pkgname=dstreamy-bin
+_pkgname=dstreamy
+pkgver=2.0.0
+pkgrel=1
+pkgdesc="Stream a window, a display or OBS's output to Discord Go Live"
+arch=(x86_64 aarch64)
+url="https://github.com/lkshrk/d-streamy"
+license=(GPL-3.0-or-later)
+depends=(
+  cairo
+  dbus
+  gdk-pixbuf2
+  glib2
+  glibc
+  gst-plugin-pipewire
+  gst-plugins-bad-libs
+  gst-plugins-base-libs
+  gst-plugins-good
+  gstreamer
+  gtk3
+  libgcc
+  libsoup3
+  webkit2gtk-4.1
+)
+optdepends=(
+  'xdg-desktop-portal-impl: window and display capture through the desktop sharing dialog'
+  'gst-plugin-va: VA-API hardware encoding (vah264enc, vah265enc)'
+  'gst-plugins-ugly: software H.264 encoding (x264enc) when no hardware encoder works'
+  'gst-plugins-bad: software H.265 encoding (x265enc)'
+)
+provides=("$_pkgname=$pkgver")
+conflicts=("$_pkgname")
+options=(!strip !debug)
+source_x86_64=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('0000000000000000000000000000000000000000000000000000000000000000')
+sha256sums_aarch64=('1111111111111111111111111111111111111111111111111111111111111111')
+
+package() {
+  cd "$_pkgname-$pkgver-$CARCH-unknown-linux-gnu"
+  install -Dm755 dstreamy "$pkgdir/usr/bin/dstreamy"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 LICENSE THIRD_PARTY_NOTICES.txt -t "$pkgdir/usr/share/licenses/$pkgname/"
+}

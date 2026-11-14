@@ -1,0 +1,32 @@
+# Maintainer: lkshrk <https://github.com/lkshrk>
+pkgname=obs-dstreamy-bin
+_pkgname=obs-dstreamy
+pkgver=2.0.0
+pkgrel=1
+pkgdesc="OBS Studio plugin that streams OBS's output to Discord Go Live through D-Streamy"
+arch=(x86_64)
+url="https://github.com/lkshrk/d-streamy"
+license=(GPL-3.0-or-later)
+depends=(
+  dstreamy
+  glibc
+  libgcc
+  libstdc++
+  'obs-studio>=32.2'
+  qt6-base
+  qt6-svg
+)
+provides=("$_pkgname=$pkgver")
+conflicts=("$_pkgname")
+options=(!strip !debug)
+source=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-linux-x86_64.tar.gz")
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+
+package() {
+  local plugins=lib/x86_64-linux-gnu/obs-plugins
+  install -Dm755 "$plugins/obs-dstreamy.so" -t "$pkgdir/usr/lib/obs-plugins/"
+  install -Dm755 "$plugins/dstreamy-ui/obs-dstreamy-ui.so" -t "$pkgdir/usr/lib/obs-plugins/dstreamy-ui/"
+  install -Dm644 "$plugins/dstreamy-ui/THIRD_PARTY_NOTICES.txt" -t "$pkgdir/usr/lib/obs-plugins/dstreamy-ui/"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+  ln -s /usr/lib/obs-plugins/dstreamy-ui/THIRD_PARTY_NOTICES.txt "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES.txt"
+}
