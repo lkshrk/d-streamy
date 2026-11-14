@@ -455,15 +455,47 @@ fn markers(
     pairs
 }
 
-/// Tolerates one first audio packet lost to receive-side track reordering, so only `dave_wire_order` guards the sender's nonce order.
-fn start_drops(recorded: &Recorded, what: &str) -> usize {
-    let tolerated = format!("{REORDERED_DAVE_DROP}audio");
+/// Leading frames of each track the mock proved lost to receive-side track reordering at a key's start.
+#[derive(Debug, Clone, Copy, Default)]
+struct StartLoss {
+    audio: usize,
+    video: usize,
+}
+
+fn reordered(recorded: &Recorded, track: &str) -> usize {
+    let tag = format!("{REORDERED_DAVE_DROP}{track}");
+    recorded
+        .dropped_frames
+        .iter()
+        .filter(|d| d.starts_with(&tag))
+        .count()
+}
+
+/// Tolerates only drops the mock proved to be reordering, so only `dave_wire_order` guards the sender's nonce order.
+fn start_drops(recorded: &Recorded, what: &str) -> StartLoss {
+    let lost = StartLoss {
+        audio: reordered(recorded, "audio"),
+        video: reordered(recorded, "video"),
+    };
     let drops = &recorded.dropped_frames;
-    assert!(
-        drops.len() <= 1 && drops.iter().all(|d| d.starts_with(&tolerated)),
-        "{what}: {drops:?}"
-    );
-    drops.len()
+    assert_eq!(lost.audio + lost.video, drops.len(), "{what}: {drops:?}");
+    lost
+}
+
+/// Video from its first keyframe on, when reordering cost the first frames and so their IDR.
+fn decodable<'a>(
+    video: &[&'a RecordedVideoFrame],
+    lost: usize,
+    what: &str,
+) -> Vec<&'a RecordedVideoFrame> {
+    if lost == 0 {
+        return video.to_vec();
+    }
+    let start = video
+        .iter()
+        .position(|v| is_keyframe(&v.data))
+        .unwrap_or_else(|| panic!("{what}: no keyframe after {lost} lost video frames"));
+    video[start..].to_vec()
 }
 
 /// One whole replay at the mock: frame and packet counts, decoding, RTP steps, pacing, A/V alignment and markers.
@@ -471,23 +503,28 @@ fn check_replay(
     video: &[&RecordedVideoFrame],
     audio: &[&RecordedAudioFrame],
     want: &Expected,
-    lost_audio: usize,
+    lost: StartLoss,
     stalls: &[Stall],
     what: &str,
 ) -> Result<Vec<MarkerPair>, Stalled> {
     assert_eq!(
         video.len(),
-        want.video.len(),
+        want.video.len() - lost.video,
         "{what}: video frames at the mock"
     );
     assert_eq!(
+        slices(&video[0].data),
+        want.video[lost.video].key,
+        "{what}: lost video other than the first frames"
+    );
+    assert_eq!(
         audio.len(),
-        want.audio.len() - lost_audio,
+        want.audio.len() - lost.audio,
         "{what}: audio packets at the mock"
     );
     assert_eq!(
-        audio[0].data, want.audio[lost_audio].key,
-        "{what}: lost audio other than the first packet"
+        audio[0].data, want.audio[lost.audio].key,
+        "{what}: lost audio other than the first packets"
     );
     let video_ts: Vec<u32> = video.iter().map(|v| v.rtp_timestamp).collect();
     let audio_ts: Vec<u32> = audio.iter().map(|a| a.rtp_timestamp).collect();
@@ -497,6 +534,8 @@ fn check_replay(
         (VIDEO_HZ / want.fps) as u32,
     );
     consecutive(&format!("{what} audio"), &audio_ts, 960);
+    let kept = decodable(video, lost.video, what);
+    let video = &kept[..];
     assert_eq!(
         luma_frames(video).len(),
         video.len(),
@@ -569,12 +608,9 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
             sent_plis += 1;
         }
         let r = h.mock.recorded();
-        let lost = r
-            .dropped_frames
-            .iter()
-            .filter(|d| d.starts_with(&format!("{REORDERED_DAVE_DROP}audio")))
-            .count();
-        if stream_video(&r).len() >= frames && producer_audio(&r).len() + lost >= packets {
+        if stream_video(&r).len() + reordered(&r, "video") >= frames
+            && producer_audio(&r).len() + reordered(&r, "audio") >= packets
+        {
             break r;
         }
         if Instant::now() >= deadline {
@@ -619,7 +655,7 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
     let (status, stderr) = p.finish();
     assert!(status.success(), "{name}: {stderr}");
     let lines = lines.lock().unwrap().clone();
-    let lost_audio = start_drops(&recorded, name);
+    let lost = start_drops(&recorded, name);
     if plis {
         let requests = lines
             .iter()
@@ -636,7 +672,7 @@ fn replay_through_serve(name: &str, dir: &Path, trace: &Trace, plis: bool) -> Re
         &stream_video(&recorded),
         &producer_audio(&recorded),
         &want,
-        lost_audio,
+        lost,
         &canary.stalls(),
         name,
     )
@@ -1263,7 +1299,7 @@ fn check_restart_prefix(
     v1: &[&RecordedVideoFrame],
     a1: &[&RecordedAudioFrame],
     want: &Expected,
-    lost_first: usize,
+    lost_first: StartLoss,
     status: &Value,
     stalls: &[Stall],
     window: (Instant, Instant),
@@ -1278,7 +1314,7 @@ fn check_restart_prefix(
     );
     let drops = serve_drops(status, stalls, window.0);
     assert_eq!(
-        a1[0].data, want.audio[lost_first].key,
+        a1[0].data, want.audio[lost_first.audio].key,
         "audio lost before the kill"
     );
     let fps = want.fps;
@@ -1412,7 +1448,7 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
         canary.stalls()
     );
     check_restart_prefix(
-        &v1,
+        &decodable(&v1, lost_first.video, "before the kill"),
         &a1,
         &want,
         lost_first,
@@ -1420,8 +1456,15 @@ fn replay_killed_and_restarted(grace: Duration, gap: Duration) {
         &stalls,
         (origin, completed),
     );
-    check_replay(&v2, &a2, &want, 0, &canary.stalls(), "after the restart")
-        .unwrap_or_else(|Stalled(e)| panic!("{e}"));
+    check_replay(
+        &v2,
+        &a2,
+        &want,
+        StartLoss::default(),
+        &canary.stalls(),
+        "after the restart",
+    )
+    .unwrap_or_else(|Stalled(e)| panic!("{e}"));
 
     let last_before = rtp_us(v1.last().unwrap().rtp_timestamp, VIDEO_HZ);
     let resumed = rtp_us(v2[0].rtp_timestamp, VIDEO_HZ) - last_before;
@@ -1772,7 +1815,7 @@ fn early_restart_loss_followed_by_an_idr_cannot_skip_alignment_without_a_stall()
         &[&first, &idr],
         &[&audio],
         &want,
-        0,
+        StartLoss::default(),
         &serve_status(40, 1, 1),
         &[],
         (origin, origin + Duration::from_secs(3)),

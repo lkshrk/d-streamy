@@ -14,7 +14,7 @@ use dstreamy_media::{
     IdleMode, OPUS_SILENCE_FRAME, ProducerInfo, TestPatternSource, VideoCodec,
 };
 use dstreamy_mock_discord::{
-    REORDERED_DAVE_DROP, MOCK_GUILD_ID, MOCK_VOICE_CHANNEL_ID, MockDiscord, Recorded,
+    MOCK_GUILD_ID, MOCK_VOICE_CHANNEL_ID, MockDiscord, REORDERED_DAVE_DROP, Recorded,
     RecordedAudioFrame, VoiceKind,
 };
 use openh264::decoder::Decoder;
@@ -263,9 +263,9 @@ async fn a_producer_swap_keeps_streaming_with_continuous_decodable_media() {
         &recorded.dropped_frames[before.dropped_frames.len()..]
     );
     let drops = &before.dropped_frames;
-    // A receiver that demuxes tracks can lose either track's first frame to the other track decrypted ahead of it.
+    // A receiver that demuxes tracks can lose either track's first frames to the other track decrypted ahead of them.
     assert!(
-        drops.len() <= 1 && drops.iter().all(|d| d.starts_with(REORDERED_DAVE_DROP)),
+        drops.iter().all(|d| d.starts_with(REORDERED_DAVE_DROP)),
         "drops before the reattach: {drops:?}"
     );
     let lost_video = format!("{REORDERED_DAVE_DROP}video");
