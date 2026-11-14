@@ -40,7 +40,7 @@ On macOS, Homebrew installs the CLI and the app from the `lkshrk/tap` tap: `brew
 
 ### pacman
 
-A signed pacman repository has `dstreamy` for x86_64 and aarch64 and the OBS plugin `obs-dstreamy` for x86_64. It holds only the latest release. Its signing key, `EC734FF47451BFB406E2E0D6178E6B5FE25AD3BF`, is on no keyserver, so `pacman-key --recv-keys` won't find it. Download it, add it and sign it locally:
+A signed pacman repository has `dstreamy` for x86_64 and aarch64 and the OBS plugin `obs-dstreamy` for x86_64. It starts with the next release, v2.0.1; v2.0.0 has none. It holds only the latest release. Its signing key, `EC734FF47451BFB406E2E0D6178E6B5FE25AD3BF`, is on no keyserver, so `pacman-key --recv-keys` won't find it. Download it, add it and sign it locally:
 
 ```bash
 curl -fsSLO https://lkshrk.github.io/d-streamy/arch/d-streamy.asc
@@ -57,10 +57,16 @@ Add the repository to `/etc/pacman.conf`:
 Server = https://lkshrk.github.io/d-streamy/arch/$arch
 ```
 
-Then install the CLI, and the plugin if you use OBS:
+Then install the CLI:
 
 ```bash
-sudo pacman -Syu dstreamy obs-dstreamy
+sudo pacman -Syu dstreamy
+```
+
+On x86_64, add the OBS plugin if you use OBS; aarch64 has no plugin package:
+
+```bash
+sudo pacman -S obs-dstreamy
 ```
 
 The packages are named `dstreamy-bin` and `obs-dstreamy-bin` and provide `dstreamy` and `obs-dstreamy`. Screen capture needs your desktop's portal backend (`xdg-desktop-portal-impl`, for example `xdg-desktop-portal-gnome`, `-kde` or `-hyprland`). Software x264 encoding always works; install `gst-plugin-va` for VA-API hardware encoding. NVIDIA's encoder comes with `gst-plugins-bad-libs`. The plugin goes into `/usr/lib/obs-plugins/`; run `dstreamy service install` once for the service it talks to.
