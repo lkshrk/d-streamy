@@ -1,0 +1,23 @@
+{
+  "detached": {
+    "clause": "H.264 Table 7-1",
+    "message_contains": "IDR slice in a frame not flagged as a keyframe",
+    "reason": "incompatible"
+  },
+  "frames": [
+    {
+      "keyframe": true,
+      "kind": "video",
+      "kind_byte": 1,
+      "payload_hex": "000000016742c01f0000000168ce3c800000000165888400",
+      "pts_us": 0
+    },
+    {
+      "keyframe": false,
+      "kind": "video",
+      "kind_byte": 1,
+      "payload_hex": "000000016742c01f0000000168ce3c800000000165888400",
+      "pts_us": 33333
+    }
+  ]
+}

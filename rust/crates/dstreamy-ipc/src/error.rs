@@ -1,0 +1,25 @@
+use std::io;
+use std::path::PathBuf;
+
+/// Why the socket could not be bound, trusted or connected to; the message names the path.
+#[derive(Debug, thiserror::Error)]
+pub enum IpcError {
+    #[error("already running at {0}")]
+    AlreadyRunning(PathBuf),
+    #[error("no service is listening at {0}")]
+    NotRunning(PathBuf),
+    #[error("refusing to use {path}: {reason}")]
+    InsecureDirectory { path: PathBuf, reason: String },
+    #[error("the service at {path} runs as {owner}, not as this user")]
+    ImpostorServer { path: PathBuf, owner: String },
+    #[error("could not verify who runs the service at {path}: {reason}")]
+    UnverifiedServer { path: PathBuf, reason: String },
+    #[error("{0} exists and is not a socket")]
+    NotASocket(PathBuf),
+    #[error("endpoint path {0} is too long for a local socket")]
+    PathTooLong(PathBuf),
+    #[error("no runtime directory and no home directory to place the endpoint in")]
+    NoHomeDirectory,
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}

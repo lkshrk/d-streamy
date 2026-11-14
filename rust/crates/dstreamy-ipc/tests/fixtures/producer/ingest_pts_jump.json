@@ -1,0 +1,23 @@
+{
+  "detached": {
+    "clause": "ADR 0004 ingest: a pts step over 10 s on either track",
+    "message_contains": "jumps more than 10 s",
+    "reason": "incompatible"
+  },
+  "frames": [
+    {
+      "keyframe": true,
+      "kind": "video",
+      "kind_byte": 1,
+      "payload_hex": "000000016742c01f0000000168ce3c800000000165888400",
+      "pts_us": 0
+    },
+    {
+      "keyframe": false,
+      "kind": "video",
+      "kind_byte": 1,
+      "payload_hex": "00000001419a02",
+      "pts_us": 10033333
+    }
+  ]
+}
