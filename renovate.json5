@@ -5,6 +5,8 @@
     "github>lkshrk/gh-ops//renovate/presets/automerge-major.json5",
     "helpers:pinGitHubActionDigests",
   ],
+  // GitHub auto-merge waits only for required checks, and path-filtered OBS can't be one.
+  platformAutomerge: false,
   packageRules: [
     {
       // Patched through [patch.crates-io] in rust/Cargo.toml; a newer requirement would silently drop the patch.
