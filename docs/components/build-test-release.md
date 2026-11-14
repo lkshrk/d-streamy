@@ -248,9 +248,11 @@ Guards that keep them out of releases:
 
 ## CI
 
-Runner labels `xcode-27` and `ubuntu-26.04` are declared as self-hosted labels in `.github/actionlint.yaml`.
+`xcode-27` and `ubuntu-26.04` are GitHub-hosted. They are listed in `.github/actionlint.yaml` because actionlint's built-in label list predates them.
 
-Release jobs import the Developer ID certificate on `xcode-27`, so jobs on the self-hosted runners skip pull requests from forks. Push the branch to this repository to run them.
+Release jobs import the Developer ID certificate on `xcode-27`, so jobs on `xcode-27` skip pull requests from forks. Push the branch to this repository to run them.
+
+Jobs that build or check what ships stay on `ubuntu-24.04`: the Rust Linux matrix, the OBS 32.2.2 baseline and `obs-linux-checks`, which reuses the baseline's OBS build. The release builds the same way, so released binaries keep 24.04's glibc floor. The other Linux jobs run on `ubuntu-26.04`. Renovate doesn't bump runner images (`renovate.json5`).
 
 | Workflow | Job | Runner | Checks |
 |---|---|---|---|
@@ -258,16 +260,16 @@ Release jobs import the Developer ID certificate on `xcode-27`, so jobs on the s
 | `rust-ci.yml` (Rust CI) | `rust-macos` | `xcode-27` | fmt, clippy, clippy and lib/`browser_login` tests with `browser-login`, nextest, `trace_replay`, doc tests, cross-user IPC |
 | | `rust-linux-x86_64`, `rust-linux-aarch64` | `ubuntu-24.04`, `ubuntu-24.04-arm` | fmt, clippy, nextest, `trace_replay`, doc tests, test-only feature guard, no-webview guard, cross-user IPC |
 | | `rust-windows` | `windows-2025` | clippy and tests of `dstreamy-ipc` (named pipes), `cargo check --workspace --all-targets`, `cargo test --workspace --no-fail-fast` |
-| | `browser-login-linux` | `ubuntu-24.04` | clippy and tests with `browser-login`, `browser_smoke` under Xvfb (must pass exactly once and with a display), binary links WebKitGTK 4.1 |
-| | `service-linux` | `ubuntu-24.04` | Starts a user systemd manager, then installs, kills and restarts the real service |
-| | `cargo-deny` | `ubuntu-24.04` | `cargo deny --locked check` in both workspaces (cargo-deny 0.20.2) |
-| | `release-scripts` | `ubuntu-24.04` | `scripts/test_release_semantics.py` |
+| | `browser-login-linux` | `ubuntu-26.04` | clippy and tests with `browser-login`, `browser_smoke` under Xvfb (must pass exactly once and with a display), binary links WebKitGTK 4.1 |
+| | `service-linux` | `ubuntu-26.04` | Starts a user systemd manager, then installs, kills and restarts the real service |
+| | `cargo-deny` | `ubuntu-26.04` | `cargo deny --locked check` in both workspaces (cargo-deny 0.20.2) |
+| | `release-scripts` | `ubuntu-26.04` | `scripts/test_release_semantics.py` |
 | `obs-ci.yml` (OBS) | `obs-linux-plugin` (OBS 32.2.2) | `ubuntu-24.04` | Plugin with test hooks; `dstreamy-cli --test obs_plugin`: OBS through the plugin to `serve` and mock Discord |
-| | `obs-linux-plugin` (OBS 33.0.1) | `ubuntu-26.04` | Same end-to-end test against OBS 33.0.1; left out of the matrix for pull requests from forks |
+| | `obs-linux-plugin` (OBS 33.0.1) | `ubuntu-26.04` | Same end-to-end test against OBS 33.0.1 |
 | | `obs-linux-checks` | `ubuntu-24.04` | ctest; install layout; build without the panel and Qt; workspace settings match; plugin crate gates; release build has no hooks; frontend ABI check; 5 s harness trace with A/V marker check; trace recording, drift and spec checks; frontend smoke with and without the UI library; encoder settings |
 | | `obs-macos` | `xcode-27` | Universal build with hooks; bundle checks (slices, install names, no `obs-frontend-api` link, minos 12.0, dependencies only from OBS.app or the system); install layout; panel ctest; crate gates for both slices; load and panic tests and encoder settings per slice; OBS.app loads the plugin |
 | | `obs-windows` | `windows-2025` | Build with hooks; crate gates and tests; DLL exports and imports; install layout; panel ctest; load and panic tests; `obs64` loads the plugin; end-to-end: `obs64` starts the bundled `serve`, streams to mock Discord and ends `serve` on exit (`dstreamy-cli --test obs_windows`) |
-| `fuzz.yml` (Fuzz) | `rust-fuzz` | `ubuntu-24.04` | `rust/fuzz/Cargo.lock` is current (`cargo metadata --locked`); the three fuzz targets (see Fuzzing) |
+| `fuzz.yml` (Fuzz) | `rust-fuzz` | `ubuntu-26.04` | `rust/fuzz/Cargo.lock` is current (`cargo metadata --locked`); the three fuzz targets (see Fuzzing) |
 
 Triggers and filters:
 
@@ -435,7 +437,7 @@ The signing key `EC734FF47451BFB406E2E0D6178E6B5FE25AD3BF` expires on 2031-11-13
 
 ### Release script tests
 
-`scripts/test_release_semantics.py` checks `release.yml` and the scripts by reading or running them. It covers exact publication refs, that rehearsals never publish, the plugin and CLI version match, that the release script's version bump relocks every lockfile and passes OBS CI's workspace checks, that a rejected branch push leaves no tag on origin and a rerun succeeds, that a push git reported as failed but that landed counts as pushed, that the signing keychain keeps passwords off argv, is passed to every `codesign`, never touches the search list, refuses a password with a line break, fails early without the Developer ID intermediate and is deleted after success and failure, that the notary key is removed on every exit, that fork pull requests reach neither `xcode-27` nor a self-hosted matrix runner, the CI gate's decisions, the universal-binary check, the test-only feature guards, the OBS release layout, the Windows CLI bundled in the plugin, that the CI runs `ci-gate` waits for are never cancelled on `main`, that `scripts/install.sh` always runs the build before installing and stops only the installed app (also with a relative install directory), the notice generator's graph selection and failure modes, that the source timestamp is read once and never empty, and for the pacman repository: that only the publishing `pages` job can deploy Pages, that the signing key reaches gpg only on stdin and only through the signing step's env, that a secret key other than the committed public key fails, that the README names the committed key's fingerprint, that pages verifies against the committed key with `SigLevel = Required` and `check-arch-repo.sh` writes `Never` only without a key, that pages deploys one at a time and refuses to replace a newer live repository, that the release uploads exactly the checked assets and never the pacman packages, that each `license` array matches the notices' licences, that the temporary `GNUPGHOME` is removed after success and failure, that `fill-pkgbuild.sh` fills the right sha256 into each array and refuses bad checksums, that each `.SRCINFO` matches its PKGBUILD, and, where makepkg exists, that the built packages hold the right files for their architecture.
+`scripts/test_release_semantics.py` checks `release.yml` and the scripts by reading or running them. It covers exact publication refs, that rehearsals never publish, the plugin and CLI version match, that the release script's version bump relocks every lockfile and passes OBS CI's workspace checks, that a rejected branch push leaves no tag on origin and a rerun succeeds, that a push git reported as failed but that landed counts as pushed, that the signing keychain keeps passwords off argv, is passed to every `codesign`, never touches the search list, refuses a password with a line break, fails early without the Developer ID intermediate and is deleted after success and failure, that the notary key is removed on every exit, that fork pull requests never reach `xcode-27`, the CI gate's decisions, the universal-binary check, the test-only feature guards, the OBS release layout, the Windows CLI bundled in the plugin, that the CI runs `ci-gate` waits for are never cancelled on `main`, that `scripts/install.sh` always runs the build before installing and stops only the installed app (also with a relative install directory), the notice generator's graph selection and failure modes, that the source timestamp is read once and never empty, and for the pacman repository: that only the publishing `pages` job can deploy Pages, that the signing key reaches gpg only on stdin and only through the signing step's env, that a secret key other than the committed public key fails, that the README names the committed key's fingerprint, that pages verifies against the committed key with `SigLevel = Required` and `check-arch-repo.sh` writes `Never` only without a key, that pages deploys one at a time and refuses to replace a newer live repository, that the release uploads exactly the checked assets and never the pacman packages, that each `license` array matches the notices' licences, that the temporary `GNUPGHOME` is removed after success and failure, that `fill-pkgbuild.sh` fills the right sha256 into each array and refuses bad checksums, that each `.SRCINFO` matches its PKGBUILD, and, where makepkg exists, that the built packages hold the right files for their architecture.
 
 ## Dependency and licence policy
 

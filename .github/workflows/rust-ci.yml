@@ -248,13 +248,13 @@ jobs:
       - run: cargo test --workspace --locked --no-fail-fast
 
   browser-login-linux:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     defaults:
       run:
         working-directory: rust
     env:
-      APT_CACHE: apt-browser-login-linux-ubuntu-24.04
+      APT_CACHE: apt-browser-login-linux-ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -306,13 +306,13 @@ jobs:
         run: ldd target/debug/dstreamy | grep -F libwebkit2gtk-4.1
 
   service-linux:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     defaults:
       run:
         working-directory: rust
     env:
-      APT_CACHE: apt-service-linux-ubuntu-24.04
+      APT_CACHE: apt-service-linux-ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -368,7 +368,7 @@ jobs:
         run: journalctl --user -u dstreamy.service --no-pager -n 200 || true
 
   cargo-deny:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     env:
       DENY_VERSION: 0.20.2
@@ -399,7 +399,7 @@ jobs:
         run: cargo deny --locked --config ../../deny.toml check
 
   release-scripts:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

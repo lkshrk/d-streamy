@@ -405,18 +405,6 @@ class WorkflowTests(unittest.TestCase):
                     self.assertRegex(job, r"^  [a-z][a-z-]*:\n    runs-on: xcode-27\n    " + re.escape(self.FORK_GUARD))
 
 
-    def test_fork_pull_requests_never_reach_a_self_hosted_matrix_runner(self):
-        same_repo = "github.event.pull_request.head.repo.full_name == github.repository"
-        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
-            source = path.read_text()
-            if "pull_request" not in source:
-                continue
-            for number, line in enumerate(source.splitlines(), 1):
-                if "ubuntu-26.04" in line and not line.lstrip().startswith("#"):
-                    with self.subTest(workflow=path.name, line=number):
-                        self.assertIn(same_repo, line)
-
-
 class TagReleaseTests(unittest.TestCase):
     RELEASE_FILES = ["obs/buildspec.json", "rust/Cargo.lock", "rust/Cargo.toml",
                      "rust/crates/dstreamy-obs/Cargo.lock", "rust/crates/dstreamy-obs/Cargo.toml",

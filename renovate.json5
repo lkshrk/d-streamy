@@ -13,7 +13,7 @@
       enabled: false,
     },
     {
-      // ubuntu-26.04 is reserved for same-repository OBS 33 runs; every other job stays on 24.04.
+      // The remaining 24.04 jobs match the release builds' glibc floor and OBS baseline; move them by hand.
       matchManagers: ["github-actions"],
       matchDepNames: ["ubuntu"],
       enabled: false,

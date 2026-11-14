@@ -54,8 +54,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # OBS 33 needs FFmpeg 8 and MbedTLS 3 from the self-hosted ubuntu-26.04 runner, which never runs fork pull requests.
-        include: ${{ fromJSON(format('[{0}{1}]', '{"obs":"32.2.2","commit":"ba2f32bdf791005443988a4955e963663e16b1ed","os":"ubuntu-24.04","baseline":true}', (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ',{"obs":"33.0.1","commit":"65c320b46e1af5c7a555161aea6182cdf7a8c524","os":"ubuntu-26.04"}' || '')) }}
+        include:
+          # The baseline matches the release build on 24.04; OBS 33 needs FFmpeg 8 and MbedTLS 3 from 26.04.
+          - obs: "32.2.2"
+            commit: ba2f32bdf791005443988a4955e963663e16b1ed
+            os: ubuntu-24.04
+            baseline: true
+          - obs: "33.0.1"
+            commit: 65c320b46e1af5c7a555161aea6182cdf7a8c524
+            os: ubuntu-26.04
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:
