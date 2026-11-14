@@ -1,0 +1,34 @@
+{
+    "id": "obs_nvenc_h264_cuda",
+    "codec": "h264",
+    "kind": "source",
+    "source": "plugins/obs-nvenc/nvenc-compat.c:100-118 (defaults), :180-241 (properties; no opts) at obs-studio ba2f32b",
+    "defaults": {
+        "bitrate": 2500,
+        "max_bitrate": 5000,
+        "keyint_sec": 0,
+        "rate_control": "CBR",
+        "preset2": "p5",
+        "tune": "hq",
+        "profile": "high",
+        "bf": 2,
+        "repeat_headers": false
+    },
+    "properties": [
+        {
+            "name": "keyint_sec"
+        },
+        {
+            "name": "preset2"
+        },
+        {
+            "name": "tune"
+        },
+        {
+            "name": "profile"
+        },
+        {
+            "name": "bf"
+        }
+    ]
+}

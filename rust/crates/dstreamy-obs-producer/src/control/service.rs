@@ -1,0 +1,576 @@
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
+
+use dstreamy_ipc::{ControlCodec, Endpoint, IpcError};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use tokio::io::{ReadHalf, WriteHalf};
+use tokio_util::codec::{FramedRead, FramedWrite};
+
+use super::{
+    ACCOUNTS, Accounts, BROWSER_LOGIN, Candidate, ControlError, Instance, Live, Named, Ownership,
+    Resolution, START_GRACE_SECS, STATUS_PLACE, StartFailed, StartRequest, Started, Stopped, owns,
+    resolve, start_in_flight,
+};
+use crate::client::REPLY_TIMEOUT;
+use crate::types::service_text;
+
+/// How often a start in flight is looked at again until serve names its starter.
+const SETTLE_POLL: Duration = Duration::from_millis(50);
+const SETTLE_MAX_POLL: Duration = Duration::from_millis(500);
+
+/// Commands that may first log in to Discord: longer than serve's first-connect budget, so serve's own error arrives first.
+pub const DISCORD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a `stop` this plugin sends waits for its reply.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Past the time serve keeps a login window open, so its own answer arrives first.
+pub const LOGIN_TIMEOUT: Duration =
+    dstreamy_ipc::control::LOGIN_WINDOW_LIMIT.saturating_add(Duration::from_secs(30));
+
+/// Talks to `dstreamy serve` over a fresh control connection per call, so nothing outlives a call.
+#[derive(Debug, Clone)]
+pub struct ObsControl {
+    endpoint: Endpoint,
+    start_timeout: Duration,
+    settle_timeout: Duration,
+}
+
+struct Connection {
+    lines: FramedRead<ReadHalf<dstreamy_ipc::Stream>, ControlCodec>,
+    writer: FramedWrite<WriteHalf<dstreamy_ipc::Stream>, ControlCodec>,
+    hello: Value,
+    instance: Instance,
+    next_id: u64,
+}
+
+impl ObsControl {
+    pub fn new(endpoint: Endpoint) -> Self {
+        Self {
+            endpoint,
+            start_timeout: DISCORD_TIMEOUT,
+            settle_timeout: REPLY_TIMEOUT,
+        }
+    }
+
+    /// How long a start or stop waits for serve to name the starter of a start in flight; [`REPLY_TIMEOUT`] by default.
+    pub fn with_settle_timeout(self, settle_timeout: Duration) -> Self {
+        Self {
+            settle_timeout,
+            ..self
+        }
+    }
+
+    /// How long a `start` waits for its reply; [`DISCORD_TIMEOUT`] by default.
+    pub fn with_start_timeout(self, start_timeout: Duration) -> Self {
+        Self {
+            start_timeout,
+            ..self
+        }
+    }
+
+    pub async fn guilds(&self) -> Result<Vec<Named>, ControlError> {
+        let mut c = self.open().await?;
+        named(
+            c.call(json!({"cmd": "guilds"}), "guilds", DISCORD_TIMEOUT)
+                .await?,
+        )
+    }
+
+    pub async fn channels(&self, guild_id: &str) -> Result<Vec<Named>, ControlError> {
+        let mut c = self.open().await?;
+        named(
+            c.call(
+                json!({"cmd": "channels", "guild_id": guild_id}),
+                "channels",
+                DISCORD_TIMEOUT,
+            )
+            .await?,
+        )
+    }
+
+    pub async fn status(&self) -> Result<Option<Live>, ControlError> {
+        let c = self.open().await?;
+        c.hello_live()
+    }
+
+    /// Starts the session, or attaches to it when it is already live in the requested channel or was ours.
+    pub async fn start(
+        &self,
+        request: &StartRequest,
+        persisted: Option<&Ownership>,
+    ) -> Result<Started, StartFailed> {
+        self.start_sending(request, persisted, &Mutex::new(None))
+            .await
+    }
+
+    /// [`start`](Self::start) until `abandon` resolves; abandoned after sending, it keeps its candidate ownership.
+    pub async fn start_until(
+        &self,
+        request: &StartRequest,
+        persisted: Option<&Ownership>,
+        abandon: impl Future<Output = ()>,
+    ) -> Result<Started, StartFailed> {
+        let sent = Mutex::new(None);
+        tokio::select! {
+            biased;
+            started = self.start_sending(request, persisted, &sent) => started,
+            () = abandon => Err(StartFailed {
+                error: ControlError::Abandoned,
+                ownership: sent
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+                    .map(Box::new),
+            }),
+        }
+    }
+
+    /// `sent` holds the candidate ownership from just before the start is sent.
+    async fn start_sending(
+        &self,
+        request: &StartRequest,
+        persisted: Option<&Ownership>,
+        sent: &Mutex<Option<Ownership>>,
+    ) -> Result<Started, StartFailed> {
+        let mut c = self.open().await?;
+        if request.grace_secs.is_some() {
+            c.require(START_GRACE_SECS)?;
+        }
+        let status = c
+            .settled(c.hello["status"].clone(), persisted, self.settle_timeout)
+            .await?;
+        match resolve(request, &status, persisted, c.instance)? {
+            Resolution::Attach(started) => Ok(started),
+            Resolution::Start => {
+                let provisional = Ownership {
+                    connections: vec![Candidate {
+                        id: c.connection()?,
+                        fps: Some(request.fps),
+                    }],
+                    guild_id: request.guild_id.clone(),
+                    channel_id: request.channel_id.clone(),
+                    instance: Some(c.instance),
+                };
+                // serve finishes a start whose connection went away, so from here on the start may still land.
+                let unconfirmed = |error| StartFailed {
+                    error,
+                    ownership: Some(Box::new(Ownership::with_candidate(
+                        persisted,
+                        provisional.clone(),
+                    ))),
+                };
+                let id = c.id();
+                *sent.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(Ownership::with_candidate(persisted, provisional.clone()));
+                c.send(request.command(&id)).await.map_err(unconfirmed)?;
+                match c
+                    .reply(&id, "start", self.start_timeout)
+                    .await
+                    .map_err(unconfirmed)?
+                {
+                    Ok(_) => {}
+                    Err(e @ ControlError::Locked(_)) => {
+                        return Ok(c
+                            .attach_after_race(request, persisted, e, self.settle_timeout)
+                            .await?);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                // The session is ours now, so a status without a place must not fail the start.
+                let channel = match c.live().await {
+                    Ok(Some(live)) => live.channel(),
+                    _ => request.channel_id.clone(),
+                };
+                Ok(Started {
+                    ownership: Some(provisional),
+                    channel,
+                })
+            }
+        }
+    }
+
+    /// Opens serve's login window for `account` (`None`: named after the user); the saved account's name.
+    pub async fn login(&self, account: Option<&str>) -> Result<Option<String>, ControlError> {
+        let mut c = self.open().await?;
+        c.require(BROWSER_LOGIN)?;
+        let env: serde_json::Map<String, Value> = dstreamy_ipc::control::LOGIN_ENV
+            .iter()
+            .filter_map(|name| Some(((*name).to_owned(), std::env::var(name).ok()?.into())))
+            .collect();
+        let mut command = json!({"cmd": "login", "env": env});
+        if let Some(account) = account.filter(|_| c.offers(ACCOUNTS)) {
+            command["account"] = account.into();
+        }
+        let user = c.call(command, "login", LOGIN_TIMEOUT).await?;
+        Ok(user["global_name"]
+            .as_str()
+            .or(user["username"].as_str())
+            .map(service_text))
+    }
+
+    /// Serve's saved accounts; `None` from a serve without account support.
+    pub async fn accounts(&self) -> Result<Option<Accounts>, ControlError> {
+        let mut c = self.open().await?;
+        if !c.offers(ACCOUNTS) {
+            return Ok(None);
+        }
+        let data = c
+            .call(json!({"cmd": "accounts"}), "accounts", REPLY_TIMEOUT)
+            .await?;
+        Accounts::from_reply(&data).map(Some)
+    }
+
+    /// Makes serve use `name`; refused while a session streams.
+    pub async fn select_account(&self, name: &str) -> Result<Accounts, ControlError> {
+        self.account_call("select_account", name).await
+    }
+
+    /// Removes `name`'s saved login from serve.
+    pub async fn logout_account(&self, name: &str) -> Result<Accounts, ControlError> {
+        self.account_call("logout_account", name).await
+    }
+
+    async fn account_call(&self, cmd: &'static str, name: &str) -> Result<Accounts, ControlError> {
+        let mut c = self.open().await?;
+        c.require(ACCOUNTS)?;
+        let data = c
+            .call(json!({"cmd": cmd, "account": name}), cmd, REPLY_TIMEOUT)
+            .await?;
+        Accounts::from_reply(&data)
+    }
+
+    /// Sends `stop` only while the live session is still the one `ownership` names.
+    pub async fn stop(&self, ownership: Option<&Ownership>) -> Result<Stopped, ControlError> {
+        let Some(ownership) = ownership else {
+            return Ok(Stopped::LeftRunning);
+        };
+        // A stop never starts a serve: with none running there is nothing to stop.
+        let mut c = match self.open_with(false).await {
+            Ok(c) => c,
+            Err(e) => return stop_without_connection(e),
+        };
+        let status = c
+            .settled(
+                c.hello["status"].clone(),
+                Some(ownership),
+                self.settle_timeout,
+            )
+            .await?;
+        match owns(&status, ownership, c.instance)? {
+            None => return Ok(Stopped::NotRunning),
+            Some(false) => return Ok(Stopped::LeftRunning),
+            Some(true) => {}
+        }
+        match c.call(json!({"cmd": "stop"}), "stop", STOP_TIMEOUT).await {
+            Ok(_) => Ok(Stopped::Stopped),
+            Err(ControlError::Refused { code, .. }) if code == "not_running" => {
+                Ok(Stopped::NotRunning)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn open(&self) -> Result<Connection, ControlError> {
+        self.open_with(true).await
+    }
+
+    async fn open_with(&self, launch: bool) -> Result<Connection, ControlError> {
+        let before = self.instance();
+        let stream = if launch {
+            crate::launch::connect(&self.endpoint).await
+        } else {
+            dstreamy_ipc::connect(&self.endpoint).await
+        };
+        let stream = stream.map_err(|e| match e {
+            IpcError::NotRunning(_) => ControlError::NotRunning(service_text(&e.to_string())),
+            e => ControlError::Connect(service_text(&e.to_string())),
+        })?;
+        let before = before.ok_or(ControlError::Restarted)?;
+        let (read, write) = tokio::io::split(stream);
+        let mut c = Connection {
+            lines: FramedRead::new(read, ControlCodec::new()),
+            writer: FramedWrite::new(write, ControlCodec::new()),
+            hello: Value::Null,
+            instance: before,
+            next_id: 0,
+        };
+        c.hello = c
+            .call(
+                json!({"cmd": "hello", "role": "control", "protocol": 2}),
+                "hello",
+                REPLY_TIMEOUT,
+            )
+            .await
+            // serve also closes unanswered when flooded, so a closed hello never proves it gone.
+            .map_err(|e| match e {
+                ControlError::NotRunning(m) => ControlError::Protocol(m),
+                e => e,
+            })?;
+        c.require(STATUS_PLACE)?;
+        // The path names whichever serve bound it last, so it must be the same file on both sides of the hello.
+        #[cfg(unix)]
+        if self.instance() != Some(before) {
+            return Err(ControlError::Restarted);
+        }
+        #[cfg(not(unix))]
+        {
+            c.instance = hello_instance(&c.hello).ok_or(ControlError::Outdated {
+                feature: "instance",
+            })?;
+        }
+        Ok(c)
+    }
+
+    /// A pipe has no file to identify; the run comes from the hello on the same connection.
+    #[cfg(not(unix))]
+    fn instance(&self) -> Option<Instance> {
+        Some(Instance {
+            dev: 0,
+            ino: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+        })
+    }
+
+    #[cfg(unix)]
+    fn instance(&self) -> Option<Instance> {
+        let meta = std::fs::metadata(self.endpoint.as_path()).ok()?;
+        Some(Instance {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        })
+    }
+}
+
+#[cfg(not(unix))]
+fn hello_instance(hello: &Value) -> Option<Instance> {
+    let run = &hello["instance"];
+    Some(Instance {
+        dev: run["pid"].as_u64()?,
+        ino: run["started"].as_u64()?,
+        mtime: 0,
+        mtime_nsec: 0,
+    })
+}
+
+impl Connection {
+    fn id(&mut self) -> String {
+        self.next_id += 1;
+        self.next_id.to_string()
+    }
+
+    fn hello_live(&self) -> Result<Option<Live>, ControlError> {
+        Ok(self.with_instance(Live::from_status(&self.hello["status"])?))
+    }
+
+    fn with_instance(&self, live: Option<Live>) -> Option<Live> {
+        live.map(|live| Live {
+            instance: Some(self.instance),
+            ..live
+        })
+    }
+
+    fn offers(&self, feature: &str) -> bool {
+        self.hello["features"]
+            .as_array()
+            .is_some_and(|f| f.iter().any(|v| v == feature))
+    }
+
+    fn require(&self, feature: &'static str) -> Result<(), ControlError> {
+        if self.offers(feature) {
+            Ok(())
+        } else {
+            Err(ControlError::Outdated { feature })
+        }
+    }
+
+    fn connection(&self) -> Result<u64, ControlError> {
+        self.hello["connection"].as_u64().ok_or_else(|| {
+            ControlError::Protocol(service_text(&format!(
+                "hello reply without a connection id: {}",
+                self.hello
+            )))
+        })
+    }
+
+    async fn send(&mut self, line: Value) -> Result<(), ControlError> {
+        self.writer
+            .send(line)
+            .await
+            .map_err(|e| ControlError::Protocol(service_text(&format!("sending: {e}"))))
+    }
+
+    /// Sends `command` with a fresh id and returns its result.
+    async fn call(
+        &mut self,
+        mut command: Value,
+        name: &'static str,
+        timeout: Duration,
+    ) -> Result<Value, ControlError> {
+        let id = self.id();
+        command["id"] = id.clone().into();
+        self.send(command).await?;
+        self.reply(&id, name, timeout).await?
+    }
+
+    /// The outer error is the connection failing; the inner one is serve's `error` reply.
+    async fn reply(
+        &mut self,
+        id: &str,
+        name: &'static str,
+        timeout: Duration,
+    ) -> Result<Result<Value, ControlError>, ControlError> {
+        let window = self.offers(BROWSER_LOGIN);
+        let wait = async {
+            loop {
+                let line = match self.lines.next().await {
+                    Some(Ok(Ok(line))) => line,
+                    Some(Ok(Err(e))) => {
+                        return Err(ControlError::Protocol(service_text(&format!(
+                            "{name} reply: {e}"
+                        ))));
+                    }
+                    Some(Err(e)) => {
+                        return Err(ControlError::Protocol(service_text(&format!(
+                            "reading the {name} reply: {e}"
+                        ))));
+                    }
+                    None => {
+                        return Err(ControlError::NotRunning(format!(
+                            "it closed the connection before answering {name}"
+                        )));
+                    }
+                };
+                if line["id"] != id {
+                    if line["type"] == "error" && line["id"].is_null() {
+                        return Err(ControlError::from_reply(&line));
+                    }
+                    continue;
+                }
+                return Ok(match line["type"].as_str() {
+                    Some("result") => Ok(line["data"].clone()),
+                    Some("error") => Err(ControlError::from_reply(&line)),
+                    _ => Err(ControlError::Protocol(service_text(&format!(
+                        "{name} reply {line}"
+                    )))),
+                });
+            }
+        };
+        tokio::time::timeout(timeout, wait)
+            .await
+            .map_err(|_| ControlError::Timeout {
+                command: name,
+                secs: timeout.as_secs(),
+            })?
+            .map(|reply| reply.map_err(|e| e.with_login_window(window)))
+    }
+
+    /// Waits out a start in flight, which may be our own whose reply was lost, until serve names its starter.
+    async fn settled(
+        &mut self,
+        mut status: Value,
+        persisted: Option<&Ownership>,
+        timeout: Duration,
+    ) -> Result<Value, ControlError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut poll = SETTLE_POLL;
+        while start_in_flight(&status, persisted, self.instance)? {
+            tokio::time::sleep(
+                poll.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
+            poll = (poll * 2).min(SETTLE_MAX_POLL);
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Err(ControlError::StillStarting);
+            }
+            status = match self.call(json!({"cmd": "status"}), "status", left).await {
+                Err(ControlError::Timeout { .. }) => return Err(ControlError::StillStarting),
+                other => other?,
+            };
+        }
+        Ok(status)
+    }
+
+    async fn live(&mut self) -> Result<Option<Live>, ControlError> {
+        let status = self
+            .call(json!({"cmd": "status"}), "status", REPLY_TIMEOUT)
+            .await?;
+        Ok(self.with_instance(Live::from_status(&status)?))
+    }
+
+    /// Another start won the race, maybe our own earlier one, or another process holds the session lock.
+    async fn attach_after_race(
+        &mut self,
+        request: &StartRequest,
+        persisted: Option<&Ownership>,
+        refused: ControlError,
+        settle_timeout: Duration,
+    ) -> Result<Started, ControlError> {
+        let status = self
+            .call(json!({"cmd": "status"}), "status", REPLY_TIMEOUT)
+            .await?;
+        let status = self.settled(status, persisted, settle_timeout).await?;
+        match resolve(request, &status, persisted, self.instance)? {
+            Resolution::Attach(started) => Ok(started),
+            Resolution::Start => Err(refused),
+        }
+    }
+}
+
+/// Only a missing or replaced serve proves our session is gone; any other failure keeps the ownership for a retry.
+fn stop_without_connection(e: ControlError) -> Result<Stopped, ControlError> {
+    match e {
+        ControlError::NotRunning(_) | ControlError::Restarted => Ok(Stopped::NotRunning),
+        e => Err(e),
+    }
+}
+
+fn named(data: Value) -> Result<Vec<Named>, ControlError> {
+    serde_json::from_value::<Vec<Named>>(data.clone())
+        .map(|list| {
+            list.into_iter()
+                .map(|n| Named {
+                    id: n.id,
+                    name: service_text(&n.name),
+                })
+                .collect()
+        })
+        .map_err(|e| ControlError::Protocol(service_text(&format!("{e}: {data}"))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calls_that_may_log_in_to_discord_wait_longer_than_quick_calls() {
+        let control = ObsControl::new(Endpoint::new("/nowhere"));
+        assert_eq!(control.start_timeout, DISCORD_TIMEOUT);
+        assert!(DISCORD_TIMEOUT > REPLY_TIMEOUT && DISCORD_TIMEOUT > STOP_TIMEOUT);
+    }
+
+    #[test]
+    fn only_a_missing_or_restarted_serve_ends_the_session() {
+        assert_eq!(
+            stop_without_connection(ControlError::NotRunning("gone".into())),
+            Ok(Stopped::NotRunning)
+        );
+        assert_eq!(
+            stop_without_connection(ControlError::Restarted),
+            Ok(Stopped::NotRunning)
+        );
+        let impostor = ControlError::Connect("the service runs as uid 7".into());
+        assert_eq!(stop_without_connection(impostor.clone()), Err(impostor));
+        assert_eq!(
+            stop_without_connection(ControlError::Stopping),
+            Err(ControlError::Stopping)
+        );
+    }
+}

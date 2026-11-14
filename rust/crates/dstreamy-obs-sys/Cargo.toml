@@ -1,0 +1,15 @@
+[package]
+name = "dstreamy-obs-sys"
+description = "bindgen bindings for the libobs headers the obs/ CMake build provides"
+workspace = "../dstreamy-obs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+links = "obs"
+
+[build-dependencies]
+bindgen = "0.72"
+
+[lints]
+workspace = true

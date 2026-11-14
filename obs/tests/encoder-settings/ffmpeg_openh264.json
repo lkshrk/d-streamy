@@ -1,0 +1,24 @@
+{
+    "id": "ffmpeg_openh264",
+    "codec": "h264",
+    "kind": "source",
+    "source": "plugins/obs-ffmpeg/obs-ffmpeg-openh264.c:194-198 (defaults), :205-218 (properties: profile, bitrate, keyint_sec at :215, ffmpeg_opts at :218), :238-241 (id, codec h264); registered only when FFmpeg has libopenh264 (obs-ffmpeg.c:353) at obs-studio ba2f32b. No B-frames: OpenH264 encodes Constrained Baseline (cisco/openh264@652bdb7719f30b52b08e506645a7322ff1b2cc6f, v2.6.0, README.md:7), which has no B slices (H.264 A.2.1)",
+    "defaults": {
+        "bitrate": 6000,
+        "profile": "main"
+    },
+    "properties": [
+        {
+            "name": "profile"
+        },
+        {
+            "name": "bitrate"
+        },
+        {
+            "name": "keyint_sec"
+        },
+        {
+            "name": "ffmpeg_opts"
+        }
+    ]
+}

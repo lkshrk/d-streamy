@@ -1,0 +1,333 @@
+//! The output's own thread: connect, `hello`, data capture and every stop signal happen here, never on an OBS thread.
+
+use std::ffi::c_int;
+use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use dstreamy_obs_producer::End;
+use dstreamy_obs_producer::Hello;
+use dstreamy_obs_producer::{self as producer, Endpoint, StartError};
+use dstreamy_obs_sys as sys;
+use futures_util::FutureExt;
+use tokio::sync::mpsc::UnboundedReceiver;
+
+use crate::guard::{self, lock};
+use crate::log;
+use crate::output::{OutputPtr, Shared, set_last_error};
+
+/// How often a destroy that is still waiting for the end of capture says so.
+const END_WAIT_LOG: Duration = Duration::from_secs(5);
+/// bindgen types the macro `0` as `u32` and the negative codes as `i32`; `obs_output_signal_stop` takes `int`.
+const SUCCESS: c_int = sys::OBS_OUTPUT_SUCCESS as c_int;
+
+pub enum Command {
+    Start {
+        hello: Hello,
+        endpoint: Option<PathBuf>,
+        /// The control thread's start this run answers, which every stop signal of the run carries.
+        run: u64,
+    },
+    Stop,
+    /// `stop` panicked: answered even when idle, since libobs waits for a stop signal.
+    StopFailed(String),
+    /// A callback panicked mid-stream: ends a running session, ignored when idle.
+    Fail(String),
+    EncodeError,
+    Shutdown,
+}
+
+enum Reason {
+    Stop,
+    Fail(String),
+    EncodeError,
+    Shutdown,
+}
+
+enum Outcome {
+    Cancelled(Reason),
+    StartFailed(String),
+    CaptureRefused,
+    Ended(End<Reason>),
+    Panicked(String),
+}
+
+pub fn spawn(
+    shared: Arc<Shared>,
+    commands: UnboundedReceiver<Command>,
+) -> std::io::Result<JoinHandle<()>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    std::thread::Builder::new()
+        .name("dstreamy output".into())
+        .spawn(move || run(&shared, &runtime, commands))
+}
+
+fn run(
+    shared: &Shared,
+    runtime: &tokio::runtime::Runtime,
+    mut commands: UnboundedReceiver<Command>,
+) {
+    // The client's writes can't raise SIGPIPE today; this guards a future writev path (see docs/specs.md).
+    #[cfg(target_os = "linux")]
+    if let Err(e) = producer::block_sigpipe_on_this_thread() {
+        log::warn(&format!(
+            "cannot block SIGPIPE on the D-Streamy thread: {e}"
+        ));
+    }
+    runtime.block_on(async {
+        let mut pending = std::collections::VecDeque::new();
+        let mut last_run = 0;
+        loop {
+            let command = match pending.pop_front() {
+                Some(command) => command,
+                None => match commands.recv().await {
+                    Some(command) => command,
+                    None => break,
+                },
+            };
+            match command {
+                Command::Start {
+                    hello,
+                    endpoint,
+                    run,
+                } => {
+                    last_run = run;
+                    let outcome = AssertUnwindSafe(session(shared, hello, endpoint, &mut commands))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|payload| {
+                            Outcome::Panicked(format!(
+                                "D-Streamy plugin error ({})",
+                                guard::record_panic("worker", payload.as_ref())
+                            ))
+                        });
+                    while let Ok(command) = commands.try_recv() {
+                        match command {
+                            Command::EncodeError => {
+                                shared.encode_error.store(true, Ordering::Release)
+                            }
+                            other => pending.push_back(other),
+                        }
+                    }
+                    crate::session::signals_belong_to(run);
+                    guard::guard("worker", (), || finish(shared, outcome));
+                    // A Shutdown may have been consumed by the session's stop; the flag doesn't get lost.
+                    if shared.is_destroying() {
+                        break;
+                    }
+                }
+                // libobs reset its stopping event before calling stop, so an idle output still signals (rtmp-stream.c:222-224).
+                Command::Stop => {
+                    crate::session::signals_belong_to(last_run);
+                    guard::guard("worker", (), || signal_stop(shared.output, SUCCESS));
+                }
+                Command::StopFailed(message) => {
+                    crate::session::signals_belong_to(last_run);
+                    guard::guard("worker", (), || fail(shared.output, &message));
+                }
+                Command::Fail(message) => log::debug(&format!(
+                    "ignoring an error after the output stopped: {message}"
+                )),
+                Command::EncodeError => {
+                    log::debug("ignoring an encoder error after the output stopped")
+                }
+                Command::Shutdown => break,
+            }
+        }
+    });
+    wait_for_end_of_capture(shared.output);
+}
+
+/// libobs joins only an end-capture thread it saw before `destroy` (obs-output.c:298-303); this joins any we started.
+fn wait_for_end_of_capture(output: OutputPtr) {
+    let mut said = Instant::now();
+    // SAFETY: destroy is blocked in join on this thread, so the output is still allocated.
+    while unsafe { sys::obs_output_active(output.0) } {
+        if said.elapsed() >= END_WAIT_LOG {
+            log::warn("destroy is still waiting for the output's capture to end");
+            said = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // SAFETY: as above; with `active` clear this joins a finishing end thread (obs-output.c:2571-2575, 2867-2870).
+    unsafe { sys::obs_output_can_begin_data_capture(output.0, 0) };
+}
+
+async fn session(
+    shared: &Shared,
+    hello: Hello,
+    endpoint: Option<PathBuf>,
+    commands: &mut UnboundedReceiver<Command>,
+) -> Outcome {
+    let endpoint = match endpoint.map_or_else(Endpoint::default_for_user, |p| Ok(Endpoint::new(p)))
+    {
+        Ok(endpoint) => endpoint,
+        Err(e) => return Outcome::StartFailed(StartError::Connect(e).to_string()),
+    };
+    log::info(&format!(
+        "connecting to the D-Streamy service at {endpoint}"
+    ));
+    let attach = async {
+        if let Some(gate) = crate::hooks::capture_gate() {
+            while !gate.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        producer::attach(&endpoint, &hello).await
+    };
+    let connection = tokio::select! {
+        attached = attach => match attached {
+            Ok(connection) => connection,
+            Err(e) => return Outcome::StartFailed(e.to_string()),
+        },
+        reason = next_reason(commands) => return Outcome::Cancelled(reason),
+    };
+    crate::hooks::observe(
+        "attached",
+        || serde_json::json!({"attachment":connection.attachment()}),
+    );
+    log::info(&format!(
+        "attached to the D-Streamy service as producer {}",
+        connection.attachment()
+    ));
+    {
+        let destroying = lock(&shared.destroying);
+        if *destroying {
+            return Outcome::Cancelled(Reason::Shutdown);
+        }
+        // SAFETY: destroy can't pass the flag while we hold it; rtmp begins capture on its connect thread too.
+        if !unsafe { sys::obs_output_begin_data_capture(shared.output.0, 0) } {
+            return Outcome::CaptureRefused;
+        }
+    }
+    let output = shared.output;
+    crate::session::set_viewers(None);
+    crate::session::set_health(None);
+    let end = producer::client::run_reconnecting(
+        (&endpoint, &hello),
+        connection,
+        &shared.ring,
+        || video_extra_data(output),
+        producer::Reports {
+            viewers: &crate::session::set_viewers,
+            health: &crate::session::set_health,
+        },
+        next_reason(commands),
+        &log::Obs,
+    )
+    .await;
+    crate::session::set_viewers(None);
+    crate::session::set_health(None);
+    Outcome::Ended(end)
+}
+
+async fn next_reason(commands: &mut UnboundedReceiver<Command>) -> Reason {
+    loop {
+        match commands.recv().await {
+            Some(Command::Stop) => return Reason::Stop,
+            Some(Command::Fail(message) | Command::StopFailed(message)) => {
+                return Reason::Fail(message);
+            }
+            Some(Command::EncodeError) => return Reason::EncodeError,
+            Some(Command::Shutdown) | None => return Reason::Shutdown,
+            Some(Command::Start { .. }) => log::warn("ignoring a start while D-Streamy runs"),
+        }
+    }
+}
+
+fn video_extra_data(output: OutputPtr) -> Option<Vec<u8>> {
+    // SAFETY: the output holds its encoder during capture; rtmp reads extra data off-thread too (rtmp-stream.c:786-798).
+    unsafe {
+        let venc = sys::obs_output_get_video_encoder(output.0);
+        if venc.is_null() {
+            return None;
+        }
+        let (mut data, mut size) = (std::ptr::null_mut(), 0usize);
+        if !sys::obs_encoder_get_extra_data(venc, &mut data, &mut size)
+            || data.is_null()
+            || size == 0
+            || size > dstreamy_obs_producer::ring::MAX_PACKET
+        {
+            return None;
+        }
+        Some(std::slice::from_raw_parts(data, size).to_vec())
+    }
+}
+
+fn finish(shared: &Shared, outcome: Outcome) {
+    let output = shared.output;
+    shared.ring.close();
+    // Before the stop signal, so a restart from its handler isn't refused as "already starting".
+    shared.busy.store(false, Ordering::Release);
+    match outcome {
+        Outcome::Cancelled(Reason::Shutdown) => {}
+        Outcome::Cancelled(Reason::Fail(message)) => fail(output, &message),
+        Outcome::Panicked(message) => fail(output, &message),
+        Outcome::Cancelled(Reason::Stop | Reason::EncodeError) => signal_stop(output, SUCCESS),
+        Outcome::StartFailed(message) => {
+            log::warn(&message);
+            set_last_error(output, &message);
+            signal_stop(output, sys::OBS_OUTPUT_CONNECT_FAILED);
+        }
+        Outcome::CaptureRefused => fail(output, "D-Streamy could not begin data capture"),
+        Outcome::Ended(end) => ended(shared, end),
+    }
+}
+
+fn ended(shared: &Shared, end: End<Reason>) {
+    let output = shared.output;
+    match end {
+        End::Stopped(Reason::Stop) if !shared.encode_error.load(Ordering::Acquire) => {
+            log::info("stopped");
+            // SAFETY: the output is live; ending capture from a plugin thread is what rtmp's send thread does.
+            unsafe { sys::obs_output_end_data_capture(output.0) };
+        }
+        End::Stopped(Reason::Stop | Reason::EncodeError) => {
+            log::warn("the encoder failed; stopping D-Streamy");
+            signal_stop(output, sys::OBS_OUTPUT_ENCODE_ERROR);
+        }
+        End::Stopped(Reason::Fail(message)) => fail(output, &message),
+        End::Stopped(Reason::Shutdown) => {
+            // SAFETY: destroy waits in join for this thread, so the output is still allocated.
+            unsafe { sys::obs_output_end_data_capture(output.0) };
+        }
+        End::Detached {
+            reason,
+            message,
+            stop,
+        } if reason.is_clean() => {
+            log::info(&format!(
+                "the D-Streamy service ended the stream ({reason}): {message}"
+            ));
+            let end = reason.session_end(&message, stop.as_ref());
+            set_last_error(output, &end.message);
+            crate::session::service_ends_next_stop(end);
+            signal_stop(output, SUCCESS);
+        }
+        End::Detached {
+            reason, message, ..
+        } => fail(
+            output,
+            &format!("The D-Streamy service ended the stream ({reason}): {message}"),
+        ),
+        End::Closed(message) => fail(output, &format!("Lost the D-Streamy service: {message}")),
+        End::Refused(e) => fail(output, &format!("D-Streamy cannot send this stream: {e}")),
+    }
+}
+
+/// Not `OBS_OUTPUT_DISCONNECTED`: that code makes libobs reconnect, which restarts the output (obs-output.c:3008-3017).
+fn fail(output: OutputPtr, message: &str) {
+    log::warn(message);
+    set_last_error(output, message);
+    signal_stop(output, sys::OBS_OUTPUT_ERROR);
+}
+
+fn signal_stop(output: OutputPtr, code: c_int) {
+    // SAFETY: the output is live until destroy joins this thread.
+    unsafe { sys::obs_output_signal_stop(output.0, code) };
+}

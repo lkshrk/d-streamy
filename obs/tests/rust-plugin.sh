@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# usage: rust-plugin.sh <obs-harness> <plugin-bin-path> <plugin-data-path> <log-dir> [harness args...] (macOS paths: %module% patterns)
+# Runs without a D-Streamy service, so only start errors; streaming through serve is rust/crates/dstreamy-cli/tests/obs_plugin.rs.
+set -euo pipefail
+
+harness=$1
+bin=$2
+data=$3
+logs=$4
+shift 4
+mkdir -p "$logs"
+modules="image-source,obs-x264,obs-ffmpeg,obs-outputs,obs-dstreamy"
+timeout=60
+until_video=60
+
+run() {
+  local name=$1
+  shift
+  echo "=== $name"
+  local rc=0
+  "$harness" --seconds "$timeout" --until-video "$until_video" --output dstreamy_output \
+    --plugin-bin "$bin" --plugin-data "$data" --modules "$modules" --trace-dir "$logs/$name-trace" "$@" \
+    >"$logs/$name.log" 2>&1 || rc=$?
+  cat "$logs/$name.log"
+  if [[ $rc != 0 ]]; then
+    echo "FAIL $name: harness exited with $rc"
+    return 1
+  fi
+}
+
+expect() {
+  local name=$1 pattern=$2
+  if ! grep -Eq -- "$pattern" "$logs/$name.log"; then
+    echo "FAIL $name: no line matching: $pattern"
+    return 1
+  fi
+}
+
+expect_event() {
+  local name=$1 event=$2
+  shift 2
+  python3 -I "$(dirname "$0")/check-plugin-events.py" "$logs/$name.log" "$event" "$@"
+}
+
+if [[ ${OS:-} == Windows_NT ]]; then
+  # A named pipe, escaped for the JSON settings it goes into.
+  absent='\\\\.\\pipe\\dstreamy-absent'
+  not_running="The D-Streamy service is not running"
+else
+  absent="${TMPDIR:-/tmp}/dstreamy-absent-$$/d/s.sock"
+  not_running="The D-Streamy service is not running"
+fi
+
+run not-running --no-encoders --seconds 3 --output-settings "{\"endpoint\": \"$absent\"}" --expect-error "$not_running" "$@"
+expect_event not-running module_loaded "name=obs-dstreamy"
+expect_event not-running expected_error "code=-2" "message~=$not_running"
+expect_event not-running alive "rendered>0"
+expect_event not-running shutdown "libobs_leaks=0"
+expect_event not-running result "value=PASS"
+
+run start-panic --no-encoders --output-settings '{"panic_in": "start"}' --expect-panics 1 \
+  --expect-error "panic caught in start: test panic in Start" "$@"
+expect start-panic '\[obs-dstreamy\] panic caught in start: test panic in Start'
+expect_event start-panic expected_error_start "message~=panic caught in start"
+expect_event start-panic shutdown "libobs_leaks=0"
+expect_event start-panic result "value=PASS"
+
+# The expected error is matched inside the harness, so keep it ASCII: Windows passes argv in the ANSI code page.
+settings_error() {
+  local name=$1 error=$2 full=$3
+  shift 3
+  run "$name" --seconds 3 --expect-error "$error" "$@"
+  expect_event "$name" expected_error_start "message~=$full"
+  expect_event "$name" shutdown "libobs_leaks=0"
+  expect_event "$name" result "value=PASS"
+}
+
+share=(--video-encoder obs_x264 --audio-encoder ffmpeg_opus --stream-output)
+no_fallback="{\"mode\": \"share\", \"share_fallback\": false, \"endpoint\": \"$absent\"}"
+settings_error share-bf2 "D-Streamy needs B-frames off: " "Tune: zerolatency, or Profile: baseline" "${share[@]}" --bf 2 --keyint-sec 2 --output-settings "$no_fallback" "$@"
+settings_error share-bf-unset "D-Streamy needs B-frames off: " "Tune: zerolatency, or Profile: baseline" "${share[@]}" --keyint-sec 2 --output-settings "$no_fallback" "$@"
+settings_error share-keyint0 "D-Streamy needs a keyframe interval of 1 or 2 seconds, not 0" "Keyframe Interval \(0=auto\)" \
+  "${share[@]}" --bf 0 --keyint-sec 0 --output-settings "$no_fallback" "$@"
+settings_error share-1440p "D-Streamy needs an output size of at most 1920" "1920.1080 with even sides, not 2560.1440: Settings . Video . Output \(Scaled\) Resolution" \
+  "${share[@]}" --bf 0 --keyint-sec 2 --width 2560 --height 1440 --output-settings "$no_fallback" "$@"
+settings_error share-idle "D-Streamy can share the stream's encoder only while streaming" "start streaming first" \
+  --video-encoder obs_x264 --audio-encoder ffmpeg_opus --bf 0 --keyint-sec 2 --output-settings "$no_fallback" "$@"
+settings_error own-24fps "D-Streamy needs 15, 30 or 60 FPS, not 24" "not 24: Settings . Video . Common FPS Values" \
+  --no-encoders --fps 24 --output-settings "{\"endpoint\": \"$absent\"}" "$@"
+settings_error no-opus "D-Streamy needs the FFmpeg Opus audio encoder" "ffmpeg_opus, from the obs-ffmpeg module" \
+  --no-encoders --output-settings "{\"endpoint\": \"$absent\"}" "$@" --modules image-source,obs-x264,obs-dstreamy
+
+echo "rust-plugin: PASS"

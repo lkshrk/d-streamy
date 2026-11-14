@@ -1,0 +1,1282 @@
+//! The control side of the OBS plugin: listing guilds and channels, and starting or stopping the session it feeds.
+
+mod service;
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::types::service_text;
+
+pub use service::{LOGIN_TIMEOUT, ObsControl, STOP_TIMEOUT};
+
+/// What a serve must offer beyond protocol 2 as first released.
+pub const STATUS_PLACE: &str = "status_place";
+/// Feature name: `start` accepts `grace_secs` (ADR 0004).
+pub const START_GRACE_SECS: &str = "start_grace_secs";
+/// Feature name: the service can open the login window (ADR 0004).
+pub const BROWSER_LOGIN: &str = "browser_login";
+/// Feature name: the account commands of ADR 0005 are available.
+pub const ACCOUNTS: &str = "accounts";
+/// Last entry of the account picker; opens a login for a new account.
+pub const ADD_ACCOUNT: &str = "Add account…";
+
+/// A saved Discord account as serve's `accounts` reply lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    pub name: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub global_name: Option<String>,
+    #[serde(default)]
+    pub has_token: bool,
+    #[serde(default)]
+    pub active: bool,
+}
+
+/// Serve's saved accounts and the one it uses.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Accounts {
+    #[serde(default)]
+    pub active: Option<String>,
+    #[serde(default)]
+    pub accounts: Vec<Account>,
+}
+
+impl Accounts {
+    pub fn from_reply(data: &Value) -> Result<Self, ControlError> {
+        let mut accounts: Self = serde_json::from_value(data.clone())
+            .map_err(|e| ControlError::Protocol(service_text(&format!("{e}: {data}"))))?;
+        accounts.active = accounts.active.map(|a| service_text(&a));
+        for a in &mut accounts.accounts {
+            a.name = service_text(&a.name);
+            a.username = a.username.as_deref().map(service_text);
+            a.global_name = a.global_name.as_deref().map(service_text);
+        }
+        Ok(accounts)
+    }
+
+    pub fn active(&self) -> Option<&Account> {
+        let name = self.active.as_deref()?;
+        self.accounts.iter().find(|a| a.name == name)
+    }
+}
+
+/// A server or channel as the service lists it: id and name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Named {
+    pub id: String,
+    pub name: String,
+}
+
+/// One run of `dstreamy serve`: its socket file on Unix, which every serve binds anew; on Windows `dev` and `ino` hold the pid and start time its hello names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Instance {
+    pub dev: u64,
+    pub ino: u64,
+    pub mtime: i64,
+    pub mtime_nsec: i64,
+}
+
+/// How many lost starts of one serve run an ownership remembers.
+pub const MAX_CANDIDATES: usize = 8;
+
+/// A start that may have begun the session: serve's `started_by` id and the fps it announced, which status lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Candidate {
+    pub id: u64,
+    #[serde(default)]
+    pub fps: Option<u32>,
+}
+
+/// The session this plugin started, kept in the module config so a relaunched OBS still stops it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredOwnership")]
+pub struct Ownership {
+    /// One once confirmed; more while starts whose replies were lost may still land.
+    pub connections: Vec<Candidate>,
+    /// Where the newest start asked to stream; the session may have moved since.
+    pub guild_id: String,
+    pub channel_id: String,
+    #[serde(default)]
+    pub instance: Option<Instance>,
+}
+
+/// The persisted form, which also reads the single `connection` and `fps` of earlier builds.
+#[derive(Deserialize)]
+struct StoredOwnership {
+    #[serde(default)]
+    connection: Option<u64>,
+    #[serde(default)]
+    fps: Option<u32>,
+    #[serde(default)]
+    connections: Vec<Candidate>,
+    guild_id: String,
+    channel_id: String,
+    #[serde(default)]
+    instance: Option<Instance>,
+}
+
+impl From<StoredOwnership> for Ownership {
+    fn from(s: StoredOwnership) -> Self {
+        let mut connections = s.connections;
+        if let Some(id) = s
+            .connection
+            .filter(|id| connections.iter().all(|c| c.id != *id))
+        {
+            connections.push(Candidate { id, fps: s.fps });
+        }
+        Self {
+            connections,
+            guild_id: s.guild_id,
+            channel_id: s.channel_id,
+            instance: s.instance,
+        }
+    }
+}
+
+impl Ownership {
+    /// Connection ids restart with serve, so only the same serve run's ids name the same start.
+    pub fn matches(&self, started_by: Option<u64>, instance: Option<Instance>) -> bool {
+        started_by.is_some_and(|id| self.connections.iter().any(|c| c.id == id))
+            && instance.is_some()
+            && instance == self.instance
+    }
+
+    /// The session's fps, known once a single start is left.
+    pub fn fps(&self) -> Option<u32> {
+        match self.connections.as_slice() {
+            [only] => only.fps,
+            _ => None,
+        }
+    }
+
+    /// A lost start joins the candidates of the same serve run; on another run it starts over.
+    pub fn with_candidate(persisted: Option<&Ownership>, lost: Ownership) -> Ownership {
+        match persisted {
+            Some(p) if p.instance.is_some() && p.instance == lost.instance => {
+                let mut connections: Vec<Candidate> = p
+                    .connections
+                    .iter()
+                    .filter(|c| lost.connections.iter().all(|l| l.id != c.id))
+                    .chain(&lost.connections)
+                    .copied()
+                    .collect();
+                // serve queues starts in arrival order, so the oldest lost start is the one most likely to land.
+                let excess = connections.len().saturating_sub(MAX_CANDIDATES);
+                if excess > 0 {
+                    connections.drain(1..=excess);
+                }
+                Ownership {
+                    connections,
+                    ..lost
+                }
+            }
+            _ => lost,
+        }
+    }
+
+    /// The ownership once serve names the start that won, with that start's fps.
+    pub fn confirmed(&self, started_by: u64) -> Ownership {
+        let fps = self
+            .connections
+            .iter()
+            .find(|c| c.id == started_by)
+            .and_then(|c| c.fps);
+        Ownership {
+            connections: vec![Candidate {
+                id: started_by,
+                fps,
+            }],
+            ..self.clone()
+        }
+    }
+}
+
+/// Whether `status` shows a live session; its place is not needed.
+fn is_live(status: &Value) -> Result<bool, ControlError> {
+    let session = &status["session"];
+    if session.is_null() {
+        return Ok(false);
+    }
+    match session["state"].as_str() {
+        Some("connecting" | "streaming" | "reconnecting") => Ok(true),
+        Some("idle" | "stopped") => Ok(false),
+        Some("stopping") => Err(ControlError::Stopping),
+        Some(other) => Err(ControlError::Protocol(service_text(&format!(
+            "unknown session state {other}"
+        )))),
+        None => Err(ControlError::Protocol(service_text(&format!(
+            "status without a session state: {status}"
+        )))),
+    }
+}
+
+/// A live session without `started_by` is a start still in flight (serve sets it once `start` returns), possibly ours.
+pub fn start_in_flight(
+    status: &Value,
+    persisted: Option<&Ownership>,
+    instance: Instance,
+) -> Result<bool, ControlError> {
+    let ours = persisted.is_some_and(|o| o.instance == Some(instance));
+    Ok(ours && status["started_by"].is_null() && is_live(status)?)
+}
+
+/// `Some(true)` when `status` shows a live session that `ownership` started, even one without a place.
+pub fn owns(
+    status: &Value,
+    ownership: &Ownership,
+    instance: Instance,
+) -> Result<Option<bool>, ControlError> {
+    if !is_live(status)? {
+        return Ok(None);
+    }
+    Ok(Some(
+        ownership.matches(status["started_by"].as_u64(), Some(instance)),
+    ))
+}
+
+/// The control `start` the panel sends: place, encoder facts and grace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartRequest {
+    pub guild_id: String,
+    pub channel_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub grace_secs: Option<u64>,
+}
+
+impl StartRequest {
+    pub fn command(&self, id: &str) -> Value {
+        let mut command = json!({
+            "id": id, "cmd": "start", "guild_id": self.guild_id, "channel_id": self.channel_id,
+            "target": "external", "resolution": format!("{}x{}", self.width, self.height),
+            "fps": self.fps, "codec": "h264",
+        });
+        if let Some(secs) = self.grace_secs {
+            command["grace_secs"] = secs.into();
+        }
+        command
+    }
+}
+
+/// A session serve reports as connecting, streaming or reconnecting, with its place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Live {
+    pub guild_id: String,
+    pub channel_id: String,
+    pub channel_name: Option<String>,
+    pub target: String,
+    pub started_by: Option<u64>,
+    /// The serve that reported this session; `from_status` leaves it to the caller.
+    pub instance: Option<Instance>,
+}
+
+impl Live {
+    /// Reads a `status` result; `Ok(None)` when no session is live.
+    pub fn from_status(status: &Value) -> Result<Option<Self>, ControlError> {
+        if !is_live(status)? {
+            return Ok(None);
+        }
+        let session = &status["session"];
+        let text = |key: &str| session[key].as_str().map(str::to_owned);
+        let (Some(guild_id), Some(channel_id), Some(target)) =
+            (text("guild_id"), text("channel_id"), text("target"))
+        else {
+            return Err(ControlError::NoPlace);
+        };
+        Ok(Some(Self {
+            guild_id,
+            channel_id,
+            channel_name: text("channel_name"),
+            target,
+            started_by: status["started_by"].as_u64(),
+            instance: None,
+        }))
+    }
+
+    pub fn channel(&self) -> String {
+        service_text(self.channel_name.as_deref().unwrap_or(&self.channel_id))
+    }
+
+    pub fn is_in(&self, guild_id: &str, channel_id: &str) -> bool {
+        self.guild_id == guild_id && self.channel_id == channel_id
+    }
+
+    pub fn owned_by(&self, ownership: &Ownership) -> bool {
+        ownership.matches(self.started_by, self.instance)
+    }
+}
+
+/// Where a start left the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Started {
+    /// `Some` when this plugin started the session, or started it before a relaunch.
+    pub ownership: Option<Ownership>,
+    pub channel: String,
+}
+
+impl Started {
+    /// Known only for a session this plugin started; see [`crate::settings::check_share_fps`].
+    pub fn session_fps(&self) -> Option<u32> {
+        self.ownership.as_ref().and_then(Ownership::fps)
+    }
+}
+
+/// How a session ended, as the panel reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    Stopped,
+    /// Someone else started the session, so it keeps running.
+    LeftRunning,
+    NotRunning,
+}
+
+/// What the panel does with a Start press once the service answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    Start,
+    Attach { owned: Option<Ownership> },
+}
+
+/// Starts when nothing is live, attaches to our session wherever it is or to an external one in the requested channel.
+pub fn decide(
+    request: &StartRequest,
+    live: Option<&Live>,
+    persisted: Option<&Ownership>,
+) -> Result<Decision, ControlError> {
+    let Some(live) = live else {
+        return Ok(Decision::Start);
+    };
+    if let (Some(owned), Some(started_by)) =
+        (persisted.filter(|o| live.owned_by(o)), live.started_by)
+    {
+        return Ok(Decision::Attach {
+            owned: Some(owned.confirmed(started_by)),
+        });
+    }
+    if !live.is_in(&request.guild_id, &request.channel_id) {
+        return Err(ControlError::Busy {
+            channel: live.channel(),
+        });
+    }
+    if live.target != "external" {
+        return Err(ControlError::OtherSource {
+            channel: live.channel(),
+        });
+    }
+    Ok(Decision::Attach { owned: None })
+}
+
+/// What a start does after reading serve's `status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    Start,
+    Attach(Started),
+}
+
+/// Our own session wins wherever it is and even without a place; otherwise [`decide`] on the live session.
+pub fn resolve(
+    request: &StartRequest,
+    status: &Value,
+    persisted: Option<&Ownership>,
+    instance: Instance,
+) -> Result<Resolution, ControlError> {
+    let placed = || {
+        Live::from_status(status).map(|live| {
+            live.map(|live| Live {
+                instance: Some(instance),
+                ..live
+            })
+        })
+    };
+    if let Some(ours) = persisted
+        && owns(status, ours, instance)? == Some(true)
+    {
+        let channel = match placed() {
+            Ok(Some(live)) => live.channel(),
+            _ => ours.channel_id.clone(),
+        };
+        let started_by = status["started_by"].as_u64().unwrap_or_default();
+        return Ok(Resolution::Attach(Started {
+            ownership: Some(ours.confirmed(started_by)),
+            channel,
+        }));
+    }
+    let live = placed()?;
+    Ok(match decide(request, live.as_ref(), persisted)? {
+        Decision::Start => Resolution::Start,
+        Decision::Attach { owned } => Resolution::Attach(Started {
+            ownership: owned,
+            channel: live.map(|l| l.channel()).unwrap_or_default(),
+        }),
+    })
+}
+
+/// A start that failed; `ownership` is set once the start was sent, since serve may still carry it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartFailed {
+    pub error: ControlError,
+    pub ownership: Option<Box<Ownership>>,
+}
+
+impl From<ControlError> for StartFailed {
+    fn from(error: ControlError) -> Self {
+        Self {
+            error,
+            ownership: None,
+        }
+    }
+}
+
+impl fmt::Display for StartFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for StartFailed {}
+
+/// Everything that can go wrong talking to the service, with a headline, a fix and a full message for the panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlError {
+    NotRunning(String),
+    Connect(String),
+    /// `window`: serve can open the login window, so the plugin offers it instead of the command.
+    NotLoggedIn {
+        window: bool,
+    },
+    InvalidToken {
+        window: bool,
+    },
+    LoginCancelled,
+    LoginFailed(String),
+    LoginRunning,
+    LoginUnavailable,
+    /// Serve has no saved account of that name; the message lists the saved ones.
+    UnknownAccount(String),
+    /// Refused while a session streams.
+    Streaming(String),
+    UnknownGuild,
+    UnknownChannel,
+    GuildUnavailable,
+    /// Another process holds the session lock; the message names its PID.
+    Locked(String),
+    Busy {
+        channel: String,
+    },
+    OtherSource {
+        channel: String,
+    },
+    Outdated {
+        feature: &'static str,
+    },
+    Stopping,
+    StillStarting,
+    /// The service restarted between two looks at its socket.
+    Restarted,
+    /// A live session without a place, as serve reports after a 2 s catch-up timeout.
+    NoPlace,
+    /// Busy or lagging; the same Start can work a moment later.
+    Retry(String),
+    /// Discord can't be reached.
+    Discord(String),
+    /// D-Streamy stopped logging in to protect the account; the message says how long to wait.
+    IdentifyLimit(String),
+    Config(String),
+    Capture(String),
+    /// A Stop cancelled the start while it was pending.
+    Cancelled(String),
+    /// The service is exiting; a new Start reaches the next run.
+    ShuttingDown(String),
+    /// The service runs with `DSTREAMY_TOKEN`, so saved accounts don't apply.
+    AccountsUnavailable(String),
+    Refused {
+        code: String,
+        message: String,
+    },
+    Timeout {
+        command: &'static str,
+        secs: u64,
+    },
+    /// The caller stopped waiting, as OBS does once it closes.
+    Abandoned,
+    Protocol(String),
+}
+
+/// The headline for the IDENTIFY limit, whether it refused a start or ended a session.
+pub const IDENTIFY_PAUSED: &str = "Discord logins paused";
+
+/// The button that opens serve's login window, in place of the `dstreamy login` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relogin {
+    /// No saved login.
+    First,
+    /// Discord rejected the saved one.
+    Again,
+    /// A login saved as another account.
+    Add,
+}
+
+impl Relogin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::First => "Log in",
+            Self::Again => "Log in again",
+            Self::Add => ADD_ACCOUNT,
+        }
+    }
+}
+
+impl ControlError {
+    pub fn relogin(&self) -> Option<Relogin> {
+        match self {
+            Self::NotLoggedIn { window: true } => Some(Relogin::First),
+            Self::InvalidToken { window: true } => Some(Relogin::Again),
+            _ => None,
+        }
+    }
+
+    /// After a login that ended with this, the login window may be opened again.
+    pub fn retries_login(&self) -> bool {
+        matches!(
+            self,
+            Self::LoginCancelled
+                | Self::LoginFailed(_)
+                | Self::LoginRunning
+                | Self::Streaming(_)
+                | Self::Timeout { .. }
+                | Self::Restarted
+                | Self::Abandoned
+                | Self::Protocol(_)
+                | Self::Refused { .. }
+                | Self::Retry(_)
+                | Self::Discord(_)
+                | Self::IdentifyLimit(_)
+                | Self::Config(_)
+                | Self::Capture(_)
+                | Self::Cancelled(_)
+                | Self::ShuttingDown(_)
+                | Self::AccountsUnavailable(_)
+        )
+    }
+
+    /// Its fix is pressing the login button, so the button can take the fix line's place.
+    pub fn fixed_by_login(&self) -> bool {
+        matches!(
+            self,
+            Self::NotLoggedIn { window: true }
+                | Self::InvalidToken { window: true }
+                | Self::LoginCancelled
+                | Self::LoginFailed(_)
+        )
+    }
+
+    /// Serve can open the login window, so a missing or rejected login offers it.
+    pub fn with_login_window(self, window: bool) -> Self {
+        match self {
+            Self::NotLoggedIn { .. } => Self::NotLoggedIn { window },
+            Self::InvalidToken { .. } => Self::InvalidToken { window },
+            e => e,
+        }
+    }
+
+    /// Maps an `error` reply by its code.
+    pub fn from_reply(reply: &Value) -> Self {
+        let code = reply["code"].as_str().unwrap_or_default();
+        let message = service_text(reply["message"].as_str().unwrap_or_default());
+        match code {
+            "not_logged_in" => Self::NotLoggedIn { window: false },
+            "invalid_token" => Self::InvalidToken { window: false },
+            "login_cancelled" => Self::LoginCancelled,
+            "login_failed" | "remote_auth" => Self::LoginFailed(message),
+            "login_running" => Self::LoginRunning,
+            "login_unavailable" => Self::LoginUnavailable,
+            "unknown_account" => Self::UnknownAccount(message),
+            "streaming" => Self::Streaming(message),
+            "unknown_guild" => Self::UnknownGuild,
+            "unknown_channel" => Self::UnknownChannel,
+            "guild_unavailable" => Self::GuildUnavailable,
+            "already_running" => Self::Locked(message),
+            "unsupported_protocol" => Self::Outdated {
+                feature: "control protocol 2",
+            },
+            "busy" | "overloaded" | "lagged" => Self::Retry(message),
+            "gateway" => Self::Discord(message),
+            "identify_limit" => Self::IdentifyLimit(message),
+            "config" => Self::Config(message),
+            "capture" => Self::Capture(message),
+            "cancelled" => Self::Cancelled(message),
+            "shutting_down" => Self::ShuttingDown(message),
+            "accounts_unavailable" => Self::AccountsUnavailable(message),
+            _ => Self::Refused {
+                code: service_text(code),
+                message,
+            },
+        }
+    }
+
+    /// A few words naming the problem; the full message says how to fix it.
+    pub fn headline(&self) -> &'static str {
+        match self {
+            Self::NotRunning(_) => "Service not running",
+            Self::Connect(_) => "Can't reach the service",
+            Self::NotLoggedIn { .. } | Self::LoginUnavailable => "Not logged in",
+            Self::InvalidToken { .. } => "Discord login expired",
+            Self::LoginCancelled => "Login cancelled",
+            Self::LoginFailed(_) => "Login failed",
+            Self::LoginRunning => "Login window open",
+            Self::UnknownAccount(_) => "Account not found",
+            Self::Streaming(_) => "Stream running",
+            Self::UnknownGuild => "Server not found",
+            Self::UnknownChannel => "Voice channel not found",
+            Self::GuildUnavailable => "Server unavailable",
+            Self::Locked(_) => "Account in use",
+            Self::Busy { .. } | Self::OtherSource { .. } => "Already live elsewhere",
+            Self::Outdated { .. } => "Service out of date",
+            Self::Stopping | Self::StillStarting | Self::Restarted => "Try again",
+            Self::NoPlace => "Session lost",
+            Self::Retry(_) => "Service busy",
+            Self::Discord(_) => "Can't connect to Discord",
+            Self::IdentifyLimit(_) => IDENTIFY_PAUSED,
+            Self::Config(_) => "Config problem",
+            Self::Capture(_) => "Capture failed",
+            Self::Cancelled(_) => "Start cancelled",
+            Self::ShuttingDown(_) => "Service stopping",
+            Self::AccountsUnavailable(_) => "Accounts unavailable",
+            Self::Refused { .. } => "Service refused",
+            Self::Timeout { .. } => "Service not answering",
+            Self::Abandoned => "Stopped waiting",
+            Self::Protocol(_) => "Unexpected service answer",
+        }
+    }
+
+    /// What to do about it, in a few words; the full message has the details.
+    pub fn fix(&self) -> &'static str {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::NotRunning(_) => "Run `dstreamy service install`",
+            #[cfg(not(target_os = "linux"))]
+            Self::NotRunning(_) => "Run `dstreamy serve`",
+            Self::Connect(_) => "Check that the service runs",
+            Self::NotLoggedIn { window: true } => "Press Log in",
+            Self::InvalidToken { window: true } => "Press Log in again",
+            Self::LoginCancelled | Self::LoginFailed(_) => "Try the login again",
+            Self::NotLoggedIn { window: false } | Self::LoginUnavailable => "Run `dstreamy login`",
+            Self::InvalidToken { window: false } => "Run `dstreamy login` again",
+            Self::LoginRunning => "Finish the login in its window",
+            Self::UnknownAccount(_) => "Pick another account",
+            Self::Streaming(_) => "Stop the stream first",
+            Self::UnknownGuild => "Pick the server again",
+            Self::UnknownChannel => "Pick the voice channel again",
+            Self::GuildUnavailable => "Try again later",
+            Self::Locked(_) => "Stop the other D-Streamy first",
+            Self::Busy { .. } | Self::OtherSource { .. } => "Stop that stream first",
+            Self::Outdated { .. } => "Update and restart the service",
+            Self::Stopping
+            | Self::StillStarting
+            | Self::Restarted
+            | Self::Abandoned
+            | Self::Retry(_)
+            | Self::Capture(_)
+            | Self::Cancelled(_)
+            | Self::ShuttingDown(_) => "Press Start again",
+            Self::Discord(_) | Self::IdentifyLimit(_) => "Try again later",
+            Self::Config(_) => "See the details, then press Start",
+            Self::AccountsUnavailable(_) => "Unset DSTREAMY_TOKEN for serve",
+            Self::NoPlace => "Stop it, then press Start",
+            Self::Refused { .. } | Self::Protocol(_) => "See the OBS log",
+            #[cfg(target_os = "linux")]
+            Self::Timeout { .. } => "Run `dstreamy service status`",
+            #[cfg(not(target_os = "linux"))]
+            Self::Timeout { .. } => "Check that `dstreamy serve` runs",
+        }
+    }
+}
+
+impl fmt::Display for ControlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotRunning(e) => write!(
+                f,
+                "The D-Streamy service is not running ({e}; {})",
+                crate::START_SERVICE_HINT
+            ),
+            Self::Connect(e) => write!(f, "Cannot connect to the D-Streamy service: {e}"),
+            Self::NotLoggedIn { window: false } => {
+                f.write_str("Log in first: run `dstreamy login`")
+            }
+            Self::NotLoggedIn { window: true } => f.write_str("Log in first: press Log in"),
+            Self::InvalidToken { window: false } => {
+                f.write_str("Discord rejected the saved login: run `dstreamy login` again")
+            }
+            Self::InvalidToken { window: true } => {
+                f.write_str("Discord rejected the saved login: press Log in again")
+            }
+            Self::LoginCancelled => {
+                f.write_str("The login window closed before the login finished; try again")
+            }
+            Self::LoginFailed(m) => write!(f, "The login didn't finish: {m}"),
+            Self::LoginRunning => {
+                f.write_str("A login window is already open: finish the login there")
+            }
+            Self::LoginUnavailable => f.write_str(
+                "This D-Streamy service can't open a login window: run `dstreamy login`",
+            ),
+            Self::UnknownAccount(_) => f.write_str("That account isn't saved anymore: pick another"),
+            Self::Streaming(_) => f.write_str("Stop the stream first"),
+            Self::UnknownGuild => f.write_str("Discord doesn't list that server: pick it again"),
+            Self::UnknownChannel => {
+                f.write_str("That server has no such voice channel: pick the channel again")
+            }
+            Self::GuildUnavailable => {
+                f.write_str("Discord reports that server as unavailable: try again later")
+            }
+            Self::Locked(message) => write!(
+                f,
+                "Another D-Streamy process is streaming with this account ({message})"
+            ),
+            Self::Busy { channel } => write!(f, "D-Streamy is already live in {channel}"),
+            Self::OtherSource { channel } => write!(
+                f,
+                "D-Streamy is already live in {channel} from another source: stop it first"
+            ),
+            Self::Outdated { feature } => write!(
+                f,
+                "The D-Streamy service is too old for this plugin (it lacks {feature}): update and restart it"
+            ),
+            Self::Stopping => f.write_str("D-Streamy is still stopping; try again"),
+            Self::StillStarting => f.write_str("D-Streamy is still starting; try again"),
+            Self::Restarted => {
+                f.write_str("The D-Streamy service restarted while connecting; try again")
+            }
+            Self::NoPlace => f.write_str(
+                "The D-Streamy service doesn't know where its session streams: stop it and start again",
+            ),
+            Self::Retry(m) => write!(f, "The D-Streamy service is busy: {m}"),
+            Self::Discord(m) => write!(f, "D-Streamy can't connect to Discord: {m}"),
+            Self::IdentifyLimit(m) => write!(f, "{IDENTIFY_PAUSED}: {m}"),
+            Self::Config(m) => write!(f, "The D-Streamy config has a problem: {m}"),
+            Self::Capture(m) => write!(f, "The D-Streamy service couldn't capture: {m}"),
+            Self::Cancelled(m) => write!(f, "The start was cancelled: {m}"),
+            Self::ShuttingDown(m) => write!(f, "The D-Streamy service is shutting down: {m}"),
+            Self::AccountsUnavailable(m) => {
+                write!(f, "The D-Streamy service can't use saved accounts: {m}")
+            }
+            Self::Refused { code, message } => {
+                write!(f, "The D-Streamy service refused ({code}): {message}")
+            }
+            Self::Timeout { command, secs } => write!(
+                f,
+                "The D-Streamy service didn't answer {command} within {secs} s"
+            ),
+            Self::Abandoned => f.write_str("D-Streamy stopped waiting for the D-Streamy service"),
+            Self::Protocol(m) => write!(f, "The D-Streamy service answered unexpectedly: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for ControlError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> StartRequest {
+        StartRequest {
+            guild_id: "g".into(),
+            channel_id: "c".into(),
+            width: 1280,
+            height: 720,
+            fps: 30,
+            grace_secs: None,
+        }
+    }
+
+    fn live(channel_id: &str, target: &str, started_by: Option<u64>) -> Live {
+        Live {
+            guild_id: "g".into(),
+            channel_id: channel_id.into(),
+            channel_name: Some(format!("#{channel_id}")),
+            target: target.into(),
+            started_by,
+            instance: Some(instance(1)),
+        }
+    }
+
+    fn instance(ino: u64) -> Instance {
+        Instance {
+            dev: 1,
+            ino,
+            mtime: 5,
+            mtime_nsec: 6,
+        }
+    }
+
+    fn owned(connection: u64) -> Ownership {
+        Ownership {
+            connections: vec![Candidate {
+                id: connection,
+                fps: Some(30),
+            }],
+            guild_id: "g".into(),
+            channel_id: "c".into(),
+            instance: Some(instance(1)),
+        }
+    }
+
+    #[test]
+    fn start_command_is_an_external_h264_start() {
+        let mut r = request();
+        assert_eq!(
+            r.command("7"),
+            json!({"id": "7", "cmd": "start", "guild_id": "g", "channel_id": "c", "target": "external",
+                   "resolution": "1280x720", "fps": 30, "codec": "h264"})
+        );
+        r.grace_secs = Some(120);
+        assert_eq!(r.command("7")["grace_secs"], 120);
+    }
+
+    #[test]
+    fn nothing_live_starts() {
+        assert_eq!(
+            decide(&request(), None, Some(&owned(3))),
+            Ok(Decision::Start)
+        );
+    }
+
+    #[test]
+    fn same_channel_attaches_and_keeps_only_a_matching_ownership() {
+        let r = request();
+        let ours = live("c", "external", Some(3));
+        assert_eq!(
+            decide(&r, Some(&ours), Some(&owned(3))),
+            Ok(Decision::Attach {
+                owned: Some(owned(3))
+            })
+        );
+        assert_eq!(
+            decide(&r, Some(&ours), Some(&owned(4))),
+            Ok(Decision::Attach { owned: None })
+        );
+        assert_eq!(
+            decide(&r, Some(&ours), None),
+            Ok(Decision::Attach { owned: None })
+        );
+    }
+
+    #[test]
+    fn our_session_is_attached_wherever_it_moved() {
+        let r = request();
+        let mut moved = live("d", "external", Some(3));
+        moved.guild_id = "h".into();
+        assert!(moved.owned_by(&owned(3)));
+        assert!(!moved.owned_by(&owned(4)));
+        assert_eq!(
+            decide(&r, Some(&moved), Some(&owned(3))),
+            Ok(Decision::Attach {
+                owned: Some(owned(3))
+            })
+        );
+        assert!(matches!(
+            decide(&r, Some(&moved), Some(&owned(4))),
+            Err(ControlError::Busy { .. })
+        ));
+    }
+
+    #[test]
+    fn our_session_without_a_place_is_attached_and_kept() {
+        let r = request();
+        let placeless = json!({"session": {"state": "streaming"}, "started_by": 3});
+        assert_eq!(
+            resolve(&r, &placeless, Some(&owned(3)), instance(1)),
+            Ok(Resolution::Attach(Started {
+                ownership: Some(owned(3)),
+                channel: "c".into(),
+            }))
+        );
+        assert_eq!(
+            resolve(&r, &placeless, Some(&owned(4)), instance(1)),
+            Err(ControlError::NoPlace)
+        );
+        assert_eq!(
+            resolve(&r, &placeless, Some(&owned(3)), instance(2)),
+            Err(ControlError::NoPlace)
+        );
+        let placed = json!({"session": {"state": "streaming", "guild_id": "g", "channel_id": "d",
+            "channel_name": "Gaming", "target": "external"}, "started_by": 3});
+        assert_eq!(
+            resolve(&r, &placed, Some(&owned(3)), instance(1)),
+            Ok(Resolution::Attach(Started {
+                ownership: Some(owned(3)),
+                channel: "Gaming".into(),
+            }))
+        );
+        assert_eq!(
+            resolve(&r, &json!({"session": null}), Some(&owned(3)), instance(1)),
+            Ok(Resolution::Start)
+        );
+    }
+
+    #[test]
+    fn a_live_session_without_a_starter_is_in_flight_for_the_same_serve_only() {
+        let in_flight = json!({"session": {"state": "connecting"}, "started_by": null});
+        assert_eq!(
+            start_in_flight(&in_flight, Some(&owned(3)), instance(1)),
+            Ok(true)
+        );
+        assert_eq!(
+            start_in_flight(&in_flight, Some(&owned(3)), instance(2)),
+            Ok(false)
+        );
+        assert_eq!(start_in_flight(&in_flight, None, instance(1)), Ok(false));
+        let started = json!({"session": {"state": "connecting"}, "started_by": 3});
+        assert_eq!(
+            start_in_flight(&started, Some(&owned(3)), instance(1)),
+            Ok(false)
+        );
+        let idle = json!({"session": {"state": "idle"}, "started_by": null});
+        assert_eq!(
+            start_in_flight(&idle, Some(&owned(3)), instance(1)),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn ownership_is_read_without_a_place() {
+        let status = |state: &str, started_by: u64| json!({"session": {"state": state}, "started_by": started_by});
+        let here = instance(1);
+        assert_eq!(
+            owns(&status("streaming", 3), &owned(3), here),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            owns(&status("streaming", 4), &owned(3), here),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            owns(&status("streaming", 3), &owned(3), instance(2)),
+            Ok(Some(false))
+        );
+        assert_eq!(owns(&status("stopped", 3), &owned(3), here), Ok(None));
+        assert_eq!(owns(&json!({"session": null}), &owned(3), here), Ok(None));
+        assert_eq!(
+            Live::from_status(&status("streaming", 3)),
+            Err(ControlError::NoPlace)
+        );
+    }
+
+    #[test]
+    fn a_restarted_service_reusing_the_connection_id_is_not_owned() {
+        let r = request();
+        let mut restarted = live("c", "external", Some(3));
+        restarted.instance = Some(instance(2));
+        assert_eq!(
+            decide(&r, Some(&restarted), Some(&owned(3))),
+            Ok(Decision::Attach { owned: None })
+        );
+        let unknown = Ownership {
+            instance: None,
+            ..owned(3)
+        };
+        assert!(!live("c", "external", Some(3)).owned_by(&unknown));
+        let mut unseen = live("c", "external", Some(3));
+        unseen.instance = None;
+        assert!(!unseen.owned_by(&unknown));
+    }
+
+    #[test]
+    fn another_channel_is_named() {
+        let err = decide(&request(), Some(&live("d", "external", None)), None).unwrap_err();
+        assert_eq!(err.to_string(), "D-Streamy is already live in #d");
+        let mut unnamed = live("d", "external", None);
+        unnamed.channel_name = None;
+        assert_eq!(
+            decide(&request(), Some(&unnamed), None).unwrap_err(),
+            ControlError::Busy {
+                channel: "d".into()
+            }
+        );
+        let mut other_guild = live("c", "external", None);
+        other_guild.guild_id = "h".into();
+        assert!(matches!(
+            decide(&request(), Some(&other_guild), None),
+            Err(ControlError::Busy { .. })
+        ));
+    }
+
+    #[test]
+    fn a_capture_session_in_the_same_channel_is_refused() {
+        assert_eq!(
+            decide(&request(), Some(&live("c", "test-pattern", None)), None),
+            Err(ControlError::OtherSource {
+                channel: "#c".into()
+            })
+        );
+    }
+
+    #[test]
+    fn status_reads_the_live_place() {
+        let status = json!({"session": {"state": "reconnecting", "attempt": 1, "guild_id": "g",
+            "channel_id": "c", "channel_name": "General", "target": "external"}, "started_by": 5});
+        assert_eq!(
+            Live::from_status(&status),
+            Ok(Some(Live {
+                guild_id: "g".into(),
+                channel_id: "c".into(),
+                channel_name: Some("General".into()),
+                target: "external".into(),
+                started_by: Some(5),
+                instance: None,
+            }))
+        );
+        for state in ["idle", "stopped"] {
+            let s = json!({"session": {"state": state}, "started_by": null});
+            assert_eq!(Live::from_status(&s), Ok(None), "{state}");
+        }
+        assert_eq!(Live::from_status(&json!({"session": null})), Ok(None));
+        assert_eq!(
+            Live::from_status(&json!({"session": {"state": "stopping"}})),
+            Err(ControlError::Stopping)
+        );
+        assert!(matches!(
+            Live::from_status(&json!({"session": {"state": "paused"}})),
+            Err(ControlError::Protocol(_))
+        ));
+        assert_eq!(
+            Live::from_status(&json!({"session": {"state": "streaming"}})),
+            Err(ControlError::NoPlace)
+        );
+    }
+
+    #[test]
+    fn service_text_in_a_channel_name_is_cleaned() {
+        let mut l = live("c", "external", None);
+        l.channel_name = Some("a\u{202E}b\nc".into());
+        assert_eq!(l.channel(), "a b c");
+    }
+
+    #[test]
+    fn error_replies_map_to_user_texts() {
+        let reply = |code: &str| json!({"type": "error", "code": code, "message": "m"});
+        assert_eq!(
+            ControlError::from_reply(&reply("not_logged_in")).to_string(),
+            "Log in first: run `dstreamy login`"
+        );
+        assert_eq!(
+            ControlError::from_reply(&reply("unknown_channel")),
+            ControlError::UnknownChannel
+        );
+        assert_eq!(
+            ControlError::from_reply(&reply("already_running")),
+            ControlError::Locked("m".into())
+        );
+        assert_eq!(
+            ControlError::from_reply(&reply("unsupported_protocol")).to_string(),
+            "The D-Streamy service is too old for this plugin (it lacks control protocol 2): update and restart it"
+        );
+        assert_eq!(
+            ControlError::from_reply(&reply("no_such_code")).to_string(),
+            "The D-Streamy service refused (no_such_code): m"
+        );
+    }
+
+    #[test]
+    fn a_refused_start_and_a_stopped_session_name_the_identify_limit_alike() {
+        let refused = ControlError::from_reply(&json!({"type": "error", "code": "identify_limit",
+            "message": "Discord kept ending the session; try again in about 2 h"}));
+        let stopped = crate::DetachReason::Stopped.session_end(
+            "",
+            Some(&crate::StopCode {
+                code: "identify_limit".into(),
+                retry_after_secs: Some(7_200),
+            }),
+        );
+        assert_eq!(refused.headline(), stopped.headline);
+        assert!(refused.to_string().contains("about 2 h"), "{refused}");
+    }
+
+    #[test]
+    fn known_service_codes_say_what_to_do() {
+        let reply = |code: &str| json!({"type": "error", "code": code, "message": "m"});
+        for (code, headline, fix) in [
+            ("busy", "Service busy", "Press Start again"),
+            ("overloaded", "Service busy", "Press Start again"),
+            ("lagged", "Service busy", "Press Start again"),
+            ("gateway", "Can't connect to Discord", "Try again later"),
+            ("identify_limit", IDENTIFY_PAUSED, "Try again later"),
+            (
+                "config",
+                "Config problem",
+                "See the details, then press Start",
+            ),
+            ("capture", "Capture failed", "Press Start again"),
+            ("cancelled", "Start cancelled", "Press Start again"),
+            ("shutting_down", "Service stopping", "Press Start again"),
+            (
+                "accounts_unavailable",
+                "Accounts unavailable",
+                "Unset DSTREAMY_TOKEN for serve",
+            ),
+            ("remote_auth", "Login failed", "Try the login again"),
+        ] {
+            let error = ControlError::from_reply(&reply(code));
+            assert_eq!(error.headline(), headline, "{code}");
+            assert_eq!(error.fix(), fix, "{code}");
+            assert!(error.to_string().ends_with(": m"), "{code}: {error}");
+        }
+    }
+
+    #[test]
+    fn ownership_round_trips_as_json() {
+        let o = owned(9);
+        let v = serde_json::to_value(&o).unwrap();
+        assert_eq!(
+            v,
+            json!({"connections": [{"id": 9, "fps": 30}], "guild_id": "g", "channel_id": "c",
+                   "instance": {"dev": 1, "ino": 1, "mtime": 5, "mtime_nsec": 6}})
+        );
+        assert_eq!(serde_json::from_value::<Ownership>(v).unwrap(), o);
+        let older: Ownership = serde_json::from_value(
+            json!({"connection": 9, "fps": 60, "guild_id": "g", "channel_id": "c"}),
+        )
+        .unwrap();
+        assert_eq!(
+            older.connections,
+            [Candidate {
+                id: 9,
+                fps: Some(60)
+            }]
+        );
+        assert_eq!(older.instance, None);
+    }
+
+    fn candidates(ids: &[u64], ino: u64) -> Ownership {
+        Ownership {
+            connections: ids
+                .iter()
+                .map(|&id| Candidate {
+                    id,
+                    fps: Some(u32::try_from(id).unwrap()),
+                })
+                .collect(),
+            instance: Some(instance(ino)),
+            ..owned(0)
+        }
+    }
+
+    fn ids(o: &Ownership) -> Vec<u64> {
+        o.connections.iter().map(|c| c.id).collect()
+    }
+
+    #[test]
+    fn lost_starts_of_one_serve_run_all_stay_candidates() {
+        let merged = Ownership::with_candidate(Some(&candidates(&[3], 1)), candidates(&[5], 1));
+        assert_eq!(ids(&merged), [3, 5]);
+        assert!(merged.matches(Some(3), Some(instance(1))));
+        assert!(merged.matches(Some(5), Some(instance(1))));
+        assert!(!merged.matches(Some(4), Some(instance(1))));
+        assert!(!merged.matches(Some(3), Some(instance(2))));
+        let again = Ownership::with_candidate(Some(&merged), candidates(&[3], 1));
+        assert_eq!(ids(&again), [5, 3]);
+        let other_run = Ownership::with_candidate(Some(&merged), candidates(&[7], 2));
+        assert_eq!(ids(&other_run), [7]);
+        assert_eq!(
+            ids(&Ownership::with_candidate(None, candidates(&[7], 1))),
+            [7]
+        );
+        let unknown_run = Ownership {
+            instance: None,
+            ..candidates(&[3], 1)
+        };
+        assert_eq!(
+            ids(&Ownership::with_candidate(
+                Some(&unknown_run),
+                candidates(&[7], 1)
+            )),
+            [7]
+        );
+    }
+
+    #[test]
+    fn the_candidates_are_bounded_and_keep_the_first_and_the_newest() {
+        let mut o = candidates(&[1], 1);
+        for id in 2..=12 {
+            o = Ownership::with_candidate(Some(&o), candidates(&[id], 1));
+        }
+        assert_eq!(ids(&o), [1, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(o.connections.len(), MAX_CANDIDATES);
+        let nine = (2..=9).fold(candidates(&[1], 1), |o, id| {
+            Ownership::with_candidate(Some(&o), candidates(&[id], 1))
+        });
+        assert_eq!(ids(&nine), [1, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn empty_candidate_lists_merge_without_panicking() {
+        let merged = Ownership::with_candidate(Some(&candidates(&[], 1)), candidates(&[], 1));
+        assert!(merged.connections.is_empty());
+        assert!(!merged.matches(Some(1), Some(instance(1))));
+        let one = Ownership::with_candidate(Some(&candidates(&[], 1)), candidates(&[4], 1));
+        assert_eq!(ids(&one), [4]);
+    }
+
+    #[test]
+    fn the_winning_start_keeps_its_own_fps() {
+        let first = Ownership {
+            connections: vec![Candidate {
+                id: 3,
+                fps: Some(60),
+            }],
+            ..candidates(&[], 1)
+        };
+        let second = Ownership {
+            connections: vec![Candidate {
+                id: 5,
+                fps: Some(30),
+            }],
+            ..candidates(&[], 1)
+        };
+        let merged = Ownership::with_candidate(Some(&first), second);
+        assert_eq!(merged.fps(), None, "unknown until one start is confirmed");
+        assert_eq!(merged.confirmed(3).fps(), Some(60));
+        assert_eq!(merged.confirmed(5).fps(), Some(30));
+        assert_eq!(merged.confirmed(4).fps(), None);
+        let started = Started {
+            ownership: Some(merged.confirmed(3)),
+            channel: "c".into(),
+        };
+        assert_eq!(started.session_fps(), Some(60));
+    }
+
+    #[test]
+    fn an_owned_attach_collapses_to_the_winning_start() {
+        let set = candidates(&[3, 5], 1);
+        let mut live = live("c", "external", Some(5));
+        live.instance = Some(instance(1));
+        assert_eq!(
+            decide(&request(), Some(&live), Some(&set)),
+            Ok(Decision::Attach {
+                owned: Some(candidates(&[5], 1))
+            })
+        );
+        let placeless = json!({"session": {"state": "streaming"}, "started_by": 3});
+        assert_eq!(
+            resolve(&request(), &placeless, Some(&set), instance(1)),
+            Ok(Resolution::Attach(Started {
+                ownership: Some(candidates(&[3], 1)),
+                channel: "c".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn a_stopping_session_blocks_a_start_with_a_retryable_error() {
+        let status = json!({"session": {"state": "stopping"}, "started_by": null});
+        let err = Live::from_status(&status).unwrap_err();
+        assert_eq!(err.to_string(), "D-Streamy is still stopping; try again");
+    }
+}

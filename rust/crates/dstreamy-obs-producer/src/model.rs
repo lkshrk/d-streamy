@@ -1,0 +1,2530 @@
+//! The panel's model without Qt or libobs: its settings, the guild and channel pickers, and the session it shows.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::control::{
+    Accounts, ControlError, Named, Ownership, Relogin, StartFailed, StartRequest, Started,
+};
+use crate::mixer::{AudioSource, MicGuard, mic_guard};
+use crate::settings::{as_int, fit_1080p, target_fps};
+
+/// The plugin's own video encoder when the user never changed it.
+pub const DEFAULT_VIDEO_ENCODER: &str = "obs_x264";
+/// Bitrate of the plugin's own encoder when the user never changed it.
+pub const DEFAULT_BITRATE_KBPS: i64 = 6000;
+/// The range the output's bitrate property offers.
+pub const BITRATE_KBPS: std::ops::RangeInclusive<i64> = 500..=50_000;
+/// OBS's mixer tracks, one-based.
+pub const AUDIO_TRACKS: std::ops::RangeInclusive<u8> = 1..=6;
+/// The last track, which OBS's default stream and recording settings leave unused.
+pub const DEFAULT_AUDIO_TRACK: u8 = 6;
+/// The default before config version 2, OBS's own stream and recording track.
+const LEGACY_DEFAULT_TRACK: u8 = 1;
+/// Version 2 moved configs still on the old default Track 1 to Track 6.
+pub const CONFIG_VERSION: u32 = 2;
+/// Title of the audio track section in the panel and the dialog.
+pub const AUDIO_TRACK_TITLE: &str = "Discord audio track";
+
+/// OBS's fixed name for a mixer track; D-Streamy keeps no labels of its own.
+pub fn track_name(track: u8) -> String {
+    format!("Track {track}")
+}
+
+/// A track picked while live, which only the next start uses.
+pub fn next_go_live(track: u8) -> String {
+    format!("Discord hears {} from the next Go Live", track_name(track))
+}
+
+/// serve refuses a longer per-start grace (ADR 0004).
+pub const MAX_GRACE_SECS: u64 = 3600;
+
+/// Own encoder or the stream's shared one (ADR 0004 encoders).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoMode {
+    #[default]
+    Own,
+    Share,
+}
+
+/// A server and voice channel picked for one account.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Pick {
+    pub guild_id: Option<String>,
+    pub channel_id: Option<String>,
+}
+
+/// What the module config keeps between OBS runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PanelSettings {
+    pub guild_id: Option<String>,
+    pub channel_id: Option<String>,
+    /// Replaces serve's grace period for sessions this plugin starts.
+    pub grace_secs: Option<u64>,
+    pub mode: VideoMode,
+    pub video_encoder: String,
+    pub bitrate_kbps: i64,
+    pub share_fallback: bool,
+    pub start_with_stream: bool,
+    /// The OBS mixer track sent to Discord, one-based.
+    pub audio_track: u8,
+    pub owned: Option<Ownership>,
+    /// The account `guild_id` and `channel_id` belong to; unset until serve names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The last pick of every other account.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub picks: std::collections::BTreeMap<String, Pick>,
+    pub config_version: u32,
+    /// A track managed under the old global setting, for the first scene collection that loads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adopt_managed_track: Option<u8>,
+}
+
+impl Default for PanelSettings {
+    fn default() -> Self {
+        Self {
+            guild_id: None,
+            channel_id: None,
+            grace_secs: None,
+            mode: VideoMode::Own,
+            video_encoder: DEFAULT_VIDEO_ENCODER.to_owned(),
+            bitrate_kbps: DEFAULT_BITRATE_KBPS,
+            share_fallback: true,
+            start_with_stream: false,
+            audio_track: DEFAULT_AUDIO_TRACK,
+            owned: None,
+            account: None,
+            picks: std::collections::BTreeMap::new(),
+            config_version: CONFIG_VERSION,
+            adopt_managed_track: None,
+        }
+    }
+}
+
+impl PanelSettings {
+    /// Reads the module config field by field, so one unreadable field falls back alone and never takes `owned` along.
+    pub fn from_json(text: &str) -> Self {
+        fn field<T: serde::de::DeserializeOwned>(
+            map: &serde_json::Map<String, Value>,
+            key: &str,
+        ) -> Option<T> {
+            map.get(key)
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+        }
+        let d = Self::default();
+        let Ok(Value::Object(map)) = serde_json::from_str::<Value>(text) else {
+            return d;
+        };
+        let version = field::<u32>(&map, "config_version").unwrap_or(0);
+        let adopt = if version >= CONFIG_VERSION {
+            field::<u8>(&map, "adopt_managed_track")
+        } else {
+            field::<u8>(&map, "managed_track")
+        }
+        .filter(|t| AUDIO_TRACKS.contains(t));
+        let bitrate = map.get("bitrate_kbps").and_then(as_int);
+        Self {
+            guild_id: field(&map, "guild_id"),
+            channel_id: field(&map, "channel_id"),
+            grace_secs: field(&map, "grace_secs"),
+            mode: field(&map, "mode").unwrap_or(d.mode),
+            video_encoder: field(&map, "video_encoder").unwrap_or(d.video_encoder),
+            bitrate_kbps: bitrate.unwrap_or(d.bitrate_kbps),
+            share_fallback: field(&map, "share_fallback").unwrap_or(d.share_fallback),
+            start_with_stream: field(&map, "start_with_stream").unwrap_or(d.start_with_stream),
+            audio_track: map
+                .get("audio_track")
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))
+                })
+                .and_then(|n| u8::try_from(n).ok())
+                .filter(|&t| {
+                    version >= CONFIG_VERSION || t != LEGACY_DEFAULT_TRACK || adopt == Some(t)
+                })
+                .unwrap_or(d.audio_track),
+            owned: field(&map, "owned"),
+            account: field(&map, "account"),
+            picks: field(&map, "picks").unwrap_or_default(),
+            config_version: CONFIG_VERSION,
+            adopt_managed_track: adopt,
+        }
+        .clamped()
+    }
+
+    fn clamped(self) -> Self {
+        Self {
+            bitrate_kbps: self
+                .bitrate_kbps
+                .clamp(*BITRATE_KBPS.start(), *BITRATE_KBPS.end()),
+            grace_secs: self.grace_secs.map(|s| s.min(MAX_GRACE_SECS)),
+            adopt_managed_track: self
+                .adopt_managed_track
+                .filter(|t| AUDIO_TRACKS.contains(t)),
+            audio_track: if AUDIO_TRACKS.contains(&self.audio_track) {
+                self.audio_track
+            } else {
+                DEFAULT_AUDIO_TRACK
+            },
+            ..self
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("settings serialize")
+    }
+
+    /// The `dstreamy_output` settings these map to.
+    pub fn output_settings(&self) -> Value {
+        json!({
+            "mode": self.mode,
+            "video_encoder": self.video_encoder,
+            "bitrate": self.bitrate_kbps,
+            "share_fallback": self.share_fallback,
+            "audio_track": self.audio_track,
+        })
+    }
+}
+
+/// OBS's video settings, as `obs_get_video_info` reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Canvas {
+    pub fps_num: u32,
+    pub fps_den: u32,
+    pub output_width: u32,
+    pub output_height: u32,
+}
+
+/// The panel's session state as the view shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PanelState {
+    Idle,
+    Starting,
+    Live {
+        channel: String,
+        /// `None` when attached to a session another client started, which rules out share mode.
+        session_fps: Option<u32>,
+    },
+    Stopping,
+}
+
+/// The selected track against the one bound to the running session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackStatus {
+    Idle { selected: u8 },
+    Live { track: u8 },
+    Pending { live: u8, next: u8 },
+}
+
+/// The settings dialog's picks; `None` is its "Pick a …" entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub guild_id: Option<String>,
+    pub channel_id: Option<String>,
+    pub audio_track: u8,
+}
+
+/// What went wrong: a short headline and fix for the panel, and the full message the dialog shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Problem {
+    pub headline: &'static str,
+    pub fix: &'static str,
+    pub message: String,
+    /// It came from loading the server or channel list, so the next good load clears it.
+    pub lists: bool,
+    /// Serve's login window fixes it.
+    pub login: Option<Relogin>,
+    /// The login button is its whole fix, so the fix text may give way to it.
+    pub login_fix: bool,
+    /// An account switch or logout failed with it, so the next one that works clears it.
+    pub account: bool,
+}
+
+impl Problem {
+    pub fn new(headline: &'static str, fix: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            headline,
+            fix,
+            message: message.into(),
+            lists: false,
+            login: None,
+            login_fix: false,
+            account: false,
+        }
+    }
+
+    pub fn control(error: &ControlError) -> Self {
+        Self {
+            headline: error.headline(),
+            fix: error.fix(),
+            message: error.to_string(),
+            lists: false,
+            login: error.relogin(),
+            login_fix: error.fixed_by_login(),
+            account: false,
+        }
+    }
+}
+
+/// Status line while a login runs.
+pub const LOGGING_IN: &str = "Logging in…";
+const LOGIN_FAILED: &str = "Login failed";
+/// Status line while serve's login window is open.
+pub const WAITING_FOR_LOGIN: &str = "Waiting for login in the browser window…";
+/// Status line while `select_account` is pending.
+pub const SWITCHING_ACCOUNT: &str = "Switching account…";
+/// Tooltip of the disabled account picker while live.
+pub const LIVE_NO_SWITCH: &str = "Stop the stream to switch accounts";
+/// Tooltip of the disabled Log out while live.
+pub const LIVE_NO_LOGOUT: &str = "Stop the stream to log out";
+/// Tooltip of the account row while a login window waits.
+pub const LOGIN_WAITS: &str = "Finish or cancel the login first";
+const ADD_AGAIN: &str = "Use Add account… again";
+const GUILD_GONE: &str = "Server not available";
+const CHANNEL_GONE: &str = "Voice channel not available";
+const PICK_GUILD_AGAIN: &str = "Pick the server again";
+const PICK_CHANNEL_AGAIN: &str = "Pick the voice channel again";
+
+const NO_CHANNEL: &str = "No voice channel picked";
+const CANT_START: &str = "Can't start";
+const DIDNT_START: &str = "Didn't start";
+const STOP_UNFINISHED: &str = "Stop didn't finish";
+const STREAM_STOPPED: &str = "Stream stopped";
+
+/// What the panel suggests for a start or stop that couldn't finish; the caller knows the cause.
+pub const FIX_LOG: &str = "See the OBS log";
+/// Fix line when only an OBS restart helps.
+pub const FIX_RESTART_OBS: &str = "Restart OBS";
+/// Fix line when the output can only restart with OBS.
+pub const FIX_AFTER_CLOSING: &str = "Start again after OBS restarts";
+/// Fix line for a canvas the encoder rules reject.
+pub const FIX_VIDEO: &str = "Check OBS's Settings › Video";
+/// Fix line for an encoder setting the rules reject.
+pub const FIX_OUTPUT_SETTING: &str = "Change the OBS setting it names";
+/// Fix line when a retry is all it takes.
+pub const FIX_PRESS_START: &str = "Press Start again";
+/// Fix line for a microphone on the unmanaged track Discord would hear.
+pub const FIX_MIC_TRACK: &str = "Manage the track, or take the microphone off it";
+/// Fix line for a session the service lost track of.
+pub const FIX_START_THEN_STOP: &str = "Press Start, then Stop";
+
+/// Fix line while no server and channel are picked.
+pub const PICK_CHANNEL: &str = "Pick a server and a voice channel first";
+
+/// The panel's whole state: settings, session, accounts, tracks and the current problem (ADR 0007).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelModel {
+    settings: PanelSettings,
+    guilds: Vec<Named>,
+    channels: Vec<Named>,
+    state: PanelState,
+    error: Option<Problem>,
+    /// The track the running output was started with; set once its start is accepted, cleared when the session ends.
+    live_track: Option<u8>,
+    /// The track written to the output's settings for the start in progress.
+    applying: Option<u8>,
+    /// List load jobs sent and not yet ended; the lists show loading until the last one ends.
+    lists_pending: u32,
+    /// The tracks D-Streamy manages in the loaded scene collection, as OBS mixer bits.
+    managed_mixers: u32,
+    /// The legacy managed track was settled this session; a stale file can't bring it back.
+    adoption_done: bool,
+    /// Tracks let go of since the panel or dialog opened; their sources may still have them off.
+    released_mixers: u32,
+    /// Tracks a dialog's Cancel couldn't put back.
+    unrestored_mixers: u32,
+    /// The login window serve opened for this button, until its login ends.
+    logging_in: Option<Relogin>,
+    /// Serve's saved accounts; `None` until listed, or from a serve without accounts.
+    accounts: Option<Accounts>,
+    /// A select or logout sent and not answered yet.
+    account_change: Option<AccountChange>,
+    /// The account whose Log out waits for its confirm.
+    confirming_logout: Option<String>,
+    /// The login offer an "Add account…" covered, for when that login fails.
+    add_prior: Option<Relogin>,
+    /// The server list came from serve since the last switch.
+    guilds_listed: bool,
+    /// The server whose channels serve listed last.
+    channels_listed: Option<String>,
+    /// The user cancelled the start in progress; the control thread ends it.
+    cancelling: bool,
+}
+
+/// What the account change in flight does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountChange {
+    Select(String),
+    Logout(String),
+}
+
+impl PanelModel {
+    pub fn new(settings: PanelSettings) -> Self {
+        Self {
+            settings: settings.clamped(),
+            guilds: Vec::new(),
+            channels: Vec::new(),
+            state: PanelState::Idle,
+            error: None,
+            live_track: None,
+            applying: None,
+            lists_pending: 0,
+            managed_mixers: 0,
+            adoption_done: false,
+            released_mixers: 0,
+            unrestored_mixers: 0,
+            logging_in: None,
+            accounts: None,
+            account_change: None,
+            confirming_logout: None,
+            add_prior: None,
+            guilds_listed: false,
+            channels_listed: None,
+            cancelling: false,
+        }
+    }
+
+    /// A start, stop or settings problem outlives a list load; only a list's own problem goes.
+    fn clear_list_problem(&mut self) {
+        if self.error.as_ref().is_some_and(|p| p.lists) {
+            self.error = None;
+        }
+    }
+
+    /// A list load job was sent.
+    pub fn lists_requested(&mut self) {
+        self.lists_pending += 1;
+    }
+
+    /// A list load job ended, whatever it got.
+    pub fn lists_finished(&mut self) {
+        self.lists_pending = self.lists_pending.saturating_sub(1);
+    }
+
+    /// Whether the server list, and the selected server's channels, are still loading.
+    pub fn loading(&self) -> (bool, bool) {
+        let loading = self.lists_pending > 0;
+        (loading, loading && self.settings.guild_id.is_some())
+    }
+
+    pub fn live_track(&self) -> Option<u8> {
+        self.live_track
+    }
+
+    pub fn track_status(&self) -> TrackStatus {
+        let selected = self.settings.audio_track;
+        match self.live_track {
+            None => TrackStatus::Idle { selected },
+            Some(track) if track == selected => TrackStatus::Live { track },
+            Some(live) => TrackStatus::Pending {
+                live,
+                next: selected,
+            },
+        }
+    }
+
+    /// Selects the track the next start binds; never touches a running session. False when out of range.
+    pub fn select_audio_track(&mut self, track: u8) -> bool {
+        if !AUDIO_TRACKS.contains(&track) {
+            return false;
+        }
+        self.settings.audio_track = track;
+        true
+    }
+
+    /// Whether D-Streamy manages the selected track's source flags in the loaded scene collection.
+    pub fn managed(&self) -> bool {
+        self.manages(self.settings.audio_track)
+    }
+
+    pub fn manages(&self, track: u8) -> bool {
+        AUDIO_TRACKS.contains(&track) && self.managed_mixers & (1 << (track - 1)) != 0
+    }
+
+    /// Every track D-Streamy manages in the loaded scene collection, as OBS mixer bits.
+    pub fn managed_mixers(&self) -> u32 {
+        self.managed_mixers
+    }
+
+    /// Marks `track` as managed, keeping the others; it changes no mixer flag.
+    pub fn take_over(&mut self, track: u8) -> bool {
+        if !AUDIO_TRACKS.contains(&track) {
+            return false;
+        }
+        let bit = 1 << (track - 1);
+        self.managed_mixers |= bit;
+        self.released_mixers &= !bit;
+        self.unrestored_mixers &= !bit;
+        true
+    }
+
+    /// A scene collection was loaded, or left (`0`); its saved mixer bits say which tracks D-Streamy manages there.
+    pub fn collection_loaded(&mut self, managed_mixers: u32) {
+        self.restore_managed(managed_mixers);
+        self.released_mixers = 0;
+        self.unrestored_mixers = 0;
+    }
+
+    /// A Cancel put the managed tracks back as they were.
+    pub fn restore_managed(&mut self, managed_mixers: u32) {
+        self.managed_mixers = managed_mixers & ((1 << AUDIO_TRACKS.end()) - 1);
+        self.released_mixers &= !self.managed_mixers;
+    }
+
+    pub fn released_mixers(&self) -> u32 {
+        self.released_mixers
+    }
+
+    /// The views that showed the released tracks' follow-ups closed; Track 1's stays, as the stream still misses it.
+    pub fn forget_released(&mut self) {
+        self.released_mixers &= 1;
+    }
+
+    pub fn unrestored_mixers(&self) -> u32 {
+        self.unrestored_mixers
+    }
+
+    /// A dialog's Cancel couldn't put back `mixers`; the panel and dialog say so until it is sorted out.
+    pub fn restore_failed(&mut self, mixers: u32) {
+        self.unrestored_mixers |= mixers & ((1 << AUDIO_TRACKS.end()) - 1);
+    }
+
+    pub fn forget_unrestored(&mut self) {
+        self.unrestored_mixers = 0;
+    }
+
+    /// The legacy managed track, once a session: the first scene collection that loads decides about it.
+    pub fn take_adoption(&mut self) -> Option<u8> {
+        self.adoption_done = true;
+        self.settings.adopt_managed_track.take()
+    }
+
+    /// Lets go of a managed track Discord doesn't get; no mixer flag changes. False when there is nothing to let go.
+    pub fn release(&mut self, track: u8) -> bool {
+        if !self.manages(track) || self.gets(track) {
+            return false;
+        }
+        let bit = 1 << (track - 1);
+        self.managed_mixers &= !bit;
+        self.released_mixers |= bit;
+        self.unrestored_mixers &= !bit;
+        true
+    }
+
+    /// Discord hears `track` now, or the next Go Live sends it.
+    pub fn gets(&self, track: u8) -> bool {
+        track == self.heard_track() || track == self.settings.audio_track
+    }
+
+    /// The track Discord hears now while a session runs, else the one the next Go Live binds.
+    pub fn heard_track(&self) -> u8 {
+        self.live_track.unwrap_or(self.settings.audio_track)
+    }
+
+    /// One line for the settings dialog.
+    pub fn status_text(&self) -> String {
+        let pending = match self.track_status() {
+            TrackStatus::Pending { next, .. } => format!(" — {}", next_go_live(next)),
+            _ => String::new(),
+        };
+        let live = self.live_track.map(track_name).unwrap_or_default();
+        match &self.state {
+            PanelState::Idle if self.logging_in() => WAITING_FOR_LOGIN.into(),
+            PanelState::Idle if self.account_change.is_some() => SWITCHING_ACCOUNT.into(),
+            PanelState::Idle => self
+                .error
+                .as_ref()
+                .map_or_else(|| "Idle".into(), |e| e.message.clone()),
+            PanelState::Starting => format!(
+                "Starting on {}…",
+                track_name(self.applying.unwrap_or(self.settings.audio_track))
+            ),
+            PanelState::Live { .. } => self.output_problem().map_or_else(
+                || format!("Live on {live}{pending}"),
+                |problem| problem.message.clone(),
+            ),
+            PanelState::Stopping => "Stopping…".into(),
+        }
+    }
+
+    pub fn settings(&self) -> &PanelSettings {
+        &self.settings
+    }
+
+    pub fn state(&self) -> &PanelState {
+        &self.state
+    }
+
+    /// A stopped output whose Discord session could not be ended still needs an explicit Stop.
+    pub fn output_problem(&self) -> Option<&Problem> {
+        self.error.as_ref().filter(|problem| {
+            matches!(self.state, PanelState::Live { .. }) && problem.headline == STREAM_STOPPED
+        })
+    }
+
+    /// A start that didn't finish and left a Discord session it may own running, until a Start or Stop sorts it out.
+    pub fn unended_start(&self) -> Option<&Problem> {
+        self.error.as_ref().filter(|problem| {
+            self.state == PanelState::Idle
+                && problem.headline == DIDNT_START
+                && self.settings.owned.is_some()
+        })
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_ref().map(|p| p.message.as_str())
+    }
+
+    pub fn problem(&self) -> Option<&Problem> {
+        self.error.as_ref()
+    }
+
+    pub fn guilds(&self) -> &[Named] {
+        &self.guilds
+    }
+
+    pub fn channels(&self) -> &[Named] {
+        &self.channels
+    }
+
+    /// Replaces every setting but the ownership, and the guild and channel unless idle; returns a guild to load.
+    pub fn set_settings(&mut self, settings: PanelSettings) -> Option<String> {
+        let settings = settings.clamped();
+        let (guild_id, channel_id, account) = if self.state == PanelState::Idle {
+            (settings.guild_id, settings.channel_id, settings.account)
+        } else {
+            (
+                self.settings.guild_id.clone(),
+                self.settings.channel_id.clone(),
+                self.settings.account.clone(),
+            )
+        };
+        let guild_changed = guild_id != self.settings.guild_id;
+        if account != self.settings.account {
+            self.guilds_listed = false;
+            self.channels_listed = None;
+        }
+        let adopt = settings.adopt_managed_track.filter(|_| !self.adoption_done);
+        self.settings = PanelSettings {
+            guild_id,
+            channel_id,
+            account,
+            owned: self.settings.owned.take(),
+            adopt_managed_track: adopt,
+            ..settings
+        };
+        if !guild_changed {
+            return None;
+        }
+        self.channels.clear();
+        self.settings.guild_id.clone()
+    }
+
+    /// Takes settings read back from the module config; its ownership counts only while no session runs.
+    pub fn reload(&mut self, settings: PanelSettings) -> Option<String> {
+        let owned = settings.owned.clone();
+        let guild = self.set_settings(settings);
+        if self.state == PanelState::Idle {
+            self.settings.owned = owned;
+        }
+        guild
+    }
+
+    /// Returns the guild whose channels to load next.
+    pub fn guilds_loaded(&mut self, result: Result<Vec<Named>, ControlError>) -> Option<String> {
+        match result {
+            Ok(guilds) => {
+                self.guilds = guilds;
+                self.guilds_listed = true;
+                self.clear_list_problem();
+                // A saved server the list lacks stays selected, flagged, until the user picks another.
+                let selected = self.settings.guild_id.clone()?;
+                if self.guilds.iter().any(|g| g.id == selected) {
+                    Some(selected)
+                } else {
+                    self.channels.clear();
+                    self.channels_listed = None;
+                    self.flag_unavailable();
+                    None
+                }
+            }
+            Err(e) => {
+                if self.output_problem().is_none() {
+                    self.error = Some(Problem {
+                        lists: true,
+                        ..Problem::control(&e)
+                    });
+                }
+                None
+            }
+        }
+    }
+
+    /// Returns the guild whose channels to load, or `None` when it is already selected.
+    pub fn select_guild(&mut self, guild_id: &str) -> Option<String> {
+        if self.settings.guild_id.as_deref() == Some(guild_id) {
+            return None;
+        }
+        self.settings.guild_id = Some(guild_id.to_owned());
+        self.settings.channel_id = None;
+        self.channels.clear();
+        self.channels_listed = None;
+        self.error = None;
+        Some(guild_id.to_owned())
+    }
+
+    /// Takes a channel list, unless the guild changed since it was asked for.
+    pub fn channels_loaded(&mut self, guild_id: &str, result: Result<Vec<Named>, ControlError>) {
+        if self.settings.guild_id.as_deref() != Some(guild_id) {
+            return;
+        }
+        match result {
+            Ok(channels) => {
+                self.channels = channels;
+                self.channels_listed = Some(guild_id.to_owned());
+                self.clear_list_problem();
+                self.flag_unavailable();
+            }
+            Err(e) => {
+                self.channels.clear();
+                self.channels_listed = None;
+                if self.output_problem().is_none() {
+                    self.error = Some(Problem {
+                        lists: true,
+                        ..Problem::control(&e)
+                    });
+                }
+            }
+        }
+    }
+
+    /// Whether the saved server is missing from serve's list for this account.
+    pub fn guild_unavailable(&self) -> bool {
+        self.guilds_listed
+            && self
+                .settings
+                .guild_id
+                .as_deref()
+                .is_some_and(|g| !self.lists_guild(g))
+    }
+
+    /// Whether the saved channel is missing from the listed server's channels.
+    pub fn channel_unavailable(&self) -> bool {
+        !self.guild_unavailable()
+            && self.channels_listed.is_some()
+            && self.channels_listed == self.settings.guild_id
+            && self
+                .settings
+                .channel_id
+                .as_deref()
+                .is_some_and(|c| !self.lists_channel(c))
+    }
+
+    fn unavailable_pick(&self) -> Option<Problem> {
+        if self.guild_unavailable() {
+            return Some(Problem {
+                lists: true,
+                ..Problem::new(
+                    GUILD_GONE,
+                    PICK_GUILD_AGAIN,
+                    "This account isn't in the saved server: pick the server again",
+                )
+            });
+        }
+        self.channel_unavailable().then(|| Problem {
+            lists: true,
+            ..Problem::new(
+                CHANNEL_GONE,
+                PICK_CHANNEL_AGAIN,
+                "The saved voice channel isn't in that server: pick the channel again",
+            )
+        })
+    }
+
+    /// A saved pick serve doesn't list becomes the problem shown, unless another one is.
+    fn flag_unavailable(&mut self) {
+        if self.error.is_none()
+            && let Some(problem) = self.unavailable_pick()
+        {
+            self.error = Some(problem);
+        }
+    }
+
+    /// Whether `channel_id` is a voice channel the service listed for the selected server.
+    pub fn lists_channel(&self, channel_id: &str) -> bool {
+        self.channels.iter().any(|c| c.id == channel_id)
+    }
+
+    /// Whether `guild_id` is a server the service listed.
+    pub fn lists_guild(&self, guild_id: &str) -> bool {
+        self.guilds.iter().any(|g| g.id == guild_id)
+    }
+
+    /// The login button to show: idle with a problem serve's login window fixes, and no window open yet.
+    pub fn login_offer(&self) -> Option<Relogin> {
+        if self.state != PanelState::Idle || self.logging_in.is_some() {
+            return None;
+        }
+        self.error.as_ref().and_then(|p| p.login)
+    }
+
+    pub fn logging_in(&self) -> bool {
+        self.logging_in.is_some()
+    }
+
+    /// The account a login repairs: the active one for "Log in again", else none, so serve names a new one.
+    pub fn login_account(&self) -> Option<String> {
+        if self.logging_in != Some(Relogin::Again) {
+            return None;
+        }
+        self.accounts.as_ref().and_then(|a| a.active.clone())
+    }
+
+    /// The login button was pressed; false when it isn't offered.
+    pub fn begin_login(&mut self) -> bool {
+        let Some(offer) = self.login_offer() else {
+            return false;
+        };
+        self.logging_in = Some(offer);
+        true
+    }
+
+    /// The login window's outcome; true when the lists should load again with the new login.
+    pub fn login_finished(&mut self, result: Result<Option<String>, ControlError>) -> bool {
+        let Some(offer) = self.logging_in.take() else {
+            return false;
+        };
+        match result {
+            Ok(_) => {
+                self.add_prior = None;
+                if self.error.as_ref().is_some_and(|p| p.login.is_some()) {
+                    self.error = None;
+                }
+                true
+            }
+            Err(e) => {
+                let prior = self.add_prior.take();
+                let mut problem = Problem {
+                    lists: true,
+                    login: match offer {
+                        Relogin::Add => prior,
+                        offer => e.retries_login().then_some(offer),
+                    },
+                    ..Problem::control(&e)
+                };
+                if offer == Relogin::Add && prior.is_none() && e.retries_login() {
+                    problem.fix = ADD_AGAIN;
+                    problem.login_fix = false;
+                }
+                self.error = Some(problem);
+                false
+            }
+        }
+    }
+
+    pub fn accounts(&self) -> Option<&Accounts> {
+        self.accounts.as_ref()
+    }
+
+    /// Serve's account list; an error keeps the last one, since the list loads report it.
+    pub fn accounts_loaded(&mut self, result: Result<Option<Accounts>, ControlError>) {
+        match result {
+            Ok(accounts) => {
+                self.accounts = accounts;
+                self.follow_account();
+            }
+            Err(ControlError::NotRunning(_) | ControlError::Outdated { .. }) => {
+                self.accounts = None;
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Swaps in the active account's saved pick; the first account seen keeps the pick made before accounts.
+    fn follow_account(&mut self) {
+        let Some(accounts) = &self.accounts else {
+            return;
+        };
+        let names: Vec<String> = accounts.accounts.iter().map(|a| a.name.clone()).collect();
+        let active = accounts.active.clone();
+        self.settings.picks.retain(|name, _| names.contains(name));
+        let Some(active) = active.filter(|_| self.state == PanelState::Idle) else {
+            return;
+        };
+        let Some(old) = self.settings.account.replace(active.clone()) else {
+            return;
+        };
+        if old == active {
+            return;
+        }
+        let current = Pick {
+            guild_id: self.settings.guild_id.take(),
+            channel_id: self.settings.channel_id.take(),
+        };
+        if names.contains(&old) && current != Pick::default() {
+            self.settings.picks.insert(old, current);
+        }
+        let next = self.settings.picks.remove(&active).unwrap_or_default();
+        self.settings.guild_id = next.guild_id;
+        self.settings.channel_id = next.channel_id;
+        self.guilds.clear();
+        self.channels.clear();
+        self.guilds_listed = false;
+        self.channels_listed = None;
+        if self.error.as_ref().is_some_and(|p| p.lists) {
+            self.error = None;
+        }
+    }
+
+    pub fn account_changing(&self) -> bool {
+        self.account_change.is_some()
+    }
+
+    /// The account being switched to, while that switch waits for serve.
+    pub fn pending_account(&self) -> Option<&str> {
+        match &self.account_change {
+            Some(AccountChange::Select(name)) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Whether the account can be switched, added or logged out now.
+    pub fn accounts_editable(&self) -> bool {
+        self.state == PanelState::Idle
+            && self.logging_in.is_none()
+            && self.account_change.is_none()
+            && self.accounts.is_some()
+    }
+
+    fn lists_account(&self, name: &str) -> bool {
+        self.accounts
+            .as_ref()
+            .is_some_and(|a| a.accounts.iter().any(|x| x.name == name))
+    }
+
+    /// A pick of another account; false when it is the active one or can't change now.
+    pub fn begin_select_account(&mut self, name: &str) -> bool {
+        let active = self.accounts.as_ref().and_then(|a| a.active.as_deref());
+        if active == Some(name) || !self.lists_account(name) || !self.accounts_editable() {
+            return false;
+        }
+        self.confirming_logout = None;
+        self.account_change = Some(AccountChange::Select(name.to_owned()));
+        true
+    }
+
+    /// Log out of a saved account; false when it can't change now.
+    pub fn begin_logout_account(&mut self, name: &str) -> bool {
+        if !self.lists_account(name) || !self.accounts_editable() {
+            return false;
+        }
+        self.confirming_logout = None;
+        self.account_change = Some(AccountChange::Logout(name.to_owned()));
+        true
+    }
+
+    /// Log out was pressed: it waits for its confirm. False when it can't change now.
+    pub fn request_logout(&mut self, name: &str) -> bool {
+        if !self.lists_account(name) || !self.accounts_editable() {
+            return false;
+        }
+        self.confirming_logout = Some(name.to_owned());
+        true
+    }
+
+    /// The account whose Log out waits for its confirm.
+    pub fn confirming_logout(&self) -> Option<&str> {
+        self.confirming_logout.as_deref()
+    }
+
+    /// The confirm's answer; the account to log out on yes.
+    pub fn confirm_logout(&mut self, yes: bool) -> Option<String> {
+        self.confirming_logout.take().filter(|_| yes)
+    }
+
+    /// A select or logout's outcome; true when the lists should load again for the account now used.
+    pub fn account_changed(&mut self, result: Result<Accounts, ControlError>) -> bool {
+        if self.account_change.take().is_none() {
+            return false;
+        }
+        match result {
+            Ok(accounts) => {
+                if self
+                    .error
+                    .as_ref()
+                    .is_some_and(|p| p.lists || p.login.is_some() || p.account)
+                {
+                    self.error = None;
+                }
+                self.accounts = Some(accounts);
+                self.guilds.clear();
+                self.channels.clear();
+                self.guilds_listed = false;
+                self.channels_listed = None;
+                self.follow_account();
+                true
+            }
+            Err(e) => {
+                let reload = matches!(e, ControlError::UnknownAccount(_));
+                self.error = Some(Problem {
+                    account: true,
+                    ..Problem::control(&e)
+                });
+                reload
+            }
+        }
+    }
+
+    /// "Add account…": serve's login window, saved as a new account; false when it can't open now.
+    pub fn begin_add_account(&mut self) -> bool {
+        if !self.accounts_editable() {
+            return false;
+        }
+        self.confirming_logout = None;
+        self.add_prior = self.error.as_ref().and_then(|p| p.login);
+        self.logging_in = Some(Relogin::Add);
+        true
+    }
+
+    /// A login that couldn't reach serve's window at all, with `message`.
+    pub fn login_unfinished(&mut self, message: String, fix: &'static str) {
+        if self.logging_in.take().is_some() {
+            self.error = Some(Problem::new(LOGIN_FAILED, fix, message));
+        }
+    }
+
+    /// While starting and still waiting for the service: the start is being set up in Discord.
+    pub fn connecting(&self) -> bool {
+        self.state == PanelState::Starting && self.applying.is_none()
+    }
+
+    /// Whether the start in progress can still be cancelled.
+    pub fn cancellable(&self) -> bool {
+        self.state == PanelState::Starting && !self.cancelling
+    }
+
+    /// Asks the control thread to drop the start in progress; false when there is none to cancel.
+    pub fn request_cancel(&mut self) -> bool {
+        let cancel = self.cancellable();
+        self.cancelling |= cancel;
+        cancel
+    }
+
+    pub fn cancelling(&self) -> bool {
+        self.state == PanelState::Starting && self.cancelling
+    }
+
+    /// The cancelled start left nothing running: back to Idle without a problem.
+    pub fn cancelled(&mut self) {
+        if self.state != PanelState::Starting {
+            return;
+        }
+        self.state = PanelState::Idle;
+        self.applying = None;
+        self.live_track = None;
+        self.cancelling = false;
+        self.settings.owned = None;
+    }
+
+    /// Ends a start or stop that can no longer finish, or refuses one that can't begin, with `message`.
+    pub fn abort(&mut self, message: String, fix: &'static str) {
+        let headline = match self.state {
+            PanelState::Starting => DIDNT_START,
+            PanelState::Stopping => STOP_UNFINISHED,
+            PanelState::Idle | PanelState::Live { .. } => CANT_START,
+        };
+        self.state = PanelState::Idle;
+        self.applying = None;
+        self.live_track = None;
+        self.error = Some(Problem::new(headline, fix, message));
+    }
+
+    /// Puts back an ownership a reload replaced, when the file's is older than this one.
+    pub fn restore_ownership(&mut self, owned: Option<Ownership>) {
+        self.settings.owned = owned;
+    }
+
+    pub fn select_channel(&mut self, channel_id: &str) {
+        self.settings.channel_id = Some(channel_id.to_owned());
+        self.error = None;
+    }
+
+    /// The dialog picked a channel; taken only when the service listed it for the selected server.
+    pub fn pick_channel(&mut self, channel_id: &str) -> bool {
+        let listed = self.lists_channel(channel_id);
+        if listed {
+            self.select_channel(channel_id);
+        }
+        listed
+    }
+
+    pub fn choice(&self) -> Choice {
+        Choice {
+            guild_id: self.settings.guild_id.clone(),
+            channel_id: self.settings.channel_id.clone(),
+            audio_track: self.settings.audio_track,
+        }
+    }
+
+    /// The dialog's server; "Pick a server" clears the server and its channel. Returns a guild whose channels to load.
+    pub fn choose_guild(&mut self, guild_id: Option<&str>) -> Option<String> {
+        if let Some(guild_id) = guild_id {
+            return self.select_guild(guild_id);
+        }
+        if self.settings.guild_id.take().is_some() {
+            self.settings.channel_id = None;
+            self.channels.clear();
+            self.error = None;
+        }
+        None
+    }
+
+    /// The dialog's channel pick: the placeholder clears it, others count only when listed; returns what to show.
+    pub fn choose_channel(&mut self, channel_id: Option<&str>) -> Option<String> {
+        match channel_id {
+            None => self.settings.channel_id = None,
+            Some(channel) if self.settings.channel_id.as_deref() != Some(channel) => {
+                self.pick_channel(channel);
+            }
+            Some(_) => {}
+        }
+        self.settings.channel_id.clone()
+    }
+
+    /// The dialog's Cancel: back to the picks it opened with, listed or not. Returns a guild whose channels to load.
+    pub fn restore_choice(&mut self, opened: &Choice) -> Option<String> {
+        let load = (self.settings.guild_id != opened.guild_id).then(|| {
+            self.channels.clear();
+            self.settings.guild_id.clone_from(&opened.guild_id);
+            opened.guild_id.clone()
+        });
+        self.settings.channel_id.clone_from(&opened.channel_id);
+        self.select_audio_track(opened.audio_track);
+        load.flatten()
+    }
+
+    /// Moves to `Starting` and returns what to send, or the reason the panel can't start.
+    pub fn start(&mut self, canvas: Canvas) -> Result<StartRequest, String> {
+        if self.state != PanelState::Idle {
+            return Err("D-Streamy is already running".into());
+        }
+        if self.logging_in() {
+            return Err("D-Streamy is waiting for the login to finish".into());
+        }
+        if self.account_change.is_some() {
+            return Err("D-Streamy is switching accounts".into());
+        }
+        if let Some(problem) = self.unavailable_pick() {
+            self.error = Some(problem.clone());
+            return Err(problem.message);
+        }
+        let request = self.start_request(canvas);
+        match &request {
+            Ok(_) => {
+                self.state = PanelState::Starting;
+                self.error = None;
+                self.applying = None;
+                self.cancelling = false;
+            }
+            Err(e) => self.error = Some(e.clone()),
+        }
+        request.map_err(|p| p.message)
+    }
+
+    fn start_request(&self, canvas: Canvas) -> Result<StartRequest, Problem> {
+        let (Some(guild_id), Some(channel_id)) =
+            (&self.settings.guild_id, &self.settings.channel_id)
+        else {
+            return Err(Problem::new(
+                NO_CHANNEL,
+                "Pick a server and voice channel",
+                PICK_CHANNEL,
+            ));
+        };
+        let (fps, _) = target_fps(canvas.fps_num, canvas.fps_den)
+            .map_err(|p| Problem::new(CANT_START, FIX_VIDEO, p.message()))?;
+        let (width, height) = fit_1080p(canvas.output_width, canvas.output_height);
+        Ok(StartRequest {
+            guild_id: guild_id.clone(),
+            channel_id: channel_id.clone(),
+            width,
+            height,
+            fps,
+            grace_secs: self.settings.grace_secs,
+        })
+    }
+
+    /// The ownership a start should honour, from this or an earlier OBS run.
+    pub fn persisted(&self) -> Option<&Ownership> {
+        self.settings.owned.as_ref()
+    }
+
+    /// The service session is up: the output settings to start with, or the mic that holds Go Live back.
+    pub fn claim(
+        &mut self,
+        ownership: Option<Ownership>,
+        sources: &[AudioSource],
+    ) -> Option<Result<Value, MicGuard>> {
+        if self.state != PanelState::Starting {
+            return None;
+        }
+        self.settings.owned = ownership;
+        if let Some(guard) = mic_guard(self, sources) {
+            return Some(Err(guard));
+        }
+        self.applying = Some(self.settings.audio_track);
+        Some(Ok(self.settings.output_settings()))
+    }
+
+    /// A start's outcome; a start that failed after it was sent keeps its provisional ownership.
+    pub fn started(&mut self, result: Result<Started, StartFailed>) {
+        if self.state != PanelState::Starting {
+            return;
+        }
+        let applied = self.applying.take();
+        match result {
+            Ok(started) => {
+                let session_fps = started.session_fps();
+                let Started { ownership, channel } = started;
+                self.settings.owned = ownership;
+                let channel = self
+                    .channels
+                    .iter()
+                    .find(|c| c.id == channel)
+                    .map_or(channel, |c| c.name.clone());
+                self.state = PanelState::Live {
+                    channel,
+                    session_fps,
+                };
+                self.live_track = Some(applied.unwrap_or(self.settings.audio_track));
+            }
+            Err(failed) => {
+                if let Some(provisional) = failed.ownership {
+                    self.settings.owned = Some(*provisional);
+                }
+                self.state = PanelState::Idle;
+                self.live_track = None;
+                self.error = Some(Problem::control(&failed.error));
+            }
+        }
+    }
+
+    /// The output refused its start after the service session came up; `session_ended` says whether that session is gone.
+    pub fn output_failed(&mut self, message: String, fix: &'static str, session_ended: bool) {
+        if self.state != PanelState::Starting {
+            return;
+        }
+        self.state = PanelState::Idle;
+        self.applying = None;
+        self.live_track = None;
+        self.error = Some(Problem::new(DIDNT_START, fix, message));
+        if session_ended {
+            self.settings.owned = None;
+        }
+    }
+
+    /// Moves to `Stopping` and returns the ownership the stop should use, or `None` if not live.
+    pub fn stop(&mut self) -> Option<Option<Ownership>> {
+        if !matches!(self.state, PanelState::Live { .. }) {
+            return None;
+        }
+        self.state = PanelState::Stopping;
+        Some(self.settings.owned.clone())
+    }
+
+    /// A stop's outcome. On failure the ownership stays, so a later stop can still end the session.
+    pub fn stopped(&mut self, result: Result<(), String>) {
+        if self.state != PanelState::Stopping {
+            return;
+        }
+        self.state = PanelState::Idle;
+        self.live_track = None;
+        match result {
+            Ok(()) => {
+                self.settings.owned = None;
+                self.error = None;
+            }
+            Err(e) => self.error = Some(Problem::new(STOP_UNFINISHED, FIX_START_THEN_STOP, e)),
+        }
+    }
+
+    pub fn output_ended(&mut self, result: Result<String, String>) {
+        if !matches!(self.state, PanelState::Live { .. }) {
+            return;
+        }
+        match result {
+            Ok(message) => {
+                self.settings.owned = None;
+                self.ended(Some(message));
+            }
+            Err(message) => {
+                self.error = Some(Problem::new(
+                    STREAM_STOPPED,
+                    "Press Stop to end the Discord session",
+                    message,
+                ));
+            }
+        }
+    }
+
+    /// The service ended the live session itself: its saved ownership is gone and the problem says what to do.
+    pub fn service_ended(&mut self, end: crate::SessionEnd) {
+        if !matches!(self.state, PanelState::Live { .. }) {
+            return;
+        }
+        self.settings.owned = None;
+        self.state = PanelState::Idle;
+        self.live_track = None;
+        self.error = Some(Problem {
+            login: end.login,
+            ..Problem::new(end.headline, end.fix, end.message)
+        });
+    }
+
+    /// The output ended on its own; while starting or stopping, the pending reply decides instead.
+    pub fn ended(&mut self, message: Option<String>) {
+        if !matches!(self.state, PanelState::Live { .. }) {
+            return;
+        }
+        self.state = PanelState::Idle;
+        self.live_track = None;
+        self.error =
+            message.map(|m| Problem::new(STREAM_STOPPED, "Press Start to go live again", m));
+    }
+
+    /// The session's fps for share mode's check, while live.
+    pub fn session_fps(&self) -> Option<u32> {
+        match self.state {
+            PanelState::Live { session_fps, .. } => session_fps,
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::Candidate;
+
+    fn named(id: &str) -> Named {
+        Named {
+            id: id.into(),
+            name: id.to_uppercase(),
+        }
+    }
+
+    fn canvas() -> Canvas {
+        Canvas {
+            fps_num: 60,
+            fps_den: 1,
+            output_width: 2560,
+            output_height: 1440,
+        }
+    }
+
+    fn ownership(connection: u64) -> Ownership {
+        ownership_at(connection, None)
+    }
+
+    fn ownership_at(connection: u64, fps: Option<u32>) -> Ownership {
+        Ownership {
+            connections: vec![Candidate {
+                id: connection,
+                fps,
+            }],
+            guild_id: "g".into(),
+            channel_id: "c".into(),
+            instance: None,
+        }
+    }
+
+    fn started(ownership: Option<Ownership>) -> Started {
+        Started {
+            ownership,
+            channel: "General".into(),
+        }
+    }
+
+    fn picked() -> PanelModel {
+        let mut m = PanelModel::new(PanelSettings::default());
+        m.guilds_loaded(Ok(vec![named("g"), named("h")]));
+        assert_eq!(m.select_guild("g"), Some("g".into()));
+        m.channels_loaded("g", Ok(vec![named("c"), named("d")]));
+        m.select_channel("c");
+        m
+    }
+
+    #[test]
+    fn per_account_picks_round_trip_and_older_configs_still_load() {
+        let mut d = PanelSettings {
+            guild_id: Some("g".into()),
+            channel_id: Some("c".into()),
+            account: Some("a".into()),
+            ..PanelSettings::default()
+        };
+        d.picks.insert(
+            "b".into(),
+            Pick {
+                guild_id: Some("x".into()),
+                channel_id: None,
+            },
+        );
+        let json = d.to_json();
+        assert!(
+            json.contains(r#""picks":{"b":{"guild_id":"x","channel_id":null}}"#),
+            "{json}"
+        );
+        assert_eq!(PanelSettings::from_json(&json), d);
+        let old =
+            PanelSettings::from_json(r#"{"guild_id":"g","channel_id":"c","config_version":2}"#);
+        assert_eq!((old.account, old.picks.len()), (None, 0));
+        assert_eq!(old.guild_id.as_deref(), Some("g"));
+        assert!(!PanelSettings::default().to_json().contains("picks"));
+        let bad = PanelSettings::from_json(r#"{"guild_id":"g","picks":[1],"account":7}"#);
+        assert_eq!(
+            (bad.guild_id.as_deref(), bad.account, bad.picks.len()),
+            (Some("g"), None, 0),
+            "a broken field falls back alone"
+        );
+    }
+
+    #[test]
+    fn settings_default_and_round_trip() {
+        let d = PanelSettings::default();
+        assert_eq!(d.mode, VideoMode::Own);
+        assert!(d.share_fallback);
+        assert!(!d.start_with_stream);
+        assert_eq!(PanelSettings::from_json(&d.to_json()), d);
+        assert_eq!(PanelSettings::from_json("{}"), d);
+        assert_eq!(PanelSettings::from_json("not json"), d);
+        assert_eq!(PanelSettings::from_json("[1]"), d);
+    }
+
+    const OWNED: &str = r#""owned":{"connection":4,"guild_id":"g","channel_id":"c"}"#;
+
+    fn with_owned(fields: &str) -> PanelSettings {
+        let s = PanelSettings::from_json(&format!("{{{fields},{OWNED}}}"));
+        assert_eq!(s.owned, Some(ownership(4)), "{fields}");
+        s
+    }
+
+    #[test]
+    fn a_bad_field_falls_back_alone_and_keeps_the_ownership() {
+        let d = PanelSettings::default();
+        assert_eq!(with_owned(r#""mode":"hybrid""#).mode, d.mode);
+        assert_eq!(with_owned(r#""mode":"share""#).mode, VideoMode::Share);
+        assert_eq!(with_owned(r#""bitrate_kbps":6000.0"#).bitrate_kbps, 6000);
+        assert_eq!(
+            with_owned(r#""bitrate_kbps":"fast""#).bitrate_kbps,
+            d.bitrate_kbps
+        );
+        assert_eq!(with_owned(r#""grace_secs":-5"#).grace_secs, None);
+        assert_eq!(with_owned(r#""grace_secs":3601"#).grace_secs, Some(3600));
+        assert_eq!(with_owned(r#""grace_secs":"long""#).grace_secs, None);
+        assert_eq!(with_owned(r#""grace_secs":120"#).grace_secs, Some(120));
+        assert_eq!(
+            with_owned(r#""share_fallback":"no""#).share_fallback,
+            d.share_fallback
+        );
+        assert_eq!(
+            with_owned(r#""video_encoder":7"#).video_encoder,
+            d.video_encoder
+        );
+        assert_eq!(with_owned(r#""guild_id":5"#).guild_id, None);
+        let kept = with_owned(r#""guild_id":"g","channel_id":"c","mode":7"#);
+        assert_eq!(kept.guild_id.as_deref(), Some("g"));
+        assert_eq!(kept.channel_id.as_deref(), Some("c"));
+        let bad_owned = PanelSettings::from_json(r#"{"guild_id":"g","owned":{"connection":"x"}}"#);
+        assert_eq!(bad_owned.owned, None);
+        assert_eq!(bad_owned.guild_id.as_deref(), Some("g"));
+    }
+
+    #[test]
+    fn bitrate_is_clamped_to_the_property_range() {
+        assert_eq!(with_owned(r#""bitrate_kbps":100"#).bitrate_kbps, 500);
+        assert_eq!(with_owned(r#""bitrate_kbps":90000"#).bitrate_kbps, 50_000);
+        let mut m = PanelModel::new(PanelSettings::default());
+        m.set_settings(PanelSettings {
+            bitrate_kbps: 0,
+            ..PanelSettings::default()
+        });
+        assert_eq!(m.settings().bitrate_kbps, 500);
+    }
+
+    #[test]
+    fn output_settings_use_the_output_keys() {
+        let s = PanelSettings {
+            mode: VideoMode::Share,
+            share_fallback: false,
+            ..PanelSettings::default()
+        };
+        assert_eq!(
+            s.output_settings(),
+            json!({"mode": "share", "video_encoder": "obs_x264", "bitrate": 6000, "share_fallback": false, "audio_track": 6})
+        );
+    }
+
+    #[test]
+    fn audio_track_defaults_to_six_and_round_trips() {
+        let d = PanelSettings::default();
+        assert_eq!(d.audio_track, 6);
+        assert_eq!(PanelSettings::from_json("{}").audio_track, 6);
+        for track in 1..=6u8 {
+            let s = PanelSettings {
+                audio_track: track,
+                ..PanelSettings::default()
+            };
+            let back = PanelSettings::from_json(&s.to_json());
+            assert_eq!(back.audio_track, track);
+            assert_eq!(s.output_settings()["audio_track"], json!(track));
+        }
+    }
+
+    #[test]
+    fn a_config_from_before_version_2_on_track_1_moves_to_track_6_once() {
+        for old in [
+            r#"{"audio_track":1,"guild_id":"g"}"#,
+            r#"{"audio_track":1.0}"#,
+            r#"{"audio_track":1,"config_version":1}"#,
+            r#"{"audio_track":1,"config_version":"x"}"#,
+        ] {
+            let s = PanelSettings::from_json(old);
+            assert_eq!(s.audio_track, 6, "{old}");
+            assert_eq!(s.config_version, CONFIG_VERSION, "{old}");
+        }
+        assert_eq!(
+            PanelSettings::from_json(r#"{"audio_track":1,"guild_id":"g"}"#)
+                .guild_id
+                .as_deref(),
+            Some("g")
+        );
+        for track in 2..=6u8 {
+            let s = PanelSettings::from_json(&format!(r#"{{"audio_track":{track}}}"#));
+            assert_eq!(s.audio_track, track, "a picked track stays");
+        }
+        let picked = PanelSettings {
+            audio_track: 1,
+            ..PanelSettings::default()
+        };
+        let saved = picked.to_json();
+        assert!(saved.contains(r#""config_version":2"#), "{saved}");
+        assert_eq!(
+            PanelSettings::from_json(&saved).audio_track,
+            1,
+            "Track 1 picked after the move stays"
+        );
+        assert!(
+            !saved.contains("\"managed_track\"") && !saved.contains("adopt_managed_track"),
+            "the managed track lives in the scene collection: {saved}"
+        );
+    }
+
+    #[test]
+    fn a_track_managed_under_the_old_global_setting_is_adopted_once() {
+        let s = PanelSettings::from_json(r#"{"audio_track":6,"managed_track":6}"#);
+        assert_eq!((s.audio_track, s.adopt_managed_track), (6, Some(6)));
+        let deliberate = PanelSettings::from_json(r#"{"audio_track":1,"managed_track":1}"#);
+        assert_eq!(
+            (deliberate.audio_track, deliberate.adopt_managed_track),
+            (1, Some(1)),
+            "a Track 1 takeover was deliberate and stays"
+        );
+        let other = PanelSettings::from_json(r#"{"audio_track":1,"managed_track":3}"#);
+        assert_eq!((other.audio_track, other.adopt_managed_track), (6, Some(3)));
+        for bad in ["0", "7", "\"6\"", "null"] {
+            let s =
+                PanelSettings::from_json(&format!(r#"{{"audio_track":6,"managed_track":{bad}}}"#));
+            assert_eq!(s.adopt_managed_track, None, "{bad}");
+        }
+        let current =
+            PanelSettings::from_json(r#"{"audio_track":6,"managed_track":6,"config_version":2}"#);
+        assert_eq!(
+            current.adopt_managed_track, None,
+            "the old field counts only before version 2"
+        );
+
+        let mut m = PanelModel::new(s_with_adoption());
+        let saved = m.settings().to_json();
+        assert_eq!(
+            PanelSettings::from_json(&saved).adopt_managed_track,
+            Some(6),
+            "kept until a collection loads: {saved}"
+        );
+        assert_eq!(m.take_adoption(), Some(6));
+        assert_eq!(m.take_adoption(), None, "once");
+        m.reload(s_with_adoption());
+        assert_eq!(
+            m.settings().adopt_managed_track,
+            None,
+            "a file that couldn't be saved doesn't bring it back"
+        );
+        let saved = m.settings().to_json();
+        assert_eq!(PanelSettings::from_json(&saved).adopt_managed_track, None);
+        assert!(!saved.contains("managed_track\":6"), "{saved}");
+    }
+
+    fn s_with_adoption() -> PanelSettings {
+        PanelSettings::from_json(r#"{"audio_track":6,"managed_track":6}"#)
+    }
+
+    #[test]
+    fn only_a_managed_track_discord_doesnt_get_can_be_let_go() {
+        let mut m = PanelModel::new(PanelSettings::default());
+        m.take_over(6);
+        m.take_over(1);
+        assert!(!m.release(6), "Discord gets Track 6");
+        assert!(!m.release(3), "not managed");
+        assert!(m.release(1));
+        assert_eq!(m.managed_mixers(), 0b10_0000);
+        assert!(!m.release(1), "once");
+    }
+
+    #[test]
+    fn managed_tracks_are_kept_per_track_and_reset_with_the_collection() {
+        let mut m = PanelModel::new(PanelSettings::default());
+        assert!(!m.managed());
+        assert!(m.take_over(6));
+        assert!(m.take_over(3));
+        assert!(!m.take_over(7));
+        assert_eq!(m.managed_mixers(), 0b10_0100);
+        assert!(m.managed());
+        assert!(m.select_audio_track(3));
+        assert!(m.managed(), "taking over Track 3 kept Track 6");
+        assert!(m.select_audio_track(4));
+        assert!(!m.managed());
+        m.collection_loaded(0);
+        assert!(!m.manages(3) && !m.manages(6));
+        m.collection_loaded(0xffff_ffff);
+        assert_eq!(m.managed_mixers(), 0b11_1111);
+        assert!(!m.manages(0) && !m.manages(7));
+    }
+
+    #[test]
+    fn invalid_audio_track_falls_back_to_six() {
+        for bad in ["0", "7", "-1", "256", "2.5", "\"2\"", "null", "true"] {
+            let s = with_owned(&format!(r#""audio_track":{bad}"#));
+            assert_eq!(s.audio_track, 6, "{bad}");
+        }
+        assert_eq!(with_owned(r#""audio_track":3.0"#).audio_track, 3);
+        let mut m = PanelModel::new(PanelSettings::default());
+        for bad in [0u8, 7, 255] {
+            m.set_settings(PanelSettings {
+                audio_track: bad,
+                ..PanelSettings::default()
+            });
+            assert_eq!(m.settings().audio_track, 6, "{bad}");
+        }
+    }
+
+    #[test]
+    fn settings_of_another_account_forget_the_listed_servers() {
+        let mut m = PanelModel::new(PanelSettings {
+            guild_id: Some("g1".into()),
+            account: Some("a".into()),
+            ..PanelSettings::default()
+        });
+        m.guilds_loaded(Ok(Vec::new()));
+        assert!(m.guild_unavailable());
+        m.set_settings(PanelSettings {
+            guild_id: Some("g2".into()),
+            account: Some("b".into()),
+            ..PanelSettings::default()
+        });
+        assert!(!m.guild_unavailable(), "b's servers aren't listed yet");
+    }
+
+    fn with_track(m: &mut PanelModel, track: u8) {
+        let mut s = m.settings().clone();
+        s.audio_track = track;
+        m.set_settings(s);
+    }
+
+    #[test]
+    fn a_new_model_is_idle_on_track_6() {
+        let m = PanelModel::new(PanelSettings::default());
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.track_status(), TrackStatus::Idle { selected: 6 });
+        assert_eq!(m.status_text(), "Idle");
+    }
+
+    #[test]
+    fn reloading_the_config_keeps_its_ownership_unless_a_session_runs() {
+        let stored = PanelSettings {
+            audio_track: 4,
+            owned: Some(ownership(3)),
+            ..picked().settings().clone()
+        };
+        let mut m = PanelModel::new(PanelSettings::default());
+        m.reload(stored.clone());
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+        assert_eq!(m.settings().audio_track, 4);
+
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership(7)))));
+        m.reload(stored);
+        assert_eq!(m.persisted(), Some(&ownership(7)), "the live session's own");
+        assert_eq!(m.settings().audio_track, 4);
+        assert_eq!(m.live_track(), Some(6));
+    }
+
+    #[test]
+    fn selecting_a_track_takes_only_tracks_1_to_6() {
+        let mut m = PanelModel::new(PanelSettings::default());
+        assert!(m.select_audio_track(6));
+        assert_eq!(m.settings().audio_track, 6);
+        for bad in [0, 7, 255] {
+            assert!(!m.select_audio_track(bad), "{bad}");
+            assert_eq!(m.settings().audio_track, 6);
+        }
+    }
+
+    #[test]
+    fn a_track_changed_while_idle_is_the_one_the_next_start_binds() {
+        let mut m = picked();
+        with_track(&mut m, 3);
+        assert_eq!(m.track_status(), TrackStatus::Idle { selected: 3 });
+        m.start(canvas()).unwrap();
+        assert_eq!(m.live_track(), None, "not bound until the output accepts");
+        assert_eq!(m.status_text(), "Starting on Track 3…");
+        m.started(Ok(started(None)));
+        assert_eq!(m.track_status(), TrackStatus::Live { track: 3 });
+        assert_eq!(m.status_text(), "Live on Track 3");
+    }
+
+    fn mic_on(mixers: u32) -> AudioSource {
+        AudioSource {
+            uuid: "m".into(),
+            name: "Mic".into(),
+            mixers,
+            mic: true,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn the_track_applied_to_the_output_is_the_one_recorded_live() {
+        let mut m = picked();
+        with_track(&mut m, 3);
+        m.start(canvas()).unwrap();
+        with_track(&mut m, 4);
+        let output = m
+            .claim(Some(ownership(7)), &[mic_on(0b1)])
+            .expect("starting")
+            .expect("no mic on Track 4");
+        assert_eq!(output["audio_track"], json!(4));
+        assert_eq!(
+            m.persisted(),
+            Some(&ownership(7)),
+            "claimed before the output starts"
+        );
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.status_text(), "Starting on Track 4…");
+        with_track(&mut m, 6);
+        m.started(Ok(started(Some(ownership(7)))));
+        assert_eq!(m.live_track(), Some(4));
+        assert_eq!(m.track_status(), TrackStatus::Pending { live: 4, next: 6 });
+        assert_eq!(m.claim(None, &[]), None, "only while starting");
+    }
+
+    #[test]
+    fn a_mic_track_picked_while_starting_is_refused_at_the_claim() {
+        let mut m = picked();
+        m.take_over(6);
+        let mic = [mic_on(0b1)];
+        assert!(mic_guard(&m, &mic).is_none(), "Track 6 is safe at Go Live");
+        m.start(canvas()).unwrap();
+        assert!(m.select_audio_track(1));
+        let refused = m.claim(Some(ownership(7)), &mic).expect("starting");
+        assert_eq!(
+            refused,
+            Err(MicGuard {
+                track: 1,
+                mics: vec!["Mic".into()],
+                live: false
+            })
+        );
+        assert_eq!(m.state(), &PanelState::Starting, "the caller ends it");
+        assert_eq!(m.persisted(), Some(&ownership(7)), "so cleanup can stop it");
+        m.output_failed("held back".into(), FIX_MIC_TRACK, true);
+        assert_eq!(m.state(), &PanelState::Idle);
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.persisted(), None);
+    }
+
+    #[test]
+    fn a_mic_routed_onto_the_track_while_starting_is_refused_at_the_claim() {
+        let mut m = picked();
+        with_track(&mut m, 3);
+        assert!(mic_guard(&m, &[mic_on(0b1)]).is_none());
+        m.start(canvas()).unwrap();
+        let refused = m.claim(None, &[mic_on(0b101)]).expect("starting");
+        assert_eq!(refused.map_err(|g| g.track), Err(3));
+
+        let mut m = picked();
+        m.take_over(6);
+        m.start(canvas()).unwrap();
+        let ticked = m.claim(None, &[mic_on(0b10_0000)]).expect("starting");
+        assert!(
+            ticked.is_ok(),
+            "a mic ticked on the managed track is chosen"
+        );
+    }
+
+    #[test]
+    fn an_output_that_refuses_its_start_returns_to_idle_with_its_error() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.claim(Some(ownership(7)), &[]);
+        m.output_failed("no encoder".into(), FIX_OUTPUT_SETTING, false);
+        assert_eq!(m.state(), &PanelState::Idle);
+        assert_eq!(m.error(), Some("no encoder"));
+        assert_eq!(m.live_track(), None);
+        assert_eq!(
+            m.persisted(),
+            Some(&ownership(7)),
+            "the session may still run"
+        );
+
+        m.start(canvas()).unwrap();
+        m.claim(Some(ownership(8)), &[]);
+        m.output_failed("no encoder".into(), FIX_OUTPUT_SETTING, true);
+        assert_eq!(m.persisted(), None, "its session was stopped");
+        m.output_failed("late".into(), FIX_OUTPUT_SETTING, true);
+        assert_eq!(m.error(), Some("no encoder"), "ignored once idle");
+    }
+
+    #[test]
+    fn a_track_changed_while_live_is_kept_for_the_next_start() {
+        let mut m = picked();
+        with_track(&mut m, 2);
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(None)));
+        with_track(&mut m, 5);
+        assert!(matches!(m.state(), PanelState::Live { .. }));
+        assert_eq!(m.settings().audio_track, 5);
+        assert_eq!(m.settings().output_settings()["audio_track"], json!(5));
+        assert_eq!(m.live_track(), Some(2));
+        assert_eq!(m.track_status(), TrackStatus::Pending { live: 2, next: 5 });
+        assert_eq!(
+            m.status_text(),
+            "Live on Track 2 — Discord hears Track 5 from the next Go Live"
+        );
+        with_track(&mut m, 2);
+        assert_eq!(m.track_status(), TrackStatus::Live { track: 2 });
+        assert_eq!(m.live_track(), Some(2));
+    }
+
+    #[test]
+    fn every_way_out_of_a_session_clears_the_live_track() {
+        let live = |track: u8| {
+            let mut m = picked();
+            with_track(&mut m, track);
+            m.start(canvas()).unwrap();
+            m.started(Ok(started(None)));
+            with_track(&mut m, 6);
+            m
+        };
+        let mut m = live(2);
+        m.stop();
+        assert_eq!(m.live_track(), Some(2), "still bound while stopping");
+        assert_eq!(m.status_text(), "Stopping…");
+        m.stopped(Ok(()));
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.track_status(), TrackStatus::Idle { selected: 6 });
+
+        let mut m = live(3);
+        m.stop();
+        m.stopped(Err("timed out".into()));
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.status_text(), "timed out");
+
+        let mut m = live(4);
+        m.ended(Some("the session ended".into()));
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.track_status(), TrackStatus::Idle { selected: 6 });
+
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.claim(None, &[]);
+        m.started(Err(ControlError::Stopping.into()));
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.status_text(), "D-Streamy is still stopping; try again");
+    }
+
+    #[test]
+    fn tracks_have_fixed_names() {
+        let names: Vec<String> = AUDIO_TRACKS.map(track_name).collect();
+        assert_eq!(
+            names,
+            [
+                "Track 1", "Track 2", "Track 3", "Track 4", "Track 5", "Track 6"
+            ]
+        );
+        assert_eq!(AUDIO_TRACK_TITLE, "Discord audio track");
+    }
+
+    #[test]
+    fn a_stored_audio_track_label_is_dropped() {
+        let s = with_owned(r#""audio_track":3,"audio_track_label":"Music""#);
+        assert_eq!(s.audio_track, 3);
+        assert!(!s.to_json().contains("label"), "{}", s.to_json());
+        assert!(s.output_settings().get("audio_track_label").is_none());
+    }
+
+    #[test]
+    fn a_guild_change_clears_the_channel_and_drops_stale_lists() {
+        let mut m = picked();
+        assert_eq!(m.select_guild("g"), None);
+        assert_eq!(m.select_guild("h"), Some("h".into()));
+        assert_eq!(m.settings().channel_id, None);
+        assert!(m.channels().is_empty());
+        m.channels_loaded("g", Ok(vec![named("c")]));
+        assert!(
+            m.channels().is_empty(),
+            "a reply for the old guild is dropped"
+        );
+        m.channels_loaded("h", Ok(vec![named("e")]));
+        assert_eq!(m.channels(), [named("e")]);
+    }
+
+    #[test]
+    fn reloaded_lists_keep_a_selection_that_still_exists() {
+        let mut m = picked();
+        assert_eq!(m.guilds_loaded(Ok(vec![named("g")])), Some("g".into()));
+        m.channels_loaded("g", Ok(vec![named("c")]));
+        assert_eq!(m.settings().channel_id.as_deref(), Some("c"));
+        m.channels_loaded("g", Ok(vec![named("d")]));
+        assert_eq!(
+            m.settings().channel_id.as_deref(),
+            Some("c"),
+            "kept until the user picks"
+        );
+        assert!(!m.lists_channel("c"));
+        assert_eq!(
+            m.guilds_loaded(Ok(vec![named("h")])),
+            None,
+            "no channels for an unlisted server"
+        );
+        assert_eq!(m.settings().guild_id.as_deref(), Some("g"));
+        assert!(m.channels().is_empty());
+    }
+
+    fn choice(guild: Option<&str>, channel: Option<&str>, track: u8) -> Choice {
+        Choice {
+            guild_id: guild.map(Into::into),
+            channel_id: channel.map(Into::into),
+            audio_track: track,
+        }
+    }
+
+    #[test]
+    fn pick_a_server_clears_the_server_and_its_channel() {
+        let mut m = picked();
+        assert_eq!(m.choose_guild(None), None);
+        assert_eq!(m.choice(), choice(None, None, 6));
+        assert!(
+            m.channels().is_empty(),
+            "the old server's channels are gone"
+        );
+        assert_eq!(
+            m.start(canvas()).unwrap_err(),
+            "Pick a server and a voice channel first"
+        );
+        assert_eq!(m.choose_guild(None), None, "already cleared");
+        assert_eq!(m.choose_guild(Some("h")), Some("h".into()));
+        assert_eq!(m.choice(), choice(Some("h"), None, 6));
+    }
+
+    #[test]
+    fn pick_a_voice_channel_clears_only_the_channel() {
+        let mut m = picked();
+        assert_eq!(m.choose_channel(None), None);
+        assert_eq!(m.choice(), choice(Some("g"), None, 6));
+        assert!(m.lists_channel("d"), "the server's channels stay listed");
+        assert_eq!(m.choose_channel(Some("d")), Some("d".into()));
+        assert_eq!(
+            m.choose_channel(Some("x")),
+            Some("d".into()),
+            "an unlisted channel is refused and the kept one shown"
+        );
+    }
+
+    #[test]
+    fn cancel_puts_back_what_the_dialog_opened_with_even_when_unlisted() {
+        let mut m = picked();
+        let opened = m.choice();
+        assert_eq!(m.choose_guild(Some("h")), Some("h".into()));
+        m.channels_loaded("h", Ok(vec![named("e")]));
+        assert_eq!(m.choose_channel(Some("e")), Some("e".into()));
+        assert!(m.select_audio_track(5));
+        assert_eq!(
+            m.restore_choice(&opened),
+            Some("g".into()),
+            "the opened server's channels are loaded again"
+        );
+        assert_eq!(m.choice(), opened);
+        assert!(m.channels().is_empty(), "h's channels are not g's");
+        assert_eq!(m.restore_choice(&opened), None, "nothing changes twice");
+
+        m.choose_guild(None);
+        assert_eq!(m.restore_choice(&opened), Some("g".into()));
+        assert_eq!(
+            m.choice(),
+            opened,
+            "the channel comes back although no list names it yet"
+        );
+        assert!(m.start(canvas()).is_ok());
+    }
+
+    #[test]
+    fn cancel_while_live_puts_back_the_track_as_pending_only() {
+        let mut m = picked();
+        assert!(m.select_audio_track(3));
+        m.start(canvas()).unwrap();
+        m.claim(None, &[]);
+        m.started(Ok(started(None)));
+        let opened = m.choice();
+        assert!(m.select_audio_track(5));
+        assert_eq!(m.track_status(), TrackStatus::Pending { live: 3, next: 5 });
+        m.restore_choice(&opened);
+        assert_eq!(m.track_status(), TrackStatus::Live { track: 3 });
+        assert!(matches!(m.state(), PanelState::Live { .. }));
+    }
+
+    #[test]
+    fn only_listed_servers_and_channels_can_be_picked() {
+        let mut m = picked();
+        m.guilds_loaded(Ok(vec![named("g"), named("h")]));
+        m.channels_loaded("g", Ok(vec![named("c"), named("d")]));
+        assert!(m.lists_guild("h") && !m.lists_guild("x"));
+        assert!(m.lists_channel("d") && !m.lists_channel("e"));
+        m.select_guild("h");
+        assert_eq!(
+            m.settings().channel_id,
+            None,
+            "a server change clears the channel"
+        );
+        assert!(!m.lists_channel("c"), "the old server's channels are gone");
+        assert!(!m.pick_channel("c"), "the old server's channel is refused");
+        assert_eq!(m.settings().channel_id, None);
+        assert!(m.start(canvas()).is_err(), "nothing to start in");
+        m.channels_loaded("h", Ok(vec![named("e")]));
+        assert!(!m.pick_channel("c"), "still not one of h's");
+        assert!(m.pick_channel("e"));
+        let request = m.start(canvas()).unwrap();
+        assert_eq!(
+            (request.guild_id.as_str(), request.channel_id.as_str()),
+            ("h", "e")
+        );
+    }
+
+    #[test]
+    fn abort_ends_a_start_or_stop_with_its_error() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.claim(Some(ownership(7)), &[]);
+        m.abort("the control step failed".into(), FIX_RESTART_OBS);
+        assert_eq!(m.state(), &PanelState::Idle);
+        assert_eq!(m.status_text(), "the control step failed");
+        assert_eq!(
+            m.persisted(),
+            Some(&ownership(7)),
+            "kept so a later stop can end it"
+        );
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership(7)))));
+        m.stop();
+        m.abort("gone".into(), FIX_RESTART_OBS);
+        assert_eq!(m.live_track(), None);
+        assert_eq!(m.state(), &PanelState::Idle);
+    }
+
+    #[test]
+    fn load_errors_are_shown() {
+        let mut m = PanelModel::new(PanelSettings::default());
+        m.guilds_loaded(Err(ControlError::NotLoggedIn { window: false }));
+        assert_eq!(m.error(), Some("Log in first: run `dstreamy login`"));
+        assert_eq!(
+            m.login_offer(),
+            None,
+            "this serve can't open a login window"
+        );
+        m.guilds_loaded(Ok(vec![named("g")]));
+        assert_eq!(m.error(), None);
+    }
+
+    #[test]
+    fn a_missing_or_rejected_login_offers_the_login_window() {
+        let mut m = PanelModel::new(PanelSettings::default());
+        m.guilds_loaded(Err(ControlError::NotLoggedIn { window: true }));
+        assert_eq!(m.login_offer(), Some(Relogin::First));
+        assert_eq!(m.status_text(), "Log in first: press Log in");
+        m.guilds_loaded(Err(ControlError::InvalidToken { window: true }));
+        assert_eq!(m.login_offer(), Some(Relogin::Again));
+        assert_eq!(Relogin::Again.label(), "Log in again");
+
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Err(ControlError::InvalidToken { window: true }.into()));
+        assert_eq!(m.login_offer(), Some(Relogin::Again), "a failed start too");
+        m.start(canvas()).unwrap();
+        assert_eq!(m.login_offer(), None, "only while idle");
+    }
+
+    #[test]
+    fn the_login_window_waits_then_clears_the_problem() {
+        let mut m = picked();
+        assert!(!m.begin_login(), "nothing to log in for");
+        m.guilds_loaded(Err(ControlError::NotLoggedIn { window: true }));
+        assert!(m.begin_login());
+        assert!(m.logging_in());
+        assert_eq!(m.login_offer(), None, "no second window while one is open");
+        assert!(!m.begin_login());
+        assert_eq!(m.status_text(), WAITING_FOR_LOGIN);
+        assert!(m.start(canvas()).is_err(), "no start while logging in");
+        assert!(
+            m.login_finished(Ok(Some("Mock".into()))),
+            "reload the lists"
+        );
+        assert!(!m.logging_in());
+        assert_eq!(m.error(), None);
+        assert_eq!(m.status_text(), "Idle");
+        assert!(!m.login_finished(Ok(None)), "no window was open");
+    }
+
+    #[test]
+    fn a_failed_or_cancelled_login_offers_the_window_again() {
+        let mut m = PanelModel::new(PanelSettings::default());
+        m.guilds_loaded(Err(ControlError::InvalidToken { window: true }));
+        m.begin_login();
+        assert!(!m.login_finished(Err(ControlError::LoginCancelled)));
+        assert_eq!(m.problem().unwrap().headline, "Login cancelled");
+        assert_eq!(m.problem().unwrap().fix, "Try the login again");
+        assert_eq!(m.login_offer(), Some(Relogin::Again), "keeps its label");
+
+        m.begin_login();
+        m.login_finished(Err(ControlError::LoginFailed("no display".into())));
+        assert_eq!(m.error(), Some("The login didn't finish: no display"));
+        assert_eq!(m.login_offer(), Some(Relogin::Again));
+
+        m.begin_login();
+        m.login_finished(Err(ControlError::Outdated {
+            feature: "browser_login",
+        }));
+        assert_eq!(m.problem().unwrap().fix, "Update and restart the service");
+        assert_eq!(m.login_offer(), None, "the service must change first");
+
+        m.guilds_loaded(Err(ControlError::NotLoggedIn { window: true }));
+        m.begin_login();
+        m.login_finished(Err(ControlError::LoginUnavailable));
+        assert_eq!(m.problem().unwrap().fix, "Run `dstreamy login`");
+        assert_eq!(m.login_offer(), None, "falls back to the command");
+    }
+
+    #[test]
+    fn a_good_list_load_keeps_a_start_or_stop_problem() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Err(ControlError::NotRunning("no socket".into()).into()));
+        let problem = m.error().map(str::to_owned);
+        assert!(problem.is_some());
+        m.guilds_loaded(Ok(vec![named("g")]));
+        m.channels_loaded("g", Ok(vec![named("c")]));
+        assert_eq!(
+            m.error().map(str::to_owned),
+            problem,
+            "the panel opening must not hide it"
+        );
+
+        let mut m = picked();
+        m.stop();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(None)));
+        m.stop();
+        m.stopped(Err("timed out".into()));
+        m.guilds_loaded(Ok(vec![named("g")]));
+        assert_eq!(m.error(), Some("timed out"));
+
+        let mut m = picked();
+        m.channels_loaded("g", Err(ControlError::GuildUnavailable));
+        assert!(m.problem().is_some_and(|p| p.lists));
+        m.channels_loaded("g", Ok(vec![named("c")]));
+        assert_eq!(
+            m.error(),
+            None,
+            "a list's own problem goes with the next good load"
+        );
+    }
+
+    #[test]
+    fn a_channel_load_error_clears_the_list() {
+        let mut m = picked();
+        m.channels_loaded("g", Err(ControlError::GuildUnavailable));
+        assert!(m.channels().is_empty());
+        assert!(m.error().is_some());
+    }
+
+    #[test]
+    fn picking_clears_a_stale_error() {
+        let mut m = picked();
+        m.channels_loaded("g", Err(ControlError::GuildUnavailable));
+        m.select_channel("d");
+        assert_eq!(m.error(), None);
+        m.channels_loaded("g", Err(ControlError::GuildUnavailable));
+        m.select_guild("h");
+        assert_eq!(m.error(), None);
+    }
+
+    #[test]
+    fn a_settings_guild_change_clears_the_list_and_asks_for_channels() {
+        let mut m = picked();
+        let next = PanelSettings {
+            guild_id: Some("h".into()),
+            channel_id: Some("e".into()),
+            ..m.settings().clone()
+        };
+        assert_eq!(m.set_settings(next), Some("h".into()));
+        assert!(m.channels().is_empty());
+        assert_eq!(m.settings().channel_id.as_deref(), Some("e"));
+        m.channels_loaded("h", Ok(vec![named("f")]));
+        assert_eq!(
+            m.settings().channel_id.as_deref(),
+            Some("e"),
+            "a saved id is kept"
+        );
+        assert!(!m.lists_channel("e"));
+        assert_eq!(m.set_settings(m.settings().clone()), None);
+    }
+
+    #[test]
+    fn a_saved_channel_the_list_lacks_is_kept() {
+        let mut m = picked();
+        let pick = |channel: &str| PanelSettings {
+            channel_id: Some(channel.into()),
+            ..picked().settings().clone()
+        };
+        assert_eq!(m.set_settings(pick("d")), None);
+        assert_eq!(m.settings().channel_id.as_deref(), Some("d"));
+        m.set_settings(pick("zz"));
+        assert_eq!(m.settings().channel_id.as_deref(), Some("zz"));
+        assert!(!m.lists_channel("zz"));
+        assert_eq!(m.channels().len(), 2);
+    }
+
+    #[test]
+    fn guild_and_channel_stay_while_the_model_is_busy() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        let next = PanelSettings {
+            guild_id: Some("h".into()),
+            channel_id: Some("e".into()),
+            bitrate_kbps: 2500,
+            ..m.settings().clone()
+        };
+        assert_eq!(m.set_settings(next.clone()), None);
+        assert_eq!(m.settings().guild_id.as_deref(), Some("g"));
+        assert_eq!(m.settings().channel_id.as_deref(), Some("c"));
+        assert_eq!(m.settings().bitrate_kbps, 2500);
+        assert_eq!(m.channels().len(), 2);
+        m.started(Ok(started(None)));
+        assert_eq!(m.set_settings(next), None);
+        assert_eq!(m.settings().guild_id.as_deref(), Some("g"));
+    }
+
+    #[test]
+    fn start_takes_the_rate_and_size_from_the_canvas() {
+        let mut m = picked();
+        m.set_settings(PanelSettings {
+            grace_secs: Some(90),
+            ..m.settings().clone()
+        });
+        let r = m.start(canvas()).unwrap();
+        assert_eq!(
+            r,
+            StartRequest {
+                guild_id: "g".into(),
+                channel_id: "c".into(),
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                grace_secs: Some(90),
+            }
+        );
+        assert_eq!(m.state(), &PanelState::Starting);
+        assert!(m.start(canvas()).is_err(), "only one start at a time");
+    }
+
+    #[test]
+    fn start_refuses_without_a_channel_or_with_an_odd_canvas() {
+        let mut m = PanelModel::new(PanelSettings::default());
+        assert_eq!(
+            m.start(canvas()).unwrap_err(),
+            "Pick a server and a voice channel first"
+        );
+        let mut m = picked();
+        let err = m
+            .start(Canvas {
+                fps_num: 25,
+                ..canvas()
+            })
+            .unwrap_err();
+        assert!(err.contains("Common FPS Values"), "{err}");
+        assert_eq!(m.state(), &PanelState::Idle);
+        assert_eq!(m.error(), Some(err.as_str()));
+    }
+
+    #[test]
+    fn a_start_records_whether_the_session_is_ours() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership(3)))));
+        assert_eq!(
+            m.state(),
+            &PanelState::Live {
+                channel: "General".into(),
+                session_fps: None,
+            }
+        );
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+        assert!(m.start(canvas()).is_err(), "no start while live");
+        assert_eq!(m.stop(), Some(Some(ownership(3))));
+        m.stopped(Ok(()));
+        assert_eq!(m.state(), &PanelState::Idle);
+        assert_eq!(m.persisted(), None);
+    }
+
+    #[test]
+    fn attaching_to_a_foreign_session_drops_a_stale_ownership() {
+        let mut m = PanelModel::new(PanelSettings {
+            owned: Some(ownership(3)),
+            ..picked().settings().clone()
+        });
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(None)));
+        assert_eq!(m.persisted(), None);
+        assert_eq!(m.stop(), Some(None));
+    }
+
+    #[test]
+    fn a_failed_start_or_stop_keeps_the_ownership() {
+        let mut m = PanelModel::new(PanelSettings {
+            owned: Some(ownership(3)),
+            ..picked().settings().clone()
+        });
+        m.start(canvas()).unwrap();
+        m.started(Err(ControlError::Busy {
+            channel: "Gaming".into(),
+        }
+        .into()));
+        assert_eq!(m.state(), &PanelState::Idle);
+        assert_eq!(m.error(), Some("D-Streamy is already live in Gaming"));
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership(3)))));
+        m.stop();
+        m.stopped(Err("timed out".into()));
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+        assert_eq!(m.error(), Some("timed out"));
+    }
+
+    #[test]
+    fn a_start_lost_after_sending_keeps_its_provisional_ownership() {
+        let mut m = PanelModel::new(PanelSettings {
+            owned: Some(ownership(3)),
+            ..picked().settings().clone()
+        });
+        m.start(canvas()).unwrap();
+        m.started(Err(StartFailed {
+            error: ControlError::Timeout {
+                command: "start",
+                secs: 10,
+            },
+            ownership: Some(Box::new(ownership(7))),
+        }));
+        assert_eq!(m.state(), &PanelState::Idle);
+        assert_eq!(m.persisted(), Some(&ownership(7)));
+        assert_eq!(
+            m.error(),
+            Some("The D-Streamy service didn't answer start within 10 s")
+        );
+    }
+
+    #[test]
+    fn a_channel_id_is_shown_by_its_name_when_the_list_has_it() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(Started {
+            ownership: None,
+            channel: "c".into(),
+        }));
+        assert_eq!(
+            m.state(),
+            &PanelState::Live {
+                channel: "C".into(),
+                session_fps: None,
+            }
+        );
+    }
+
+    #[test]
+    fn settings_changes_never_touch_the_ownership() {
+        let mut m = PanelModel::new(PanelSettings {
+            owned: Some(ownership(3)),
+            ..PanelSettings::default()
+        });
+        m.set_settings(PanelSettings {
+            bitrate_kbps: 2500,
+            ..PanelSettings::default()
+        });
+        assert_eq!(m.settings().bitrate_kbps, 2500);
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+    }
+
+    #[test]
+    fn the_session_fps_is_known_only_for_our_own_session() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership_at(3, Some(60))))));
+        assert_eq!(m.session_fps(), Some(60));
+        m.stop();
+        assert_eq!(m.session_fps(), None);
+        m.stopped(Ok(()));
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(None)));
+        assert_eq!(m.session_fps(), None);
+    }
+
+    #[test]
+    fn replies_count_only_in_the_state_that_waits_for_them() {
+        let mut m = picked();
+        m.started(Ok(started(Some(ownership(3)))));
+        assert_eq!(m.state(), &PanelState::Idle);
+        assert_eq!(m.persisted(), None);
+        m.stopped(Ok(()));
+        assert_eq!(m.state(), &PanelState::Idle);
+        m.start(canvas()).unwrap();
+        m.stopped(Err("late".into()));
+        assert_eq!(m.state(), &PanelState::Starting);
+        m.started(Ok(started(Some(ownership(3)))));
+        m.started(Err(ControlError::Stopping.into()));
+        assert!(matches!(m.state(), PanelState::Live { .. }));
+        assert_eq!(m.error(), None);
+    }
+
+    #[test]
+    fn ended_while_starting_or_stopping_leaves_the_reply_to_decide() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.ended(Some("output stopped".into()));
+        assert_eq!(m.state(), &PanelState::Starting);
+        m.started(Ok(started(Some(ownership(3)))));
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+        m.stop();
+        m.ended(Some("output stopped".into()));
+        assert_eq!(m.state(), &PanelState::Stopping);
+        m.stopped(Err("timed out".into()));
+        assert_eq!(m.state(), &PanelState::Idle);
+        assert_eq!(m.error(), Some("timed out"));
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+    }
+
+    #[test]
+    fn a_session_the_service_ended_clears_ownership_and_can_offer_the_login() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership(3)))));
+        let end = crate::DetachReason::Stopped.session_end(
+            "x",
+            Some(&crate::StopCode {
+                code: "invalid_token".into(),
+                retry_after_secs: None,
+            }),
+        );
+        m.service_ended(end.clone());
+        assert_eq!(m.state(), &PanelState::Idle);
+        assert_eq!(m.persisted(), None);
+        assert_eq!(m.status_text(), end.message);
+        assert_eq!(m.login_offer(), Some(Relogin::Again));
+    }
+
+    #[test]
+    fn a_failed_output_keeps_stop_available_until_the_service_session_ends() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership(3)))));
+        let message = "The Discord session is still live; press Stop";
+        m.output_ended(Err(message.into()));
+        assert!(matches!(m.state(), PanelState::Live { .. }));
+        assert_eq!(m.status_text(), message);
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+        assert_eq!(m.stop(), Some(Some(ownership(3))));
+        m.stopped(Ok(()));
+        assert_eq!(m.status_text(), "Idle");
+        assert!(m.output_problem().is_none());
+        assert_eq!(m.persisted(), None);
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(None)));
+        assert!(m.status_text().starts_with("Live on "));
+        assert!(m.output_problem().is_none());
+    }
+
+    #[test]
+    fn a_terminal_output_warning_survives_reopen_and_list_refreshes_until_stop() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership(3)))));
+        let failure = "Output ended; cleanup failed; press Stop";
+        m.output_ended(Err(failure.into()));
+        m.reload(m.settings().clone());
+        m.lists_requested();
+        m.accounts_loaded(Err(ControlError::NotRunning("offline".into())));
+        m.guilds_loaded(Err(ControlError::NotRunning("offline".into())));
+        assert_eq!(m.status_text(), failure);
+        m.channels_loaded("g", Err(ControlError::NotRunning("offline".into())));
+        assert_eq!(m.status_text(), failure);
+        m.guilds_loaded(Ok(vec![]));
+        assert!(m.guild_unavailable());
+        assert_eq!(m.status_text(), failure);
+        m.guilds_loaded(Ok(vec![named("g")]));
+        m.channels_loaded("g", Ok(vec![]));
+        assert!(m.channel_unavailable());
+        assert_eq!(m.status_text(), failure);
+        m.channels_loaded("g", Ok(vec![named("c")]));
+        m.lists_finished();
+        assert_eq!(m.loading(), (false, false));
+        assert_eq!(m.status_text(), failure);
+        assert_eq!(m.persisted(), Some(&ownership(3)));
+        assert_eq!(m.stop(), Some(Some(ownership(3))));
+        m.stopped(Ok(()));
+        assert!(m.output_problem().is_none());
+        assert_eq!(m.status_text(), "Idle");
+    }
+
+    #[test]
+    fn an_output_failure_that_ends_its_service_session_forgets_ownership() {
+        let mut m = picked();
+        m.start(canvas()).unwrap();
+        m.started(Ok(started(Some(ownership(3)))));
+        m.output_ended(Ok("encoder failed".into()));
+        assert_eq!(m.state(), &PanelState::Idle);
+        assert!(m.persisted().is_none());
+    }
+
+    #[test]
+    fn stop_needs_a_live_model_and_ended_returns_to_idle() {
+        let mut m = picked();
+        assert_eq!(m.stop(), None);
+        m.start(canvas()).unwrap();
+        assert_eq!(m.stop(), None);
+        m.started(Ok(started(None)));
+        m.ended(Some("the session ended".into()));
+        assert_eq!(m.state(), &PanelState::Idle);
+        assert_eq!(m.error(), Some("the session ended"));
+    }
+}

@@ -1,0 +1,48 @@
+[package]
+name = "dstreamy-obs"
+description = "D-Streamy OBS plugin module"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dstreamy-obs-producer = { path = "../dstreamy-obs-producer" }
+dstreamy-obs-sys = { path = "../dstreamy-obs-sys" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+libloading = "0.8"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+
+[features]
+# Settings that force panics and delays, for the obs/ tests only; never in a shipped plugin.
+test-hooks = []
+
+[lints]
+workspace = true
+
+# Own workspace: building needs libobs, so it stays out of `cargo test --workspace` in rust/.
+[workspace]
+members = ["."]
+
+# Keep in step with [workspace.package] and [workspace.lints] in rust/Cargo.toml; cargo cannot inherit across workspaces.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+panic = "unwind"
