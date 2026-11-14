@@ -8,7 +8,7 @@ D-Streamy is a SwiftUI menu bar app (ScreenCaptureKit + VideoToolbox) feeding a 
 
 ## Decision
 
-- Rewrite everything in Rust, as a Cargo workspace under `rust/`, built on the `rust-rewrite` branch.
+- Rewrite everything in Rust, as a Cargo workspace under `rust/`, built on the `rust-rewrite` branch until it replaced the Bun app on `main`.
 - The UI is a CLI with a TUI (`ratatui`); the menu bar app is dropped.
 - Capture and encode sit behind a `CaptureSource` trait, with compile-time backends selected by `cfg(target_os)`; no runtime dylib plugins (Rust has no stable ABI).
   - macOS: `screencapturekit` + VideoToolbox.

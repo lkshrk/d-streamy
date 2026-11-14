@@ -271,10 +271,10 @@ Release jobs import the Developer ID certificate on `xcode-27`, so jobs on the s
 
 Triggers and filters:
 
-- `ci.yml`: push to `main` and `rust-rewrite`, pull requests to any branch, dispatch.
-- `rust-ci.yml`: push to `main` and `rust-rewrite`, pull requests to `main`, dispatch.
-- `fuzz.yml`: push to `main` and `rust-rewrite`, pull requests to `main`, nightly at 03:17 UTC, dispatch with a `seconds` input.
-- `obs-ci.yml`: push to `main`, `rust-rewrite` and `ci/obs-**`, and pull requests to `main` and `rust-rewrite`, only when these paths change: `obs/**`, `rust/crates/**`, `rust/vendor/**`, `rust/Cargo.toml`, `rust/Cargo.lock`, `rust/rust-toolchain.toml`, the workflow itself, `.github/actions/obs-prefix-*/**`, `.github/actions/apt-archives-save/**`, `.github/scripts/obs-*.sh` and `.github/scripts/apt-install.sh`.
+- `ci.yml`: push to `main`, pull requests to any branch, dispatch.
+- `rust-ci.yml`: push to `main`, pull requests to `main`, dispatch.
+- `fuzz.yml`: push to `main`, pull requests to `main`, nightly at 03:17 UTC, dispatch with a `seconds` input.
+- `obs-ci.yml`: push to `main` and `ci/obs-**`, and pull requests to `main`, only when these paths change: `obs/**`, `rust/crates/**`, `rust/vendor/**`, `rust/Cargo.toml`, `rust/Cargo.lock`, `rust/rust-toolchain.toml`, the workflow itself, `.github/actions/obs-prefix-*/**`, `.github/actions/apt-archives-save/**`, `.github/scripts/obs-*.sh` and `.github/scripts/apt-install.sh`.
 
 A newer run on the same ref cancels an older one, except on `main`, where each commit gets its own concurrency group, so a later push neither cancels nor replaces a queued run. The release gate needs the tagged commit's runs to finish, so tag releases on `main`.
 

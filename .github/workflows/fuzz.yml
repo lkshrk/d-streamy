@@ -2,7 +2,7 @@ name: Fuzz
 
 on:
   push:
-    branches: [main, rust-rewrite]
+    branches: [main]
   pull_request:
     branches: [main]
   schedule:

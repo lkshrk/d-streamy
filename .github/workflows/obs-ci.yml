@@ -2,7 +2,7 @@ name: OBS
 
 on:
   push:
-    branches: [main, rust-rewrite, "ci/obs-**"]
+    branches: [main, "ci/obs-**"]
     paths:
       - "obs/**"
       - "rust/crates/**"
@@ -16,7 +16,7 @@ on:
       - ".github/scripts/obs-*.sh"
       - ".github/scripts/apt-install.sh"
   pull_request:
-    branches: [main, rust-rewrite]
+    branches: [main]
     paths:
       - "obs/**"
       - "rust/crates/**"
