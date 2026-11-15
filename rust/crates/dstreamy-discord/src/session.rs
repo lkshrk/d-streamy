@@ -854,9 +854,7 @@ impl Run {
         Box::pin(async move {
             Ok(match redo {
                 Redo::Voice => Connected {
-                    voice: Some(
-                        join_voice(&client, guild_id, channel_id, options.step_timeout).await?,
-                    ),
+                    voice: Some(join_voice(&client, guild_id, channel_id, &options).await?),
                     stream: None,
                     attrs,
                 },

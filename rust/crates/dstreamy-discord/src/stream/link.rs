@@ -17,20 +17,34 @@ pub(crate) async fn join_voice(
     client: &DiscordClient,
     guild_id: Option<String>,
     channel_id: String,
-    step: Duration,
+    options: &StreamOptions,
 ) -> Result<(MediaConnection, Events), StreamError> {
     let mut voice = client.join_voice(guild_id, channel_id);
-    let conn = timeout(step, async {
-        let conn = voice.ready().await?;
-        // Discord ignores Create Stream until the voice media link is connected.
+    let conn = timeout(options.step_timeout, voice.ready())
+        .await
+        .map_err(|_| StreamError::Timeout("joining voice"))??;
+    // Discord ignores Create Stream until the voice media link is connected.
+    connected(
+        &conn,
+        options.peer_connect_timeout,
+        "connecting the voice peer connection",
+    )
+    .await?;
+    Ok((conn, voice.events))
+}
+
+async fn connected(
+    conn: &MediaConnection,
+    limit: Duration,
+    what: &'static str,
+) -> Result<(), StreamError> {
+    timeout(limit, async {
         while !conn.is_ready().await {
             sleep(POLL).await;
         }
-        Ok::<_, StreamError>(conn)
     })
     .await
-    .map_err(|_| StreamError::Timeout("joining voice"))??;
-    Ok((conn, voice.events))
+    .map_err(|_| StreamError::Timeout(what))
 }
 
 /// Creates Go Live on the joined channel and readies it for media.
@@ -44,13 +58,12 @@ pub(crate) async fn open_stream(
     let conn = timeout(step, stream.ready())
         .await
         .map_err(|_| StreamError::Timeout("creating the stream"))??;
-    timeout(step, async {
-        while !conn.is_ready().await {
-            sleep(POLL).await;
-        }
-    })
-    .await
-    .map_err(|_| StreamError::Timeout("connecting the peer connection"))?;
+    connected(
+        &conn,
+        options.peer_connect_timeout,
+        "connecting the stream peer connection",
+    )
+    .await?;
     let mut dave_version = None;
     while let Ok(event) = stream.events.try_recv() {
         match event {

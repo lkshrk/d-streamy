@@ -775,6 +775,44 @@ async fn a_kick_while_joining_recovers_on_the_step_timeout() {
     f.finish().await;
 }
 
+/// A connection whose peer never connects is retried after `peer_connect_timeout`, well inside the 30 s step limit and the test's wait.
+async fn a_peer_that_never_connects_is_retried(kind: VoiceKind, what: &str) {
+    let mut f = Fixture::streaming().await;
+    let mut options = options();
+    options.stream.peer_connect_timeout = Duration::from_secs(1);
+    stop_and_start(&mut f, MOCK_VOICE_CHANNEL_ID, options, |mock| {
+        mock.unreachable_media_once(kind);
+    })
+    .await;
+    f.wait_state_explained(|s| *s == SessionState::Streaming)
+        .await;
+    f.video_flowing().await;
+    let errors: Vec<_> = events_seen(&mut f)
+        .into_iter()
+        .filter_map(|e| match e {
+            SessionEvent::Error { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors, [format!("connecting failed: timed out {what}")]);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voice_peer_that_never_connects_is_retried_after_its_limit() {
+    a_peer_that_never_connects_is_retried(VoiceKind::Voice, "connecting the voice peer connection")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_peer_that_never_connects_is_retried_after_its_limit() {
+    a_peer_that_never_connects_is_retried(
+        VoiceKind::Stream,
+        "connecting the stream peer connection",
+    )
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn voice_states_queued_when_the_join_completes_never_move_the_run() {
     let mut f = Fixture::streaming().await;
@@ -1048,10 +1086,7 @@ async fn gateway_drop_resumes_and_leaves_the_stream_alone() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invalid_session_rejoins_and_recovers() {
-    let mut options = options();
-    // A peer connection that never connects is retried after the step timeout, which must come within the wait below.
-    options.stream.step_timeout = Duration::from_secs(5);
-    let mut f = Fixture::streaming_with(options).await;
+    let mut f = Fixture::streaming().await;
     f.states_seen();
     assert!(f.mock.invalidate_session(false));
     f.mock

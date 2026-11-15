@@ -569,6 +569,16 @@ async fn select_protocol(
         rtp_rx,
     );
     c.peer = Some((pc, sink));
+    let sdp = {
+        let mut state = shared.state();
+        match state.unreachable_media.iter().position(|k| *k == c.kind) {
+            Some(i) => {
+                state.unreachable_media.remove(i);
+                unreachable_port(&sdp)
+            }
+            None => sdp,
+        }
+    };
     let ack = json!({
         "audio_codec": "opus",
         "video_codec": video_name,
@@ -593,6 +603,29 @@ async fn select_protocol(
         }
     }
     Ok(())
+}
+
+/// The answer with its media port swapped for the discard port, where no ICE check is ever answered.
+fn unreachable_port(sdp: &str) -> String {
+    let Some(port) = sdp
+        .lines()
+        .find_map(|l| l.strip_prefix("m=audio "))
+        .and_then(|rest| rest.split_whitespace().next())
+    else {
+        return sdp.to_owned();
+    };
+    sdp.lines()
+        .map(|line| {
+            if line == format!("a=rtcp:{port}") {
+                "a=rtcp:9".to_owned()
+            } else if line.starts_with("m=audio ") || line.starts_with("a=candidate") {
+                line.replacen(&format!(" {port} "), " 9 ", 1)
+            } else {
+                line.to_owned()
+            }
+        })
+        .map(|line| line + "\n")
+        .collect()
 }
 
 async fn answer(

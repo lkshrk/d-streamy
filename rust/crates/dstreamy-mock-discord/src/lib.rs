@@ -426,6 +426,11 @@ impl MockDiscord {
         self.shared.state().quiet_set_paused = true;
     }
 
+    /// The next SELECT_PROTOCOL on a `kind` connection answers with an unreachable media port, so its peer connection never connects.
+    pub fn unreachable_media_once(&self, kind: VoiceKind) {
+        self.shared.state().unreachable_media.push(kind);
+    }
+
     /// Leaves the next `n` STREAM_CREATEs unanswered.
     pub fn ignore_stream_creates(&self, n: usize) {
         self.shared.state().ignore_stream_creates = n;

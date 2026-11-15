@@ -230,6 +230,8 @@ pub(crate) struct State {
     pub reset_voice_on_stream_create: bool,
     pub ignore_stream_creates: usize,
     pub quiet_set_paused: bool,
+    /// Each entry makes the next SELECT_PROTOCOL of that kind answer with an unreachable media port.
+    pub unreachable_media: Vec<VoiceKind>,
 }
 
 pub(crate) struct Shared {

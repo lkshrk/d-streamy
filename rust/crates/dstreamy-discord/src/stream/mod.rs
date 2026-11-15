@@ -20,8 +20,10 @@ use pump::MediaPump;
 pub struct StreamOptions {
     /// Passed to the source; also gives the codec and the initial video attributes.
     pub capture: CaptureConfig,
-    /// Limit for each of: joining voice, creating the stream, the peer connection.
+    /// Limit for each of: joining voice and creating the stream, until Discord answers.
     pub step_timeout: Duration,
+    /// Limit for a peer connection to connect once Discord answered; a stuck handshake is retried, not waited out.
+    pub peer_connect_timeout: Duration,
     /// Limit for a session's first source start, which may wait on the user in a screen sharing dialog.
     pub source_start_timeout: Duration,
     /// How long to hold media back for DAVE before sending anyway.
@@ -44,6 +46,7 @@ impl StreamOptions {
         Self {
             capture,
             step_timeout: Duration::from_secs(30),
+            peer_connect_timeout: Duration::from_secs(10),
             source_start_timeout: Duration::from_secs(300),
             dave_timeout: Duration::from_secs(10),
             max_queued_video: 8,
@@ -162,7 +165,7 @@ pub async fn start_stream(
     let attrs = initial_attributes(&options);
     let teardown = Teardown(Some(&client));
     let connected = async {
-        let voice = join_voice(&client, guild_id, channel_id, options.step_timeout).await?;
+        let voice = join_voice(&client, guild_id, channel_id, &options).await?;
         let stream = open_stream(&client, &options, attrs).await?;
         Ok::<_, StreamError>((voice, stream))
     };
