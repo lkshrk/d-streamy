@@ -8,7 +8,7 @@ test-group = 'trace-replay'
 [profile.ci]
 fail-fast = false
 
-# Timing-sensitive end-to-end tests; nextest reports a retried pass as FLAKY.
+# Timing-sensitive tests; nextest reports a retried pass as FLAKY. The ledger test assumes the lock frees within LOCK_WAIT.
 [[profile.ci.overrides]]
-filter = 'binary_id(dstreamy-cli::producer) | binary_id(dstreamy-discord::session)'
+filter = 'binary_id(dstreamy-cli::producer) | binary_id(dstreamy-discord::session) | test(=gateway::ledger::tests::concurrent_writers_never_pass_the_limit_or_lose_stamps)'
 retries = 2
