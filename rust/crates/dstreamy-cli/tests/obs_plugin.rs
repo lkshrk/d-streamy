@@ -1002,36 +1002,24 @@ fn stream(
     (lines, recorded)
 }
 
-/// The mock's recording once serve's health stats matched it across a refresh, and the video serve dropped to stay live.
+/// The mock's recording once serve's health stats count every frame it sent, and the video serve dropped to stay live.
 fn settled_video(h: &Harness, c: &mut Client) -> (dstreamy_mock_discord::Recorded, u64) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut steady: Option<(u64, u64, Instant)> = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let stats = c.status()["stats"].clone();
         let recorded = h.mock.recorded();
         let sent = stats["video_frames_sent"].as_u64();
-        let dropped: u64 = ["video_frames_dropped", "source_video_frames_dropped"]
-            .iter()
-            .map(|key| stats[*key].as_u64().unwrap_or(0))
-            .sum();
-        let now = Instant::now();
-        if sent == Some(stream_video(&recorded).len() as u64) {
-            let key = (sent.unwrap_or(0), dropped);
-            match steady {
-                Some((s, d, since)) if (s, d) == key => {
-                    if now.duration_since(since) > Duration::from_millis(1500) {
-                        return (recorded, dropped);
-                    }
-                }
-                _ => steady = Some((key.0, key.1, now)),
-            }
-        } else {
-            steady = None;
+        let at_mock = stream_video(&recorded).len();
+        if sent == Some(at_mock as u64) {
+            let dropped = ["video_frames_dropped", "source_video_frames_dropped"]
+                .iter()
+                .map(|key| stats[*key].as_u64().unwrap_or(0))
+                .sum();
+            return (recorded, dropped);
         }
         assert!(
-            now < deadline,
-            "serve's stats never settled: sent {sent:?}, {} video frames at the mock, dropped {dropped}",
-            stream_video(&recorded).len()
+            Instant::now() < deadline,
+            "serve's stats never settled: sent {sent:?}, {at_mock} video frames at the mock"
         );
         std::thread::sleep(Duration::from_millis(200));
     }

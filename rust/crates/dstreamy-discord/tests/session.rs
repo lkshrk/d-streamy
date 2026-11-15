@@ -779,7 +779,7 @@ async fn a_kick_while_joining_recovers_on_the_step_timeout() {
 async fn a_peer_that_never_connects_is_retried(kind: VoiceKind, what: &str) {
     let mut f = Fixture::streaming().await;
     let mut options = options();
-    options.stream.peer_connect_timeout = Duration::from_secs(1);
+    options.stream.peer_connect_timeout = Duration::from_secs(3);
     stop_and_start(&mut f, MOCK_VOICE_CHANNEL_ID, options, |mock| {
         mock.unreachable_media_once(kind);
     })
@@ -1107,10 +1107,13 @@ async fn invalid_session_rejoins_and_recovers() {
         .await;
     f.video_flowing().await;
 
-    let joins = f.voice_joins();
-    assert!(
-        (2..=4).contains(&joins.len()) && joins.iter().all(|c| c == MOCK_VOICE_CHANNEL_ID),
-        "{joins:?}"
+    let peer_timeouts = events_seen(&mut f)
+        .iter()
+        .filter(|e| matches!(e, SessionEvent::Error { message, .. } if message.contains("peer connection")))
+        .count();
+    assert_eq!(
+        f.voice_joins(),
+        vec![MOCK_VOICE_CHANNEL_ID; 2 + peer_timeouts]
     );
     assert_eq!(f.starts(), 1);
     f.finish().await;

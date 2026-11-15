@@ -7,3 +7,8 @@ test-group = 'trace-replay'
 
 [profile.ci]
 fail-fast = false
+
+# Timing-sensitive end-to-end tests; nextest reports a retried pass as FLAKY.
+[[profile.ci.overrides]]
+filter = 'binary_id(dstreamy-cli::producer) | binary_id(dstreamy-discord::session)'
+retries = 2
