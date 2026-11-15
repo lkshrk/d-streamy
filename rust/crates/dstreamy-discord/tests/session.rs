@@ -1109,7 +1109,7 @@ async fn invalid_session_rejoins_and_recovers() {
 
     let peer_timeouts = events_seen(&mut f)
         .iter()
-        .filter(|e| matches!(e, SessionEvent::Error { message, .. } if message.contains("peer connection")))
+        .filter(|e| matches!(e, SessionEvent::Error { message, .. } if message.contains("timed out connecting the")))
         .count();
     assert_eq!(
         f.voice_joins(),
