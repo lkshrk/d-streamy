@@ -1408,7 +1408,7 @@ name = "dstreamy-discord"
 version = "2.0.2"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "discord-stream-rs",
  "dstreamy-core",
  "dstreamy-discord",
