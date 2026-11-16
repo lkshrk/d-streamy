@@ -12,7 +12,7 @@ dstreamy-media = { path = "../dstreamy-media" }
 base64 = "0.23"
 flate2 = "1"
 futures-util = "0.3"
-rand = "0.9"
+rand = "0.10"
 rsa = { version = "0.9", features = ["sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 secrecy = "0.10"
