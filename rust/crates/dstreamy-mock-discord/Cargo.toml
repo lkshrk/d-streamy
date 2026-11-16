@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-davey = "0.1.5"
+davey = "0.2.0"
 flate2 = "1"
 futures-util = "0.3"
 openmls = "0.8"
