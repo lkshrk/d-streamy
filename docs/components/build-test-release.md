@@ -389,8 +389,9 @@ Secrets, by name:
 | `SIGNING_IDENTITY` | Developer ID identity for `codesign` |
 | `DEVELOPER_ID_CERT_P12`, `DEVELOPER_ID_CERT_PASSWORD` | The certificate, imported by `.github/actions/macos-signing-keychain` |
 | `NOTARY_KEY_P8`, `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID` | App Store Connect API key for `xcrun notarytool` (`.github/actions/macos-notarize`) |
-| `TAP_TOKEN` | Push to `lkshrk/homebrew-tap` |
 | `PACMAN_SIGNING_KEY` | The ASCII-armoured secret key, without a passphrase, that signs the pacman packages and databases; its public half is `packaging/arch/d-streamy.asc` |
+
+The push to `lkshrk/homebrew-tap` needs no secret: the release job exchanges its OIDC token for a short-lived token from the `homebrew-tap-publish` octo-sts identity (`sts.h-cloud.io`, policy in `lkshrk/.github`).
 
 `.github/actions/macos-signing-keychain` creates a keychain under `$RUNNER_TEMP` with a random password, imports the certificate and exports the keychain's path as `SIGNING_KEYCHAIN`. Every `codesign --sign` passes `--keychain "$SIGNING_KEYCHAIN"` (`scripts/release.sh` does when the variable is set), so the action never changes the user's keychain search list and concurrent signing jobs under one macOS user can't drop each other's keychain. codesign still builds the certificate chain from the search list, so the runner must have Apple's Developer ID G2 intermediate; the action fails early when it is missing. Commands that carry a password go to `security -i` on stdin, so they never show in the process list; a certificate password containing a line break is refused. Its post step runs even when the job fails: it locks the keychain and deletes it with the decoded files. `macos-notarize` deletes the decoded `.p8` on every exit.
 

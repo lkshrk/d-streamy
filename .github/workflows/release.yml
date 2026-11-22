@@ -776,16 +776,24 @@ jobs:
           set -euo pipefail
           scripts/fill-formula.sh "$VERSION" dist Formula/dstreamy.rb > "$RUNNER_TEMP/dstreamy.rb"
           scripts/fill-cask.sh "$VERSION" dist Casks/d-streamy.rb > "$RUNNER_TEMP/d-streamy.rb"
+      - name: Create homebrew-tap-publish token
+        id: tap-token
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05 # v1.1.1
+        with:
+          domain: sts.h-cloud.io
+          scope: lkshrk
+          identity: homebrew-tap-publish
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: lkshrk/homebrew-tap
-          token: ${{ secrets.TAP_TOKEN }}
+          token: ${{ steps.tap-token.outputs.token }}
           path: tap
           persist-credentials: false
       - name: Push the formula and cask to the tap
         env:
           # gh's credential helper hands this to git for the push only; nothing lands in .git/config.
-          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
         run: |
           set -euo pipefail
           gh auth setup-git
