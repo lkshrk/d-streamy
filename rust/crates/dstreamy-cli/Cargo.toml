@@ -39,7 +39,7 @@ dstreamy-capture-macos = { path = "../dstreamy-capture-macos" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "2.0.2", optional = true }
-gtk = { version = "0.18", optional = true }
+gtk = { version = "0.19", optional = true }
 dstreamy-capture-linux = { path = "../dstreamy-capture-linux" }
 
 [dev-dependencies]
